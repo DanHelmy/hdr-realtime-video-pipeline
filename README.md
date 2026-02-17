@@ -74,6 +74,32 @@ python -m venv venv
 venv\Scripts\activate
 
 ### Install Dependencies
+pip install -r requirements.txt
+
+### Run the Application
+python src/main.py
+
+---
+
+## 🎯 Research Objective
+
+This project focuses on:
+
+- Precision-aware optimization
+- Real-time inference feasibility
+- Latency measurement and benchmarking
+- Performance–accuracy evaluation under quantization
+
+Network architecture modification is outside the scope of this study.
+
+---
+
+## 📚 Academic Context
+
+This repository represents the implementation component of an academic thesis project.
+
+Experimental benchmarks, quantitative evaluation, and comparative analysis will be documented in future releases.
+
 
 pip install torch torchvision
 pip install opencv-python numpy
