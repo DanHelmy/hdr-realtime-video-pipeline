@@ -1,20 +1,22 @@
 import numpy as np
+from models.base_processor import BaseProcessor
 
-class DummyProcessor:
+
+class DummyProcessor(BaseProcessor):
     """
     Placeholder for HDR / ML inference.
     This will later be replaced by FP32 / FP16 / INT8 models.
     """
 
-    def process(self, frame_bgr):
-        # Convert to float
-        img = frame_bgr.astype(np.float32) / 255.0
+    def preprocess(self, frame_bgr):
+        # Convert to float [0,1]
+        return frame_bgr.astype(np.float32) / 255.0
 
+    def infer(self, tensor):
         # Dummy "HDR-like" expansion (gamma curve)
-        img = np.power(img, 2.2)
+        return np.power(tensor, 2.2)
 
+    def postprocess(self, output):
         # Back to displayable range
-        img = np.clip(img, 0.0, 1.0)
-        img = (img * 255.0).astype(np.uint8)
-
-        return img
+        output = np.clip(output, 0.0, 1.0)
+        return (output * 255.0).astype(np.uint8)
