@@ -1,61 +1,124 @@
-# HDR Real-Time Video Pipeline
+# HDR Real-Time Video Processing Framework
 
-Real-time SDR-to-HDR reconstruction pipeline built for an undergraduate thesis on mixed-precision inference.
+![Version](https://img.shields.io/badge/version-v0.3-blue)
+![Status](https://img.shields.io/badge/status-active%20development-yellow)
+![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
-Current focus:
-- ONNX Runtime inference
-- DirectML acceleration on AMD/Windows
-- FP32 vs FP16 performance analysis
+---
 
-## Highlights
-- Modular pipeline (`decode -> preprocess -> infer -> postprocess -> render`)
-- Dual-input HDRTVNet ONNX execution (`input`, `condition`)
-- DirectML-first provider selection with CPU fallback
-- Runtime timing output for benchmarking
+## 📌 Overview
 
-## Requirements
-- Windows 11
+This repository contains the implementation framework for an undergraduate thesis:
+
+**Mixed-Precision Quantization for HDR Reconstruction Networks (HDRTVNet++)**
+
+The project studies performance-accuracy tradeoffs between FP32, FP16, and future INT8/mixed-precision methods for real-time SDR-to-HDR video reconstruction.
+
+---
+
+## 🚀 Current Status (v0.3)
+
+Version `v0.3` introduces ONNX Runtime GPU inference in the real-time pipeline with cross-backend provider selection.
+
+### Implemented
+
+- FP32 and FP16 HDRTVNet++ ONNX models
+- ONNX Runtime inference integration
+- Execution provider auto-selection (GPU-first, CPU fallback)
+- Dual-input model handling (`input` + `condition`)
+- Runtime timing output (`decode`, `resize`, `infer`, `render`)
+- Optional ONNX Runtime profiling output
+
+---
+
+## 🧠 Architecture
+
+Pipeline flow:
+
+`Video Source -> Preprocess -> HDRTVNet (ONNX) -> Postprocess -> Renderer`
+
+Inference backends are kept modular so you can benchmark variants without changing pipeline structure.
+
+---
+
+## 🛠 Installation
+
+### Requirements
+
 - Python 3.10+
-- AMD GPU with DirectX 12 drivers (for DirectML path)
+- OpenCV
+- NumPy
+- ONNX Runtime package for your hardware/backend
 
-## Install
+### Setup
+
 ```bash
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Run
-Default run:
+### ONNX Runtime backend packages
+
+Install **one** backend package that matches your machine:
+
+- AMD / Windows (DirectML): `pip install onnxruntime-directml`
+- NVIDIA (CUDA): `pip install onnxruntime-gpu`
+- CPU only: `pip install onnxruntime`
+
+---
+
+## ▶️ Running
+
+Default:
+
 ```bash
 python src/main.py
 ```
 
-Useful flags:
+Examples:
+
 ```bash
 python src/main.py --video input.mp4 --model hdrtvnet_fp16.onnx --provider auto
 python src/main.py --provider dml
+python src/main.py --provider cuda
 python src/main.py --provider cpu
 python src/main.py --no-display --timing-interval 120
 python src/main.py --ort-profile
 ```
 
-## Benchmark Notes
-- Use `--no-display` to measure throughput without GUI overhead.
-- Timing output fields:
-  - `decode`: video read time
-  - `resize`: pre-inference resize time
-  - `infer`: preprocess + ONNX inference + postprocess
-  - `render`: display overlay + window update
-- Keep input video, resolution, and drivers fixed between FP32/FP16 runs.
+Available provider options:
 
-## Export ONNX
+- `auto`
+- `dml`
+- `cuda`
+- `rocm`
+- `tensorrt`
+- `coreml`
+- `openvino`
+- `cpu`
+
+---
+
+## 📊 Benchmark Notes
+
+- Use `--no-display` for throughput benchmarking.
+- Keep video, resolution, drivers, and model constant when comparing FP32 vs FP16.
+- `infer` includes preprocess + ONNX session + postprocess.
+
+---
+
+## 📦 Export ONNX
+
 ```bash
 python export_onnx_fp32.py
 python export_onnx_fp16.py
 ```
 
-## Project Layout
+---
+
+## 📂 Project Structure
+
 ```text
 src/
   main.py
@@ -69,5 +132,8 @@ src/
     weights/
 ```
 
-## Thesis Context
-This repository is the implementation framework for evaluating precision-performance tradeoffs in real-time HDR reconstruction, including FP32, FP16, and later INT8/mixed-precision paths.
+---
+
+## 🎓 Academic Context
+
+This repository is the implementation component of an undergraduate thesis focused on precision-aware optimization for real-time HDR reconstruction.

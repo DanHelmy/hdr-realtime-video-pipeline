@@ -19,8 +19,8 @@ def parse_args():
     parser.add_argument(
         "--provider",
         default="auto",
-        choices=["auto", "dml", "cpu"],
-        help="Execution provider preference"
+        choices=["auto", "dml", "cuda", "rocm", "tensorrt", "coreml", "openvino", "cpu"],
+        help="Execution provider preference (auto picks first available GPU backend)"
     )
     parser.add_argument("--device-id", type=int, default=0, help="DirectML device id")
     parser.add_argument("--max-width", type=int, default=TARGET_WIDTH, help="Max processing width")

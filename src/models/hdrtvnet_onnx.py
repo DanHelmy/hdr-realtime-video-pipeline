@@ -40,18 +40,52 @@ class HDRTVNetONNX:
     def _build_providers(self, provider, device_id):
         available = set(ort.get_available_providers())
         mode = provider.lower()
-
-        if mode not in {"auto", "dml", "cpu"}:
-            raise ValueError("provider must be one of: auto, dml, cpu")
+        valid = {"auto", "dml", "cuda", "rocm", "tensorrt", "coreml", "openvino", "cpu"}
+        if mode not in valid:
+            raise ValueError(f"provider must be one of: {sorted(valid)}")
 
         resolved = []
+        gpu_priority = [
+            ("TensorrtExecutionProvider", None),
+            ("CUDAExecutionProvider", None),
+            ("ROCMExecutionProvider", None),
+            ("DmlExecutionProvider", {"device_id": device_id}),
+            ("CoreMLExecutionProvider", None),
+            ("OpenVINOExecutionProvider", None),
+        ]
+        mode_to_ep = {
+            "dml": ("DmlExecutionProvider", {"device_id": device_id}),
+            "cuda": ("CUDAExecutionProvider", None),
+            "rocm": ("ROCMExecutionProvider", None),
+            "tensorrt": ("TensorrtExecutionProvider", None),
+            "coreml": ("CoreMLExecutionProvider", None),
+            "openvino": ("OpenVINOExecutionProvider", None),
+        }
 
-        if mode in {"auto", "dml"} and "DmlExecutionProvider" in available:
-            resolved.append(("DmlExecutionProvider", {"device_id": device_id}))
-        elif mode == "dml":
-            raise RuntimeError("DmlExecutionProvider is not available in this environment.")
+        if mode == "auto":
+            for ep_name, ep_opts in gpu_priority:
+                if ep_name in available:
+                    resolved.append((ep_name, ep_opts) if ep_opts is not None else ep_name)
+                    break
+        elif mode == "cpu":
+            pass
+        else:
+            ep_name, ep_opts = mode_to_ep[mode]
+            if ep_name not in available:
+                raise RuntimeError(
+                    f"{ep_name} is not available in this environment. "
+                    f"Available providers: {sorted(available)}"
+                )
+            resolved.append((ep_name, ep_opts) if ep_opts is not None else ep_name)
 
-        if "CPUExecutionProvider" in available:
+        # Always keep CPU fallback unless user explicitly requests CPU only.
+        if mode != "cpu" and "CPUExecutionProvider" in available:
+            resolved.append("CPUExecutionProvider")
+        elif mode == "cpu":
+            if "CPUExecutionProvider" not in available:
+                raise RuntimeError(
+                    f"CPUExecutionProvider is not available. Available providers: {sorted(available)}"
+                )
             resolved.append("CPUExecutionProvider")
 
         if not resolved:
