@@ -1,7 +1,26 @@
 venv/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
+*.so
+
+# Local media and generated runtime artifacts
 *.mp4
 *.avi
 *.mov
 *.mkv
+onnxruntime_profile__*.json
+
+# Build/test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Large model artifacts (prefer release assets or Git LFS)
+*.onnx
+*.pth
