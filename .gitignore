@@ -11,6 +11,7 @@ __pycache__/
 *.mov
 *.mkv
 onnxruntime_profile__*.json
+benchmark_results_*.csv
 
 # Build/test caches
 .pytest_cache/

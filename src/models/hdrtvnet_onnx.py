@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import onnxruntime as ort
+import time
 
 
 class HDRTVNetONNX:
@@ -22,6 +23,11 @@ class HDRTVNetONNX:
 
         self.input_name, self.cond_name = self._resolve_input_names()
         self.output_name = self.session.get_outputs()[0].name
+        self.expected_hw = self._resolve_expected_hw()
+        self.is_static_input_model = self.expected_hw is not None
+        if self.is_static_input_model:
+            exp_h, exp_w = self.expected_hw
+            print(f"Static model input detected: {exp_w}x{exp_h}")
 
         # Detect precision
         input_type = self.session.get_inputs()[0].type
@@ -31,6 +37,16 @@ class HDRTVNetONNX:
         else:
             self.dtype = np.float32
             print("Running in FP32 mode")
+
+        self._scale = np.float32(1.0 / 255.0)
+        self._cached_hw = None
+        self._cond_hw = None
+        self._frame_rgb = None
+        self._cond_rgb = None
+        self._input_fp32 = None
+        self._cond_fp32 = None
+        self._input_fp16 = None
+        self._cond_fp16 = None
 
     def end_profiling(self):
         if hasattr(self.session, "end_profiling"):
@@ -112,30 +128,69 @@ class HDRTVNetONNX:
         cond_name = lowered.get("condition") or names[1]
         return input_name, cond_name
 
+    def _resolve_expected_hw(self):
+        shape = self.session.get_inputs()[0].shape
+        if len(shape) < 4:
+            return None
+        h = shape[2]
+        w = shape[3]
+        if isinstance(h, int) and isinstance(w, int) and h > 0 and w > 0:
+            return (h, w)
+        return None
+
+    def _ensure_preprocess_buffers(self, h, w):
+        if self._cached_hw == (h, w):
+            return
+
+        cond_h = max(1, h // 4)
+        cond_w = max(1, w // 4)
+
+        self._frame_rgb = np.empty((h, w, 3), dtype=np.uint8)
+        self._cond_rgb = np.empty((cond_h, cond_w, 3), dtype=np.uint8)
+
+        self._input_fp32 = np.empty((1, 3, h, w), dtype=np.float32)
+        self._cond_fp32 = np.empty((1, 3, cond_h, cond_w), dtype=np.float32)
+
+        if self.dtype == np.float16:
+            self._input_fp16 = np.empty((1, 3, h, w), dtype=np.float16)
+            self._cond_fp16 = np.empty((1, 3, cond_h, cond_w), dtype=np.float16)
+        else:
+            self._input_fp16 = None
+            self._cond_fp16 = None
+
+        self._cached_hw = (h, w)
+        self._cond_hw = (cond_h, cond_w)
+
     def preprocess(self, frame_bgr):
+        h, w = frame_bgr.shape[:2]
+        self._ensure_preprocess_buffers(h, w)
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB, dst=self._frame_rgb)
 
-        # CPU preprocessing is typically faster in FP32; cast to FP16 at the edge.
-        frame = frame_rgb.astype(np.float32)
-        frame *= (1.0 / 255.0)
-        frame = np.transpose(frame, (2, 0, 1))[None, :]
+        frame = self._input_fp32
+        frame[0, 0, :, :] = self._frame_rgb[:, :, 0]
+        frame[0, 1, :, :] = self._frame_rgb[:, :, 1]
+        frame[0, 2, :, :] = self._frame_rgb[:, :, 2]
+        np.multiply(frame, self._scale, out=frame)
 
-        cond_w = max(1, frame_rgb.shape[1] // 4)
-        cond_h = max(1, frame_rgb.shape[0] // 4)
-        cond_small = cv2.resize(
-            frame_rgb,
+        cond_h, cond_w = self._cond_hw
+        cv2.resize(
+            self._frame_rgb,
             (cond_w, cond_h),
+            dst=self._cond_rgb,
             interpolation=cv2.INTER_LINEAR
         )
 
-        cond = cond_small.astype(np.float32)
-        cond *= (1.0 / 255.0)
-        cond = np.transpose(cond, (2, 0, 1))[None, :]
+        cond = self._cond_fp32
+        cond[0, 0, :, :] = self._cond_rgb[:, :, 0]
+        cond[0, 1, :, :] = self._cond_rgb[:, :, 1]
+        cond[0, 2, :, :] = self._cond_rgb[:, :, 2]
+        np.multiply(cond, self._scale, out=cond)
 
         if self.dtype == np.float16:
-            frame = frame.astype(np.float16, copy=False)
-            cond = cond.astype(np.float16, copy=False)
+            self._input_fp16[...] = frame
+            self._cond_fp16[...] = cond
+            return self._input_fp16, self._cond_fp16
 
         return frame, cond
 
@@ -152,7 +207,6 @@ class HDRTVNetONNX:
         return cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
 
     def process(self, frame_bgr):
-
         input_tensor, cond_tensor = self.preprocess(frame_bgr)
 
         outputs = self.session.run(
@@ -164,3 +218,22 @@ class HDRTVNetONNX:
         )
 
         return self.postprocess(outputs[0])
+
+    def process_timed(self, frame_bgr):
+        t0 = time.perf_counter()
+        input_tensor, cond_tensor = self.preprocess(frame_bgr)
+        t1 = time.perf_counter()
+
+        outputs = self.session.run(
+            None,
+            {
+                self.input_name: input_tensor,
+                self.cond_name: cond_tensor
+            }
+        )
+        t2 = time.perf_counter()
+
+        output = self.postprocess(outputs[0])
+        t3 = time.perf_counter()
+
+        return output, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t3 - t2) * 1000.0
