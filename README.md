@@ -1,6 +1,6 @@
 # HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.2-blue)
+![Version](https://img.shields.io/badge/version-v0.3-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -14,30 +14,36 @@ Mixed-Precision Quantization for HDR Reconstruction Networks (HDRTVNet++)
 
 The project investigates the performance–accuracy trade-off of FP32, FP16, and mixed-precision INT8 quantization techniques for real-time SDR-to-HDR video reconstruction.
 
-The system is designed to progressively integrate optimized inference backends while maintaining a clean and modular real-time video pipeline.
+The system is designed as a modular real-time video pipeline that progressively integrates optimized inference backends while maintaining clean architectural separation between decoding, inference, and rendering.
 
 ---
 
-## 🚀 Current Status (v0.2)
+## 🚀 Current Status (v0.3)
 
-Version v0.2 integrates the full HDRTVNet++ (Ensemble_AGCM_LE) model into the real-time video pipeline.
+Version v0.3 introduces ONNX Runtime + DirectML GPU acceleration into the real-time pipeline.
 
 ### Newly Implemented
 
-- FP32 HDRTVNet++ model integration
-- Clean inference-only wrapper (no training dependencies)
-- Modular BaseProcessor interface
-- SDR → HDR real-time video processing
-- CPU-based PyTorch inference
-- FPS performance measurement overlay
+- FP32 HDRTVNet++ exported to ONNX
+- ONNX Runtime inference integration
+- DirectML GPU acceleration (Windows 11 / DirectX 12)
+- Dual-input model handling (image + condition tensor)
+- Optimized session configuration (full graph optimization)
+- Real-time FPS overlay
+- Modular inference abstraction preserved
 
 ### Current Performance
 
-- 4K input resolution supported
-- CPU-only inference
-- ~0.5 FPS expected (no optimization yet)
+- 1080p recommended for testing
+- DirectML GPU execution
+- ~6–7 FPS on mid-range GPU (baseline FP32 ONNX)
+- CPU usage significantly reduced compared to PyTorch-only inference
 
-This release establishes the FP32 baseline inside the live pipeline, serving as the foundation for upcoming optimization and quantization experiments.
+This release establishes the ONNX + GPU accelerated FP32 baseline that will serve as the reference point for:
+
+- FP16 acceleration
+- INT8 quantization
+- Mixed-Precision QAT optimization
 
 ---
 
@@ -45,17 +51,18 @@ This release establishes the FP32 baseline inside the live pipeline, serving as 
 
 System flow:
 
-Video Source → Processor Interface → HDRTVNet FP32 → Renderer
+Video Source → Preprocess → HDRTVNet (ONNX FP32) → Postprocess → Renderer
 
 The processor abstraction allows seamless integration of future inference backends:
 
-- FP32 baseline (current)
-- FP16 mixed precision
-- INT8 quantization (QAT / PTQ)
-- ONNX Runtime backend
-- DirectML acceleration
+- FP32 PyTorch (legacy baseline)
+- FP32 ONNX (current GPU baseline)
+- FP16 ONNX
+- INT8 (PTQ)
+- Mixed-Precision QAT
+- DirectML backend acceleration
 
-The architecture ensures that inference engines can evolve independently from the core video pipeline.
+The architecture ensures inference engines evolve independently from the core video pipeline.
 
 ---
 
@@ -63,8 +70,9 @@ The architecture ensures that inference engines can evolve independently from th
 
 ### Requirements
 
-- Python 3.9+
-- PyTorch (CPU)
+- Windows 11 (DirectX 12 required for DirectML)
+- Python 3.10+
+- ONNX Runtime (DirectML)
 - OpenCV
 - NumPy
 
@@ -74,42 +82,19 @@ python -m venv venv
 venv\Scripts\activate
 
 ### Install Dependencies
-pip install -r requirements.txt
 
-### Run the Application
-python src/main.py
-
----
-
-## 🎯 Research Objective
-
-This project focuses on:
-
-- Precision-aware optimization
-- Real-time inference feasibility
-- Latency measurement and benchmarking
-- Performance–accuracy evaluation under quantization
-
-Network architecture modification is outside the scope of this study.
-
----
-
-## 📚 Academic Context
-
-This repository represents the implementation component of an academic thesis project.
-
-Experimental benchmarks, quantitative evaluation, and comparative analysis will be documented in future releases.
-
-
-pip install torch torchvision
+pip install onnxruntime-directml
 pip install opencv-python numpy
+
+If exporting models:
+pip install torch torchvision onnx
 
 ---
 
 ## ▶️ Running the Pipeline
 
 1. Place an SDR video file in the project directory.
-2. Update VIDEO_PATH in main.py.
+2. Update VIDEO_PATH inside src/main.py.
 3. Run:
 
 python src/main.py
@@ -125,11 +110,37 @@ src/
  ├── video_source.py
  ├── timer.py
  └── models/
+      ├── hdrtvnet_onnx.py
       ├── base_processor.py
-      ├── hdrtvnet_fp32.py
       └── hdrtvnet_modules/
 
-The models directory contains the inference abstraction layer and extracted HDRTVNet architecture modules.
+The models directory contains:
+- ONNX inference wrapper
+- Extracted HDRTVNet++ architecture modules
+- Modular processor abstraction layer
+
+---
+
+## 🎯 Research Objective
+
+This project focuses on:
+
+- Precision-aware optimization
+- Real-time inference feasibility
+- Latency benchmarking
+- Performance–accuracy trade-off analysis
+- Mixed-Precision Quantization with QAT
+
+Network architecture modification is outside the scope of this study.
+
+---
+
+## ⚠️ Important Notes
+
+- Current output is SDR-display compatible (PQ/BT.2020 display pipeline not yet implemented).
+- True HDR10 output rendering will be implemented in a future release.
+- GUI interface is under development.
+- Quantization experiments (FP16 / INT8 / Mixed-QAT) are upcoming.
 
 ---
 
@@ -137,15 +148,10 @@ The models directory contains the inference abstraction layer and extracted HDRT
 
 This repository represents the implementation component of an undergraduate thesis project.
 
-The official HDRTVNet++ pretrained model is used for baseline FP32 evaluation before quantization.
+The official HDRTVNet++ pretrained model is used as the FP32 baseline prior to quantization.
 
-Future releases will introduce:
-
-- ONNX export
-- Mixed-precision acceleration
-- INT8 quantization experiments
-- Real-time optimization
+Experimental benchmarks, quantitative evaluation, and comparative analysis will be documented in subsequent releases.
 
 ---
 
-This version marks the first successful integration of HDRTVNet++ into a live real-time video processing pipeline.
+Version v0.3 marks the first successful GPU-accelerated HDRTVNet++ inference inside a live real-time video processing pipeline.
