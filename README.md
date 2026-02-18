@@ -1,6 +1,6 @@
 # HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.3-blue)
+![Version](https://img.shields.io/badge/version-v0.4-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -16,9 +16,9 @@ The project studies performance-accuracy tradeoffs between FP32, FP16, and futur
 
 ---
 
-## 🚀 Current Status (v0.3)
+## 🚀 Current Status (v0.4)
 
-Version `v0.3` introduces ONNX Runtime GPU inference in the real-time pipeline with cross-backend provider selection.
+Version `v0.4` introduces ONNX Runtime GPU inference in the real-time pipeline with cross-backend provider selection.
 
 ### Implemented
 
