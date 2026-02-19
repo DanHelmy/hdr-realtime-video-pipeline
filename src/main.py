@@ -1,31 +1,60 @@
 import cv2
 import argparse
 import time
+import numpy as np
 from collections import deque
 from video_source import VideoSource
 from timer import FPSTimer
-from models.hdrtvnet_onnx import HDRTVNetONNX
+from models.hdrtvnet_torch import HDRTVNetTorch
 
 VIDEO_PATH = "input.mp4"
-MODEL_PATH = "hdrtvnet_fp16.onnx"
+MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
 
 TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
 
+# Pre-allocated letterbox canvas to avoid allocation every frame
+_letterbox_canvas = None
+_letterbox_shape = None
+
+def letterbox_frame(frame, target_w, target_h):
+    global _letterbox_canvas, _letterbox_shape
+    h, w = frame.shape[:2]
+    if w == 0 or h == 0:
+        return frame
+
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    if new_w != w or new_h != h:
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        resized = frame
+
+    shape_key = (target_h, target_w, frame.dtype)
+    if _letterbox_canvas is None or _letterbox_shape != shape_key:
+        _letterbox_canvas = np.zeros((target_h, target_w, 3), dtype=frame.dtype)
+        _letterbox_shape = shape_key
+    else:
+        _letterbox_canvas[:] = 0  # clear is cheaper than allocating
+
+    x0 = (target_w - new_w) // 2
+    y0 = (target_h - new_h) // 2
+    _letterbox_canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return _letterbox_canvas
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Real-time HDRTVNet ONNX video pipeline")
+    parser = argparse.ArgumentParser(description="Real-time HDRTVNet video pipeline")
     parser.add_argument("--video", default=VIDEO_PATH, help="Input video path")
-    parser.add_argument("--model", default=MODEL_PATH, help="ONNX model path")
-    parser.add_argument(
-        "--provider",
-        default="auto",
-        choices=["auto", "dml", "cuda", "rocm", "tensorrt", "coreml", "openvino", "cpu"],
-        help="Execution provider preference (auto picks first available GPU backend)"
-    )
-    parser.add_argument("--device-id", type=int, default=0, help="DirectML device id")
+    parser.add_argument("--model", default=MODEL_PATH, help="Model path (.pth/.pt)")
     parser.add_argument("--max-width", type=int, default=TARGET_WIDTH, help="Max processing width")
     parser.add_argument("--max-height", type=int, default=TARGET_HEIGHT, help="Max processing height")
+    parser.add_argument(
+        "--letterbox",
+        action="store_true",
+        help="Preserve aspect ratio by fitting frame into target size with black bars"
+    )
     parser.add_argument(
         "--static-input",
         action="store_true",
@@ -42,19 +71,53 @@ def parse_args():
         help="Report preprocess/session/postprocess timing breakdown"
     )
     parser.add_argument("--no-display", action="store_true", help="Disable cv2.imshow for pure throughput testing")
-    parser.add_argument("--ort-profile", action="store_true", help="Enable ONNX Runtime profiling output")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="PyTorch device selection"
+    )
+    parser.add_argument(
+        "--precision",
+        default="auto",
+        choices=["auto", "fp16", "fp32"],
+        help="PyTorch inference precision"
+    )
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile() even if available (PyTorch engine only)"
+    )
+    parser.add_argument(
+        "--force-compile",
+        action="store_true",
+        help="Force torch.compile() even on ROCm-Windows (requires HIP SDK installed)"
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help="Use CUDA graph replay for static-shape inputs (PyTorch engine only)"
+    )
+    parser.add_argument(
+        "--channels-last",
+        action="store_true",
+        help="Force channels_last memory format (PyTorch engine only). "
+             "Auto-enabled on NVIDIA; use this flag to test on ROCm+Triton."
+    )
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
 
     source = VideoSource(args.video, prefetch=args.prefetch)
-    processor = HDRTVNetONNX(
+    processor = HDRTVNetTorch(
         args.model,
-        provider=args.provider,
-        device_id=args.device_id,
-        enable_profiling=args.ort_profile
+        device=args.device,
+        precision=args.precision,
+        compile_model=not args.no_compile,
+        force_compile=args.force_compile,
+        use_cuda_graphs=args.cuda_graphs,
+        force_channels_last=args.channels_last,
     )
     timer = FPSTimer()
     frame_idx = 0
@@ -78,30 +141,25 @@ def main():
         if not ret:
             break
 
-        # Optional static-input mode for fixed-shape ONNX benchmarking.
         h, w = frame.shape[:2]
         if args.static_input:
             if w != args.max_width or h != args.max_height:
+                if args.letterbox:
+                    frame = letterbox_frame(frame, args.max_width, args.max_height)
+                else:
+                    frame = cv2.resize(
+                        frame,
+                        (args.max_width, args.max_height),
+                        interpolation=cv2.INTER_AREA
+                    )
+        elif w > args.max_width or h > args.max_height:
+            if args.letterbox:
+                frame = letterbox_frame(frame, args.max_width, args.max_height)
+            else:
                 frame = cv2.resize(
                     frame,
                     (args.max_width, args.max_height),
                     interpolation=cv2.INTER_AREA
-                )
-        elif w > args.max_width or h > args.max_height:
-            frame = cv2.resize(
-                frame,
-                (args.max_width, args.max_height),
-                interpolation=cv2.INTER_AREA
-            )
-
-        if processor.is_static_input_model:
-            exp_h, exp_w = processor.expected_hw
-            fh, fw = frame.shape[:2]
-            if (fh, fw) != (exp_h, exp_w):
-                raise RuntimeError(
-                    f"Static ONNX expects {exp_w}x{exp_h} but frame is {fw}x{fh}. "
-                    f"Use --static-input --max-width {exp_w} --max-height {exp_h}, "
-                    "or switch to a dynamic-shape ONNX."
                 )
         t2 = time.perf_counter()
 
@@ -125,7 +183,7 @@ def main():
                 (0, 255, 0),
                 2
             )
-            cv2.imshow("HDRTVNet ONNX", output)
+            cv2.imshow("HDRTVNet PyTorch", output)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
         t4 = time.perf_counter()
@@ -248,10 +306,7 @@ def main():
 
     source.release()
     cv2.destroyAllWindows()
-    if args.ort_profile:
-        profile_path = processor.end_profiling()
-        print(f"ONNX Runtime profile saved to: {profile_path}")
-
 
 if __name__ == "__main__":
     main()
+

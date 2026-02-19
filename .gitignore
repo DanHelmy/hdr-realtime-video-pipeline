@@ -12,6 +12,9 @@ __pycache__/
 *.mkv
 onnxruntime_profile__*.json
 benchmark_results_*.csv
+dataset/
+hdrtvnet_int8*.onnx
+int8_*.onnx
 
 # Build/test caches
 .pytest_cache/
@@ -25,3 +28,8 @@ benchmark_results_*.csv
 # Large model artifacts (prefer release assets or Git LFS)
 *.onnx
 *.pth
+# But keep the runtime weights needed by the pipeline
+!src/models/weights/Ensemble_AGCM_LE.pth
+
+# Source Pipeline (upstream reference, not part of this project)
+Source Pipeline/

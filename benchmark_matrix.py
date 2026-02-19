@@ -12,12 +12,30 @@ KV_RE = re.compile(r"([a-zA-Z0-9_]+)=([^\s]+)")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Benchmark matrix runner for HDRTVNet pipeline")
+    parser = argparse.ArgumentParser(description="Benchmark matrix runner for HDRTVNet PyTorch pipeline")
     parser.add_argument("--video", default="input.mp4")
-    parser.add_argument("--provider", default="auto")
+    parser.add_argument(
+        "--models",
+        default="src/models/weights/Ensemble_AGCM_LE.pth",
+        help="Comma-separated .pth model paths"
+    )
+    parser.add_argument(
+        "--precisions",
+        default="auto,fp16,fp32",
+        help="Comma-separated precisions to test: auto,fp16,fp32"
+    )
+    parser.add_argument(
+        "--compile-modes",
+        default="no-compile,force-compile",
+        help="Comma-separated compile modes: no-compile,compile,force-compile"
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="PyTorch device selection"
+    )
     parser.add_argument("--prefetch-values", default="0,8")
-    parser.add_argument("--models", default="hdrtvnet_fp32.onnx,hdrtvnet_fp16.onnx")
-    parser.add_argument("--static-models", default="hdrtvnet_fp32_1080_static.onnx,hdrtvnet_fp16_1080_static.onnx")
     parser.add_argument("--max-width", type=int, default=1920)
     parser.add_argument("--max-height", type=int, default=1080)
     parser.add_argument("--warmup", type=int, default=30)
@@ -25,21 +43,20 @@ def parse_args():
     parser.add_argument("--timing-interval", type=int, default=120)
     parser.add_argument("--target-fps", type=float, default=0.0)
     parser.add_argument("--output-csv", default="")
+    parser.add_argument(
+        "--channels-last",
+        action="store_true",
+        help="Include --channels-last flag in benchmark cases"
+    )
     return parser.parse_args()
 
 
-def parse_prefetch(values):
-    out = []
-    for item in values.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        out.append(int(item))
-    return out
-
-
-def parse_models(values):
+def parse_list(values):
     return [x.strip() for x in values.split(",") if x.strip()]
+
+
+def parse_prefetch(values):
+    return [int(x.strip()) for x in values.split(",") if x.strip()]
 
 
 def run_case(cmd):
@@ -70,28 +87,27 @@ def print_table(rows):
 
 def main():
     args = parse_args()
+    models = parse_list(args.models)
+    precisions = parse_list(args.precisions)
+    compile_modes = parse_list(args.compile_modes)
     prefetch_values = parse_prefetch(args.prefetch_values)
-    dynamic_models = parse_models(args.models)
-    static_models = parse_models(args.static_models)
 
     cases = []
-    for model in dynamic_models:
-        for prefetch in prefetch_values:
-            cases.append({
-                "case": f"dynamic:{os.path.basename(model)}:prefetch={prefetch}",
-                "model": model,
-                "prefetch": prefetch,
-                "static_input": False,
-            })
-    for model in static_models:
-        if os.path.exists(model):
-            for prefetch in prefetch_values:
-                cases.append({
-                    "case": f"static:{os.path.basename(model)}:prefetch={prefetch}",
-                    "model": model,
-                    "prefetch": prefetch,
-                    "static_input": True,
-                })
+    for model in models:
+        for precision in precisions:
+            for compile_mode in compile_modes:
+                for prefetch in prefetch_values:
+                    tag = (f"torch:{os.path.basename(model)}:{precision}"
+                           f":{compile_mode}:prefetch={prefetch}")
+                    if args.channels_last:
+                        tag += ":cl"
+                    cases.append({
+                        "case": tag,
+                        "model": model,
+                        "prefetch": prefetch,
+                        "precision": precision,
+                        "compile_mode": compile_mode,
+                    })
 
     rows = []
     for case in cases:
@@ -100,7 +116,8 @@ def main():
             "src/main.py",
             "--video", args.video,
             "--model", case["model"],
-            "--provider", args.provider,
+            "--device", args.device,
+            "--precision", case["precision"],
             "--prefetch", str(case["prefetch"]),
             "--warmup", str(args.warmup),
             "--timing-interval", str(args.timing_interval),
@@ -110,10 +127,15 @@ def main():
             "--model-stage-timing",
             "--no-display",
         ]
+        compile_mode = case["compile_mode"]
+        if compile_mode == "no-compile":
+            cmd.append("--no-compile")
+        elif compile_mode == "force-compile":
+            cmd.append("--force-compile")
+        if args.channels_last:
+            cmd.append("--channels-last")
         if args.target_fps > 0:
             cmd.extend(["--target-fps", str(args.target_fps)])
-        if case["static_input"]:
-            cmd.append("--static-input")
 
         print(f"Running: {case['case']}")
         result = run_case(cmd)

@@ -1,52 +1,54 @@
-# HDR Real-Time Video Processing Framework
+﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.5-blue)
+![Version](https://img.shields.io/badge/version-v0.6-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
 ---
 
-## 🚀 Overview
+## Overview
 
 This repository contains the implementation framework for an undergraduate thesis:
 
-**Mixed-Precision Quantization for HDR Reconstruction Networks (HDRTVNet++)**
+**Real-Time SDR-to-HDR Video Reconstruction with HDRTVNet++ and PyTorch**
 
-The project studies performance-accuracy tradeoffs between FP32, FP16, and upcoming INT8 / mixed-precision methods for real-time SDR-to-HDR video reconstruction.
-
-Version `v0.5` focuses on pipeline-level performance engineering before INT8 integration.
+The project achieves real-time HDR reconstruction using a fully GPU-accelerated PyTorch pipeline with `torch.compile` optimizations, including support for AMD ROCm on Windows.
 
 ---
 
-## ✨ Current Status (v0.5)
+## Current Status (v0.6)
 
 ### Implemented
 
-- FP32 and FP16 HDRTVNet++ ONNX inference
-- Cross-backend ONNX Runtime provider selection
-- GPU-first auto provider with CPU fallback
+- Full PyTorch inference pipeline (FP16, FP32)
+- `torch.compile` with Triton (`max-autotune`) — 2.4× model inference speedup
+- ROCm-Windows support with automatic platform detection
+- GPU-side preprocessing (BGR→RGB, normalize, permute on GPU)
+- GPU-side postprocessing (clamp, scale, quantize, RGB→BGR on GPU)
+- Pre-allocated GPU tensor buffers (zero per-frame allocation)
+- `torch.inference_mode()` throughout
 - Async video prefetch queue (`--prefetch`)
-- Reused preprocess buffers for lower CPU overhead
 - Stage timing breakdown (`pre`, `run`, `post`)
 - Frame pacing stats (`fps`, `fps_1p_low`, `late`, `drop_est`)
 - Benchmark matrix runner (`benchmark_matrix.py`)
-- Static-shape ONNX export support (`--static`)
-- Static-model runtime input guard (clear error on mismatch)
+- Optional CUDA graph replay (`--cuda-graphs`)
+- Optional channels_last memory format (`--channels-last`)
 
 ### Pipeline
 
-`Video Source -> Preprocess -> ONNX Runtime -> Postprocess -> Renderer`
+```
+Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU Postprocess → CPU Download → Renderer
+```
 
 ---
 
-## 🛠 Installation
+## Installation
 
 ### Requirements
 
 - Python 3.10+
-- OpenCV
-- NumPy
-- ONNX Runtime backend package for your hardware
+- PyTorch 2.0+
+- OpenCV, NumPy
 
 ### Setup
 
@@ -56,89 +58,161 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### ONNX Runtime backend packages (install one)
+### PyTorch GPU backends
 
-- AMD / Windows (DirectML): `pip install onnxruntime-directml`
-- NVIDIA (CUDA): `pip install onnxruntime-gpu`
-- CPU only: `pip install onnxruntime`
+**AMD (ROCm/HIP):**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+```
+
+**NVIDIA (CUDA):**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+**Intel (CPU / oneAPI):**
+```bash
+pip install torch torchvision
+```
+
+### ROCm-Windows + torch.compile
+
+To enable `torch.compile` on ROCm-Windows, install Triton and copy HIP SDK headers:
+
+```bash
+pip install triton-windows
+xcopy /E /I "C:\Program Files\AMD\ROCm\7.1\include\hip" "venv\Lib\site-packages\_rocm_sdk_devel\include\hip"
+```
+
+Then use `--force-compile` when running.
 
 ---
 
-## ▶️ Running
+## Running
 
-Default:
+Default (FP16, auto device):
 
 ```bash
 python src/main.py
 ```
 
-Common:
+With torch.compile (recommended):
 
 ```bash
-python src/main.py --model hdrtvnet_fp16.onnx --provider dml --prefetch 8
-python src/main.py --model hdrtvnet_fp32.onnx --provider dml --prefetch 8
-python src/main.py --no-display --timing-interval 120
-python src/main.py --model-stage-timing --timing-interval 120
-python src/main.py --target-fps 8 --timing-interval 120
+python src/main.py --force-compile --model-stage-timing
 ```
 
-Provider options:
+FP32 mode:
 
-- `auto`
-- `dml`
-- `cuda`
-- `rocm`
-- `tensorrt`
-- `coreml`
-- `openvino`
-- `cpu`
+```bash
+python src/main.py --force-compile --precision fp32 --model-stage-timing
+```
+
+Headless benchmark:
+
+```bash
+python src/main.py --force-compile --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
+```
+
+### CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--model PATH` | Model weights path (default: `src/models/weights/Ensemble_AGCM_LE.pth`) |
+| `--device auto\|cuda\|cpu` | Device selection (default: auto) |
+| `--precision auto\|fp16\|fp32` | Inference precision (default: auto → fp16 on GPU) |
+| `--force-compile` | Enable `torch.compile` on ROCm (auto on NVIDIA) |
+| `--no-compile` | Disable `torch.compile` entirely |
+| `--channels-last` | Force channels_last memory format (auto on NVIDIA) |
+| `--cuda-graphs` | Enable CUDA graph replay for static shapes |
+| `--prefetch N` | Video reader prefetch queue size (default: 8) |
+| `--model-stage-timing` | Report pre/run/post timing breakdown |
+| `--no-display` | Headless mode for pure throughput testing |
+| `--warmup N` | Frames to skip before collecting stats (default: 30) |
+| `--timing-interval N` | Frames between timing reports (default: 120) |
+| `--max-frames N` | Stop after N frames (0 = full video) |
+| `--target-fps F` | Target FPS for late-frame and drop stats |
+| `--max-width W` | Max processing width (default: 1920) |
+| `--max-height H` | Max processing height (default: 1080) |
+| `--static-input` | Force resize all frames to max-width × max-height |
+| `--letterbox` | Preserve aspect ratio with black bars |
 
 ---
 
-## 📊 Benchmarking
+## Benchmarking
 
-### Single run benchmark style
+### Single run
 
 ```bash
-python src/main.py --model hdrtvnet_fp16.onnx --provider dml --prefetch 8 --no-display --warmup 30 --timing-interval 120 --model-stage-timing
+python src/main.py --force-compile --no-display --warmup 30 --timing-interval 120 --model-stage-timing
 ```
 
 ### Matrix benchmark (auto CSV)
 
 ```bash
-python benchmark_matrix.py --provider dml --prefetch-values 0,8 --max-frames 360 --warmup 30 --timing-interval 120 --target-fps 8
+python benchmark_matrix.py
 ```
 
-This writes `benchmark_results_*.csv` in the project root.
+This runs the full matrix: precisions × compile modes × prefetch values, saving results to `benchmark_results_*.csv`.
 
----
-
-## 📦 Export ONNX
-
-Dynamic shape:
+Customize:
 
 ```bash
-python export_onnx_fp32.py --output hdrtvnet_fp32.onnx
-python export_onnx_fp16.py --output hdrtvnet_fp16.onnx
-```
+# Quick: just fp16, compile vs no-compile
+python benchmark_matrix.py --precisions fp16 --prefetch-values 8 --max-frames 200
 
-Static shape (example 1440x1080):
+# Full matrix with target FPS stats
+python benchmark_matrix.py --target-fps 24
 
-```bash
-python export_onnx_fp32.py --static --height 1080 --width 1440 --output hdrtvnet_fp32_1440x1080_static.onnx
-python export_onnx_fp16.py --static --height 1080 --width 1440 --output hdrtvnet_fp16_1440x1080_static.onnx
+# Custom output
+python benchmark_matrix.py --output-csv thesis_benchmarks.csv
 ```
 
 ---
 
-## 📌 Notes
+## Notes
 
-- Dynamic models are recommended when source resolution/aspect ratio varies.
-- Static models are useful for fixed-resolution benchmarking.
-- For 4:3 content (e.g., 1440x1080), keep matching width/height to avoid stretch.
+- `torch.compile` requires a warmup compilation pass on the first run (cached by Triton afterwards).
+- On ROCm-Windows, `--force-compile` is required because Triton ROCm codegen needs HIP SDK headers.
+- `channels_last` and `cudnn.benchmark` are auto-enabled on NVIDIA but skipped on ROCm (MIOpen regression). Use `--channels-last` to test on ROCm.
 
 ---
 
-## 🎓 Academic Context
+## Citation
 
-This repository is the implementation component of an undergraduate thesis focused on precision-aware optimization for real-time HDR reconstruction.
+If this project is useful in your work, please cite the HDRTVNet/HDRTVNet++ papers:
+
+```bibtex
+@article{chen2023towards,
+  title={Towards Efficient SDRTV-to-HDRTV by Learning from Image Formation},
+  author={Chen, Xiangyu and Li, Zheyuan and Zhang, Zhengwen and Ren, Jimmy S and Liu, Yihao and He, Jingwen and Qiao, Yu and Zhou, Jiantao and Dong, Chao},
+  journal={arXiv preprint arXiv:2309.04084},
+  year={2023}
+}
+```
+
+```bibtex
+@InProceedings{chen2021hdrtvnet,
+  author    = {Chen, Xiangyu and Zhang, Zhengwen and Ren, Jimmy S. and Tian, Lynhoo and Qiao, Yu and Dong, Chao},
+  title     = {A New Journey From SDRTV to HDRTV},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  month     = {October},
+  year      = {2021},
+  pages     = {4500-4509}
+}
+```
+
+---
+
+## License and Attribution
+
+- This repository contains original real-time pipeline engineering and optimization work for thesis purposes.
+- Model architecture and pretrained model lineage are based on HDRTVNet/HDRTVNet++ research code and publications.
+- Please review upstream licenses/terms before redistributing pretrained weights or derived artifacts.
+- Original HDRTVNet++ repository: `https://github.com/xiaom233/HDRTVNet-plus`
+
+---
+
+## Academic Context
+
+This repository is the implementation component of an undergraduate thesis focused on real-time GPU-accelerated HDR reconstruction with precision-aware optimization.
