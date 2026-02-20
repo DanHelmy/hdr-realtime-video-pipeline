@@ -123,7 +123,7 @@ Default (FP16, max-autotune compile, auto device):
 python src/main.py
 ```
 
-# Skip compile entirely:
+Default (FP16, max-autotune compile, auto device):
 python src/main.py --no-compile
 ```
 
