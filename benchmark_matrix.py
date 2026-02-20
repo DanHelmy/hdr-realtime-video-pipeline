@@ -22,7 +22,17 @@ def parse_args():
     parser.add_argument(
         "--precisions",
         default="auto,fp16,fp32",
-        help="Comma-separated precisions to test: auto,fp16,fp32"
+        help="Comma-separated precisions: auto,fp16,fp32,int8-full,int8-mixed"
+    )
+    parser.add_argument(
+        "--int8-full-model",
+        default="src/models/weights/Ensemble_AGCM_LE_int8_full.pt",
+        help="Path to INT8 W8A8 model (used when precision=int8-full)"
+    )
+    parser.add_argument(
+        "--int8-mixed-model",
+        default="src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt",
+        help="Path to INT8 mixed model (used when precision=int8-mixed)"
     )
     parser.add_argument(
         "--compile-modes",
@@ -92,9 +102,36 @@ def main():
     compile_modes = parse_list(args.compile_modes)
     prefetch_values = parse_prefetch(args.prefetch_values)
 
+    # Map INT8 precision variants to their model paths
+    int8_model_map = {
+        "int8-full": (args.int8_full_model, "quantize_int8_full.py"),
+        "int8-mixed": (args.int8_mixed_model, "quantize_int8_mixed.py"),
+    }
+
     cases = []
     for model in models:
         for precision in precisions:
+            # INT8 variants use dedicated model paths
+            if precision in int8_model_map:
+                int8_path, quant_script = int8_model_map[precision]
+                if not os.path.isfile(int8_path):
+                    print(f"SKIP {precision}: {int8_path} not found (run {quant_script} first)")
+                    continue
+                for compile_mode in compile_modes:
+                    for prefetch in prefetch_values:
+                        tag = (f"torch:{os.path.basename(int8_path)}:{precision}"
+                               f":{compile_mode}:prefetch={prefetch}")
+                        if args.channels_last:
+                            tag += ":cl"
+                        cases.append({
+                            "case": tag,
+                            "model": int8_path,
+                            "prefetch": prefetch,
+                            "precision": precision,
+                            "compile_mode": compile_mode,
+                        })
+                continue
+
             for compile_mode in compile_modes:
                 for prefetch in prefetch_values:
                     tag = (f"torch:{os.path.basename(model)}:{precision}"

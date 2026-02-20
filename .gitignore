@@ -5,16 +5,15 @@ __pycache__/
 *.pyd
 *.so
 
-# Local media and generated runtime artifacts
+# Local media
 *.mp4
 *.avi
 *.mov
 *.mkv
-onnxruntime_profile__*.json
+
+# Generated runtime artifacts
 benchmark_results_*.csv
-dataset/
-hdrtvnet_int8*.onnx
-int8_*.onnx
+*.txt
 
 # Build/test caches
 .pytest_cache/
@@ -28,8 +27,15 @@ int8_*.onnx
 # Large model artifacts (prefer release assets or Git LFS)
 *.onnx
 *.pth
-# But keep the runtime weights needed by the pipeline
+*.pt
+# Pipeline weights — tracked
 !src/models/weights/Ensemble_AGCM_LE.pth
+!src/models/weights/Ensemble_AGCM_LE_int8_full.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
+
+# Calibration / training dataset (download separately)
+dataset/
 
 # Source Pipeline (upstream reference, not part of this project)
 Source Pipeline/

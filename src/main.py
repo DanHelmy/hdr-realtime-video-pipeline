@@ -80,8 +80,8 @@ def parse_args():
     parser.add_argument(
         "--precision",
         default="auto",
-        choices=["auto", "fp16", "fp32"],
-        help="PyTorch inference precision"
+        choices=["auto", "fp16", "fp32", "int8-full", "int8-mixed"],
+        help="Inference precision: int8-full = W8A8 (all layers), int8-mixed = selective W8A8/W8A16"
     )
     parser.add_argument(
         "--no-compile",
@@ -91,7 +91,13 @@ def parse_args():
     parser.add_argument(
         "--force-compile",
         action="store_true",
-        help="Force torch.compile() even on ROCm-Windows (requires HIP SDK installed)"
+        help="Force torch.compile() on ROCm-Windows when HIP SDK auto-detection fails"
+    )
+    parser.add_argument(
+        "--compile-mode",
+        default="auto",
+        choices=["auto", "default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode (auto = 'max-autotune' on all GPUs)"
     )
     parser.add_argument(
         "--cuda-graphs",
@@ -116,9 +122,15 @@ def main():
         precision=args.precision,
         compile_model=not args.no_compile,
         force_compile=args.force_compile,
+        compile_mode=args.compile_mode,
         use_cuda_graphs=args.cuda_graphs,
         force_channels_last=args.channels_last,
     )
+    # torch.compile is lazy — first inference triggers compilation.
+    # Print a message so the user knows it's working.
+    if hasattr(processor, '_compiled') and processor._compiled:
+        print("First frame will trigger torch.compile — this may take several minutes...")
+
     timer = FPSTimer()
     frame_idx = 0
     stats_frames = 0

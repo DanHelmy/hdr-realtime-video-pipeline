@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.6-blue)
+![Version](https://img.shields.io/badge/version-v0.7-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,17 +12,20 @@ This repository contains the implementation framework for an undergraduate thesi
 
 **Real-Time SDR-to-HDR Video Reconstruction with HDRTVNet++ and PyTorch**
 
-The project achieves real-time HDR reconstruction using a fully GPU-accelerated PyTorch pipeline with `torch.compile` optimizations, including support for AMD ROCm on Windows.
+The project achieves real-time HDR reconstruction using a fully GPU-accelerated PyTorch pipeline with `torch.compile` optimizations. Supports NVIDIA CUDA, AMD ROCm, and CPU backends.
 
 ---
 
-## Current Status (v0.6)
+## Current Status (v0.7)
 
 ### Implemented
 
-- Full PyTorch inference pipeline (FP16, FP32)
-- `torch.compile` with Triton (`max-autotune`) — 2.4× model inference speedup
-- ROCm-Windows support with automatic platform detection
+- Full PyTorch inference pipeline (FP16, FP32, INT8)
+- `torch.compile` with Triton — auto-enabled on all GPUs (auto-detects HIP SDK on ROCm-Windows)
+- Cross-GPU support: NVIDIA (CUDA), AMD (ROCm), CPU
+- INT8 weight quantization (W8A16) — 3.29× model compression
+- INT8 full quantization (W8A8) — weights and activations
+- INT8 mixed quantization — selective W8A8/W8A16 per layer
 - GPU-side preprocessing (BGR→RGB, normalize, permute on GPU)
 - GPU-side postprocessing (clamp, scale, quantize, RGB→BGR on GPU)
 - Pre-allocated GPU tensor buffers (zero per-frame allocation)
@@ -32,7 +35,7 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 - Frame pacing stats (`fps`, `fps_1p_low`, `late`, `drop_est`)
 - Benchmark matrix runner (`benchmark_matrix.py`)
 - Optional CUDA graph replay (`--cuda-graphs`)
-- Optional channels_last memory format (`--channels-last`)
+- Optional channels_last memory format (auto on NVIDIA)
 
 ### Pipeline
 
@@ -47,71 +50,106 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 ### Requirements
 
 - Python 3.10+
-- PyTorch 2.0+
+- PyTorch 2.0+ (CUDA or ROCm build)
 - OpenCV, NumPy
 
 ### Setup
 
 ```bash
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\activate       # Windows
+source venv/bin/activate    # Linux/macOS
 pip install -r requirements.txt
 ```
 
 ### PyTorch GPU backends
-
-**AMD (ROCm/HIP):**
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
-```
 
 **NVIDIA (CUDA):**
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
-**Intel (CPU / oneAPI):**
+**AMD ROCm-Windows (Python 3.12):**
+```cmd
+pip install --no-cache-dir ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_devel-7.2.0.dev0-py3-none-win_amd64.whl ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz
+
+pip install --no-cache-dir ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchaudio-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ^
+    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl
+```
+
+**AMD ROCm-Linux:**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+```
+
+**CPU only:**
 ```bash
 pip install torch torchvision
 ```
 
-### ROCm-Windows + torch.compile
+### torch.compile setup
 
-To enable `torch.compile` on ROCm-Windows, install Triton and copy HIP SDK headers:
+**NVIDIA CUDA**: Works automatically when Triton is installed (included with modern PyTorch).
 
+**AMD ROCm-Windows**: Auto-detects HIP SDK and enables compile automatically. Install `triton-windows` and ensure HIP SDK headers are available:
 ```bash
 pip install triton-windows
 xcopy /E /I "C:\Program Files\AMD\ROCm\7.1\include\hip" "venv\Lib\site-packages\_rocm_sdk_devel\include\hip"
 ```
+If auto-detection fails, use `--force-compile` to enable manually.
 
-Then use `--force-compile` when running.
+**AMD ROCm-Linux**: Works automatically like NVIDIA.
 
 ---
 
 ## Running
 
-Default (FP16, auto device):
+Activate the virtual environment first (or use `.\venv\Scripts\python.exe` directly):
+
+```bash
+venv\Scripts\activate       # Windows
+source venv/bin/activate    # Linux/macOS
+```
+
+Default (FP16, max-autotune compile, auto device):
 
 ```bash
 python src/main.py
 ```
 
-With torch.compile (recommended):
+All platforms auto-select the best settings — no extra flags needed. Override if desired:
 
 ```bash
-python src/main.py --force-compile --model-stage-timing
+# Explicit compile mode:
+python src/main.py --compile-mode reduce-overhead --model-stage-timing
+
+# Skip compile entirely:
+python src/main.py --no-compile
 ```
 
-FP32 mode:
+INT8 quantized model:
 
 ```bash
-python src/main.py --force-compile --precision fp32 --model-stage-timing
+# W8A8 (full INT8):
+python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full.pt
+
+# Mixed INT8:
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
+
+# Mixed INT8 (QAT fine-tuned):
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
 ```
 
 Headless benchmark:
 
 ```bash
-python src/main.py --force-compile --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
+python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
 ```
 
 ### CLI Flags
@@ -120,8 +158,9 @@ python src/main.py --force-compile --no-display --warmup 30 --timing-interval 12
 |---|---|
 | `--model PATH` | Model weights path (default: `src/models/weights/Ensemble_AGCM_LE.pth`) |
 | `--device auto\|cuda\|cpu` | Device selection (default: auto) |
-| `--precision auto\|fp16\|fp32` | Inference precision (default: auto → fp16 on GPU) |
-| `--force-compile` | Enable `torch.compile` on ROCm (auto on NVIDIA) |
+| `--precision auto\|fp16\|fp32\|int8-full\|int8-mixed` | Inference precision (default: auto → fp16 on GPU) |
+| `--compile-mode auto\|default\|reduce-overhead\|max-autotune` | torch.compile mode (auto = max-autotune on all GPUs) |
+| `--force-compile` | Force `torch.compile` on ROCm-Windows when HIP SDK auto-detection fails |
 | `--no-compile` | Disable `torch.compile` entirely |
 | `--channels-last` | Force channels_last memory format (auto on NVIDIA) |
 | `--cuda-graphs` | Enable CUDA graph replay for static shapes |
@@ -139,12 +178,45 @@ python src/main.py --force-compile --no-display --warmup 30 --timing-interval 12
 
 ---
 
+## INT8 Quantization
+
+Two INT8 quantization modes are provided for model compression and (on supported hardware) inference acceleration:
+
+### W8A8 (Full INT8)  
+```bash
+python quantize_int8_full.py
+```
+- Both weights and activations quantized to INT8
+- Requires calibration data (uses `dataset/test_sdr/`)
+- **3.11× compression**, 35.90 dB PSNR
+
+### Mixed W8A8/W8A16
+```bash
+python quantize_int8_mixed.py
+```
+- Memory-bound 1×1 convs → W8A8 (INT8 activations help bandwidth)
+- Compute-bound 3×3 convs → W8A16 (weight-only saves storage)
+- **3.17× compression**, 49.66 dB PSNR
+
+### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training)
+```bash
+python quantize_int8_mixed_qat.py
+```
+- Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
+- Learnable weight/activation scales adapt to minimize reconstruction loss
+- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
+- Output is fully compatible with `--precision int8-mixed` (same checkpoint format)
+- **3.17× compression**, 46.43 dB PSNR (vs FP16 reference)
+- Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch` (no PTQ checkpoint needed)
+
+---
+
 ## Benchmarking
 
 ### Single run
 
 ```bash
-python src/main.py --force-compile --no-display --warmup 30 --timing-interval 120 --model-stage-timing
+python src/main.py --no-display --warmup 30 --timing-interval 120 --model-stage-timing
 ```
 
 ### Matrix benchmark (auto CSV)
@@ -170,11 +242,35 @@ python benchmark_matrix.py --output-csv thesis_benchmarks.csv
 
 ---
 
+## Platform Notes
+
+| Feature | NVIDIA (CUDA) | AMD (ROCm) | CPU |
+|---|---|---|---|
+| torch.compile | Auto | `--force-compile` (Windows) | Not supported |
+| channels_last | Auto | `--channels-last` to test | N/A |
+| cudnn.benchmark | Auto | N/A (MIOpen) | N/A |
+| FP16 inference | ✅ | ✅ | Fallback to FP32 |
+| INT8 quantization | ✅ (tensor core acceleration possible) | ✅ (compression only, no INT8 compute path) | ✅ (compression only) |
+| CUDA graphs | ✅ | ✅ | N/A |
+
+### Compile time
+
+`torch.compile` adds a one-time startup cost (cached by Triton on subsequent runs with the same resolution):
+
+| Mode | Typical compile time | Best for |
+|---|---|---|
+| `default` | 30-60 seconds | Short clips, development |
+| `max-autotune` | 2-5 minutes | Long videos, production benchmarks |
+
+For a 2-hour movie (~172k frames), compile overhead is <1% of total processing time.
+
+---
+
 ## Notes
 
-- `torch.compile` requires a warmup compilation pass on the first run (cached by Triton afterwards).
-- On ROCm-Windows, `--force-compile` is required because Triton ROCm codegen needs HIP SDK headers.
-- `channels_last` and `cudnn.benchmark` are auto-enabled on NVIDIA but skipped on ROCm (MIOpen regression). Use `--channels-last` to test on ROCm.
+- On ROCm-Windows, `--force-compile` is required because Triton codegen needs HIP SDK headers.
+- `channels_last` and `cudnn.benchmark` are auto-enabled on NVIDIA but skipped on ROCm (MIOpen regression).
+- INT8 inference speedup depends on hardware: NVIDIA tensor cores support native INT8 compute; AMD consumer GPUs (RDNA3) currently lack INT8 conv kernel support in MIOpen, so INT8 provides compression benefits only.
 
 ---
 
