@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.8-blue)
+![Version](https://img.shields.io/badge/version-v0.7-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -16,7 +16,7 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 
 ---
 
-## Current Status (v0.8)
+## Current Status (v0.7)
 
 ### Implemented
 
