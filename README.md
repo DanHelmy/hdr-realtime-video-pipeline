@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.7-blue)
+![Version](https://img.shields.io/badge/version-v0.8-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -16,16 +16,16 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 
 ---
 
-## Current Status (v0.7)
+## Current Status (v0.8)
 
 ### Implemented
 
 - Full PyTorch inference pipeline (FP16, FP32, INT8)
 - `torch.compile` with Triton — auto-enabled on all GPUs (auto-detects HIP SDK on ROCm-Windows)
 - Cross-GPU support: NVIDIA (CUDA), AMD (ROCm), CPU
-- INT8 weight quantization (W8A16) — 3.29× model compression
 - INT8 full quantization (W8A8) — weights and activations
 - INT8 mixed quantization — selective W8A8/W8A16 per layer
+- Quantization-Aware Training (QAT) for mixed INT8 — fine-tunes against HDR ground truth
 - GPU-side preprocessing (BGR→RGB, normalize, permute on GPU)
 - GPU-side postprocessing (clamp, scale, quantize, RGB→BGR on GPU)
 - Pre-allocated GPU tensor buffers (zero per-frame allocation)
@@ -123,12 +123,6 @@ Default (FP16, max-autotune compile, auto device):
 python src/main.py
 ```
 
-All platforms auto-select the best settings — no extra flags needed. Override if desired:
-
-```bash
-# Explicit compile mode:
-python src/main.py --compile-mode reduce-overhead --model-stage-timing
-
 # Skip compile entirely:
 python src/main.py --no-compile
 ```
@@ -188,7 +182,7 @@ python quantize_int8_full.py
 ```
 - Both weights and activations quantized to INT8
 - Requires calibration data (uses `dataset/test_sdr/`)
-- **3.11× compression**, 35.90 dB PSNR
+- **3.11× compression**
 
 ### Mixed W8A8/W8A16
 ```bash
@@ -196,17 +190,17 @@ python quantize_int8_mixed.py
 ```
 - Memory-bound 1×1 convs → W8A8 (INT8 activations help bandwidth)
 - Compute-bound 3×3 convs → W8A16 (weight-only saves storage)
-- **3.17× compression**, 49.66 dB PSNR
+- **3.17× compression**
 
 ### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training)
 ```bash
 python quantize_int8_mixed_qat.py
 ```
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
-- Learnable weight/activation scales adapt to minimize reconstruction loss
+- Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
 - Output is fully compatible with `--precision int8-mixed` (same checkpoint format)
-- **3.17× compression**, 46.43 dB PSNR (vs FP16 reference)
+- **3.17× compression**
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch` (no PTQ checkpoint needed)
 
 ---
