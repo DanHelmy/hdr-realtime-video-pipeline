@@ -926,5 +926,36 @@ class HDRTVNetTorch:
 
         return output, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t3 - t2) * 1000.0
 
+    # -----------------------------------------------------------------------
+    # Compile cache warmup — pre-compile Triton kernels for a given resolution
+    # -----------------------------------------------------------------------
+    @torch.inference_mode()
+    def warmup_compile(self, width=1920, height=1080):
+        """Run a dummy frame through the compiled model to trigger and cache
+        Triton kernel compilation for the given resolution.
+
+        After this call, any video at the same resolution will start
+        inference immediately without recompilation.  Triton persists
+        compiled kernels to its on-disk cache, so subsequent *process
+        launches* also skip compilation.
+
+        Only meaningful when torch.compile is active; returns immediately
+        otherwise.
+        """
+        if not self._compiled:
+            return
+
+        print(f"Warming up torch.compile cache for {width}x{height} — "
+              "this may take several minutes on first run...")
+        t0 = time.perf_counter()
+
+        dummy = np.zeros((height, width, 3), dtype=np.uint8)
+        self.process(dummy)  # triggers full compile → Triton disk cache
+        if self._use_cuda:
+            torch.cuda.synchronize()
+
+        elapsed = time.perf_counter() - t0
+        print(f"Compile cache warm — {width}x{height} ready ({elapsed:.1f}s)")
+
     def end_profiling(self):
         return None

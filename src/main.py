@@ -11,7 +11,7 @@ from video_source import VideoSource
 from timer import FPSTimer
 from models.hdrtvnet_torch import HDRTVNetTorch
 
-VIDEO_PATH = "input.mp4"
+VIDEO_PATH = "input2.mp4"
 MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
 
 TARGET_WIDTH = 1920
@@ -123,6 +123,13 @@ def parse_args():
              "giving FP16 inference speed with compressed checkpoint storage. "
              "'on' forces pre-dequantization, 'off' keeps INT8 runtime dequant."
     )
+    parser.add_argument(
+        "--cache-resolution",
+        default="1920x1080",
+        help="Pre-compile Triton kernels for this resolution at startup. "
+             "Format: WIDTHxHEIGHT. Cached to disk so subsequent runs are instant. "
+             "Set to 'none' to skip warmup."
+    )
     return parser.parse_args()
 
 def main():
@@ -141,10 +148,19 @@ def main():
         force_channels_last=args.channels_last,
         predequantize=predeq,
     )
-    # torch.compile is lazy — first inference triggers compilation.
-    # Print a message so the user knows it's working.
+    # Pre-compile Triton kernels for the target resolution so video
+    # playback starts immediately.  Triton caches to disk, so only the
+    # first invocation is slow; subsequent runs at the same resolution
+    # load from cache in seconds.
     if hasattr(processor, '_compiled') and processor._compiled:
-        print("First frame will trigger torch.compile — this may take several minutes...")
+        cache_res = args.cache_resolution.strip().lower()
+        if cache_res and cache_res != "none":
+            try:
+                cw, ch = cache_res.split("x")
+                processor.warmup_compile(int(cw), int(ch))
+            except ValueError:
+                print(f"Invalid --cache-resolution '{args.cache_resolution}', "
+                      "expected WIDTHxHEIGHT (e.g. 1920x1080). Skipping warmup.")
 
     timer = FPSTimer()
     frame_idx = 0

@@ -35,8 +35,6 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 - Async video prefetch queue (`--prefetch`)
 - Stage timing breakdown (`pre`, `run`, `post`)
 - Frame pacing stats (`fps`, `fps_1p_low`, `late`, `drop_est`)
-- Benchmark matrix runner (`benchmark_matrix.py`)
-- INT8 speedup proof benchmark (`benchmark_int8_proof.py`) — roofline analysis + projected speedup on INT8-capable hardware
 - Optional CUDA graph replay (`--cuda-graphs`)
 - Optional channels_last memory format (auto on NVIDIA)
 - Real-time metrics overlay (FPS, latency, GPU/CPU memory, model size)
@@ -165,6 +163,7 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 | `--channels-last` | Force channels_last memory format (auto on NVIDIA) |
 | `--cuda-graphs` | Enable CUDA graph replay for static shapes |
 | `--predequantize auto\|on\|off` | Pre-dequantize INT8 weights to FP16 at load time (auto = enabled on GPUs without INT8 tensor cores) |
+| `--cache-resolution WxH` | Pre-compile Triton kernels for this resolution at startup (default: `1920x1080`). Set to `none` to skip. |
 | `--prefetch N` | Video reader prefetch queue size (default: 8) |
 | `--model-stage-timing` | Report pre/run/post timing breakdown |
 | `--no-display` | Headless mode for pure throughput testing |
@@ -223,52 +222,14 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt --predequantize off
 ```
 
-| Metric | INT8 dequant (per-frame) | INT8 pre-dequantized | Native FP16 |
-|---|---|---|---|
-| Latency (960×544) | 73.9 ms | **34.8 ms** | 34.9 ms |
-| FPS | 13.5 | **28.7** | 28.6 |
-| Checkpoint size | 815 KB | **815 KB** | 2,399 KB |
-| Speedup vs dequant | 1.00× | **2.12×** | 2.12× |
-
 **Result:** Same FP16 speed + 2.94× compressed checkpoint storage.
-
-### INT8 Speedup Proof (for thesis)
-
-```bash
-python benchmark_int8_proof.py --csv int8_proof.csv
-```
-
-Generates roofline analysis, per-layer bandwidth savings, and projected speedup on INT8-capable hardware. On NVIDIA Turing+ GPUs, the same INT8 checkpoint projects **1.35×** speedup over FP16 due to native INT8 tensor core support.
 
 ---
 
 ## Benchmarking
 
-### Single run
-
 ```bash
 python src/main.py --no-display --warmup 30 --timing-interval 120 --model-stage-timing
-```
-
-### Matrix benchmark (auto CSV)
-
-```bash
-python benchmark_matrix.py
-```
-
-This runs the full matrix: precisions × compile modes × prefetch values, saving results to `benchmark_results_*.csv`.
-
-Customize:
-
-```bash
-# Quick: just fp16, compile vs no-compile
-python benchmark_matrix.py --precisions fp16 --prefetch-values 8 --max-frames 200
-
-# Full matrix with target FPS stats
-python benchmark_matrix.py --target-fps 24
-
-# Custom output
-python benchmark_matrix.py --output-csv thesis_benchmarks.csv
 ```
 
 ---
@@ -286,14 +247,26 @@ python benchmark_matrix.py --output-csv thesis_benchmarks.csv
 
 ### Compile time
 
-`torch.compile` adds a one-time startup cost (cached by Triton on subsequent runs with the same resolution):
+`torch.compile` with `max-autotune` adds a one-time startup cost, but compiled kernels are **cached to disk by Triton**. The pipeline pre-compiles for 1920×1080 by default (`--cache-resolution 1920x1080`), so:
 
-| Mode | Typical compile time | Best for |
+| Scenario | Time | Notes |
 |---|---|---|
-| `default` | 30-60 seconds | Short clips, development |
-| `max-autotune` | 2-5 minutes | Long videos, production benchmarks |
+| First-ever run at a resolution | 2-5 minutes | Triton compiles + saves to disk cache |
+| Subsequent runs at same resolution | ~5-10 seconds | Loads pre-compiled kernels from disk |
+| Different resolution | 2-5 minutes | New kernel shapes require recompilation |
 
-For a 2-hour movie (~172k frames), compile overhead is <1% of total processing time.
+Recompilation only happens when the input resolution changes (i.e. different aspect ratio). All 1080p videos reuse the same cached kernels regardless of content, codec, or duration.
+
+```bash
+# Default: pre-compile for 1080p
+python src/main.py
+
+# Pre-compile for 720p instead
+python src/main.py --cache-resolution 1280x720
+
+# Skip warmup (compile on first frame)
+python src/main.py --cache-resolution none
+```
 
 ---
 

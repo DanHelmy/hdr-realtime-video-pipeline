@@ -13,7 +13,11 @@ __pycache__/
 
 # Generated runtime artifacts
 benchmark_results_*.csv
+int8_proof*.csv
 *.txt
+
+# Benchmark scripts (development only, not part of pipeline)
+benchmark_*.py
 
 # Build/test caches
 .pytest_cache/
