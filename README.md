@@ -131,6 +131,12 @@ Skip compile entirely:
 python src/main.py --no-compile
 ```
 
+FP32 precision (slower, useful for accuracy comparison):
+
+```bash
+python src/main.py --precision fp32
+```
+
 INT8 quantized model:
 
 ```bash
