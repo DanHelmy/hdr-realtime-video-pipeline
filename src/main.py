@@ -1,7 +1,11 @@
 import cv2
 import argparse
+import os
 import time
+
 import numpy as np
+import psutil
+import torch
 from collections import deque
 from video_source import VideoSource
 from timer import FPSTimer
@@ -110,12 +114,22 @@ def parse_args():
         help="Force channels_last memory format (PyTorch engine only). "
              "Auto-enabled on NVIDIA; use this flag to test on ROCm+Triton."
     )
+    parser.add_argument(
+        "--predequantize",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Pre-dequantize INT8 weights to FP16 at load time. "
+             "'auto' enables on GPUs without INT8 tensor cores (e.g. AMD RDNA3), "
+             "giving FP16 inference speed with compressed checkpoint storage. "
+             "'on' forces pre-dequantization, 'off' keeps INT8 runtime dequant."
+    )
     return parser.parse_args()
 
 def main():
     args = parse_args()
 
     source = VideoSource(args.video, prefetch=args.prefetch)
+    predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
     processor = HDRTVNetTorch(
         args.model,
         device=args.device,
@@ -125,6 +139,7 @@ def main():
         compile_mode=args.compile_mode,
         use_cuda_graphs=args.cuda_graphs,
         force_channels_last=args.channels_last,
+        predequantize=predeq,
     )
     # torch.compile is lazy — first inference triggers compilation.
     # Print a message so the user knows it's working.
@@ -134,6 +149,11 @@ def main():
     timer = FPSTimer()
     frame_idx = 0
     stats_frames = 0
+
+    # ---- Static metrics (computed once) --------------------------------
+    model_size_mb = os.path.getsize(args.model) / (1024 * 1024)
+    process = psutil.Process(os.getpid())
+    use_cuda = torch.cuda.is_available() and args.device != "cpu"
     decode_ms = 0.0
     resize_ms = 0.0
     infer_ms = 0.0
@@ -186,15 +206,47 @@ def main():
         fps = timer.update()
 
         if not args.no_display:
-            cv2.putText(
-                output,
+            # ---- Gather live metrics ------------------------------------
+            latency_ms = (t3 - t0) * 1000.0  # decode + resize + infer
+            cpu_mem_mb = process.memory_info().rss / (1024 * 1024)
+            if use_cuda:
+                gpu_mem_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            else:
+                gpu_mem_mb = 0.0
+
+            # ---- Draw metrics overlay (ROI-only, avoids full-frame copy) --
+            overlay_lines = [
                 f"FPS: {fps:.2f}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 255, 0),
-                2
-            )
+                f"Latency: {latency_ms:.1f} ms/frame",
+                f"GPU Memory: {gpu_mem_mb:.1f} MB",
+                f"CPU Memory: {cpu_mem_mb:.1f} MB",
+                f"Model Size: {model_size_mb:.2f} MB",
+            ]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            thickness = 2
+            color = (0, 255, 0)
+            y_start = 30
+            line_height = 30
+
+            # Compute box dimensions from text
+            max_text_w = 0
+            for line in overlay_lines:
+                (tw, _), _ = cv2.getTextSize(line, font, font_scale, thickness)
+                max_text_w = max(max_text_w, tw)
+            box_x, box_y = 10, 5
+            box_w = max_text_w + 30
+            box_h = len(overlay_lines) * line_height + 10
+
+            # Alpha-blend only the small overlay ROI (not the entire frame)
+            # ~300x fewer pixels than full-frame addWeighted at 1080p
+            roi = output[box_y:box_y + box_h, box_x:box_x + box_w]
+            roi //= 3  # fast integer darken (~33% brightness, no float/alloc)
+
+            for i, line in enumerate(overlay_lines):
+                cv2.putText(output, line, (20, y_start + i * line_height),
+                            font, font_scale, color, thickness)
+
             cv2.imshow("HDRTVNet PyTorch", output)
             if cv2.waitKey(1) & 0xFF == 27:
                 break

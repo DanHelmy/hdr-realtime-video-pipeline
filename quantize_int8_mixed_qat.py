@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE
 from models.hdrtvnet_torch import (
     W8A8Conv2d, W8A8Linear, W8Conv2d, W8Linear,
-    _quantize_model_mixed, calibrate_w8a8,
+    _quantize_model_mixed, _quantize_model_mixed_v2, calibrate_w8a8,
 )
 
 
@@ -67,9 +67,27 @@ class _FakeQuantizeSTE(torch.autograd.Function):
         return grad_output, None, None
 
 
+class _FakeQuantizeAsymSTE(torch.autograd.Function):
+    """Asymmetric fake quantization with STE: unsigned [0, 255] with zero-point."""
+
+    @staticmethod
+    def forward(ctx, x, scale, zero_point):
+        x_q = ((x - zero_point) / scale).round().clamp(0, 255)
+        return x_q * scale + zero_point
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
+
+
 def fake_quantize(x, scale):
-    """Apply fake quantization with STE gradient."""
+    """Apply symmetric fake quantization with STE gradient."""
     return _FakeQuantizeSTE.apply(x, scale)
+
+
+def fake_quantize_asymmetric(x, scale, zero_point):
+    """Apply asymmetric fake quantization with STE gradient."""
+    return _FakeQuantizeAsymSTE.apply(x, scale, zero_point)
 
 
 # ===================================================================
@@ -81,16 +99,18 @@ class QATConv2d(nn.Module):
 
     If `quantize_activations=True`, acts like W8A8Conv2d (both weight + act quantized).
     If `quantize_activations=False`, acts like W8Conv2d (weight-only).
+    If `asymmetric=True`, activations use unsigned [0, 255] with zero-point.
 
     Weight scale and activation scale are learnable parameters.
     The actual weights are stored in FP16/FP32 and quantized in the forward pass.
     """
 
     def __init__(self, conv_or_w8, compute_dtype=torch.float16,
-                 quantize_activations=False):
+                 quantize_activations=False, asymmetric=False):
         super().__init__()
         self.quantize_activations = quantize_activations
         self.compute_dtype = compute_dtype
+        self.asymmetric = asymmetric
 
         # Extract original conv parameters from either nn.Conv2d or W8*/W8A8*
         if isinstance(conv_or_w8, (W8A8Conv2d, W8Conv2d)):
@@ -127,8 +147,13 @@ class QATConv2d(nn.Module):
             # Activation scale (learnable, only used if quantize_activations)
             if isinstance(mod, W8A8Conv2d):
                 self.x_scale = nn.Parameter(mod.x_scale.float().clone())
+                if hasattr(mod, 'x_zero'):
+                    self.x_zero = nn.Parameter(mod.x_zero.float().clone())
+                else:
+                    self.x_zero = nn.Parameter(torch.tensor(0.0))
             else:
                 self.x_scale = nn.Parameter(torch.tensor(1.0))
+                self.x_zero = nn.Parameter(torch.tensor(0.0))
 
         elif isinstance(conv_or_w8, nn.Conv2d):
             conv = conv_or_w8
@@ -151,6 +176,7 @@ class QATConv2d(nn.Module):
             w_sc = w_flat.abs().amax(dim=1).clamp(min=1e-8) / 127.0
             self.w_scale = nn.Parameter(w_sc)
             self.x_scale = nn.Parameter(torch.tensor(1.0))
+            self.x_zero = nn.Parameter(torch.tensor(0.0))
         else:
             raise TypeError(f"Unsupported module type: {type(conv_or_w8)}")
 
@@ -162,8 +188,13 @@ class QATConv2d(nn.Module):
 
         # Optionally fake-quantize activations
         if self.quantize_activations:
-            x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
-            x = fake_quantize(x, x_scale)
+            if self.asymmetric:
+                x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
+                x_zp = self.x_zero.to(x.dtype)
+                x = fake_quantize_asymmetric(x, x_scale, x_zp)
+            else:
+                x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
+                x = fake_quantize(x, x_scale)
 
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.conv2d(x, w_fq, bias, self.stride, self.padding,
@@ -171,11 +202,19 @@ class QATConv2d(nn.Module):
 
 
 class QATLinear(nn.Module):
-    """QAT Linear: fake-quantized weights (W8A16 style — weight-only)."""
+    """QAT Linear: fake-quantized weights + optional fake-quantized activations.
 
-    def __init__(self, linear_or_w8, compute_dtype=torch.float16):
+    If `quantize_activations=True`, acts like W8A8Linear (both weight + act).
+    If `quantize_activations=False`, acts like W8Linear (weight-only).
+    If `asymmetric=True`, activations use unsigned [0, 255] with zero-point.
+    """
+
+    def __init__(self, linear_or_w8, compute_dtype=torch.float16,
+                 quantize_activations=False, asymmetric=False):
         super().__init__()
         self.compute_dtype = compute_dtype
+        self.quantize_activations = quantize_activations
+        self.asymmetric = asymmetric
 
         if isinstance(linear_or_w8, (W8A8Linear, W8Linear)):
             mod = linear_or_w8
@@ -197,6 +236,17 @@ class QATLinear(nn.Module):
 
             self.w_scale = nn.Parameter(w_scale.clone())
 
+            # Activation scale (learnable, only used if quantize_activations)
+            if isinstance(mod, W8A8Linear):
+                self.x_scale = nn.Parameter(mod.x_scale.float().clone())
+                if hasattr(mod, 'x_zero'):
+                    self.x_zero = nn.Parameter(mod.x_zero.float().clone())
+                else:
+                    self.x_zero = nn.Parameter(torch.tensor(0.0))
+            else:
+                self.x_scale = nn.Parameter(torch.tensor(1.0))
+                self.x_zero = nn.Parameter(torch.tensor(0.0))
+
         elif isinstance(linear_or_w8, nn.Linear):
             linear = linear_or_w8
             self.in_features = linear.in_features
@@ -210,13 +260,27 @@ class QATLinear(nn.Module):
 
             w_sc = self.weight.data.abs().amax(dim=1).clamp(min=1e-8) / 127.0
             self.w_scale = nn.Parameter(w_sc)
+            self.x_scale = nn.Parameter(torch.tensor(1.0))
+            self.x_zero = nn.Parameter(torch.tensor(0.0))
         else:
             raise TypeError(f"Unsupported module type: {type(linear_or_w8)}")
 
     def forward(self, x):
+        # Fake-quantize weights
         w_scale = self.w_scale.abs().clamp(min=1e-8)
         w_fq = fake_quantize(self.weight, w_scale.view(-1, 1))
         w_fq = w_fq.to(x.dtype)
+
+        # Optionally fake-quantize activations
+        if self.quantize_activations:
+            if self.asymmetric:
+                x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
+                x_zp = self.x_zero.to(x.dtype)
+                x = fake_quantize_asymmetric(x, x_scale, x_zp)
+            else:
+                x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
+                x = fake_quantize(x, x_scale)
+
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w_fq, bias)
 
@@ -238,13 +302,19 @@ def convert_to_qat(model):
 
         if isinstance(module, W8A8Conv2d):
             setattr(parent, parts[-1],
-                    QATConv2d(module, quantize_activations=True))
+                    QATConv2d(module, quantize_activations=True,
+                              asymmetric=module.is_asymmetric))
             converted += 1
         elif isinstance(module, W8Conv2d):
             setattr(parent, parts[-1],
                     QATConv2d(module, quantize_activations=False))
             converted += 1
-        elif isinstance(module, (W8A8Linear, W8Linear)):
+        elif isinstance(module, W8A8Linear):
+            setattr(parent, parts[-1],
+                    QATLinear(module, quantize_activations=True,
+                              asymmetric=module.is_asymmetric))
+            converted += 1
+        elif isinstance(module, W8Linear):
             setattr(parent, parts[-1], QATLinear(module))
             converted += 1
 
@@ -277,9 +347,12 @@ def convert_qat_to_ptq(model, compute_dtype=torch.float16):
                 tmp_conv.bias.data = module.bias.data.float()
 
             if module.quantize_activations:
-                new_mod = W8A8Conv2d(tmp_conv, compute_dtype)
+                new_mod = W8A8Conv2d(tmp_conv, compute_dtype,
+                                     asymmetric=module.asymmetric)
                 # Transfer the learned activation scale
                 new_mod.x_scale.fill_(module.x_scale.abs().clamp(min=1e-8).item())
+                if module.asymmetric:
+                    new_mod.x_zero.fill_(module.x_zero.item())
             else:
                 new_mod = W8Conv2d(tmp_conv, compute_dtype)
 
@@ -295,7 +368,16 @@ def convert_qat_to_ptq(model, compute_dtype=torch.float16):
             if module.bias is not None:
                 tmp_linear.bias.data = module.bias.data.float()
 
-            new_mod = W8Linear(tmp_linear, compute_dtype)
+            if module.quantize_activations:
+                new_mod = W8A8Linear(tmp_linear, compute_dtype,
+                                     asymmetric=module.asymmetric)
+                new_mod.x_scale.fill_(
+                    module.x_scale.abs().clamp(min=1e-8).item())
+                if module.asymmetric:
+                    new_mod.x_zero.fill_(module.x_zero.item())
+            else:
+                new_mod = W8Linear(tmp_linear, compute_dtype)
+
             setattr(parent, parts[-1], new_mod)
             converted += 1
 
@@ -529,6 +611,8 @@ def main():
                         for t in calib_tensors]
         calibrate_w8a8(model, calib_inputs)
         channel_threshold = args.channel_threshold
+        w8a8_layers = None  # v1 from-scratch uses channel heuristic
+        use_asym = False
     else:
         print(f"\nLoading PTQ checkpoint from {args.ptq_checkpoint} ...")
         checkpoint = torch.load(args.ptq_checkpoint, map_location="cpu",
@@ -550,7 +634,16 @@ def main():
             act_type=arch.get("act_type", "relu"),
             weighting_network=arch.get("weighting_network", False),
         )
-        _quantize_model_mixed(model, compute_dtype, channel_threshold)
+
+        # Support both v1 (channel-threshold) and v2 (sensitivity-based) checkpoints
+        w8a8_layers = checkpoint.get("w8a8_layers", None)
+        use_asym = checkpoint.get("activation_quant", "symmetric") == "asymmetric"
+        if w8a8_layers is not None:
+            _quantize_model_mixed_v2(model, compute_dtype,
+                                      w8a8_layers=w8a8_layers,
+                                      asymmetric=use_asym)
+        else:
+            _quantize_model_mixed(model, compute_dtype, channel_threshold)
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         model = model.to(dtype=compute_dtype, device=device)
         model.eval()
@@ -634,6 +727,11 @@ def main():
             "weighting_network": False,
         },
     }
+    # Propagate v2 metadata from source checkpoint
+    if w8a8_layers is not None:
+        save_data["w8a8_layers"] = w8a8_layers
+    if use_asym:
+        save_data["activation_quant"] = "asymmetric"
     torch.save(save_data, args.output)
 
     orig_kb = os.path.getsize(args.fp32_model) / 1024

@@ -1,22 +1,22 @@
 """
-Mixed INT8 Quantization for HDRTVNet++ (Selective W8A8 / W8A16).
+Optimized Mixed INT8 Quantization for HDRTVNet++ (Sensitivity-Based).
 
-Inspired by FSR4's INT8 path (DP4A-based memory compression), this
-applies activation quantization ONLY to memory-bound 1×1 convolutions
-(SFT layers with ≤32 channels) where our Triton INT8-IO benchmark
-measured 1.74 – 2.28× bandwidth speedup.  All other layers use
-weight-only W8A16, avoiding the activation quant/dequant overhead
-where it hurts.
+Two key improvements over the original channel-threshold heuristic:
 
-Selection criteria:
-  * W8A8 → Conv2d with kernel_size=1 AND max(in_ch, out_ch) ≤ threshold
-  * W8A16 → everything else (3×3 convs, large-channel 1×1s, Linear)
+  1. **Per-layer sensitivity analysis** — quantize one layer at a time to
+     W8A8, measure output MSE, rank by impact.  Layers causing less than
+     ``--sensitivity-threshold`` MSE are assigned W8A8; the rest stay W8A16.
+
+  2. **Asymmetric activation quantization** — W8A8 layers use unsigned
+     [0, 255] with a zero-point instead of symmetric [-128, 127].
+     This gives 2x precision for post-ReLU layers and ~1.8x for
+     post-LeakyReLU, since the full 256 levels map the actual value range.
 
 Usage
 -----
     python quantize_int8_mixed.py
-    python quantize_int8_mixed.py --channel-threshold 64
-    python quantize_int8_mixed.py --num-calibrate 32
+    python quantize_int8_mixed.py --sensitivity-threshold 1e-6
+    python quantize_int8_mixed.py --legacy  # old channel-threshold mode
 """
 
 import argparse
@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE
 from models.hdrtvnet_torch import (
     W8A8Conv2d, W8A8Linear, W8Conv2d, W8Linear,
-    _quantize_model_mixed, calibrate_w8a8,
+    _quantize_model_mixed, _quantize_model_mixed_v2, calibrate_w8a8,
 )
 
 
@@ -106,13 +106,110 @@ def prepare_model_input(img_tensor, device, dtype):
 
 
 # ===================================================================
+# Per-layer sensitivity analysis
+# ===================================================================
+
+def compute_layer_sensitivity(model, calibration_inputs, num_samples=8):
+    """Measure per-layer quantization sensitivity (output MSE).
+
+    For each Conv2d / Linear layer, inject W8A8 quantization noise
+    (asymmetric activation + per-channel weight) into that layer alone
+    and measure how much the final output changes vs the FP16 reference.
+
+    Returns dict: {layer_name: mean_output_mse}.
+    """
+    model.eval()
+    inputs = calibration_inputs[:num_samples]
+
+    # Collect FP16 reference outputs
+    ref_outputs = []
+    with torch.inference_mode():
+        for inp in inputs:
+            out, _ = model(inp)
+            ref_outputs.append(out.clone())
+
+    layers = [(n, m) for n, m in model.named_modules()
+              if isinstance(m, (nn.Conv2d, nn.Linear))]
+    print(f"  Sensitivity sweep: {len(layers)} layers x {len(inputs)} images")
+
+    sensitivities = {}
+    for idx, (name, module) in enumerate(layers):
+        # Hook: inject W8A8 quant noise (asymmetric act + per-channel weight)
+        def _make_hook(mod):
+            def _hook(m, inp, out):
+                x = inp[0]
+                w = mod.weight
+
+                # Per-output-channel weight quantization
+                w_flat = w.reshape(w.shape[0], -1)
+                w_sc = w_flat.abs().amax(dim=1).clamp(min=1e-8) / 127.0
+
+                # Asymmetric activation quantization [0, 255]
+                x_min = x.detach().amin()
+                x_max = x.detach().amax()
+                x_range = (x_max - x_min).clamp(min=1e-8)
+                x_sc = x_range / 255.0
+                x_q = ((x - x_min) / x_sc).round().clamp(0, 255)
+                x_dq = x_q * x_sc + x_min
+
+                if isinstance(mod, nn.Conv2d):
+                    w_q = (w / w_sc.view(-1, 1, 1, 1)).round().clamp(
+                        -128, 127) * w_sc.view(-1, 1, 1, 1)
+                    return F.conv2d(x_dq, w_q, mod.bias, mod.stride,
+                                    mod.padding, mod.dilation, mod.groups)
+                else:
+                    w_q = (w / w_sc.view(-1, 1)).round().clamp(
+                        -128, 127) * w_sc.view(-1, 1)
+                    return F.linear(x_dq, w_q, mod.bias)
+            return _hook
+
+        h = module.register_forward_hook(_make_hook(module))
+
+        mses = []
+        with torch.inference_mode():
+            for i, inp in enumerate(inputs):
+                out, _ = model(inp)
+                mse = ((out.float() - ref_outputs[i].float()) ** 2).mean().item()
+                mses.append(mse)
+
+        sensitivities[name] = np.mean(mses)
+        h.remove()
+
+        if (idx + 1) % 32 == 0 or idx + 1 == len(layers):
+            print(f"    {idx + 1}/{len(layers)} done...")
+
+    return sensitivities
+
+
+def select_w8a8_layers(sensitivities, threshold=1e-6):
+    """Select layers for W8A8 based on sensitivity threshold.
+
+    Layers whose individual W8A8 quantization causes output MSE < threshold
+    are safe for W8A8.  The rest stay W8A16 (weight-only).
+
+    Returns (w8a8_names, w8a16_names) sorted by sensitivity.
+    """
+    sorted_layers = sorted(sensitivities.items(), key=lambda x: x[1])
+
+    w8a8 = []
+    w8a16 = []
+    for name, mse in sorted_layers:
+        if mse <= threshold:
+            w8a8.append(name)
+        else:
+            w8a16.append(name)
+
+    return w8a8, w8a16
+
+
+# ===================================================================
 # Main
 # ===================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Mixed INT8 quantization for HDRTVNet++ "
-                    "(selective W8A8 for memory-bound layers)"
+        description="Optimized mixed INT8 quantization for HDRTVNet++ "
+                    "(sensitivity-based with asymmetric activation quant)"
     )
     parser.add_argument("--model", default="src/models/weights/Ensemble_AGCM_LE.pth",
                         help="Path to FP32 .pth weights")
@@ -121,17 +218,24 @@ def main():
                         help="Output path for quantized checkpoint")
     parser.add_argument("--precision", default="fp16", choices=["fp16", "fp32"],
                         help="Compute precision for runtime dequantization")
-    parser.add_argument("--channel-threshold", type=int, default=32,
-                        help="Max channel count for W8A8 (1×1 convs only). "
-                             "Layers with max(in_ch, out_ch) > threshold use W8A16.")
+    parser.add_argument("--sensitivity-threshold", type=float, default=1e-6,
+                        help="Max per-layer MSE for W8A8 assignment. "
+                             "Lower = more conservative (fewer W8A8 layers)")
+    parser.add_argument("--num-sensitivity", type=int, default=8,
+                        help="Images for sensitivity analysis")
     parser.add_argument("--calibration-dir", default="dataset/test_sdr",
-                        help="Directory of SDR images for activation calibration")
+                        help="Directory of SDR images for calibration")
     parser.add_argument("--num-calibrate", type=int, default=16,
                         help="Number of images for activation scale calibration")
     parser.add_argument("--num-validate", type=int, default=8,
                         help="Number of images for quality validation")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
                         help="Device (auto = GPU if available)")
+    # Legacy mode
+    parser.add_argument("--legacy", action="store_true",
+                        help="Use v1 channel-threshold heuristic (no sensitivity)")
+    parser.add_argument("--channel-threshold", type=int, default=32,
+                        help="(Legacy) Max channel count for W8A8 (1x1 convs)")
     args = parser.parse_args()
 
     compute_dtype = torch.float16 if args.precision == "fp16" else torch.float32
@@ -147,28 +251,102 @@ def main():
     model = load_fp32_model(args.model)
 
     # ------------------------------------------------------------------
-    # 2. Mixed quantization: W8A8 for memory-bound 1×1, W8A16 otherwise
+    # 2. Quantization strategy
     # ------------------------------------------------------------------
-    print(f"\nMixed INT8 quantization (channel threshold = {args.channel_threshold}):")
-    _quantize_model_mixed(model, compute_dtype,
-                          channel_threshold=args.channel_threshold)
+    if args.legacy:
+        # v1: simple channel-threshold heuristic
+        print(f"\nLegacy mixed INT8 (channel threshold = {args.channel_threshold}):")
+        _quantize_model_mixed(model, compute_dtype,
+                              channel_threshold=args.channel_threshold)
+        w8a8_layers = None
+        use_asymmetric = False
+    else:
+        # v2: sensitivity analysis + asymmetric activation quant
+        print(f"\n{'='*60}")
+        print("Phase 1: Per-layer sensitivity analysis")
+        print(f"{'='*60}")
 
-    # List which layers got W8A8 vs W8A16
-    print("\n  W8A8 layers (INT8 weights + activations):")
+        # Move to device for sensitivity sweep
+        model = model.to(dtype=compute_dtype, device=device)
+        model.eval()
+
+        calib_images = load_calibration_images(
+            args.calibration_dir, max(args.num_calibrate, args.num_sensitivity)
+        )
+        print(f"  Loaded {len(calib_images)} images")
+        sens_inputs = [prepare_model_input(img, device, compute_dtype)
+                       for img in calib_images[:args.num_sensitivity]]
+
+        t0 = time.perf_counter()
+        sensitivities = compute_layer_sensitivity(model, sens_inputs,
+                                                  args.num_sensitivity)
+        dt = time.perf_counter() - t0
+        print(f"  Sweep took {dt:.1f}s")
+
+        # Select layers
+        w8a8_layers, w8a16_layers = select_w8a8_layers(
+            sensitivities, threshold=args.sensitivity_threshold
+        )
+
+        # Print sensitivity results
+        print(f"\n{'='*60}")
+        print("Phase 2: Layer assignment")
+        print(f"{'='*60}")
+        sorted_sens = sorted(sensitivities.items(), key=lambda x: x[1])
+        print(f"\n  Per-layer sensitivity (MSE, ascending):")
+        for name, mse in sorted_sens:
+            tag = "W8A8" if name in set(w8a8_layers) else "W8A16"
+            psnr_str = (f"{-10 * np.log10(mse):.1f} dB"
+                        if mse > 1e-10 else ">100 dB")
+            print(f"    [{tag:5s}] {name:55s}  MSE={mse:.2e}  PSNR={psnr_str}")
+
+        print(f"\n  W8A8  (asymmetric): {len(w8a8_layers)} layers")
+        print(f"  W8A16 (weight-only): {len(w8a16_layers)} layers")
+
+        # Re-load FP32 model (clean weights for quantization)
+        model = load_fp32_model(args.model)
+        use_asymmetric = True
+
+        print(f"\n{'='*60}")
+        print("Phase 3: Quantization + calibration")
+        print(f"{'='*60}")
+        _quantize_model_mixed_v2(model, compute_dtype,
+                                  w8a8_layers=w8a8_layers,
+                                  asymmetric=True)
+
+    # List W8A8 layers
+    print("\n  W8A8 layers:")
+    w8a8_params = 0
+    w8_params = 0
     for name, m in model.named_modules():
         if isinstance(m, (W8A8Conv2d, W8A8Linear)):
+            asym_tag = " (asymmetric)" if m.is_asymmetric else ""
             if isinstance(m, W8A8Conv2d):
-                print(f"    {name}: Conv2d({m.in_channels}→{m.out_channels}, "
-                      f"k={m.kernel_size})")
+                n_params = m.weight_int8.numel()
+                print(f"    {name}: Conv2d({m.in_channels}->{m.out_channels}, "
+                      f"k={m.kernel_size}){asym_tag}  [{n_params} params]")
             else:
-                print(f"    {name}: Linear({m.in_features}→{m.out_features})")
+                n_params = m.weight_int8.numel()
+                print(f"    {name}: Linear({m.in_features}->{m.out_features})"
+                      f"{asym_tag}  [{n_params} params]")
+            w8a8_params += n_params
+        elif isinstance(m, (W8Conv2d, W8Linear)):
+            if isinstance(m, W8Conv2d):
+                w8_params += m.weight_int8.numel()
+            else:
+                w8_params += m.weight_int8.numel()
+    total_params = w8a8_params + w8_params
+    print(f"\n  Composition: W8A8 = {w8a8_params:,} params "
+          f"({100*w8a8_params/max(total_params,1):.1f}%), "
+          f"W8A16 = {w8_params:,} params "
+          f"({100*w8_params/max(total_params,1):.1f}%)")
 
-    # Cast remaining parameters (norms, etc.) to compute_dtype
+    # Cast remaining parameters to compute_dtype + move to device
     model = model.to(dtype=compute_dtype, device=device)
     model.eval()
 
     # ------------------------------------------------------------------
-    # 3. Calibrate activation scales (only W8A8 layers have x_scale)
+    # 3. Calibrate activation scales
     # ------------------------------------------------------------------
     print(f"\nCalibrating activation scales ({args.num_calibrate} images) ...")
     calib_images = load_calibration_images(
@@ -188,7 +366,6 @@ def main():
         "state_dict": model.state_dict(),
         "compute_dtype": str(compute_dtype),
         "quantization": "w8a8_mixed",
-        "channel_threshold": args.channel_threshold,
         "architecture": {
             "classifier": "color_condition",
             "cond_c": 6,
@@ -199,18 +376,26 @@ def main():
             "weighting_network": False,
         },
     }
+
+    if args.legacy:
+        save_data["channel_threshold"] = args.channel_threshold
+    else:
+        save_data["w8a8_layers"] = w8a8_layers
+        save_data["activation_quant"] = "asymmetric"
+        save_data["sensitivity_threshold"] = args.sensitivity_threshold
+
     torch.save(save_data, args.output)
 
     orig_kb = os.path.getsize(args.model) / 1024
     quant_kb = os.path.getsize(args.output) / 1024
-    print(f"\n  Saved → {args.output}")
+    print(f"\n  Saved -> {args.output}")
     print(f"  Original : {orig_kb:,.1f} KB")
     print(f"  Quantized: {quant_kb:,.1f} KB")
     if quant_kb > 0:
         print(f"  Ratio    : {orig_kb / quant_kb:.2f}x")
 
     # ------------------------------------------------------------------
-    # 5. Quality validation — FP16 reference vs Mixed INT8
+    # 5. Quality validation -- FP16 reference vs Mixed INT8
     # ------------------------------------------------------------------
     print(f"\nValidation ({device}, {args.precision}):")
     val_images = calib_images[:args.num_validate]
@@ -248,11 +433,11 @@ def main():
         times = []
         for _ in range(20):
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
+            t0_t = time.perf_counter()
             with torch.inference_mode():
                 model(test_inp)
             torch.cuda.synchronize()
-            times.append((time.perf_counter() - t0) * 1000)
+            times.append((time.perf_counter() - t0_t) * 1000)
 
         avg = np.mean(times)
         std = np.std(times)

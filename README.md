@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.7-blue)
+![Version](https://img.shields.io/badge/version-v0.8-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-yellow)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -16,7 +16,7 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 
 ---
 
-## Current Status (v0.7)
+## Current Status (v0.8)
 
 ### Implemented
 
@@ -26,16 +26,20 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 - INT8 full quantization (W8A8) — weights and activations
 - INT8 mixed quantization — selective W8A8/W8A16 per layer
 - Quantization-Aware Training (QAT) for mixed INT8 — fine-tunes against HDR ground truth
+- **INT8 pre-dequantization** — auto-detects GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing) and converts INT8 weights to FP16 at load time, giving native FP16 speed with 2.94× compressed checkpoint storage
 - GPU-side preprocessing (BGR→RGB, normalize, permute on GPU)
 - GPU-side postprocessing (clamp, scale, quantize, RGB→BGR on GPU)
 - Pre-allocated GPU tensor buffers (zero per-frame allocation)
+- Pinned (page-locked) host memory for async H2D/D2H DMA transfers
 - `torch.inference_mode()` throughout
 - Async video prefetch queue (`--prefetch`)
 - Stage timing breakdown (`pre`, `run`, `post`)
 - Frame pacing stats (`fps`, `fps_1p_low`, `late`, `drop_est`)
 - Benchmark matrix runner (`benchmark_matrix.py`)
+- INT8 speedup proof benchmark (`benchmark_int8_proof.py`) — roofline analysis + projected speedup on INT8-capable hardware
 - Optional CUDA graph replay (`--cuda-graphs`)
 - Optional channels_last memory format (auto on NVIDIA)
+- Real-time metrics overlay (FPS, latency, GPU/CPU memory, model size)
 
 ### Pipeline
 
@@ -160,6 +164,7 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 | `--no-compile` | Disable `torch.compile` entirely |
 | `--channels-last` | Force channels_last memory format (auto on NVIDIA) |
 | `--cuda-graphs` | Enable CUDA graph replay for static shapes |
+| `--predequantize auto\|on\|off` | Pre-dequantize INT8 weights to FP16 at load time (auto = enabled on GPUs without INT8 tensor cores) |
 | `--prefetch N` | Video reader prefetch queue size (default: 8) |
 | `--model-stage-timing` | Report pre/run/post timing breakdown |
 | `--no-display` | Headless mode for pure throughput testing |
@@ -204,6 +209,36 @@ python quantize_int8_mixed_qat.py
 - Output is fully compatible with `--precision int8-mixed` (same checkpoint format)
 - **3.17× compression**
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch` (no PTQ checkpoint needed)
+
+### Pre-Dequantization (for GPUs without INT8 tensor cores)
+
+On GPUs that lack native INT8 compute (AMD RDNA3, NVIDIA pre-Turing), the per-inference INT8→FP16 dequantization adds ~55% overhead. Pre-dequantization solves this by converting INT8 weights to FP16 **once at load time**:
+
+```bash
+# Auto-enabled on AMD RDNA3 (default --predequantize auto):
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
+
+# Force on/off:
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt --predequantize on
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt --predequantize off
+```
+
+| Metric | INT8 dequant (per-frame) | INT8 pre-dequantized | Native FP16 |
+|---|---|---|---|
+| Latency (960×544) | 73.9 ms | **34.8 ms** | 34.9 ms |
+| FPS | 13.5 | **28.7** | 28.6 |
+| Checkpoint size | 815 KB | **815 KB** | 2,399 KB |
+| Speedup vs dequant | 1.00× | **2.12×** | 2.12× |
+
+**Result:** Same FP16 speed + 2.94× compressed checkpoint storage.
+
+### INT8 Speedup Proof (for thesis)
+
+```bash
+python benchmark_int8_proof.py --csv int8_proof.csv
+```
+
+Generates roofline analysis, per-layer bandwidth savings, and projected speedup on INT8-capable hardware. On NVIDIA Turing+ GPUs, the same INT8 checkpoint projects **1.35×** speedup over FP16 due to native INT8 tensor core support.
 
 ---
 

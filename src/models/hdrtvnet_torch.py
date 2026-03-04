@@ -120,9 +120,14 @@ class W8A8Conv2d(nn.Module):
     determined during a calibration pass.  At inference both are dequantized
     to ``compute_dtype`` and passed to F.conv2d.  torch.compile fuses the
     dequant + conv into a single efficient kernel.
+
+    When ``asymmetric=True``, activations are quantized to unsigned [0, 255]
+    with a zero-point, giving 2× precision for non-negative (post-ReLU)
+    distributions and ~1.8× for post-LeakyReLU distributions.
     """
 
-    def __init__(self, conv: nn.Conv2d, compute_dtype: torch.dtype = torch.float16):
+    def __init__(self, conv: nn.Conv2d, compute_dtype: torch.dtype = torch.float16,
+                 asymmetric: bool = False):
         super().__init__()
         self.in_channels = conv.in_channels
         self.out_channels = conv.out_channels
@@ -132,6 +137,7 @@ class W8A8Conv2d(nn.Module):
         self.dilation = conv.dilation
         self.groups = conv.groups
         self.compute_dtype = compute_dtype
+        self.is_asymmetric = asymmetric
 
         # Quantize weights (identical to W8Conv2d)
         w = conv.weight.data.float()
@@ -147,11 +153,18 @@ class W8A8Conv2d(nn.Module):
             self.bias = None
         # Activation scale — set during calibration via calibrate_w8a8()
         self.register_buffer("x_scale", torch.tensor(1.0, dtype=compute_dtype))
+        if asymmetric:
+            self.register_buffer("x_zero", torch.tensor(0.0, dtype=compute_dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Quantize activation to INT8 then dequantize
-        x_int8 = (x / self.x_scale).round().clamp(-128, 127).to(torch.int8)
-        x_deq = x_int8.to(self.compute_dtype) * self.x_scale
+        if self.is_asymmetric:
+            # Asymmetric: map [x_zero, x_zero + x_scale*255] → [0, 255]
+            x_q = ((x - self.x_zero) / self.x_scale).round().clamp(0, 255)
+            x_deq = x_q * self.x_scale + self.x_zero
+        else:
+            # Symmetric: map [-x_scale*127, x_scale*127] → [-128, 127]
+            x_int8 = (x / self.x_scale).round().clamp(-128, 127).to(torch.int8)
+            x_deq = x_int8.to(self.compute_dtype) * self.x_scale
         # Dequantize weights
         w = self.weight_int8.to(self.compute_dtype) * self.w_scale.view(-1, 1, 1, 1)
         return F.conv2d(x_deq, w, self.bias, self.stride, self.padding,
@@ -161,11 +174,13 @@ class W8A8Conv2d(nn.Module):
 class W8A8Linear(nn.Module):
     """Linear with INT8 weights and INT8 activations (static quantization)."""
 
-    def __init__(self, linear: nn.Linear, compute_dtype: torch.dtype = torch.float16):
+    def __init__(self, linear: nn.Linear, compute_dtype: torch.dtype = torch.float16,
+                 asymmetric: bool = False):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.compute_dtype = compute_dtype
+        self.is_asymmetric = asymmetric
 
         w = linear.weight.data.float()
         w_scale = w.abs().amax(dim=1).clamp(min=1e-8) / 127.0
@@ -178,10 +193,16 @@ class W8A8Linear(nn.Module):
         else:
             self.bias = None
         self.register_buffer("x_scale", torch.tensor(1.0, dtype=compute_dtype))
+        if asymmetric:
+            self.register_buffer("x_zero", torch.tensor(0.0, dtype=compute_dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_int8 = (x / self.x_scale).round().clamp(-128, 127).to(torch.int8)
-        x_deq = x_int8.to(self.compute_dtype) * self.x_scale
+        if self.is_asymmetric:
+            x_q = ((x - self.x_zero) / self.x_scale).round().clamp(0, 255)
+            x_deq = x_q * self.x_scale + self.x_zero
+        else:
+            x_int8 = (x / self.x_scale).round().clamp(-128, 127).to(torch.int8)
+            x_deq = x_int8.to(self.compute_dtype) * self.x_scale
         w = self.weight_int8.to(self.compute_dtype) * self.w_scale.view(-1, 1)
         return F.linear(x_deq, w, self.bias)
 
@@ -203,6 +224,81 @@ def _quantize_model_w8a8(model: nn.Module,
             replaced += 1
     print(f"  Quantized {replaced} layers to W8A8 (INT8 weights + activations, "
           f"{compute_dtype} compute)")
+    return model
+
+
+# ===================================================================
+# Pre-dequantization — convert W8* layers back to native FP16 layers
+# for GPUs without INT8 tensor cores (removes per-inference dequant
+# overhead while keeping the compressed checkpoint on disk).
+# ===================================================================
+
+def _predequantize_conv(w8_mod, compute_dtype):
+    """Convert a W8Conv2d or W8A8Conv2d back to a standard nn.Conv2d."""
+    conv = nn.Conv2d(
+        w8_mod.in_channels, w8_mod.out_channels,
+        w8_mod.kernel_size, stride=w8_mod.stride,
+        padding=w8_mod.padding, dilation=w8_mod.dilation,
+        groups=w8_mod.groups,
+        bias=w8_mod.bias is not None,
+    )
+    # Reconstruct FP weights: w_fp = w_int8 * scale
+    if hasattr(w8_mod, "w_scale"):
+        scale = w8_mod.w_scale  # W8A8Conv2d
+    else:
+        scale = w8_mod.scale   # W8Conv2d
+    w_fp = w8_mod.weight_int8.to(compute_dtype) * scale.view(-1, 1, 1, 1)
+    conv.weight = nn.Parameter(w_fp, requires_grad=False)
+    if w8_mod.bias is not None:
+        conv.bias = nn.Parameter(w8_mod.bias.data.clone(), requires_grad=False)
+    return conv
+
+
+def _predequantize_linear(w8_mod, compute_dtype):
+    """Convert a W8Linear or W8A8Linear back to a standard nn.Linear."""
+    linear = nn.Linear(
+        w8_mod.in_features, w8_mod.out_features,
+        bias=w8_mod.bias is not None,
+    )
+    if hasattr(w8_mod, "w_scale"):
+        scale = w8_mod.w_scale  # W8A8Linear
+    else:
+        scale = w8_mod.scale   # W8Linear
+    w_fp = w8_mod.weight_int8.to(compute_dtype) * scale.view(-1, 1)
+    linear.weight = nn.Parameter(w_fp, requires_grad=False)
+    if w8_mod.bias is not None:
+        linear.bias = nn.Parameter(w8_mod.bias.data.clone(), requires_grad=False)
+    return linear
+
+
+def _predequantize_model(model: nn.Module,
+                         compute_dtype: torch.dtype = torch.float16) -> nn.Module:
+    """Convert all W8*/W8A8* layers back to native FP Conv2d/Linear in-place.
+
+    This is used on GPUs without INT8 tensor cores (e.g. AMD RDNA3) to
+    eliminate the per-inference dequant→FP16 overhead.  The model still
+    loads from a 2.94× compressed INT8 checkpoint — we just decompress
+    the weights once at load time instead of every forward pass.
+
+    Returns the model with all quantized layers replaced by native FP16
+    layers (same inference speed as the original FP16 model).
+    """
+    converted = 0
+    for name, module in list(model.named_modules()):
+        if isinstance(module, (W8Conv2d, W8A8Conv2d, W8Linear, W8A8Linear)):
+            parts = name.split(".")
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            if isinstance(module, (W8Conv2d, W8A8Conv2d)):
+                setattr(parent, parts[-1],
+                        _predequantize_conv(module, compute_dtype))
+            else:
+                setattr(parent, parts[-1],
+                        _predequantize_linear(module, compute_dtype))
+            converted += 1
+    print(f"  Pre-dequantized {converted} INT8 layers → native FP16 "
+          f"(no runtime dequant overhead)")
     return model
 
 
@@ -255,22 +351,82 @@ def _quantize_model_mixed(model: nn.Module,
     return model
 
 
+def _quantize_model_mixed_v2(model: nn.Module,
+                              compute_dtype: torch.dtype = torch.float16,
+                              w8a8_layers: list = None,
+                              asymmetric: bool = True) -> nn.Module:
+    """Sensitivity-based mixed INT8: W8A8 for specified layers, W8A16 otherwise.
+
+    Unlike v1 which uses a simple channel-count heuristic, this version
+    accepts an explicit list of layer names determined by per-layer
+    sensitivity analysis.  All W8A8 layers use asymmetric activation
+    quantization [0, 255] with zero-point by default.
+
+    Args:
+        model: FP32 model to quantize (modified in-place).
+        compute_dtype: Runtime precision for dequantized values.
+        w8a8_layers: List of layer names to assign W8A8.
+        asymmetric: Use asymmetric activation quantization for W8A8 layers.
+    """
+    w8a8_set = set(w8a8_layers or [])
+    w8a8_count = 0
+    w8_count = 0
+
+    for name, module in list(model.named_modules()):
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            parts = name.split(".")
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+
+            if name in w8a8_set:
+                if isinstance(module, nn.Conv2d):
+                    setattr(parent, parts[-1],
+                            W8A8Conv2d(module, compute_dtype,
+                                       asymmetric=asymmetric))
+                else:
+                    setattr(parent, parts[-1],
+                            W8A8Linear(module, compute_dtype,
+                                       asymmetric=asymmetric))
+                w8a8_count += 1
+            elif isinstance(module, nn.Conv2d):
+                setattr(parent, parts[-1], W8Conv2d(module, compute_dtype))
+                w8_count += 1
+            else:
+                setattr(parent, parts[-1], W8Linear(module, compute_dtype))
+                w8_count += 1
+
+    total = w8a8_count + w8_count
+    mode = "asymmetric" if asymmetric else "symmetric"
+    print(f"  Mixed INT8 v2: {w8a8_count} layers → W8A8 ({mode}), "
+          f"{w8_count} layers → W8A16 ({total} total, {compute_dtype} compute)")
+    return model
+
+
 def calibrate_w8a8(model: nn.Module, calibration_inputs: list) -> None:
     """Run calibration data through the model to determine activation scales.
 
-    Each W8A8Conv2d / W8A8Linear records the maximum absolute activation value
-    observed across all calibration samples, then sets x_scale = max_abs / 127.
+    For symmetric layers: x_scale = max_abs / 127.
+    For asymmetric layers: x_zero = min, x_scale = (max - min) / 255.
+    This gives 2× precision for post-ReLU layers and ~1.8× for post-LeakyReLU.
     """
     # Attach hooks to record activation ranges
     hooks = []
-    max_vals = {}
+    stats = {}  # name → {"max_abs", "min", "max"}
 
     def _make_hook(name):
         def _hook(module, inp, out):
-            x = inp[0]
-            abs_max = x.detach().abs().amax().item()
-            if name not in max_vals or abs_max > max_vals[name]:
-                max_vals[name] = abs_max
+            x = inp[0].detach()
+            abs_max = x.abs().amax().item()
+            x_min = x.amin().item()
+            x_max = x.amax().item()
+            if name not in stats:
+                stats[name] = {"max_abs": abs_max, "min": x_min, "max": x_max}
+            else:
+                s = stats[name]
+                s["max_abs"] = max(s["max_abs"], abs_max)
+                s["min"] = min(s["min"], x_min)
+                s["max"] = max(s["max"], x_max)
         return _hook
 
     for name, module in model.named_modules():
@@ -289,13 +445,22 @@ def calibrate_w8a8(model: nn.Module, calibration_inputs: list) -> None:
 
     # Set activation scales
     calibrated = 0
+    asym_count = 0
     for name, module in model.named_modules():
-        if isinstance(module, (W8A8Conv2d, W8A8Linear)) and name in max_vals:
-            x_scale = max(max_vals[name], 1e-8) / 127.0
-            module.x_scale.fill_(x_scale)
+        if isinstance(module, (W8A8Conv2d, W8A8Linear)) and name in stats:
+            s = stats[name]
+            if module.is_asymmetric:
+                x_range = max(s["max"] - s["min"], 1e-8)
+                module.x_scale.fill_(x_range / 255.0)
+                module.x_zero.fill_(s["min"])
+                asym_count += 1
+            else:
+                module.x_scale.fill_(max(s["max_abs"], 1e-8) / 127.0)
             calibrated += 1
 
-    print(f"  Calibrated {calibrated} layers (activation scales set)")
+    sym_count = calibrated - asym_count
+    print(f"  Calibrated {calibrated} layers "
+          f"({asym_count} asymmetric, {sym_count} symmetric)")
 
 
 def _get_gpu_info() -> str:
@@ -319,11 +484,13 @@ class HDRTVNetTorch:
       * AMD ROCm-Windows: auto-detects HIP SDK; use --force-compile to
         override if detection fails.
       * Optional CUDA-graph replay for static-shape inputs.
+      * Pre-dequantize INT8 weights on GPUs without tensor cores (auto).
     """
 
     def __init__(self, model_path, device="auto", precision="auto",
                  compile_model=True, force_compile=False, compile_mode="auto",
-                 use_cuda_graphs=False, force_channels_last=False):
+                 use_cuda_graphs=False, force_channels_last=False,
+                 predequantize="auto"):
         self.model_path = model_path
         self.device = self._resolve_device(device)
         self.precision = self._resolve_precision(precision, self.device)
@@ -333,6 +500,7 @@ class HDRTVNetTorch:
         )
         self._is_flat_model = False  # True for old-style FX quantized models
         self._is_w8_model = False    # True for GPU W8 weight-only INT8
+        self._predequantize = predequantize  # "auto", True, or False
 
         # ---- Print platform info ------------------------------------------
         if self._use_cuda:
@@ -401,6 +569,11 @@ class HDRTVNetTorch:
         self._buf_hw = None
         self._gpu_input = None       # persistent GPU tensor (1,3,H,W)
         self._gpu_cond = None        # persistent GPU tensor (1,3,H//4,W//4)
+        self._pin_input = None       # pinned host staging tensor (H,W,3) uint8
+        self._pin_output = None      # pinned host tensor for D2H (H,W,3) uint8
+        self._d2h_stream = (
+            torch.cuda.Stream() if self._use_cuda else None
+        )
 
         # ---- CUDA graph state (optional) -----------------------------------
         self._use_cuda_graphs = (
@@ -480,9 +653,19 @@ class HDRTVNetTorch:
 
         # Replace Conv2d / Linear with correct quantized equivalents
         if quant_type == "w8a8_mixed":
-            _quantize_model_mixed(model, compute_dtype,
-                                  channel_threshold=checkpoint.get(
-                                      "channel_threshold", 32))
+            w8a8_layers = checkpoint.get("w8a8_layers", None)
+            use_asym = checkpoint.get(
+                "activation_quant", "symmetric") == "asymmetric"
+            if w8a8_layers is not None:
+                # v2: explicit layer list from sensitivity analysis
+                _quantize_model_mixed_v2(model, compute_dtype,
+                                         w8a8_layers=w8a8_layers,
+                                         asymmetric=use_asym)
+            else:
+                # v1: channel-threshold heuristic (legacy checkpoints)
+                _quantize_model_mixed(model, compute_dtype,
+                                      channel_threshold=checkpoint.get(
+                                          "channel_threshold", 32))
         elif quant_type == "w8a8_full":
             _quantize_model_w8a8(model, compute_dtype)
         else:
@@ -497,10 +680,40 @@ class HDRTVNetTorch:
         # On CUDA, this is a harmless optimization (avoids unnecessary casts).
         model = model.to(dtype=compute_dtype, device=self.device)
         model.eval()
-        self._is_w8_model = True
-        label = {"w8a8_full": "W8A8", "w8a8_mixed": "Mixed W8A8/W8A16"}.get(
-            quant_type, quant_type)
-        print(f"Loaded {label} INT8 model (compute_dtype={compute_dtype})")
+
+        # ---- Pre-dequantize on GPUs without INT8 tensor cores -------------
+        # Auto: AMD RDNA3 (no native INT8 conv) → pre-dequantize
+        #       NVIDIA Turing+ (sm >= 75) → keep INT8 for tensor core speedup
+        should_predequantize = self._predequantize
+        if should_predequantize == "auto":
+            if _IS_ROCM:
+                # AMD has no native INT8 conv kernels in MIOpen
+                should_predequantize = True
+                print("Auto-detected AMD GPU: pre-dequantizing INT8 → FP16 "
+                      "(no native INT8 conv on RDNA3)")
+            elif _IS_NVIDIA:
+                props = torch.cuda.get_device_properties(0)
+                has_int8_tc = (props.major > 7 or
+                               (props.major == 7 and props.minor >= 5))
+                should_predequantize = not has_int8_tc
+                if should_predequantize:
+                    print(f"NVIDIA sm_{props.major}{props.minor}: no INT8 "
+                          f"tensor cores, pre-dequantizing → FP16")
+            else:
+                should_predequantize = False
+
+        if should_predequantize and should_predequantize != "auto":
+            _predequantize_model(model, compute_dtype)
+            self._is_w8_model = False  # now a regular FP16 model
+            label = {"w8a8_full": "W8A8", "w8a8_mixed": "Mixed W8A8/W8A16"}.get(
+                quant_type, quant_type)
+            print(f"Loaded {label} INT8 checkpoint → pre-dequantized to FP16 "
+                  f"(compressed storage, native FP16 speed)")
+        else:
+            self._is_w8_model = True
+            label = {"w8a8_full": "W8A8", "w8a8_mixed": "Mixed W8A8/W8A16"}.get(
+                quant_type, quant_type)
+            print(f"Loaded {label} INT8 model (compute_dtype={compute_dtype})")
         return model
 
     def _load_model(self, model_path):
@@ -560,6 +773,16 @@ class HDRTVNetTorch:
             (1, 3, cond_h, cond_w), dtype=self._dtype, device=self.device,
         ).to(memory_format=mem_fmt)
 
+        # Pinned host buffers — page-locked memory makes non_blocking=True
+        # actually overlap H2D/D2H with GPU compute
+        if self._use_cuda:
+            self._pin_input = torch.empty(
+                (h, w, 3), dtype=torch.uint8, pin_memory=True
+            )
+            self._pin_output = torch.empty(
+                (h, w, 3), dtype=torch.uint8, pin_memory=True
+            )
+
         # Invalidate any cached CUDA graph on resolution change
         self._graph = None
         self._graph_hw = None
@@ -572,11 +795,16 @@ class HDRTVNetTorch:
         h, w = frame_bgr.shape[:2]
         self._ensure_buffers(h, w)
 
-        # Upload raw uint8 BGR frame to GPU, then do all math there
-        # from_numpy is zero-copy; the .to(device) does the actual H2D
-        raw = torch.from_numpy(frame_bgr).to(
-            device=self.device, non_blocking=self._use_cuda
-        )
+        # Copy frame into pinned staging buffer, then async H2D
+        if self._use_cuda and self._pin_input is not None:
+            self._pin_input.copy_(torch.from_numpy(frame_bgr))  # CPU→pinned (memcpy)
+            raw = self._pin_input.to(
+                device=self.device, non_blocking=True            # pinned→GPU (async DMA)
+            )
+        else:
+            raw = torch.from_numpy(frame_bgr).to(
+                device=self.device, non_blocking=self._use_cuda
+            )
         # (H,W,3) uint8 → BGR→RGB via channel flip → CHW → add batch → fp → /255
         raw = raw.flip(2)                                  # BGR → RGB
         raw = raw.permute(2, 0, 1).unsqueeze(0)           # (1,3,H,W)
@@ -663,7 +891,13 @@ class HDRTVNetTorch:
         t = t.to(dtype=torch.uint8)                # quantize on GPU
         t = t.flip(0)                              # RGB→BGR via channel flip
         t = t.permute(1, 2, 0).contiguous()        # CHW → HWC, contiguous for cv2
-        return t.cpu().numpy()                     # single D2H copy of uint8
+
+        # Async D2H into pinned host buffer (avoids implicit sync)
+        if self._use_cuda and self._pin_output is not None:
+            self._pin_output.copy_(t, non_blocking=True)   # GPU→pinned (async DMA)
+            torch.cuda.current_stream().synchronize()       # ensure D2H completes
+            return self._pin_output.numpy()                 # zero-copy view
+        return t.cpu().numpy()                              # fallback: CPU path
 
     # -----------------------------------------------------------------------
     # Public API
