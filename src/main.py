@@ -125,9 +125,10 @@ def parse_args():
     )
     parser.add_argument(
         "--cache-resolution",
-        default="1920x1080",
+        default="auto",
         help="Pre-compile Triton kernels for this resolution at startup. "
-             "Format: WIDTHxHEIGHT. Cached to disk so subsequent runs are instant. "
+             "'auto' (default) detects the video resolution. "
+             "Format: WIDTHxHEIGHT for manual override. "
              "Set to 'none' to skip warmup."
     )
     return parser.parse_args()
@@ -136,6 +137,18 @@ def main():
     args = parse_args()
 
     source = VideoSource(args.video, prefetch=args.prefetch)
+
+    # Probe actual video resolution so we warm up for the right shape
+    _probe = cv2.VideoCapture(args.video)
+    _vid_w = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+    _vid_h = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    _probe.release()
+    # Cap to max processing size (same logic as the main loop)
+    if args.static_input or _vid_w > args.max_width or _vid_h > args.max_height:
+        _proc_w, _proc_h = args.max_width, args.max_height
+    else:
+        _proc_w, _proc_h = _vid_w, _vid_h
+
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
     processor = HDRTVNetTorch(
         args.model,
@@ -148,13 +161,17 @@ def main():
         force_channels_last=args.channels_last,
         predequantize=predeq,
     )
-    # Pre-compile Triton kernels for the target resolution so video
-    # playback starts immediately.  Triton caches to disk, so only the
-    # first invocation is slow; subsequent runs at the same resolution
-    # load from cache in seconds.
+    # Pre-compile Triton kernels for the actual processing resolution so
+    # video playback starts immediately.  If --cache-resolution is set,
+    # use that instead (for manual override).  Triton caches to disk, so
+    # only the first invocation is slow; subsequent runs at the same
+    # resolution load from cache in seconds.
     if hasattr(processor, '_compiled') and processor._compiled:
         cache_res = args.cache_resolution.strip().lower()
-        if cache_res and cache_res != "none":
+        if cache_res == "auto":
+            # Use the video's actual processing resolution
+            processor.warmup_compile(_proc_w, _proc_h)
+        elif cache_res and cache_res != "none":
             try:
                 cw, ch = cache_res.split("x")
                 processor.warmup_compile(int(cw), int(ch))

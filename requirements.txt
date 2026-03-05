@@ -3,3 +3,5 @@ numpy
 torch
 torchvision
 psutil
+PyQt6
+python-mpv

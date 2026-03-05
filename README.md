@@ -1,7 +1,7 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v0.8-blue)
-![Status](https://img.shields.io/badge/status-active%20development-yellow)
+![Version](https://img.shields.io/badge/version-v1.0-blue)
+![Status](https://img.shields.io/badge/status-first%20public%20build-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
 ---
@@ -16,7 +16,7 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 
 ---
 
-## Current Status (v0.8)
+## Current Status (v1.0)
 
 ### Implemented
 
@@ -38,6 +38,11 @@ The project achieves real-time HDR reconstruction using a fully GPU-accelerated 
 - Optional CUDA graph replay (`--cuda-graphs`)
 - Optional channels_last memory format (auto on NVIDIA)
 - Real-time metrics overlay (FPS, latency, GPU/CPU memory, model size)
+- **PyQt6 GUI** — browse/drag-drop video, live precision switching, side-by-side SDR/HDR view, metrics panel
+- **mpv HDR display** — real BT.2020/PQ output via libmpv (auto tone-maps on SDR monitors)
+- **Playback controls** — play/pause/resume/stop, seek slider with live scrubbing (drag to seek)
+- **HDR metadata panel** — live display of color primaries, transfer function, peak luminance (nits), and video output API
+- **Fullscreen mode** — F11 or double-click to toggle; Escape to exit
 
 ### Pipeline
 
@@ -125,6 +130,41 @@ Default (FP16, max-autotune compile, auto device):
 python src/main.py
 ```
 
+### GUI mode
+
+```bash
+python src/gui.py
+```
+
+Opens a PyQt6 window where you can:
+- Browse or drag-and-drop any video file — **playback starts automatically**
+  (the GUI compiles kernels via a clean subprocess if needed, then starts playing)
+- Switch precision (FP16 / FP32 / INT8 variants) at any time, even mid-playback
+- Toggle between side-by-side SDR/HDR view, HDR-only, or SDR-only
+- **Play / Pause / Seek** — full playback controls with a live-scrubbing seek bar
+  (drag the slider to seek while playing or paused)
+- Show/hide a live metrics panel (FPS, latency, GPU/CPU memory, model size)
+- **HDR metadata panel** — shows HDR status (active/inactive), color primaries,
+  transfer function, peak luminance in nits, and video output API
+- **Fullscreen** — press **F11** or double-click the video area to toggle;
+  **Escape** exits fullscreen
+- **HDR display** via embedded mpv — on HDR monitors the output is true
+  BT.2020/PQ HDR10; on SDR monitors mpv automatically tone-maps
+- **Always-subprocess compilation** — kernels are always compiled in a clean
+  subprocess (`compile_kernels.py`) with zero GPU interference from the GUI;
+  cached kernels load instantly on subsequent plays and the dialog auto-closes
+- **Tools → Pre-compile Kernels** — manually compile for any resolution(s)
+  ahead of time in a clean subprocess
+- **Tools → Clear Kernel Cache** — one-click cache reset if you need to
+  recompile (e.g. after a PyTorch / driver update)
+
+> **Note:** HDR display requires `libmpv-2.dll` in the `src/` folder.
+> Download from [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
+> (the `mpv-dev-x86_64-*-git-*.7z` archive). If the DLL is missing the GUI
+> falls back to a standard QLabel preview.
+
+### CLI mode
+
 Skip compile entirely:
 
 ```bash
@@ -169,7 +209,7 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 | `--channels-last` | Force channels_last memory format (auto on NVIDIA) |
 | `--cuda-graphs` | Enable CUDA graph replay for static shapes |
 | `--predequantize auto\|on\|off` | Pre-dequantize INT8 weights to FP16 at load time (auto = enabled on GPUs without INT8 tensor cores) |
-| `--cache-resolution WxH` | Pre-compile Triton kernels for this resolution at startup (default: `1920x1080`). Set to `none` to skip. |
+| `--cache-resolution WxH` | Pre-compile Triton kernels for this resolution at startup (default: auto = video resolution) |
 | `--prefetch N` | Video reader prefetch queue size (default: 8) |
 | `--model-stage-timing` | Report pre/run/post timing breakdown |
 | `--no-display` | Headless mode for pure throughput testing |
@@ -253,7 +293,7 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --model-stage-
 
 ### Compile time
 
-`torch.compile` with `max-autotune` adds a one-time startup cost, but compiled kernels are **cached to disk by Triton**. The pipeline pre-compiles for 1920×1080 by default (`--cache-resolution 1920x1080`), so:
+`torch.compile` with `max-autotune` adds a one-time startup cost, but compiled kernels are **cached to disk by Triton**. Both the GUI and CLI auto-detect the video resolution and pre-compile for it (`--cache-resolution auto` by default), so:
 
 | Scenario | Time | Notes |
 |---|---|---|
@@ -263,8 +303,21 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --model-stage-
 
 Recompilation only happens when the input resolution changes (i.e. different aspect ratio). All 1080p videos reuse the same cached kernels regardless of content, codec, or duration.
 
+**GUI:** When you press Play for the first time at a given resolution, the GUI automatically launches a **clean subprocess** (`compile_kernels.py`) to compile kernels without GPU interference from the GUI itself. A real-time log dialog shows progress. On subsequent plays at the same resolution, cached kernels load instantly. You can also use **Tools → Pre-compile Kernels** to compile for any resolution ahead of time, or **Tools → Clear Kernel Cache** to force a fresh recompile.
+
+You can also run the compiler manually:
 ```bash
-# Default: pre-compile for 1080p
+# Compile for one or more resolutions
+python src/compile_kernels.py 1920x1080
+python src/compile_kernels.py 1920x1080 1440x1080
+
+# Clear cache and recompile
+python src/compile_kernels.py --clear-cache 1920x1080
+```
+
+**CLI:**
+```bash
+# Default: auto-detect video resolution and pre-compile
 python src/main.py
 
 # Pre-compile for 720p instead

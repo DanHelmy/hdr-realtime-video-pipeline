@@ -8,6 +8,10 @@ __pycache__/
 # Local media
 *.mp4
 *.avi
+*.7z
+
+# mpv runtime DLL (112 MB — download separately)
+libmpv-2.dll
 *.mov
 *.mkv
 
