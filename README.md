@@ -175,8 +175,8 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 | **FP16** | Half-precision (default on GPU) | — |
 | **FP32** | Full precision | — |
 | **INT8 Full (W8A8)** | Weights + activations quantized | 3.11× |
-| **INT8 Mixed** | 1×1 convs W8A8, 3×3 convs W8A16 | 3.17× |
-| **INT8 Mixed (QAT)** | Mixed + quantization-aware fine-tuning | 3.17× |
+| **INT8 Mixed** | 1×1 convs W8A8, 3×3 convs W8A16 | 2.94× |
+| **INT8 Mixed (QAT)** | Mixed + quantization-aware fine-tuning | 2.93× |
 
 INT8 modes include **pre-dequantization** for GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing): INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage.
 
@@ -254,7 +254,7 @@ python quantize_int8_mixed.py
 ```
 - Memory-bound 1×1 convs → W8A8 (INT8 activations help bandwidth)
 - Compute-bound 3×3 convs → W8A16 (weight-only saves storage)
-- **3.17× compression**
+- **2.94× compression**
 
 ### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training)
 ```bash
@@ -263,7 +263,7 @@ python quantize_int8_mixed_qat.py
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
-- **3.17× compression**
+- **2.93× compression**
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
 ### Pre-Dequantization
