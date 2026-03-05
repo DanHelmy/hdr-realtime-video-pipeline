@@ -8,47 +8,83 @@
 
 ## Overview
 
-This repository contains the implementation framework for an undergraduate thesis:
-
 **Real-Time SDR-to-HDR Video Reconstruction with HDRTVNet++ and PyTorch**
 
-The project achieves real-time HDR reconstruction using a fully GPU-accelerated PyTorch pipeline with `torch.compile` optimizations. Supports NVIDIA CUDA, AMD ROCm, and CPU backends.
+This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using a deep learning model (HDRTVNet++). It runs entirely on the GPU with `torch.compile` optimizations and includes a full-featured desktop GUI.
+
+Supports **NVIDIA CUDA**, **AMD ROCm**, and **CPU** backends.
 
 ---
 
-## Current Status (v1.0)
+## Quick Start
 
-### Implemented
+```bash
+# 1. Clone and set up
+git clone https://github.com/DanHelmy/hdr-realtime-video-pipeline.git
+cd hdr-realtime-video-pipeline
+python -m venv venv
+venv\Scripts\activate          # Windows
+pip install -r requirements.txt
 
-- Full PyTorch inference pipeline (FP16, FP32, INT8)
-- `torch.compile` with Triton — auto-enabled on all GPUs (auto-detects HIP SDK on ROCm-Windows)
-- Cross-GPU support: NVIDIA (CUDA), AMD (ROCm), CPU
-- INT8 full quantization (W8A8) — weights and activations
-- INT8 mixed quantization — selective W8A8/W8A16 per layer
-- Quantization-Aware Training (QAT) for mixed INT8 — fine-tunes against HDR ground truth
-- **INT8 pre-dequantization** — auto-detects GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing) and converts INT8 weights to FP16 at load time, giving native FP16 speed with 2.94× compressed checkpoint storage
-- GPU-side preprocessing (BGR→RGB, normalize, permute on GPU)
-- GPU-side postprocessing (clamp, scale, quantize, RGB→BGR on GPU)
-- Pre-allocated GPU tensor buffers (zero per-frame allocation)
-- Pinned (page-locked) host memory for async H2D/D2H DMA transfers
-- `torch.inference_mode()` throughout
-- Async video prefetch queue (`--prefetch`)
-- Stage timing breakdown (`pre`, `run`, `post`)
-- Frame pacing stats (`fps`, `fps_1p_low`, `late`, `drop_est`)
-- Optional CUDA graph replay (`--cuda-graphs`)
-- Optional channels_last memory format (auto on NVIDIA)
-- Real-time metrics overlay (FPS, latency, GPU/CPU memory, model size)
-- **PyQt6 GUI** — browse/drag-drop video, live precision switching, side-by-side SDR/HDR view, metrics panel
-- **mpv HDR display** — real BT.2020/PQ output via libmpv (auto tone-maps on SDR monitors)
-- **Playback controls** — play/pause/resume/stop, seek slider with live scrubbing (drag to seek)
-- **HDR metadata panel** — live display of color primaries, transfer function, peak luminance (nits), and video output API
-- **Fullscreen mode** — F11 or double-click to toggle; Escape to exit
+# 2. Install PyTorch for your GPU (see "PyTorch GPU Backends" below)
 
-### Pipeline
-
+# 3. Launch the GUI
+python src/gui.py
 ```
-Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU Postprocess → CPU Download → Renderer
+
+Open a video, and it plays — SDR input on the left, real-time HDR output on the right.
+
+---
+
+## GUI
+
+```bash
+python src/gui.py
 ```
+
+The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Open any video** | Browse or drag-and-drop — playback starts automatically |
+| **Side-by-side view** | SDR input vs HDR output, or HDR-only / SDR-only |
+| **Live precision switching** | FP16, FP32, INT8 variants — switch mid-playback |
+| **Playback controls** | Play / Pause / Resume / Stop |
+| **Seek bar** | Drag to scrub — works while playing or paused |
+| **Live metrics** | FPS, latency, frame count, GPU/CPU memory, model size |
+| **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
+| **Fullscreen** | **F11** or double-click to toggle; **Escape** to exit |
+| **HDR display** | True BT.2020/PQ HDR10 via embedded mpv (auto tone-maps on SDR monitors) |
+| **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|---|---|
+| **F11** | Toggle fullscreen |
+| **Escape** | Exit fullscreen |
+
+### Tools Menu
+
+- **Pre-compile Kernels** — compile for any resolution(s) ahead of time
+- **Clear Kernel Cache** — force recompilation (e.g. after a PyTorch / driver update)
+
+### HDR Display
+
+The HDR output is rendered through an embedded **mpv** player using the D3D11 GPU API with BT.2020 primaries and PQ transfer function. On HDR monitors with Windows "Use HDR" enabled, you get true HDR10 output. On SDR monitors, mpv automatically tone-maps.
+
+> **Requires** `libmpv-2.dll` in the `src/` folder.
+> Download from [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
+> (the `mpv-dev-x86_64-*-git-*.7z` archive). If the DLL is missing, the GUI
+> falls back to a standard QLabel preview.
+
+### First Run
+
+The first time you play a video at a given resolution, `torch.compile` with `max-autotune` needs to compile Triton kernels. This takes **2–5 minutes** and runs in a clean subprocess with a progress dialog. The compiled kernels are **cached to disk**, so subsequent runs at the same resolution load in **~5–10 seconds**.
+
+All 1080p videos reuse the same cached kernels regardless of content, codec, or duration. A different resolution (different aspect ratio) triggers a one-time recompile.
 
 ---
 
@@ -69,7 +105,7 @@ source venv/bin/activate    # Linux/macOS
 pip install -r requirements.txt
 ```
 
-### PyTorch GPU backends
+### PyTorch GPU Backends
 
 **NVIDIA (CUDA):**
 ```bash
@@ -100,103 +136,76 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6
 pip install torch torchvision
 ```
 
-### torch.compile setup
+### torch.compile Setup
 
-**NVIDIA CUDA**: Works automatically when Triton is installed (included with modern PyTorch).
+**NVIDIA CUDA**: Works automatically (Triton included with modern PyTorch).
 
-**AMD ROCm-Windows**: Auto-detects HIP SDK and enables compile automatically. Install `triton-windows` and ensure HIP SDK headers are available:
+**AMD ROCm-Windows**: Auto-detects HIP SDK. Install `triton-windows` and copy HIP headers:
 ```bash
 pip install triton-windows
 xcopy /E /I "C:\Program Files\AMD\ROCm\7.1\include\hip" "venv\Lib\site-packages\_rocm_sdk_devel\include\hip"
 ```
-If auto-detection fails, use `--force-compile` to enable manually.
+If auto-detection fails, use `--force-compile` in CLI mode.
 
 **AMD ROCm-Linux**: Works automatically like NVIDIA.
 
 ---
 
-## Running
+## Architecture
 
-Activate the virtual environment first (or use `.\venv\Scripts\python.exe` directly):
+### Pipeline
 
-```bash
-venv\Scripts\activate       # Windows
-source venv/bin/activate    # Linux/macOS
+```
+Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU Postprocess → CPU Download → Renderer
 ```
 
-Default (FP16, max-autotune compile, auto device):
+### Key Optimizations
+
+- GPU-side preprocessing (BGR→RGB, normalize, permute) and postprocessing (clamp, scale, quantize, RGB→BGR)
+- Pre-allocated GPU tensor buffers (zero per-frame allocation)
+- Pinned (page-locked) host memory for async H2D/D2H DMA transfers
+- `torch.inference_mode()` throughout
+- Async video prefetch queue
+- mpv fast path: skips GPU→CPU postprocess when mpv handles HDR display
+
+### Precision Modes
+
+| Mode | Description | Compression |
+|---|---|---|
+| **FP16** | Half-precision (default on GPU) | — |
+| **FP32** | Full precision | — |
+| **INT8 Full (W8A8)** | Weights + activations quantized | 3.11× |
+| **INT8 Mixed** | 1×1 convs W8A8, 3×3 convs W8A16 | 3.17× |
+| **INT8 Mixed (QAT)** | Mixed + quantization-aware fine-tuning | 3.17× |
+
+INT8 modes include **pre-dequantization** for GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing): INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage.
+
+---
+
+## CLI Mode
+
+For headless benchmarking or scripted workflows:
 
 ```bash
+# Default (FP16, max-autotune compile, auto device)
 python src/main.py
-```
 
-### GUI mode
-
-```bash
-python src/gui.py
-```
-
-Opens a PyQt6 window where you can:
-- Browse or drag-and-drop any video file — **playback starts automatically**
-  (the GUI compiles kernels via a clean subprocess if needed, then starts playing)
-- Switch precision (FP16 / FP32 / INT8 variants) at any time, even mid-playback
-- Toggle between side-by-side SDR/HDR view, HDR-only, or SDR-only
-- **Play / Pause / Seek** — full playback controls with a live-scrubbing seek bar
-  (drag the slider to seek while playing or paused)
-- Show/hide a live metrics panel (FPS, latency, GPU/CPU memory, model size)
-- **HDR metadata panel** — shows HDR status (active/inactive), color primaries,
-  transfer function, peak luminance in nits, and video output API
-- **Fullscreen** — press **F11** or double-click the video area to toggle;
-  **Escape** exits fullscreen
-- **HDR display** via embedded mpv — on HDR monitors the output is true
-  BT.2020/PQ HDR10; on SDR monitors mpv automatically tone-maps
-- **Always-subprocess compilation** — kernels are always compiled in a clean
-  subprocess (`compile_kernels.py`) with zero GPU interference from the GUI;
-  cached kernels load instantly on subsequent plays and the dialog auto-closes
-- **Tools → Pre-compile Kernels** — manually compile for any resolution(s)
-  ahead of time in a clean subprocess
-- **Tools → Clear Kernel Cache** — one-click cache reset if you need to
-  recompile (e.g. after a PyTorch / driver update)
-
-> **Note:** HDR display requires `libmpv-2.dll` in the `src/` folder.
-> Download from [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
-> (the `mpv-dev-x86_64-*-git-*.7z` archive). If the DLL is missing the GUI
-> falls back to a standard QLabel preview.
-
-### CLI mode
-
-Skip compile entirely:
-
-```bash
+# Skip compile
 python src/main.py --no-compile
-```
 
-FP32 precision (slower, useful for accuracy comparison):
-
-```bash
+# FP32 precision
 python src/main.py --precision fp32
-```
 
-INT8 quantized model:
-
-```bash
-# W8A8 (full INT8):
+# INT8 quantized models
 python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full.pt
-
-# Mixed INT8:
-python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
-
-# Mixed INT8 (QAT fine-tuned):
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
-```
 
-Headless benchmark:
-
-```bash
+# Headless benchmark
 python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
 ```
 
-### CLI Flags
+<details>
+<summary><strong>All CLI Flags</strong></summary>
 
 | Flag | Description |
 |---|---|
@@ -222,13 +231,16 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 | `--static-input` | Force resize all frames to max-width × max-height |
 | `--letterbox` | Preserve aspect ratio with black bars |
 
+</details>
+
 ---
 
 ## INT8 Quantization
 
-Two INT8 quantization modes are provided for model compression and (on supported hardware) inference acceleration:
+<details>
+<summary><strong>Quantization details</strong></summary>
 
-### W8A8 (Full INT8)  
+### W8A8 (Full INT8)
 ```bash
 python quantize_int8_full.py
 ```
@@ -251,32 +263,20 @@ python quantize_int8_mixed_qat.py
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
-- Output is fully compatible with `--precision int8-mixed` (same checkpoint format)
 - **3.17× compression**
-- Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch` (no PTQ checkpoint needed)
+- Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
-### Pre-Dequantization (for GPUs without INT8 tensor cores)
+### Pre-Dequantization
 
-On GPUs that lack native INT8 compute (AMD RDNA3, NVIDIA pre-Turing), the per-inference INT8→FP16 dequantization adds ~55% overhead. Pre-dequantization solves this by converting INT8 weights to FP16 **once at load time**:
+On GPUs without native INT8 compute, per-inference dequantization adds ~55% overhead. Pre-dequantization converts INT8 weights to FP16 **once at load time**:
 
 ```bash
-# Auto-enabled on AMD RDNA3 (default --predequantize auto):
-python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
-
-# Force on/off:
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt --predequantize on
-python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt --predequantize off
 ```
 
-**Result:** Same FP16 speed + 2.94× compressed checkpoint storage.
+**Result:** Same FP16 speed + 2.94× compressed storage.
 
----
-
-## Benchmarking
-
-```bash
-python src/main.py --no-display --warmup 30 --timing-interval 120 --model-stage-timing
-```
+</details>
 
 ---
 
@@ -284,56 +284,25 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --model-stage-
 
 | Feature | NVIDIA (CUDA) | AMD (ROCm) | CPU |
 |---|---|---|---|
-| torch.compile | Auto | `--force-compile` (Windows) | Not supported |
-| channels_last | Auto | `--channels-last` to test | N/A |
-| cudnn.benchmark | Auto | N/A (MIOpen) | N/A |
+| torch.compile | Auto | Auto (Windows: needs HIP SDK) | Not supported |
 | FP16 inference | ✅ | ✅ | Fallback to FP32 |
-| INT8 quantization | ✅ (tensor core acceleration possible) | ✅ (compression only, no INT8 compute path) | ✅ (compression only) |
+| INT8 quantization | ✅ (tensor cores) | ✅ (compression only) | ✅ (compression only) |
 | CUDA graphs | ✅ | ✅ | N/A |
+| channels_last | Auto | `--channels-last` | N/A |
 
-### Compile time
+### Compile Cache
 
-`torch.compile` with `max-autotune` adds a one-time startup cost, but compiled kernels are **cached to disk by Triton**. Both the GUI and CLI auto-detect the video resolution and pre-compile for it (`--cache-resolution auto` by default), so:
+| Scenario | Time |
+|---|---|
+| First run at a resolution | 2–5 minutes |
+| Cached resolution | ~5–10 seconds |
+| Different resolution | 2–5 minutes (one-time) |
 
-| Scenario | Time | Notes |
-|---|---|---|
-| First-ever run at a resolution | 2-5 minutes | Triton compiles + saves to disk cache |
-| Subsequent runs at same resolution | ~5-10 seconds | Loads pre-compiled kernels from disk |
-| Different resolution | 2-5 minutes | New kernel shapes require recompilation |
-
-Recompilation only happens when the input resolution changes (i.e. different aspect ratio). All 1080p videos reuse the same cached kernels regardless of content, codec, or duration.
-
-**GUI:** When you press Play for the first time at a given resolution, the GUI automatically launches a **clean subprocess** (`compile_kernels.py`) to compile kernels without GPU interference from the GUI itself. A real-time log dialog shows progress. On subsequent plays at the same resolution, cached kernels load instantly. You can also use **Tools → Pre-compile Kernels** to compile for any resolution ahead of time, or **Tools → Clear Kernel Cache** to force a fresh recompile.
-
-You can also run the compiler manually:
+You can also pre-compile manually:
 ```bash
-# Compile for one or more resolutions
 python src/compile_kernels.py 1920x1080
-python src/compile_kernels.py 1920x1080 1440x1080
-
-# Clear cache and recompile
 python src/compile_kernels.py --clear-cache 1920x1080
 ```
-
-**CLI:**
-```bash
-# Default: auto-detect video resolution and pre-compile
-python src/main.py
-
-# Pre-compile for 720p instead
-python src/main.py --cache-resolution 1280x720
-
-# Skip warmup (compile on first frame)
-python src/main.py --cache-resolution none
-```
-
----
-
-## Notes
-
-- On ROCm-Windows, `--force-compile` is required because Triton codegen needs HIP SDK headers.
-- `channels_last` and `cudnn.benchmark` are auto-enabled on NVIDIA but skipped on ROCm (MIOpen regression).
-- INT8 inference speedup depends on hardware: NVIDIA tensor cores support native INT8 compute; AMD consumer GPUs (RDNA3) currently lack INT8 conv kernel support in MIOpen, so INT8 provides compression benefits only.
 
 ---
 
@@ -365,10 +334,10 @@ If this project is useful in your work, please cite the HDRTVNet/HDRTVNet++ pape
 
 ## License and Attribution
 
-- This repository contains original real-time pipeline engineering and optimization work for thesis purposes.
-- Model architecture and pretrained model lineage are based on HDRTVNet/HDRTVNet++ research code and publications.
-- Please review upstream licenses/terms before redistributing pretrained weights or derived artifacts.
-- Original HDRTVNet++ repository: `https://github.com/xiaom233/HDRTVNet-plus`
+- Original real-time pipeline engineering and optimization work for thesis purposes.
+- Model architecture and pretrained model lineage based on HDRTVNet/HDRTVNet++ research code.
+- Please review upstream licenses before redistributing pretrained weights.
+- Original HDRTVNet++ repository: [github.com/xiaom233/HDRTVNet-plus](https://github.com/xiaom233/HDRTVNet-plus)
 
 ---
 
