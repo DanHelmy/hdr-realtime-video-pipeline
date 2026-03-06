@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v1.1-blue)
+![Version](https://img.shields.io/badge/version-v1.2-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -36,7 +36,7 @@ Open a video, and it plays — SDR input on the left, real-time HDR output on th
 
 ---
 
-## GUI (v1.1)
+## GUI (v1.2)
 
 ```bash
 python src/gui.py
@@ -44,7 +44,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v1.1
+### New in v1.2
 
 - **Drag-and-drop video support**
 - **Live precision switching** (FP16, FP32, INT8 PTQ/QAT/full) at any time, even mid-playback
@@ -52,7 +52,7 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 - **Real-time metrics panel** (FPS, latency, GPU/CPU memory, model size)
 - **Dark theme** (auto-applied)
 - **Native HDR display via mpv** (BT.2020/PQ, D3D11, tone-mapping on SDR monitors)
-- **Resolution presets** (Native, 720p, 540p) and upscaling (Film Bicubic, FSRCNN x2)
+- **Resolution presets** (Native, 720p, 540p) and upscaling (Film Bicubic, Lanczos, Spline36)
 - **Pre-compile kernels** for any resolution/precision
 - **Clear kernel cache** tool
 - **Audio support** (auto-detect, attach external audio)
@@ -72,7 +72,7 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **HDR display** | True BT.2020/PQ HDR10 via embedded mpv (auto tone-maps on SDR monitors) |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
-| **Resolution presets** | Native, 720p, 540p; upscaling with Film Bicubic or FSRCNN x2 |
+| **Resolution presets** | Native, 720p, 540p; upscaling with Film Bicubic, Lanczos, or Spline36 |
 | **Audio support** | Auto-detect, attach external audio |
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
 | **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |

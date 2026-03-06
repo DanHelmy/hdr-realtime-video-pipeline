@@ -1,4 +1,4 @@
-"""
+﻿"""
 HDRTVNet++ Real-Time Video Pipeline — PyQt6 GUI
 
 Usage:
@@ -56,7 +56,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSplitter, QDialog, QMessageBox, QProgressBar,
     QTextEdit, QInputDialog, QSlider, QStyle, QStackedWidget,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QProcess, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QProcess, QTimer, QRect
 from PyQt6.QtGui import QImage, QPixmap, QFont, QPalette, QColor
 from PyQt6.QtCore import QUrl
 try:
@@ -73,6 +73,7 @@ from video_source import VideoSource
 # ── Paths ────────────────────────────────────────────────────
 _ROOT = os.path.dirname(_HERE)
 _MPV_DIAG = os.environ.get("HDRTVNET_MPV_DIAG", "1").strip().lower() in {"1", "true", "yes", "on"}
+_PREFS_PATH = os.path.join(_ROOT, ".gui_prefs.json")
 
 
 def _weight(name):
@@ -165,6 +166,14 @@ def _fit_with_aspect(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[in
     return max(2, out_w), max(2, out_h)
 
 
+def _limited_playback_fps(src_fps: float) -> float:
+    """Limit playback FPS by halving high-FPS sources (e.g., 50->25, 60->30)."""
+    fps = float(src_fps) if src_fps and src_fps > 0 else 30.0
+    while fps > 30.0:
+        fps *= 0.5
+    return max(1.0, fps)
+
+
 def _letterbox_bgr(frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     """Resize with preserved aspect ratio and black padding to exact output size."""
     h, w = frame.shape[:2]
@@ -210,53 +219,31 @@ PRECISIONS = {
 
 MAX_W, MAX_H = 1920, 1080
 
-# ── Resolution-scale presets (process lower → upscale to output) ──
+# ── Resolution-scale presets (process lower resolution) ──
 RESOLUTION_SCALES = {
-    "Native": None,           # use video's native resolution (capped at 1080p)
+    "1080p": None,            # full output resolution path (no upscale stage)
     "720p":  (1280, 720),
     "540p":  (960,  540),
 }
 
 UPSCALE_MODES = [
-    "Film Bicubic",
-    "FSRCNN x2 (Experimental)",
+    "Bicubic (GPU)",
+    "Lanczos (GPU)",
+    "Spline36 (GPU)",
 ]
 
+UPSCALE_MODE_TO_MPV_SCALE = {
+    "Bicubic (GPU)": "bicubic",
+    "Lanczos (GPU)": "lanczos",
+    "Spline36 (GPU)": "spline36",
+}
 
-class _FSRCNNUpscaler:
-    """Optional OpenCV dnn_superres FSRCNN x2 upscaler."""
-
-    def __init__(self, model_path: str):
-        self.model_path = model_path
-        self._sr = None
-        self.ready = False
-        self.error = ""
-        self._init_model()
-
-    def _init_model(self):
-        if not os.path.isfile(self.model_path):
-            self.error = f"FSRCNN model not found: {self.model_path}"
-            return
-        if not hasattr(cv2, "dnn_superres"):
-            self.error = ("OpenCV dnn_superres unavailable. "
-                          "Install opencv-contrib-python.")
-            return
-        try:
-            sr = cv2.dnn_superres.DnnSuperResImpl_create()
-            sr.readModel(self.model_path)
-            sr.setModel("fsrcnn", 2)
-            self._sr = sr
-            self.ready = True
-        except Exception as exc:
-            self.error = f"FSRCNN init failed: {exc}"
-
-    def upscale_to(self, bgr: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
-        if not self.ready or self._sr is None:
-            raise RuntimeError(self.error or "FSRCNN unavailable")
-        up = self._sr.upsample(bgr)
-        if up.shape[1] != out_w or up.shape[0] != out_h:
-            up = cv2.resize(up, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-        return up
+UPSCALE_MODE_TO_CV2_INTERP = {
+    "Bicubic (GPU)": cv2.INTER_CUBIC,
+    "Lanczos (GPU)": cv2.INTER_LANCZOS4,
+    # Closest OpenCV equivalent for CPU fallback.
+    "Spline36 (GPU)": cv2.INTER_LANCZOS4,
+}
 
 
 # ╔═══════════════════════════════════════════════════════════════╗
@@ -359,6 +346,17 @@ class MpvHDRWidget(QWidget):
         props = {"t_trc": t_trc, "t_prim": t_prim}
         return hdr_info, aux, props
 
+    @staticmethod
+    def _kernel_antiring(scale_kernel: str) -> tuple[str, float]:
+        """Return normalized kernel name and anti-ringing strength."""
+        k = str(scale_kernel or "bicubic").strip().lower()
+        if not k:
+            k = "bicubic"
+        # Lanczos/Spline can ring on high-contrast text edges; clamp it.
+        if k in {"lanczos", "spline36"}:
+            return k, 0.80
+        return k, 0.0
+
     def _attach_audio_async(self, audio_path: str):
         """Attach external audio after mpv is fully initialized."""
         def _worker():
@@ -453,6 +451,8 @@ class MpvHDRWidget(QWidget):
     # ── public API ───────────────────────────────────────────
 
     def start_playback(self, width: int, height: int, fps: float = 30.0,
+                       scale_kernel: str = "bicubic",
+                       scale_antiring: float | None = None,
                        audio_path: str | None = None,
                        force_hdr_metadata: bool = True):
         """Create an mpv instance and begin reading frames."""
@@ -461,10 +461,15 @@ class MpvHDRWidget(QWidget):
         self._queue = _queue.Queue(maxsize=1)
         self._fps = float(fps) if fps and fps > 0 else 30.0
         self._force_hdr_metadata = bool(force_hdr_metadata)
+        kernel_name, antiring = self._kernel_antiring(scale_kernel)
+        if scale_antiring is not None:
+            antiring = max(0.0, min(1.0, float(scale_antiring)))
+
         self._last_playback_cfg = {
             "width": int(width),
             "height": int(height),
             "fps": float(self._fps),
+            "scale_kernel": str(kernel_name),
             "audio_path": audio_path,
             "force_hdr_metadata": self._force_hdr_metadata,
         }
@@ -509,6 +514,10 @@ class MpvHDRWidget(QWidget):
             demuxer_max_bytes=max_demux,    # ~2 frames (not 0!)
             demuxer_readahead_secs=0,
             video_sync="desync",            # avoid VO clock drift vs worker
+            scale=str(kernel_name),         # GPU scaler kernel in mpv
+            cscale=str(kernel_name),
+            scale_antiring=str(antiring),
+            cscale_antiring=str(antiring),
         )
         if self._force_hdr_metadata:
             mpv_kwargs.update(
@@ -610,6 +619,48 @@ class MpvHDRWidget(QWidget):
                 self._seek_warned = True
                 print("[mpv] seek command failed; keeping video-only seek.")
 
+    def set_muted(self, muted: bool):
+        """Mute/unmute mpv audio."""
+        p = self._player
+        if p is None:
+            return
+        try:
+            p.mute = bool(muted)
+        except Exception:
+            try:
+                p.command("set", "mute", "yes" if muted else "no")
+            except Exception:
+                pass
+
+    def set_volume_percent(self, volume_percent: int):
+        """Set mpv audio volume in 0..100 range."""
+        p = self._player
+        if p is None:
+            return
+        v = max(0, min(100, int(volume_percent)))
+        try:
+            p.volume = v
+        except Exception:
+            try:
+                p.command("set", "volume", str(v))
+            except Exception:
+                pass
+
+    def set_scale_kernel(self, scale_kernel: str) -> bool:
+        """Update mpv luma/chroma scaling kernels at runtime."""
+        p = self._player
+        if p is None:
+            return False
+        kernel, antiring = self._kernel_antiring(scale_kernel)
+        try:
+            p.command("set", "scale", kernel)
+            p.command("set", "cscale", kernel)
+            p.command("set", "scale-antiring", str(antiring))
+            p.command("set", "cscale-antiring", str(antiring))
+            return True
+        except Exception:
+            return False
+
     def get_time_seconds(self) -> float | None:
         """Return mpv playback clock (seconds), if available."""
         p = self._player
@@ -649,7 +700,11 @@ class MpvHDRWidget(QWidget):
         cfg = self._last_playback_cfg
         if not cfg:
             return
-        self.start_playback(**cfg)
+        # Defensive copy: ignore stale/unknown keys from older runs.
+        allowed = {"width", "height", "fps", "scale_kernel", "scale_antiring",
+                   "audio_path", "force_hdr_metadata"}
+        safe_cfg = {k: v for k, v in cfg.items() if k in allowed}
+        self.start_playback(**safe_cfg)
 
 
 # ╔═══════════════════════════════════════════════════════════════╗
@@ -677,6 +732,7 @@ class PipelineWorker(QThread):
     playback_finished = pyqtSignal()
     compile_ready = pyqtSignal()          # emitted after warmup_compile finishes
     position_updated = pyqtSignal(int, int)  # (current_frame, total_frames)
+    seek_frame_ready = pyqtSignal(int)    # emitted after first rendered frame post-seek
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -699,15 +755,18 @@ class PipelineWorker(QThread):
         self._user_paused: bool = False          # True while user has paused
         self._source: VideoSource | None = None  # ref for seeking
         self._pending_resolution: tuple[int, int] | None = None
-        self._upscale_mode: str = "Film Bicubic"
-        self._fsrcnn: _FSRCNNUpscaler | None = None
-        self._fsrcnn_warned: bool = False
+        self._upscale_mode: str = "Bicubic (GPU)"
+        self._pending_upscale_mode: str | None = None
         self._input_is_hdr: bool = False
+        # App-level dedicated GPU memory (VRAM) from Windows perf counters.
+        self._app_vram_mb: float = 0.0
+        self._app_vram_poll_stop = threading.Event()
+        self._app_vram_poll_thread: threading.Thread | None = None
 
     # ── public API (called from main thread) ──
 
     def configure(self, video_path, precision_key, proc_w=MAX_W, proc_h=MAX_H,
-                  output_w=MAX_W, output_h=MAX_H, upscale_mode="Film Bicubic",
+                  output_w=MAX_W, output_h=MAX_H, upscale_mode="Bicubic (GPU)",
                   input_is_hdr=False):
         self._video_path = video_path
         self._precision_key = precision_key
@@ -724,6 +783,10 @@ class PipelineWorker(QThread):
     def request_resolution_change(self, proc_w: int, proc_h: int):
         """Request a processing-resolution change (thread-safe)."""
         self._pending_resolution = (proc_w, proc_h)
+
+    def request_upscale_change(self, upscale_mode: str):
+        """Request display upscale-kernel change (thread-safe)."""
+        self._pending_upscale_mode = str(upscale_mode)
 
     def set_mpv_widget(self, widget):
         """Set the MpvHDRWidget reference for feeding HDR frames."""
@@ -850,6 +913,130 @@ class PipelineWorker(QThread):
         self.status_message.emit(f"Ready — {key}")
         return True
 
+    @staticmethod
+    def _tensor_mb(t: torch.Tensor | None) -> float:
+        if t is None:
+            return 0.0
+        try:
+            return (t.numel() * t.element_size()) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    def _model_memory_breakdown_mb(self) -> tuple[float, float, float]:
+        """Return (total_mb, cpu_mb, gpu_mb) for loaded model tensors only.
+
+        This reflects the active quantization model footprint (parameters +
+        registered buffers), excluding runtime working/staging tensors.
+        """
+        p = self._processor
+        if p is None:
+            return 0.0, 0.0, 0.0
+
+        model = getattr(p, "model", None)
+        if model is None:
+            return 0.0, 0.0, 0.0
+        model = getattr(model, "_orig_mod", model)
+
+        cpu_mb = 0.0
+        gpu_mb = 0.0
+        seen = set()
+
+        def _accumulate_tensor(t: torch.Tensor | None):
+            nonlocal cpu_mb, gpu_mb
+            if t is None:
+                return
+            tid = id(t)
+            if tid in seen:
+                return
+            seen.add(tid)
+            mb = self._tensor_mb(t)
+            if mb <= 0:
+                return
+            try:
+                dev_type = t.device.type
+            except Exception:
+                dev_type = "cpu"
+            if dev_type == "cuda":
+                gpu_mb += mb
+            else:
+                cpu_mb += mb
+
+        try:
+            for t in model.parameters(recurse=True):
+                _accumulate_tensor(t)
+            for t in model.buffers(recurse=True):
+                _accumulate_tensor(t)
+        except Exception:
+            pass
+
+        total_mb = cpu_mb + gpu_mb
+        return total_mb, cpu_mb, gpu_mb
+
+    @staticmethod
+    def _query_app_vram_mb_windows(pid: int) -> float | None:
+        """Return dedicated GPU process memory (MB) for this process on Windows.
+
+        Uses the Windows GPU performance counter category:
+        \\GPU Process Memory(*)\\Dedicated Usage
+        """
+        if os.name != "nt":
+            return None
+        try:
+            pid_i = int(pid)
+        except Exception:
+            return None
+        if pid_i <= 0:
+            return None
+
+        ps_cmd = (
+            "$tag='pid_" + str(pid_i) + "'; "
+            "$d=(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' "
+            "| Select-Object -ExpandProperty CounterSamples "
+            "| Where-Object { $_.InstanceName -like \"*$tag*\" } "
+            "| Measure-Object -Property CookedValue -Sum).Sum; "
+            "$td=if ($null -eq $d) { 0 } else { [double]$d }; "
+            "[string]$td"
+        )
+        try:
+            cp = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            raw = (cp.stdout or "").strip()
+            if not raw:
+                return 0.0
+            bytes_used = float(raw)
+            return max(0.0, bytes_used / (1024.0 * 1024.0))
+        except Exception:
+            return None
+
+    def _start_app_vram_poll(self):
+        """Poll app VRAM off the render loop to avoid FPS stalls."""
+        if os.name != "nt":
+            return
+        self._app_vram_poll_stop.clear()
+
+        def _poll():
+            pid = os.getpid()
+            while not self._app_vram_poll_stop.is_set():
+                q = self._query_app_vram_mb_windows(pid)
+                if q is not None:
+                    self._app_vram_mb = q
+                self._app_vram_poll_stop.wait(0.5)
+
+        self._app_vram_poll_thread = threading.Thread(target=_poll, daemon=True)
+        self._app_vram_poll_thread.start()
+
+    def _stop_app_vram_poll(self):
+        self._app_vram_poll_stop.set()
+        t = self._app_vram_poll_thread
+        if t is not None:
+            t.join(timeout=1.0)
+        self._app_vram_poll_thread = None
+
     # ── background HDR feeder (runs on its own thread) ──
 
     @staticmethod
@@ -917,34 +1104,11 @@ class PipelineWorker(QThread):
         self._hdr_queue = None
         self._hdr_thread = None
 
-    def _upscale_output(self, bgr: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
-        """Upscale HDR output preview to display size."""
-        if self._upscale_mode == "FSRCNN x2 (Experimental)":
-            if self._fsrcnn is None:
-                model_path = os.path.join(_HERE, "models", "weights", "FSRCNN_x2.pb")
-                self._fsrcnn = _FSRCNNUpscaler(model_path)
-            if self._fsrcnn.ready:
-                try:
-                    return self._fsrcnn.upscale_to(bgr, out_w, out_h)
-                except Exception as exc:
-                    if not self._fsrcnn_warned:
-                        self.status_message.emit(
-                            f"FSRCNN upscale failed ({exc}); using bicubic."
-                        )
-                        self._fsrcnn_warned = True
-            elif not self._fsrcnn_warned:
-                self.status_message.emit(
-                    f"{self._fsrcnn.error} Falling back to bicubic."
-                )
-                self._fsrcnn_warned = True
-        return cv2.resize(bgr, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-
     # ── main loop ──
 
     def run(self):
         self._stop_flag = False
         self._pending_precision = None
-        self._fsrcnn_warned = False
 
         if self._input_is_hdr:
             # No SDR->HDR inference when source is already HDR.
@@ -980,28 +1144,29 @@ class PipelineWorker(QThread):
         mpv_w = self._mpv_widget
         if mpv_w is not None and not self._input_is_hdr:
             self._start_hdr_feeder()
-            if self._upscale_mode == "FSRCNN x2 (Experimental)":
-                self.status_message.emit(
-                    "FSRCNN currently applies to QLabel fallback path; "
-                    "mpv HDR path keeps GPU bicubic for HDR precision."
-                )
+        self._start_app_vram_poll()
 
-        source = VideoSource(self._video_path, prefetch=8)
+        # Keep prefetch shallow to improve frame-accurate seek behavior.
+        source = VideoSource(self._video_path, prefetch=1)
         self._source = source
         total_frames = source.frame_count
-        vid_fps = source.fps if source.fps and source.fps > 0 else 30.0
-        frame_interval_s = 1.0 / vid_fps
+        src_fps = source.fps if source.fps and source.fps > 0 else 30.0
+        out_fps = _limited_playback_fps(src_fps)
+        frame_stride = max(1, int(round(src_fps / out_fps)))
+        frame_interval_s = 1.0 / src_fps
         next_frame_t = time.perf_counter()
-        frame_times = deque(maxlen=300)
-        presented_times = deque(maxlen=300)
+        frame_times = deque(maxlen=30)
+        presented_times = deque(maxlen=30)
         frame_idx = 0
+        force_position_emit = False
+        seek_frame_ready_pending = False
         process = psutil.Process(os.getpid())
         use_cuda = torch.cuda.is_available()
 
         # Local copies of resolution settings (may change mid-playback)
         proc_w, proc_h = self._proc_w, self._proc_h
         out_w, out_h = self._output_w, self._output_h
-        upscaling = (proc_w != out_w or proc_h != out_h)
+        lower_res_processing = (proc_w != out_w or proc_h != out_h)
 
         while not self._stop_flag:
             # Hot-swap precision
@@ -1021,17 +1186,24 @@ class PipelineWorker(QThread):
                         f"Switching to {new_pw}×{new_ph} …")
                     self._proc_w, self._proc_h = new_pw, new_ph
                     proc_w, proc_h = new_pw, new_ph
-                    upscaling = (proc_w != out_w or proc_h != out_h)
+                    lower_res_processing = (proc_w != out_w or proc_h != out_h)
                     self._silent_warmup(self._processor, proc_w, proc_h)
                     self.status_message.emit(
                         f"Ready — {self._precision_key} @ {proc_w}×{proc_h}")
+
+            pending_up = self._pending_upscale_mode
+            if pending_up is not None:
+                self._pending_upscale_mode = None
+                self._upscale_mode = pending_up
 
             # Seek gate
             seek_to = self._seek_frame
             if seek_to is not None:
                 self._seek_frame = None
                 source.seek(seek_to)
-                frame_idx = seek_to
+                frame_idx = max(0, seek_to - 1)
+                force_position_emit = True
+                seek_frame_ready_pending = True
                 next_frame_t = time.perf_counter()
 
             # Pause gate
@@ -1054,13 +1226,20 @@ class PipelineWorker(QThread):
             if not ret:
                 break
 
+            frame_idx += 1
+
+            # FPS limiter via frame skipping (keeps wall-clock speed).
+            if (not seek_frame_ready_pending) and frame_stride > 1 and (frame_idx % frame_stride) != 0:
+                next_frame_t += frame_interval_s
+                continue
+
             t0 = time.perf_counter()
 
             # Match display/output resolution without stretch (black bars as needed).
             display_frame = _letterbox_bgr(frame, out_w, out_h)
 
             # Downscale for model if processing at lower resolution
-            if upscaling:
+            if lower_res_processing:
                 model_inp = _letterbox_bgr(display_frame, proc_w, proc_h)
             else:
                 model_inp = display_frame
@@ -1080,7 +1259,7 @@ class PipelineWorker(QThread):
                 elif self._sdr_visible:
                     need_hdr_cpu = True
             else:
-                # ── Fast path: preprocess → infer → (upscale →) mpv ─────────
+                # ── Fast path: preprocess → infer → mpv ─────────────────────
                 # When mpv handles HDR display, skip postprocess entirely:
                 # the GPU→CPU D2H transfer + numpy conversion would be wasted
                 # since the QLabel HDR fallback is not active.  This is the
@@ -1092,11 +1271,6 @@ class PipelineWorker(QThread):
                 if mpv_w is not None and self._hdr_queue is not None:
                     t_raw = (raw_out[0] if isinstance(raw_out, (tuple, list))
                              else raw_out)
-                    # Upscale on GPU to output resolution before feeding mpv
-                    if upscaling:
-                            t_raw = torch.nn.functional.interpolate(
-                                t_raw, size=(out_h, out_w),
-                                mode='bicubic', align_corners=False)
                     try:
                         self._hdr_queue.put_nowait(t_raw.clone())
                     except _queue.Full:
@@ -1116,23 +1290,32 @@ class PipelineWorker(QThread):
                 if need_hdr_cpu:
                     output = self._processor.postprocess(raw_out)
                     # postprocess() already calls stream.synchronize()
-                    # Upscale CPU output to display resolution
-                    if upscaling:
-                        output = self._upscale_output(output, out_w, out_h)
+                    if (output.shape[1], output.shape[0]) != (out_w, out_h):
+                        if out_w > output.shape[1] or out_h > output.shape[0]:
+                            interp = UPSCALE_MODE_TO_CV2_INTERP.get(
+                                self._upscale_mode, cv2.INTER_CUBIC
+                            )
+                        else:
+                            interp = cv2.INTER_AREA
+                        output = cv2.resize(output, (out_w, out_h), interpolation=interp)
                 elif use_cuda:
                     # Sync for timing only (no D2H to wait for)
                     torch.cuda.synchronize()
 
             t1 = time.perf_counter()
-            frame_idx += 1
             next_frame_t += frame_interval_s
             frame_ms = (t1 - t0) * 1000.0
             frame_times.append(frame_ms)
             presented_times.append(t1)
 
-            # Position update (every 10 frames to reduce signal overhead)
-            if frame_idx % 10 == 0:
+            # Position update (every 10 frames, plus immediately after seeks,
+            # and every frame while paused for accurate paused-frame actions).
+            if self._user_paused or force_position_emit or (frame_idx % 10 == 0):
                 self.position_updated.emit(frame_idx, total_frames)
+                force_position_emit = False
+            if seek_frame_ready_pending:
+                self.seek_frame_ready.emit(frame_idx)
+                seek_frame_ready_pending = False
 
             # Emit only what the UI actually needs
             if need_hdr_cpu:
@@ -1148,8 +1331,8 @@ class PipelineWorker(QThread):
             if self._user_paused and self._seek_frame is None:
                 self._pause_event.clear()
 
-            # Metrics every 20 frames to reduce UI overhead.
-            if frame_idx % 20 == 0 and frame_times:
+            # Metrics every 2 frames for responsive dashboard/audio policy.
+            if frame_idx % 2 == 0 and frame_times:
                 avg = sum(frame_times) / len(frame_times)
                 if len(presented_times) >= 2:
                     dt = presented_times[-1] - presented_times[0]
@@ -1157,8 +1340,12 @@ class PipelineWorker(QThread):
                 else:
                     fps = 1000.0 / avg if avg > 0 else 0.0
                 cpu_mb = process.memory_info().rss / (1024 * 1024)
-                gpu_mb = (torch.cuda.memory_allocated() / (1024 * 1024)
-                          if use_cuda else 0)
+                gpu_mb = self._app_vram_mb
+                if gpu_mb <= 0.0 and use_cuda:
+                    # Fallback when Windows counters are unavailable:
+                    # allocator reservation is closer to "reserved VRAM"
+                    # than memory_allocated() (live tensor bytes only).
+                    gpu_mb = torch.cuda.memory_reserved() / (1024 * 1024)
                 if self._input_is_hdr:
                     model_mb = 0.0
                     prec_label = "Bypass (HDR input)"
@@ -1180,6 +1367,7 @@ class PipelineWorker(QThread):
         source.release()
         self._source = None
         self._stop_hdr_feeder()
+        self._stop_app_vram_poll()
         self.playback_finished.emit()
         self.status_message.emit("Playback finished.")
 
@@ -1440,7 +1628,7 @@ def _mark_compiled(w: int, h: int, precision: str):
 class MainWindow(QMainWindow):
     def __init__(self, initial_video=None, initial_resolution=None,
                  initial_precision=None, initial_upscale=None, initial_view=None,
-                 initial_autoplay=False):
+                 initial_autoplay=False, initial_start_frame=None):
         super().__init__()
         self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
         self.setMinimumSize(1024, 600)
@@ -1465,25 +1653,64 @@ class MainWindow(QMainWindow):
         self._await_seek_settle = False
         self._await_seek_frame = 0
         self._await_seek_started_t = 0.0
+        self._resume_after_seek_settle = False
+        self._pause_after_seek_settle = False
+        self._pending_seek_on_resume: int | None = None
         self._audio_last_hard_sync_t = 0.0
         self._audio_player = None
         self._audio_output = None
         self._audio_available = _HAS_QT_AUDIO
+        self._volume_percent = 100
+        self._auto_muted_low_fps = False
+        self._low_fps_count = 0
+        self._high_fps_count = 0
+        self._audio_fade_timer: QTimer | None = None
+        self._audio_fade_steps = 12
+        self._audio_fade_step_idx = 0
         self._startup_sync_pending = False
+        self._last_sdr_frame: np.ndarray | None = None
+        self._source_proc_dims: tuple[int, int] | None = None
+        self._borderless_full_window = False
+        self._saved_window_geometry: QRect | None = None
+        self._saved_window_state = Qt.WindowState.WindowNoState
+        self._act_borderless_full_window = None
+        self._root_layout: QVBoxLayout | None = None
+        self._immersive_saved_margins: tuple[int, int, int, int] | None = None
+        self._immersive_saved_spacing: int | None = None
+        self._immersive_saved_split_handle_width: int | None = None
+        self._immersive_saved_view_mode: str | None = None
+        self._immersive_saved_vis: dict[str, bool] = {}
+        try:
+            self._startup_seek_frame = (
+                int(initial_start_frame) if initial_start_frame is not None else None
+            )
+        except (TypeError, ValueError):
+            self._startup_seek_frame = None
 
         self._build_ui()
         self._connect_signals()
         self._init_audio_backend()
+        self._load_user_settings(initial_resolution, initial_precision, initial_upscale, initial_view)
 
         # Auto-open video passed via --video (used by restart)
         if initial_video and os.path.isfile(initial_video):
             def _boot_open():
                 if initial_precision in PRECISIONS:
                     self._cmb_prec.setCurrentText(initial_precision)
-                if initial_resolution in RESOLUTION_SCALES:
-                    self._cmb_res.setCurrentText(initial_resolution)
-                if initial_upscale in UPSCALE_MODES:
-                    self._cmb_upscale.setCurrentText(initial_upscale)
+                legacy_resolution_map = {
+                    "Native": "1080p",
+                }
+                mapped_resolution = legacy_resolution_map.get(initial_resolution, initial_resolution)
+                if mapped_resolution in RESOLUTION_SCALES or mapped_resolution == "Source":
+                    self._cmb_res.setCurrentText(mapped_resolution)
+                legacy_upscale_map = {
+                    "Film Bicubic": "Bicubic (GPU)",
+                    "Lanczos": "Lanczos (GPU)",
+                    "Spline36": "Spline36 (GPU)",
+                }
+                mapped_upscale = legacy_upscale_map.get(initial_upscale, initial_upscale)
+                if mapped_upscale in UPSCALE_MODES:
+                    self._cmb_upscale.setCurrentText(mapped_upscale)
                 if initial_view in ("Side by Side", "HDR Only", "SDR Only"):
                     self._cmb_view.setCurrentText(initial_view)
                 self._set_video(initial_video, auto_play=bool(initial_autoplay))
@@ -1495,6 +1722,7 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        self._root_layout = root
         root.setContentsMargins(8, 8, 8, 4)
         root.setSpacing(6)
 
@@ -1513,6 +1741,13 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(
             "\U0001F5D1  Clear &Kernel Cache \u2026", self._clear_kernel_cache
         )
+
+        view_menu = menu_bar.addMenu("&View")
+        self._act_borderless_full_window = view_menu.addAction(
+            "Borderless Full Window\tF11",
+            self._toggle_borderless_full_window,
+        )
+        self._act_borderless_full_window.setCheckable(True)
 
         # ---- Row 1: file + precision + view ----
         self._row1_widget = QWidget()
@@ -1538,7 +1773,7 @@ class MainWindow(QMainWindow):
         self._cmb_res.setFixedWidth(100)
         row1.addWidget(self._cmb_res)
 
-        self._lbl_upscale = QLabel("Upscale:")
+        self._lbl_upscale = QLabel("GPU Scale:")
         row1.addWidget(self._lbl_upscale)
         self._cmb_upscale = QComboBox()
         self._cmb_upscale.addItems(UPSCALE_MODES)
@@ -1575,11 +1810,22 @@ class MainWindow(QMainWindow):
 
         self._chk_metrics = QCheckBox("Show Metrics")
         self._chk_metrics.setChecked(True)
+        self._lbl_volume = QLabel("Volume:")
+        self._sld_volume = QSlider(Qt.Orientation.Horizontal)
+        self._sld_volume.setRange(0, 100)
+        self._sld_volume.setValue(100)
+        self._sld_volume.setFixedWidth(140)
+        self._sld_volume.setToolTip("Master volume")
+        self._lbl_volume_val = QLabel("100%")
+        self._lbl_volume_val.setFixedWidth(42)
 
         row2.addWidget(self._btn_play)
         row2.addWidget(self._btn_pause)
         row2.addWidget(self._btn_stop)
         row2.addStretch()
+        row2.addWidget(self._lbl_volume)
+        row2.addWidget(self._sld_volume)
+        row2.addWidget(self._lbl_volume_val)
         row2.addWidget(self._chk_metrics)
         root.addWidget(self._row2_widget)
 
@@ -1685,10 +1931,16 @@ class MainWindow(QMainWindow):
         self._btn_apply_settings.clicked.connect(self._apply_runtime_settings)
         self._chk_metrics.toggled.connect(
             lambda on: self._grp_metrics.setVisible(on))
+        self._chk_metrics.toggled.connect(lambda _on: self._save_user_settings())
+        self._sld_volume.valueChanged.connect(self._on_volume_changed)
         self._cmb_prec.currentTextChanged.connect(self._on_precision)
+        self._cmb_prec.currentTextChanged.connect(lambda _v: self._save_user_settings())
         self._cmb_res.currentTextChanged.connect(self._on_resolution)
+        self._cmb_res.currentTextChanged.connect(lambda _v: self._save_user_settings())
         self._cmb_upscale.currentTextChanged.connect(self._on_upscale)
+        self._cmb_upscale.currentTextChanged.connect(lambda _v: self._save_user_settings())
         self._cmb_view.currentTextChanged.connect(self._on_view)
+        self._cmb_view.currentTextChanged.connect(lambda _v: self._save_user_settings())
 
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.metrics_updated.connect(self._on_metrics)
@@ -1705,19 +1957,249 @@ class MainWindow(QMainWindow):
             self._disp_hdr_mpv.hdr_info_ready.connect(self._on_hdr_info)
 
     def _sync_upscale_controls(self):
-        """Disable upscale controls for Native processing resolution."""
-        is_native = (self._cmb_res.currentText() == "Native")
-        if is_native and self._cmb_upscale.currentText() != "Film Bicubic":
-            self._cmb_upscale.setCurrentText("Film Bicubic")
-        self._lbl_upscale.setEnabled(not is_native)
-        self._cmb_upscale.setEnabled(not is_native)
-        if is_native:
-            self._cmb_upscale.setToolTip("Upscaling is disabled in Native mode.")
+        """Disable scaler selection when full-resolution path has no upscale stage."""
+        res_key = self._cmb_res.currentText()
+        upscale_enabled = (res_key != "1080p")
+        self._lbl_upscale.setEnabled(upscale_enabled)
+        self._cmb_upscale.setEnabled(upscale_enabled)
+        if upscale_enabled:
+            self._cmb_upscale.setToolTip("Select mpv GPU scaling kernel.")
         else:
-            self._cmb_upscale.setToolTip("")
+            self._cmb_upscale.setToolTip("Disabled at 1080p (no upscale step).")
+
+    def _refresh_resolution_options_for_video(self, path: str):
+        """Show only processing presets that do not exceed source resolution."""
+        options = list(RESOLUTION_SCALES.keys())
+        source_dims = None
+        current = self._cmb_res.currentText()
+        self._source_proc_dims = None
+
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            if vw > 0 and vh > 0:
+                source_dims = (vw, vh)
+                filtered = []
+                for key, dims in RESOLUTION_SCALES.items():
+                    tw, th = (MAX_W, MAX_H) if dims is None else dims
+                    if tw <= vw and th <= vh:
+                        filtered.append(key)
+                if filtered:
+                    options = filtered
+                    self._source_proc_dims = None
+                else:
+                    sw = max(2, vw - (vw % 2))
+                    sh = max(2, vh - (vh % 2))
+                    self._source_proc_dims = (sw, sh)
+                    options = ["Source"]
+        else:
+            cap.release()
+
+        self._cmb_res.blockSignals(True)
+        self._cmb_res.clear()
+        self._cmb_res.addItems(options)
+        if current in options:
+            self._cmb_res.setCurrentText(current)
+        else:
+            self._cmb_res.setCurrentIndex(0)
+        self._cmb_res.blockSignals(False)
+        self._sync_upscale_controls()
+
+        if source_dims is not None and source_dims[1] < MAX_H:
+            self.statusBar().showMessage(
+                f"Source is {source_dims[0]}x{source_dims[1]}: hiding higher processing presets."
+            )
+
+    def _current_screen_geometry(self) -> QRect:
+        """Get full monitor geometry (not availableGeometry) to cover taskbar."""
+        win_handle = self.windowHandle()
+        screen = win_handle.screen() if win_handle is not None else None
+        if screen is None:
+            screen = self.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return QRect(0, 0, 1600, 900)
+        return screen.geometry()
+
+    def _safe_borderless_geometry(self) -> QRect:
+        """Near-fullscreen rect to avoid exclusive/fullscreen optimizations."""
+        g = self._current_screen_geometry()
+        # Keep a 1px inset so Windows does not treat it like true fullscreen.
+        if g.width() > 4 and g.height() > 4:
+            return g.adjusted(1, 1, -1, -1)
+        return g
+
+    def _set_view_mode_silently(self, mode: str):
+        prev = self._cmb_view.blockSignals(True)
+        self._cmb_view.setCurrentText(mode)
+        self._cmb_view.blockSignals(prev)
+        self._on_view(mode)
+
+    @staticmethod
+    def _without_fullscreen(state: Qt.WindowState) -> Qt.WindowState:
+        return state & ~Qt.WindowState.WindowFullScreen
+
+    def _set_immersive_video_ui(self, enabled: bool):
+        """Hide controls/panels and make video surface edge-to-edge."""
+        if self._root_layout is None:
+            return
+
+        targets = {
+            "row1": self._row1_widget,
+            "row2": self._row2_widget,
+            "metrics": self._grp_metrics,
+            "hdr": self._grp_hdr,
+        }
+
+        if enabled:
+            self._immersive_saved_vis = {k: w.isVisible() for k, w in targets.items()}
+            m = self._root_layout.contentsMargins()
+            self._immersive_saved_margins = (m.left(), m.top(), m.right(), m.bottom())
+            self._immersive_saved_spacing = self._root_layout.spacing()
+            self._immersive_saved_split_handle_width = self._split.handleWidth()
+            self._immersive_saved_view_mode = self._cmb_view.currentText()
+
+            for w in targets.values():
+                w.setVisible(False)
+            self._root_layout.setContentsMargins(0, 0, 0, 0)
+            self._root_layout.setSpacing(0)
+            self._split.setHandleWidth(0)
+            self._set_view_mode_silently("HDR Only")
+            return
+
+        for key, w in targets.items():
+            w.setVisible(self._immersive_saved_vis.get(key, True))
+
+        if self._immersive_saved_margins is not None:
+            l, t, r, b = self._immersive_saved_margins
+            self._root_layout.setContentsMargins(l, t, r, b)
+        if self._immersive_saved_spacing is not None:
+            self._root_layout.setSpacing(self._immersive_saved_spacing)
+        if self._immersive_saved_split_handle_width is not None:
+            self._split.setHandleWidth(self._immersive_saved_split_handle_width)
+        if self._immersive_saved_view_mode:
+            self._set_view_mode_silently(self._immersive_saved_view_mode)
+
+    def _set_pause_button_labels(self, paused: bool):
+        if paused:
+            self._btn_pause.setText("▶  Resume")
+        else:
+            self._btn_pause.setText("⏸  Pause")
+
+    def _toggle_borderless_full_window(self):
+        if self._borderless_full_window:
+            self._exit_borderless_full_window()
+        else:
+            self._enter_borderless_full_window()
+
+    def _enter_borderless_full_window(self):
+        if self._borderless_full_window:
+            return
+        self._saved_window_geometry = self.geometry()
+        self._saved_window_state = self._without_fullscreen(self.windowState())
+
+        self.menuBar().setVisible(False)
+        self.statusBar().setVisible(False)
+        self._set_immersive_video_ui(True)
+
+        self.setWindowState(self._without_fullscreen(self.windowState()))
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.show()
+        self.setGeometry(self._safe_borderless_geometry())
+
+        self._borderless_full_window = True
+        if self._act_borderless_full_window is not None:
+            self._act_borderless_full_window.setChecked(True)
+        QTimer.singleShot(0, self._refresh_mpv_after_window_state_change)
+
+    def _exit_borderless_full_window(self):
+        if not self._borderless_full_window:
+            return
+        restore_state = self._without_fullscreen(self._saved_window_state)
+        restore_geom = self._saved_window_geometry
+
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+        self.show()
+        self.menuBar().setVisible(True)
+        self.statusBar().setVisible(True)
+        self._set_immersive_video_ui(False)
+
+        self._borderless_full_window = False
+        if self._act_borderless_full_window is not None:
+            self._act_borderless_full_window.setChecked(False)
+
+        self.setWindowState(self._without_fullscreen(self.windowState()))
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        if restore_geom is not None:
+            self.setGeometry(restore_geom)
+        if bool(restore_state & Qt.WindowState.WindowMaximized):
+            self.showMaximized()
+        else:
+            self.showNormal()
+
+        QTimer.singleShot(0, self._refresh_mpv_after_window_state_change)
 
     def _should_use_mpv_pipeline(self) -> bool:
         return self._disp_hdr_mpv is not None
+
+    def _load_user_settings(self, initial_resolution, initial_precision, initial_upscale, initial_view):
+        """Load persisted GUI preferences unless explicitly overridden by CLI."""
+        if not os.path.isfile(_PREFS_PATH):
+            return
+        try:
+            with open(_PREFS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        if initial_precision is None:
+            p = data.get("precision")
+            if p in PRECISIONS:
+                self._cmb_prec.setCurrentText(p)
+        if initial_resolution is None:
+            r = data.get("resolution")
+            if r == "Native":
+                r = "1080p"
+            if r in RESOLUTION_SCALES or r == "Source":
+                self._cmb_res.setCurrentText(r)
+        if initial_upscale is None:
+            u = data.get("upscale")
+            if u in UPSCALE_MODES:
+                self._cmb_upscale.setCurrentText(u)
+        if initial_view is None:
+            v = data.get("view")
+            if v in ("Side by Side", "HDR Only", "SDR Only"):
+                self._cmb_view.setCurrentText(v)
+
+        m = data.get("show_metrics")
+        if isinstance(m, bool):
+            self._chk_metrics.setChecked(m)
+            self._grp_metrics.setVisible(m)
+
+        vol = data.get("volume_percent")
+        if isinstance(vol, int):
+            self._sld_volume.setValue(max(0, min(100, vol)))
+
+    def _save_user_settings(self):
+        data = {
+            "precision": self._cmb_prec.currentText(),
+            "resolution": self._cmb_res.currentText(),
+            "upscale": self._cmb_upscale.currentText(),
+            "view": self._cmb_view.currentText(),
+            "show_metrics": self._chk_metrics.isChecked(),
+            "volume_percent": int(self._volume_percent),
+        }
+        try:
+            with open(_PREFS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
     def _init_audio_backend(self):
         """Initialize Qt audio backend (used for seekable timeline audio)."""
@@ -1727,13 +2209,109 @@ class MainWindow(QMainWindow):
         try:
             self._audio_player = QMediaPlayer(self)
             self._audio_output = QAudioOutput(self)
-            self._audio_output.setVolume(1.0)
+            self._audio_output.setVolume(self._volume_percent / 100.0)
             self._audio_player.setAudioOutput(self._audio_output)
             self._audio_available = True
         except Exception:
             self._audio_player = None
             self._audio_output = None
             self._audio_available = False
+
+    def _apply_volume_to_backends(self):
+        """Apply current volume/mute policy to Qt audio and mpv fallback audio."""
+        muted = self._auto_muted_low_fps
+        if muted and self._audio_fade_timer is not None:
+            self._audio_fade_timer.stop()
+        if self._audio_output is not None:
+            self._audio_output.setVolume(0.0 if muted else (self._volume_percent / 100.0))
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.set_muted(muted)
+            if not muted:
+                self._disp_hdr_mpv.set_volume_percent(self._volume_percent)
+
+    def _start_audio_restore_fade(self, duration_ms: int = 320):
+        """Smoothly restore audio level after auto-mute release."""
+        if self._auto_muted_low_fps:
+            return
+        if self._audio_fade_timer is None:
+            self._audio_fade_timer = QTimer(self)
+            self._audio_fade_timer.timeout.connect(self._on_audio_fade_tick)
+        self._audio_fade_step_idx = 0
+        if self._audio_output is not None:
+            self._audio_output.setVolume(0.0)
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.set_muted(False)
+            self._disp_hdr_mpv.set_volume_percent(0)
+        step_ms = max(10, int(duration_ms / max(1, self._audio_fade_steps)))
+        self._audio_fade_timer.start(step_ms)
+
+    def _on_audio_fade_tick(self):
+        if self._auto_muted_low_fps:
+            if self._audio_fade_timer is not None:
+                self._audio_fade_timer.stop()
+            return
+        self._audio_fade_step_idx += 1
+        ratio = min(1.0, self._audio_fade_step_idx / max(1, self._audio_fade_steps))
+        target = max(0.0, min(1.0, self._volume_percent / 100.0))
+        if self._audio_output is not None:
+            self._audio_output.setVolume(target * ratio)
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.set_volume_percent(int(round(self._volume_percent * ratio)))
+        if ratio >= 1.0 and self._audio_fade_timer is not None:
+            self._audio_fade_timer.stop()
+            self._apply_volume_to_backends()
+
+    def _set_low_fps_mute(self, enabled: bool):
+        enabled = bool(enabled)
+        if self._auto_muted_low_fps == enabled:
+            return
+        self._auto_muted_low_fps = enabled
+        if enabled:
+            self._apply_volume_to_backends()
+            self.statusBar().showMessage("Audio auto-muted (FPS below 20).")
+        else:
+            self._start_audio_restore_fade()
+            self.statusBar().showMessage("Audio restored.")
+
+    def _update_auto_mute_from_fps(self, fps_value: float):
+        """Hysteresis/debounce to avoid sticky mute after transient skips."""
+        fps = float(fps_value)
+        # Hysteresis band:
+        # - Mute only if fps stays low enough.
+        # - Unmute only if fps recovers well above threshold.
+        low_trip = 18.0
+        high_trip = 23.0
+
+        if fps < low_trip:
+            self._low_fps_count += 1
+            self._high_fps_count = 0
+        elif fps > high_trip:
+            self._high_fps_count += 1
+            self._low_fps_count = 0
+        else:
+            # Inside deadband: decay counters to avoid stale state.
+            self._low_fps_count = max(0, self._low_fps_count - 1)
+            self._high_fps_count = max(0, self._high_fps_count - 1)
+
+        # Require consecutive updates to toggle.
+        if not self._auto_muted_low_fps and self._low_fps_count >= 3:
+            self._set_low_fps_mute(True)
+            self._low_fps_count = 0
+            self._high_fps_count = 0
+        elif self._auto_muted_low_fps and self._high_fps_count >= 2:
+            self._set_low_fps_mute(False)
+            self._low_fps_count = 0
+            self._high_fps_count = 0
+
+    def _on_volume_changed(self, value: int):
+        self._volume_percent = int(value)
+        self._lbl_volume_val.setText(f"{self._volume_percent}%")
+        if self._audio_fade_timer is not None and self._audio_fade_timer.isActive():
+            # Fade tick uses current _volume_percent as target.
+            self._save_user_settings()
+            return
+        self._apply_volume_to_backends()
+        self._save_user_settings()
 
     def _start_audio_playback(self, path: str):
         if not self._audio_available or self._audio_player is None:
@@ -1744,6 +2322,7 @@ class MainWindow(QMainWindow):
             self._audio_player.setPosition(0)
             self._audio_player.setPlaybackRate(1.0)
             self._audio_player.play()
+            self._apply_volume_to_backends()
         except Exception as exc:
             self.statusBar().showMessage(f"Qt audio unavailable: {exc}")
             self._audio_available = False
@@ -1888,11 +2467,12 @@ class MainWindow(QMainWindow):
 
         pending = getattr(self, '_pending_mpv_start', None)
         if pending and self._disp_hdr_mpv is not None:
-            pw, ph, fps, audio_path, force_hdr_metadata = pending
+            pw, ph, fps, scale_kernel, audio_path, force_hdr_metadata = pending
             self._disp_hdr_mpv.start_playback(
-                pw, ph, fps=fps, audio_path=audio_path,
+                pw, ph, fps=fps, scale_kernel=scale_kernel, audio_path=audio_path,
                 force_hdr_metadata=force_hdr_metadata,
             )
+            self._apply_volume_to_backends()
             if self._startup_sync_pending:
                 self._disp_hdr_mpv.set_paused(True)
             self._worker.set_mpv_widget(self._disp_hdr_mpv)
@@ -2023,6 +2603,7 @@ class MainWindow(QMainWindow):
             return
 
         self._video_path = path
+        self._refresh_resolution_options_for_video(path)
         self._lbl_file.setText(os.path.basename(path))
         self._btn_play.setEnabled(True)
         self._btn_pause.setEnabled(False)
@@ -2038,7 +2619,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._play)
 
     def _restart_with_video(self, path, resolution=None, precision=None, upscale=None, view=None,
-                            autoplay=False):
+                            autoplay=False, start_frame=None):
         """Restart the GUI process with a new video.
 
         A fresh process avoids stale torch.compile/dynamo state that
@@ -2065,6 +2646,8 @@ class MainWindow(QMainWindow):
         args = [sys.executable, sys.argv[0], "--video", path]
         if resolution in RESOLUTION_SCALES:
             args += ["--resolution", resolution]
+        elif resolution == "Source":
+            args += ["--resolution", "Source"]
         if precision in PRECISIONS:
             args += ["--precision", precision]
         if upscale in UPSCALE_MODES:
@@ -2073,6 +2656,8 @@ class MainWindow(QMainWindow):
             args += ["--view", view]
         if autoplay:
             args += ["--autoplay", "1"]
+        if start_frame is not None:
+            args += ["--start-frame", str(max(0, int(start_frame)))]
         rc = _sp.call(args)
         sys.exit(rc)
 
@@ -2092,16 +2677,15 @@ class MainWindow(QMainWindow):
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
 
-        # Output (display) resolution: fixed 1080p cap (letterbox handles aspect).
-        if vw > MAX_W or vh > MAX_H:
-            ow, oh = MAX_W, MAX_H
-        else:
-            ow, oh = vw, vh
+        # Output (display) resolution: always 1080p (letterbox handles aspect).
+        ow, oh = MAX_W, MAX_H
         self._cur_output_w, self._cur_output_h = ow, oh
 
         # Processing resolution from scale selector (fixed preset; letterbox handles aspect).
         scale_key = self._cmb_res.currentText()
         scale_dims = RESOLUTION_SCALES.get(scale_key)
+        if scale_key == "Source" and self._source_proc_dims is not None:
+            scale_dims = self._source_proc_dims
         if scale_dims is not None and (scale_dims[0] < ow or scale_dims[1] < oh):
             pw, ph = scale_dims
         else:
@@ -2109,9 +2693,11 @@ class MainWindow(QMainWindow):
 
         # Set up seek slider
         self._vid_fps = vfps if vfps > 0 else 30.0
+        display_fps = _limited_playback_fps(self._vid_fps)
         self._seek_slider.setRange(0, max(0, total_frames - 1))
         self._seek_slider.setValue(0)
         self._seek_slider.setEnabled(True)
+        self._seek_slider.setToolTip("Seek while paused is queued and applied on Resume.")
         self._lbl_time.setText("0:00")
         dur_secs = total_frames / self._vid_fps if self._vid_fps > 0 else 0
         self._lbl_duration.setText(self._fmt_time(dur_secs))
@@ -2169,15 +2755,19 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(True)
         self._btn_file.setEnabled(False)
         self._cmb_prec.setEnabled(True)
+        self._set_pause_button_labels(False)
 
         # Start mpv HDR display AFTER compile finishes (via signal)
         # so that mpv's D3D11 GPU usage doesn't pollute Triton autotuning.
-        # mpv always receives frames at the output resolution (not proc).
+        # mpv receives frames at processing resolution; GPU scaling happens in mpv.
         self._pending_mpv_start = None
         if use_mpv_pipeline and self._disp_hdr_mpv is not None:
             mpv_audio_path = None if self._audio_available else self._video_path
+            mpv_scale_kernel = UPSCALE_MODE_TO_MPV_SCALE.get(
+                self._cmb_upscale.currentText(), "bicubic"
+            )
             self._pending_mpv_start = (
-                ow, oh, float(vfps) if vfps > 0 else 30.0, mpv_audio_path,
+                pw, ph, float(display_fps), mpv_scale_kernel, mpv_audio_path,
                 True,
             )
         else:
@@ -2197,9 +2787,19 @@ class MainWindow(QMainWindow):
         self._compile_dlg.show()
 
         self._worker.start()
+        if pw != ow or ph != oh:
+            upscale_backend = "mpv GPU" if use_mpv_pipeline else "CPU fallback"
+            self.statusBar().showMessage(
+                f"Upscale active: {pw}×{ph} -> {ow}×{oh} via {self._cmb_upscale.currentText()} ({upscale_backend})"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"No upscale stage: processing at {ow}×{oh}."
+            )
         self._post_seek_resync_frames = 0
         self._await_seek_settle = False
         self._await_seek_frame = 0
+        self._pending_seek_on_resume = None
         if self._startup_sync_pending:
             self._worker.pause()
         if self._audio_available:
@@ -2211,18 +2811,38 @@ class MainWindow(QMainWindow):
                 "Qt audio backend unavailable; using mpv audio fallback (seek sync may be limited)."
             )
 
+        # Restore timeline position after process restart (resolution change).
+        if self._startup_seek_frame is not None:
+            target = max(0, min(int(self._startup_seek_frame), self._seek_slider.maximum()))
+            self._worker.request_seek(target)
+            self._seek_slider.setValue(target)
+            self._lbl_time.setText(self._fmt_time(target / max(self._vid_fps, 1e-6)))
+            self._seek_audio_seconds(target / max(self._vid_fps, 1e-6))
+            if self._disp_hdr_mpv is not None and not self._audio_available:
+                self._disp_hdr_mpv.seek_seconds(target / max(self._vid_fps, 1e-6))
+            self._startup_seek_frame = None
+
     def _toggle_pause(self):
         if not self._playing:
             return
         if self._worker.is_paused:
+            queued = self._pending_seek_on_resume
+            if queued is not None:
+                self._worker.request_seek(int(queued))
+                fps = getattr(self, '_vid_fps', 30.0)
+                self._seek_audio_seconds(int(queued) / max(fps, 1e-6))
+                if self._disp_hdr_mpv is not None and not self._audio_available:
+                    self._disp_hdr_mpv.seek_seconds(int(queued) / max(fps, 1e-6))
+                self._post_seek_resync_frames = 120
+                self._pending_seek_on_resume = None
             self._worker.resume()
-            self._btn_pause.setText("⏸  Pause")
+            self._set_pause_button_labels(False)
             if self._disp_hdr_mpv is not None:
                 self._disp_hdr_mpv.set_paused(False)
             self._set_audio_paused(False)
         else:
             self._worker.pause()
-            self._btn_pause.setText("▶  Resume")
+            self._set_pause_button_labels(True)
             if self._disp_hdr_mpv is not None:
                 self._disp_hdr_mpv.set_paused(True)
             self._set_audio_paused(True)
@@ -2260,10 +2880,8 @@ class MainWindow(QMainWindow):
         new_prec = self._cmb_prec.currentText()
         new_res = self._cmb_res.currentText()
         new_up = self._cmb_upscale.currentText()
-        needs_restart = (
-            new_res != self._active_resolution
-            or new_up != self._active_upscale
-        )
+        needs_restart = (new_res != self._active_resolution)
+        notices: list[str] = []
 
         if needs_restart:
             self._restart_with_video(
@@ -2273,23 +2891,53 @@ class MainWindow(QMainWindow):
                 upscale=new_up,
                 view=self._cmb_view.currentText(),
                 autoplay=True,
+                start_frame=int(self._seek_slider.value()),
             )
             return
 
         if new_prec != self._active_precision:
             self._worker.request_precision_change(new_prec)
-            self.statusBar().showMessage(
-                f"Applying precision change: {new_prec}"
-            )
+            notices.append(f"Applying precision change: {new_prec}")
             self._active_precision = new_prec
+
+        if new_up != self._active_upscale:
+            old_up = self._active_upscale or "Unknown"
+            mpv_scale_kernel = UPSCALE_MODE_TO_MPV_SCALE.get(new_up, "bicubic")
+            _, antiring = MpvHDRWidget._kernel_antiring(mpv_scale_kernel)
+            applied_now = False
+            if self._disp_hdr_mpv is not None and self._active_use_mpv:
+                applied_now = self._disp_hdr_mpv.set_scale_kernel(mpv_scale_kernel)
+            if self._worker is not None:
+                self._worker.request_upscale_change(new_up)
+                applied_now = True
+            if applied_now:
+                notices.append(
+                    f"Applying upscale change: {old_up} -> {new_up} (mpv kernel: {mpv_scale_kernel}, antiring: {antiring:.2f})"
+                )
+            else:
+                notices.append(
+                    f"Upscale changed: {old_up} -> {new_up}. Will apply on next playback start."
+                )
 
         self._active_resolution = new_res
         self._active_upscale = new_up
+        self._save_user_settings()
         self._update_apply_button_state()
+        if notices:
+            self.statusBar().showMessage(" | ".join(notices))
 
     def _on_view(self, mode):
         self._disp_sdr.setVisible(mode != "HDR Only")
         self._disp_hdr.setVisible(mode != "SDR Only")
+        if mode == "Side by Side":
+            # Always restore equal split when returning to side-by-side mode.
+            self._split.setSizes([1, 1])
+        elif mode == "SDR Only":
+            # Give SDR pane all available width.
+            self._split.setSizes([1, 0])
+        elif mode == "HDR Only":
+            # Give HDR pane all available width.
+            self._split.setSizes([0, 1])
         if _HAS_MPV and self._disp_hdr_mpv is not None:
             # Show textual placeholder when idle; switch to mpv only during playback.
             if self._playing and mode != "SDR Only":
@@ -2298,15 +2946,26 @@ class MainWindow(QMainWindow):
                 self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
         # Let the worker skip unnecessary copies / postprocess
         if self._playing:
-            self._worker.set_sdr_visible(mode != "HDR Only")
+            # Keep SDR path running in all views so switching back from HDR-only
+            # is instantaneous and frame-accurate without forcing a seek.
+            self._worker.set_sdr_visible(True)
+            if mode != "HDR Only" and self._last_sdr_frame is not None:
+                self._disp_sdr.update_frame(self._last_sdr_frame)
 
     def _refresh_mpv_after_window_state_change(self):
         if self._disp_hdr_mpv is None or not self._playing:
             return
         if self._cmb_view.currentText() == "SDR Only":
             return
+        mpv_scale_kernel = UPSCALE_MODE_TO_MPV_SCALE.get(
+            self._cmb_upscale.currentText(), "bicubic"
+        )
+        # Smooth path: avoid full VO recreation unless scaler command fails.
+        if self._disp_hdr_mpv.set_scale_kernel(mpv_scale_kernel):
+            return
         try:
             self._disp_hdr_mpv.refresh_surface()
+            self._disp_hdr_mpv.set_scale_kernel(mpv_scale_kernel)
         except Exception:
             pass
 
@@ -2324,6 +2983,7 @@ class MainWindow(QMainWindow):
 
     def _on_position(self, current_frame: int, total_frames: int):
         """Update seek slider + time labels from worker."""
+        self._last_seek_frame = int(current_frame)
         if not self._seek_slider.isSliderDown():
             self._seek_slider.setValue(current_frame)
         fps = getattr(self, '_vid_fps', 30.0)
@@ -2331,11 +2991,30 @@ class MainWindow(QMainWindow):
 
         if self._await_seek_settle:
             # Start audio only after video has reached the seek neighborhood.
-            settled = (abs(int(current_frame) - int(self._await_seek_frame)) <= 8)
-            timed_out = ((time.perf_counter() - self._await_seek_started_t) > 0.45)
+            target = int(self._await_seek_frame)
+            settled = (abs(int(current_frame) - target) <= 1)
+            timed_out = ((time.perf_counter() - self._await_seek_started_t) > 0.8)
             if settled or timed_out:
-                self._seek_audio_seconds(current_frame / max(fps, 1e-6))
-                self._set_audio_paused(False)
+                # Apply post-seek playback state only after the target frame
+                # has been presented in HDR/mpv.
+                if self._resume_after_seek_settle:
+                    self._seek_audio_seconds(target / max(fps, 1e-6))
+                    self._set_audio_paused(False)
+                    self._worker.resume()
+                    if self._disp_hdr_mpv is not None:
+                        self._disp_hdr_mpv.set_paused(False)
+                elif self._pause_after_seek_settle:
+                    # If still not frame-accurate while paused, retry seek
+                    # until the exact preview frame is shown.
+                    if not settled:
+                        self._worker.request_seek(target)
+                        self._await_seek_started_t = time.perf_counter()
+                        return
+                    self._set_audio_paused(True)
+                    if self._disp_hdr_mpv is not None:
+                        self._disp_hdr_mpv.set_paused(True)
+                self._resume_after_seek_settle = False
+                self._pause_after_seek_settle = False
                 self._await_seek_settle = False
 
         if (
@@ -2381,55 +3060,35 @@ class MainWindow(QMainWindow):
         if not self._playing:
             return
         self._is_scrubbing = True
-        self._last_seek_frame = int(self._seek_slider.value())
-        self._last_scrub_seek_t = 0.0
-        self._await_seek_settle = False
-        # Pause playback while scrubbing to avoid decode thrash and drift.
-        if not self._worker.is_paused:
-            self._scrub_resume_playback = True
-            self._worker.pause()
-            if self._disp_hdr_mpv is not None:
-                self._disp_hdr_mpv.set_paused(True)
-            self._set_audio_paused(True)
-        else:
-            self._scrub_resume_playback = False
 
     def _on_seek(self, frame_number: int):
-        """User is dragging the seek slider (throttled live scrub)."""
+        if not self._playing:
+            return
         self._last_seek_frame = int(frame_number)
-        if self._playing and self._is_scrubbing:
-            now = time.perf_counter()
-            if (now - self._last_scrub_seek_t) >= 0.08:
-                self._worker.request_seek(self._last_seek_frame)
-                self._last_scrub_seek_t = now
-        # Update time label immediately during drag
         fps = getattr(self, '_vid_fps', 30.0)
         self._lbl_time.setText(self._fmt_time(frame_number / fps))
 
     def _on_seek_released(self):
-        """Seek video+audio once after completed slider drag."""
         if not self._playing:
             return
         self._is_scrubbing = False
         target_frame = int(self._seek_slider.value())
         self._last_seek_frame = target_frame
-        self._worker.request_seek(target_frame)
         fps = getattr(self, '_vid_fps', 30.0)
+
+        if self._worker.is_paused:
+            self._pending_seek_on_resume = target_frame
+            self._lbl_time.setText(self._fmt_time(target_frame / max(fps, 1e-6)))
+            self.statusBar().showMessage(
+                f"Seek queued to {self._fmt_time(target_frame / max(fps, 1e-6))}. Press Resume to apply."
+            )
+            return
+
+        self._worker.request_seek(target_frame)
         self._seek_audio_seconds(target_frame / max(fps, 1e-6))
-        self._await_seek_settle = False
-        self._await_seek_frame = target_frame
-        self._await_seek_started_t = 0.0
         self._post_seek_resync_frames = 120
-        if self._disp_hdr_mpv is not None:
-            # If Qt audio backend is unavailable and mpv handles audio,
-            # seek mpv timeline directly as a fallback.
-            if not self._audio_available:
-                self._disp_hdr_mpv.seek_seconds(target_frame / max(fps, 1e-6))
-        if self._scrub_resume_playback:
-            self._worker.resume()
-            if self._disp_hdr_mpv is not None:
-                self._disp_hdr_mpv.set_paused(False)
-            self._set_audio_paused(False)
+        if self._disp_hdr_mpv is not None and not self._audio_available:
+            self._disp_hdr_mpv.seek_seconds(target_frame / max(fps, 1e-6))
 
     def _on_hdr_info(self, info: dict):
         """Update the HDR Info panel from mpv metadata."""
@@ -2461,6 +3120,7 @@ class MainWindow(QMainWindow):
     # ── Slots: worker signals ────────────────────────────────
 
     def _on_frame(self, sdr, hdr):
+        self._last_sdr_frame = sdr
         if self._disp_sdr.isVisible():
             self._disp_sdr.update_frame(sdr)
         # HDR QLabel fallback (mpv gets fed directly from the worker)
@@ -2472,10 +3132,11 @@ class MainWindow(QMainWindow):
         self._m["latency"].setText(f"Latency: {m['latency_ms']:.1f} ms")
         self._m["frame"].setText(f"Frame: {m['frame']}")
         self._m["res"].setText(f"Res: {m['proc_res']}")
-        self._m["gpu"].setText(f"GPU: {m['gpu_mb']:.0f} MB")
+        self._m["gpu"].setText(f"VRAM: {m['gpu_mb']:.0f} MB")
         self._m["cpu"].setText(f"CPU: {m['cpu_mb']:.0f} MB")
         self._m["model"].setText(f"Model: {m['model_mb']:.2f} MB")
         self._m["prec"].setText(f"Prec: {m['precision']}")
+        self._update_auto_mute_from_fps(m.get("fps", 0.0))
     def _on_status_message(self, text: str):
         """Forward worker status to status bar *and* compile dialog."""
         self.statusBar().showMessage(text)
@@ -2498,6 +3159,12 @@ class MainWindow(QMainWindow):
         self._playing = False
         self._active_use_mpv = False
         self._startup_sync_pending = False
+        self._auto_muted_low_fps = False
+        self._low_fps_count = 0
+        self._high_fps_count = 0
+        if self._audio_fade_timer is not None:
+            self._audio_fade_timer.stop()
+        self._apply_volume_to_backends()
         self._is_scrubbing = False
         self._scrub_resume_playback = False
         self._post_seek_resync_frames = 0
@@ -2505,6 +3172,9 @@ class MainWindow(QMainWindow):
         self._await_seek_settle = False
         self._await_seek_frame = 0
         self._await_seek_started_t = 0.0
+        self._resume_after_seek_settle = False
+        self._pause_after_seek_settle = False
+        self._pending_seek_on_resume = None
         if self._compile_dlg is not None:
             self._compile_dlg.close()
             self._compile_dlg.deleteLater()
@@ -2513,7 +3183,7 @@ class MainWindow(QMainWindow):
         self._btn_pause.setEnabled(False)
         self._btn_stop.setEnabled(False)
         self._btn_file.setEnabled(True)
-        self._btn_pause.setText("⏸  Pause")
+        self._set_pause_button_labels(False)
         self._btn_apply_settings.setEnabled(False)
         if _HAS_MPV and self._disp_hdr_mpv is not None:
             self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
@@ -2545,6 +3215,7 @@ class MainWindow(QMainWindow):
     # ── Clean shutdown ───────────────────────────────────────
 
     def closeEvent(self, event):
+        self._save_user_settings()
         if self._playing:
             self._worker.stop()
             self._worker.wait(10000)
@@ -2552,6 +3223,21 @@ class MainWindow(QMainWindow):
             self._disp_hdr_mpv.stop_playback()
         self._stop_audio_playback()
         super().closeEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_F11:
+            self._toggle_borderless_full_window()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Space and self._playing:
+            self._toggle_pause()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._borderless_full_window:
+            self._exit_borderless_full_window()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 # ╔═══════════════════════════════════════════════════════════════╗
@@ -2587,15 +3273,17 @@ def main():
     parser.add_argument("--video", default=None,
                         help="Auto-open this video on launch")
     parser.add_argument("--resolution", default=None,
-                        help="Initial resolution preset (Native/720p/540p)")
+                        help="Initial resolution preset (1080p/720p/540p/Source)")
     parser.add_argument("--precision", default=None,
                         help="Initial precision preset (GUI label)")
     parser.add_argument("--upscale", default=None,
-                        help="Initial upscale mode preset")
+                        help="Initial GPU scaling kernel preset")
     parser.add_argument("--view", default=None,
                         help="Initial view mode (Side by Side/HDR Only/SDR Only)")
     parser.add_argument("--autoplay", default="0",
                         help="Auto-start playback after loading video (0/1)")
+    parser.add_argument("--start-frame", default=None,
+                        help="Initial frame index to seek to after startup")
     args, _unknown = parser.parse_known_args()
 
     os.chdir(_ROOT)
@@ -2608,6 +3296,7 @@ def main():
         initial_upscale=args.upscale,
         initial_view=args.view,
         initial_autoplay=(str(args.autoplay).strip() == "1"),
+        initial_start_frame=args.start_frame,
     )
     win.show()
     sys.exit(app.exec())
