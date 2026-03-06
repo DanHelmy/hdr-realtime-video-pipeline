@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v1.2-blue)
+![Version](https://img.shields.io/badge/version-v1.0-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -36,7 +36,7 @@ Open a video, and it plays — SDR input on the left, real-time HDR output on th
 
 ---
 
-## GUI (v1.2)
+## GUI (v1.0)
 
 ```bash
 python src/gui.py
@@ -44,7 +44,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v1.2
+### New in v1.0
 
 - **Drag-and-drop video support**
 - **Live precision switching** (FP16, FP32, INT8 PTQ/QAT/full) at any time, even mid-playback
