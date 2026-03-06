@@ -1157,6 +1157,7 @@ class PipelineWorker(QThread):
         next_frame_t = time.perf_counter()
         frame_times = deque(maxlen=30)
         presented_times = deque(maxlen=30)
+        metrics_warmup_frames = 0
         frame_idx = 0
         force_position_emit = False
         seek_frame_ready_pending = False
@@ -1205,6 +1206,10 @@ class PipelineWorker(QThread):
                 force_position_emit = True
                 seek_frame_ready_pending = True
                 next_frame_t = time.perf_counter()
+                # Discard stale FPS history so metrics/auto-mute re-lock quickly.
+                frame_times.clear()
+                presented_times.clear()
+                metrics_warmup_frames = 4
 
             # Pause gate
             paused_before_wait = not self._pause_event.is_set()
@@ -1213,6 +1218,10 @@ class PipelineWorker(QThread):
                 break
             if paused_before_wait:
                 next_frame_t = time.perf_counter()
+                # Pauses create a long timestamp gap that pollutes FPS windows.
+                frame_times.clear()
+                presented_times.clear()
+                metrics_warmup_frames = 4
 
             # Playback pacing: cap processing to the video FPS.
             now = time.perf_counter()
@@ -1307,6 +1316,8 @@ class PipelineWorker(QThread):
             frame_ms = (t1 - t0) * 1000.0
             frame_times.append(frame_ms)
             presented_times.append(t1)
+            if metrics_warmup_frames > 0:
+                metrics_warmup_frames -= 1
 
             # Position update (every 10 frames, plus immediately after seeks,
             # and every frame while paused for accurate paused-frame actions).
@@ -1332,7 +1343,7 @@ class PipelineWorker(QThread):
                 self._pause_event.clear()
 
             # Metrics every 2 frames for responsive dashboard/audio policy.
-            if frame_idx % 2 == 0 and frame_times:
+            if frame_idx % 2 == 0 and frame_times and metrics_warmup_frames == 0:
                 avg = sum(frame_times) / len(frame_times)
                 if len(presented_times) >= 2:
                     dt = presented_times[-1] - presented_times[0]
@@ -1646,22 +1657,19 @@ class MainWindow(QMainWindow):
         self._active_use_mpv = False
         self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
         self._last_seek_frame = 0
-        self._is_scrubbing = False
-        self._scrub_resume_playback = False
         self._post_seek_resync_frames = 0
-        self._last_scrub_seek_t = 0.0
-        self._await_seek_settle = False
-        self._await_seek_frame = 0
-        self._await_seek_started_t = 0.0
-        self._resume_after_seek_settle = False
-        self._pause_after_seek_settle = False
         self._pending_seek_on_resume: int | None = None
         self._audio_last_hard_sync_t = 0.0
+        self._resume_audio_after_seek = False
+        self._seek_resume_target = 0
+        self._seek_resume_started_t = 0.0
         self._audio_player = None
         self._audio_output = None
         self._audio_available = _HAS_QT_AUDIO
         self._volume_percent = 100
         self._auto_muted_low_fps = False
+        self._scrub_muted = False
+        self._scrub_unmute_seq = 0
         self._low_fps_count = 0
         self._high_fps_count = 0
         self._audio_fade_timer: QTimer | None = None
@@ -2219,7 +2227,7 @@ class MainWindow(QMainWindow):
 
     def _apply_volume_to_backends(self):
         """Apply current volume/mute policy to Qt audio and mpv fallback audio."""
-        muted = self._auto_muted_low_fps
+        muted = (self._auto_muted_low_fps or self._scrub_muted)
         if muted and self._audio_fade_timer is not None:
             self._audio_fade_timer.stop()
         if self._audio_output is not None:
@@ -2272,6 +2280,13 @@ class MainWindow(QMainWindow):
         else:
             self._start_audio_restore_fade()
             self.statusBar().showMessage("Audio restored.")
+
+    def _arm_mute_until_fps_recovery(self):
+        """Force mute now; unmute only via measured FPS recovery logic."""
+        self._low_fps_count = 0
+        self._high_fps_count = 0
+        if not self._auto_muted_low_fps:
+            self._set_low_fps_mute(True)
 
     def _update_auto_mute_from_fps(self, fps_value: float):
         """Hysteresis/debounce to avoid sticky mute after transient skips."""
@@ -2797,8 +2812,6 @@ class MainWindow(QMainWindow):
                 f"No upscale stage: processing at {ow}×{oh}."
             )
         self._post_seek_resync_frames = 0
-        self._await_seek_settle = False
-        self._await_seek_frame = 0
         self._pending_seek_on_resume = None
         if self._startup_sync_pending:
             self._worker.pause()
@@ -2834,12 +2847,16 @@ class MainWindow(QMainWindow):
                 if self._disp_hdr_mpv is not None and not self._audio_available:
                     self._disp_hdr_mpv.seek_seconds(int(queued) / max(fps, 1e-6))
                 self._post_seek_resync_frames = 120
+                self._resume_audio_after_seek = bool(self._audio_available)
+                self._seek_resume_target = int(queued)
+                self._seek_resume_started_t = time.perf_counter()
                 self._pending_seek_on_resume = None
             self._worker.resume()
             self._set_pause_button_labels(False)
             if self._disp_hdr_mpv is not None:
                 self._disp_hdr_mpv.set_paused(False)
-            self._set_audio_paused(False)
+            if not self._resume_audio_after_seek:
+                self._set_audio_paused(False)
         else:
             self._worker.pause()
             self._set_pause_button_labels(True)
@@ -2989,40 +3006,18 @@ class MainWindow(QMainWindow):
         fps = getattr(self, '_vid_fps', 30.0)
         self._lbl_time.setText(self._fmt_time(current_frame / fps))
 
-        if self._await_seek_settle:
-            # Start audio only after video has reached the seek neighborhood.
-            target = int(self._await_seek_frame)
-            settled = (abs(int(current_frame) - target) <= 1)
-            timed_out = ((time.perf_counter() - self._await_seek_started_t) > 0.8)
+        if self._resume_audio_after_seek and not self._worker.is_paused:
+            settled = abs(int(current_frame) - int(self._seek_resume_target)) <= 1
+            timed_out = (time.perf_counter() - self._seek_resume_started_t) > 0.45
             if settled or timed_out:
-                # Apply post-seek playback state only after the target frame
-                # has been presented in HDR/mpv.
-                if self._resume_after_seek_settle:
-                    self._seek_audio_seconds(target / max(fps, 1e-6))
-                    self._set_audio_paused(False)
-                    self._worker.resume()
-                    if self._disp_hdr_mpv is not None:
-                        self._disp_hdr_mpv.set_paused(False)
-                elif self._pause_after_seek_settle:
-                    # If still not frame-accurate while paused, retry seek
-                    # until the exact preview frame is shown.
-                    if not settled:
-                        self._worker.request_seek(target)
-                        self._await_seek_started_t = time.perf_counter()
-                        return
-                    self._set_audio_paused(True)
-                    if self._disp_hdr_mpv is not None:
-                        self._disp_hdr_mpv.set_paused(True)
-                self._resume_after_seek_settle = False
-                self._pause_after_seek_settle = False
-                self._await_seek_settle = False
+                self._set_audio_paused(False)
+                self._resume_audio_after_seek = False
 
         if (
             self._playing
             and self._audio_available
             and self._audio_player is not None
             and not self._seek_slider.isSliderDown()
-            and not self._await_seek_settle
         ):
             want_ms = int((current_frame / max(fps, 1e-6)) * 1000.0)
             have_ms = int(self._audio_player.position())
@@ -3059,11 +3054,24 @@ class MainWindow(QMainWindow):
     def _on_seek_pressed(self):
         if not self._playing:
             return
-        self._is_scrubbing = True
+        self._scrub_unmute_seq += 1
+        if self._audio_available:
+            self._set_audio_paused(True)
+        self._arm_mute_until_fps_recovery()
+        if not self._scrub_muted:
+            self._scrub_muted = True
+            self._apply_volume_to_backends()
 
     def _on_seek(self, frame_number: int):
         if not self._playing:
             return
+        # Fast click-seek can race sliderPressed; enforce mute/pause here too.
+        if self._audio_available:
+            self._set_audio_paused(True)
+        self._arm_mute_until_fps_recovery()
+        if not self._scrub_muted:
+            self._scrub_muted = True
+            self._apply_volume_to_backends()
         self._last_seek_frame = int(frame_number)
         fps = getattr(self, '_vid_fps', 30.0)
         self._lbl_time.setText(self._fmt_time(frame_number / fps))
@@ -3071,7 +3079,13 @@ class MainWindow(QMainWindow):
     def _on_seek_released(self):
         if not self._playing:
             return
-        self._is_scrubbing = False
+        # Defensive gate for very fast release where press handler may lag.
+        if self._audio_available:
+            self._set_audio_paused(True)
+        self._arm_mute_until_fps_recovery()
+        if not self._scrub_muted:
+            self._scrub_muted = True
+            self._apply_volume_to_backends()
         target_frame = int(self._seek_slider.value())
         self._last_seek_frame = target_frame
         fps = getattr(self, '_vid_fps', 30.0)
@@ -3082,13 +3096,32 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Seek queued to {self._fmt_time(target_frame / max(fps, 1e-6))}. Press Resume to apply."
             )
+            self._schedule_scrub_unmute(120)
             return
 
         self._worker.request_seek(target_frame)
         self._seek_audio_seconds(target_frame / max(fps, 1e-6))
         self._post_seek_resync_frames = 120
+        self._resume_audio_after_seek = bool(self._audio_available)
+        self._seek_resume_target = int(target_frame)
+        self._seek_resume_started_t = time.perf_counter()
         if self._disp_hdr_mpv is not None and not self._audio_available:
             self._disp_hdr_mpv.seek_seconds(target_frame / max(fps, 1e-6))
+        self._schedule_scrub_unmute(120)
+
+    def _schedule_scrub_unmute(self, delay_ms: int = 120):
+        token = self._scrub_unmute_seq = (self._scrub_unmute_seq + 1)
+
+        def _release():
+            if token != self._scrub_unmute_seq:
+                return
+            if self._seek_slider.isSliderDown():
+                return
+            if self._scrub_muted:
+                self._scrub_muted = False
+                self._apply_volume_to_backends()
+
+        QTimer.singleShot(max(0, int(delay_ms)), _release)
 
     def _on_hdr_info(self, info: dict):
         """Update the HDR Info panel from mpv metadata."""
@@ -3136,7 +3169,7 @@ class MainWindow(QMainWindow):
         self._m["cpu"].setText(f"CPU: {m['cpu_mb']:.0f} MB")
         self._m["model"].setText(f"Model: {m['model_mb']:.2f} MB")
         self._m["prec"].setText(f"Prec: {m['precision']}")
-        self._update_auto_mute_from_fps(m.get("fps", 0.0))
+        self._update_auto_mute_from_fps(float(m.get("fps", 0.0)))
     def _on_status_message(self, text: str):
         """Forward worker status to status bar *and* compile dialog."""
         self.statusBar().showMessage(text)
@@ -3160,21 +3193,17 @@ class MainWindow(QMainWindow):
         self._active_use_mpv = False
         self._startup_sync_pending = False
         self._auto_muted_low_fps = False
+        self._scrub_muted = False
         self._low_fps_count = 0
         self._high_fps_count = 0
         if self._audio_fade_timer is not None:
             self._audio_fade_timer.stop()
         self._apply_volume_to_backends()
-        self._is_scrubbing = False
-        self._scrub_resume_playback = False
         self._post_seek_resync_frames = 0
-        self._last_scrub_seek_t = 0.0
-        self._await_seek_settle = False
-        self._await_seek_frame = 0
-        self._await_seek_started_t = 0.0
-        self._resume_after_seek_settle = False
-        self._pause_after_seek_settle = False
         self._pending_seek_on_resume = None
+        self._resume_audio_after_seek = False
+        self._seek_resume_target = 0
+        self._seek_resume_started_t = 0.0
         if self._compile_dlg is not None:
             self._compile_dlg.close()
             self._compile_dlg.deleteLater()

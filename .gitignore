@@ -31,6 +31,7 @@ benchmark_*.py
 # IDE/editor
 .vscode/
 .idea/
+.gui_prefs.json
 
 # Large model artifacts (prefer release assets or Git LFS)
 *.onnx

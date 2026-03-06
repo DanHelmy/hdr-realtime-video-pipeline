@@ -133,6 +133,57 @@ def parse_args():
     )
     return parser.parse_args()
 
+def build_timing_report(
+    stats_frames,
+    decode_ms,
+    resize_ms,
+    infer_ms,
+    render_ms,
+    pre_ms,
+    run_ms,
+    post_ms,
+    avg_fps,
+    one_percent_low,
+    model_stage_timing,
+    target_fps,
+    late_frames,
+    overrun_ms,
+):
+    if model_stage_timing:
+        msg = (
+            f"[timing] frames={stats_frames} "
+            f"decode={decode_ms / stats_frames:.2f}ms "
+            f"resize={resize_ms / stats_frames:.2f}ms "
+            f"infer={infer_ms / stats_frames:.2f}ms "
+            f"pre={pre_ms / stats_frames:.2f}ms "
+            f"run={run_ms / stats_frames:.2f}ms "
+            f"post={post_ms / stats_frames:.2f}ms "
+            f"render={render_ms / stats_frames:.2f}ms "
+            f"fps={avg_fps:.2f} "
+            f"fps_1p_low={one_percent_low:.2f}"
+        )
+    else:
+        msg = (
+            f"[timing] frames={stats_frames} "
+            f"decode={decode_ms / stats_frames:.2f}ms "
+            f"resize={resize_ms / stats_frames:.2f}ms "
+            f"infer={infer_ms / stats_frames:.2f}ms "
+            f"render={render_ms / stats_frames:.2f}ms "
+            f"fps={avg_fps:.2f} "
+            f"fps_1p_low={one_percent_low:.2f}"
+        )
+
+    if target_fps > 0:
+        late_pct = (100.0 * late_frames / stats_frames) if stats_frames > 0 else 0.0
+        budget_ms = 1000.0 / target_fps
+        drop_est = int(overrun_ms / budget_ms) if budget_ms > 0 else 0
+        msg += (
+            f" target={target_fps:.2f} "
+            f"late={late_frames}/{stats_frames}({late_pct:.1f}%) "
+            f"drop_est={drop_est}"
+        )
+    return msg
+
 def main():
     args = parse_args()
 
@@ -319,40 +370,22 @@ def main():
                 else:
                     one_percent_low = 0.0
 
-                if args.model_stage_timing:
-                    msg = (
-                        f"[timing] frames={stats_frames} "
-                        f"decode={decode_ms / stats_frames:.2f}ms "
-                        f"resize={resize_ms / stats_frames:.2f}ms "
-                        f"infer={infer_ms / stats_frames:.2f}ms "
-                        f"pre={pre_ms / stats_frames:.2f}ms "
-                        f"run={run_ms / stats_frames:.2f}ms "
-                        f"post={post_ms / stats_frames:.2f}ms "
-                        f"render={render_ms / stats_frames:.2f}ms "
-                        f"fps={avg_fps:.2f} "
-                        f"fps_1p_low={one_percent_low:.2f}"
-                    )
-                else:
-                    msg = (
-                        f"[timing] frames={stats_frames} "
-                        f"decode={decode_ms / stats_frames:.2f}ms "
-                        f"resize={resize_ms / stats_frames:.2f}ms "
-                        f"infer={infer_ms / stats_frames:.2f}ms "
-                        f"render={render_ms / stats_frames:.2f}ms "
-                        f"fps={avg_fps:.2f} "
-                        f"fps_1p_low={one_percent_low:.2f}"
-                    )
-
-                if args.target_fps > 0:
-                    late_pct = (100.0 * late_frames / stats_frames) if stats_frames > 0 else 0.0
-                    budget_ms = 1000.0 / args.target_fps
-                    drop_est = int(overrun_ms / budget_ms) if budget_ms > 0 else 0
-                    msg += (
-                        f" target={args.target_fps:.2f} "
-                        f"late={late_frames}/{stats_frames}({late_pct:.1f}%) "
-                        f"drop_est={drop_est}"
-                    )
-
+                msg = build_timing_report(
+                    stats_frames=stats_frames,
+                    decode_ms=decode_ms,
+                    resize_ms=resize_ms,
+                    infer_ms=infer_ms,
+                    render_ms=render_ms,
+                    pre_ms=pre_ms,
+                    run_ms=run_ms,
+                    post_ms=post_ms,
+                    avg_fps=avg_fps,
+                    one_percent_low=one_percent_low,
+                    model_stage_timing=args.model_stage_timing,
+                    target_fps=args.target_fps,
+                    late_frames=late_frames,
+                    overrun_ms=overrun_ms,
+                )
                 print(msg)
 
     if stats_frames > 0 and stats_frames % args.timing_interval != 0:
@@ -365,40 +398,22 @@ def main():
         else:
             one_percent_low = 0.0
 
-        if args.model_stage_timing:
-            msg = (
-                f"[timing] frames={stats_frames} "
-                f"decode={decode_ms / stats_frames:.2f}ms "
-                f"resize={resize_ms / stats_frames:.2f}ms "
-                f"infer={infer_ms / stats_frames:.2f}ms "
-                f"pre={pre_ms / stats_frames:.2f}ms "
-                f"run={run_ms / stats_frames:.2f}ms "
-                f"post={post_ms / stats_frames:.2f}ms "
-                f"render={render_ms / stats_frames:.2f}ms "
-                f"fps={avg_fps:.2f} "
-                f"fps_1p_low={one_percent_low:.2f}"
-            )
-        else:
-            msg = (
-                f"[timing] frames={stats_frames} "
-                f"decode={decode_ms / stats_frames:.2f}ms "
-                f"resize={resize_ms / stats_frames:.2f}ms "
-                f"infer={infer_ms / stats_frames:.2f}ms "
-                f"render={render_ms / stats_frames:.2f}ms "
-                f"fps={avg_fps:.2f} "
-                f"fps_1p_low={one_percent_low:.2f}"
-            )
-
-        if args.target_fps > 0:
-            late_pct = (100.0 * late_frames / stats_frames) if stats_frames > 0 else 0.0
-            budget_ms = 1000.0 / args.target_fps
-            drop_est = int(overrun_ms / budget_ms) if budget_ms > 0 else 0
-            msg += (
-                f" target={args.target_fps:.2f} "
-                f"late={late_frames}/{stats_frames}({late_pct:.1f}%) "
-                f"drop_est={drop_est}"
-            )
-
+        msg = build_timing_report(
+            stats_frames=stats_frames,
+            decode_ms=decode_ms,
+            resize_ms=resize_ms,
+            infer_ms=infer_ms,
+            render_ms=render_ms,
+            pre_ms=pre_ms,
+            run_ms=run_ms,
+            post_ms=post_ms,
+            avg_fps=avg_fps,
+            one_percent_low=one_percent_low,
+            model_stage_timing=args.model_stage_timing,
+            target_fps=args.target_fps,
+            late_frames=late_frames,
+            overrun_ms=overrun_ms,
+        )
         print(msg)
 
     source.release()
