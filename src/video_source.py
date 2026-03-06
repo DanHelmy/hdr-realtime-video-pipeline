@@ -30,6 +30,15 @@ class VideoSource:
             self._thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._thread.start()
 
+    def _drain_prefetch_queue(self):
+        if self._queue is None:
+            return
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
     def _reader_loop(self):
         while not self._stopped:
             # Check for pending seek
@@ -39,11 +48,7 @@ class VideoSource:
             if target is not None:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
                 # Drain buffered frames so the consumer gets fresh data
-                while not self._queue.empty():
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        break
+                self._drain_prefetch_queue()
 
             ret, frame = self.cap.read()
             if not ret:
@@ -64,6 +69,9 @@ class VideoSource:
         """Seek to *frame_number*.  Thread-safe for prefetch mode."""
         frame_number = max(0, min(frame_number, self.frame_count - 1))
         if self._queue is not None:
+            # Flush immediately so consumer won't read stale prefetch frames
+            # while the reader thread performs the seek.
+            self._drain_prefetch_queue()
             with self._seek_lock:
                 self._seek_target = frame_number
         else:

@@ -1,6 +1,7 @@
 import functools
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import init as init
 from torch.nn.modules.batchnorm import _BatchNorm
 from . import arch_util
@@ -70,6 +71,34 @@ class HDRUNet3T1(nn.Module):
         elif act_type == 'leakyrelu':
             self.act = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
+    @staticmethod
+    def _align_to(x, ref):
+        """Center-crop/pad x so spatial size matches ref (H, W)."""
+        xh, xw = x.shape[-2:]
+        rh, rw = ref.shape[-2:]
+
+        # Crop when x is larger.
+        if xh > rh:
+            dh = xh - rh
+            top = dh // 2
+            x = x[..., top:top + rh, :]
+        if xw > rw:
+            dw = xw - rw
+            left = dw // 2
+            x = x[..., :, left:left + rw]
+
+        # Pad when x is smaller.
+        xh, xw = x.shape[-2:]
+        ph = rh - xh
+        pw = rw - xw
+        if ph > 0 or pw > 0:
+            pt = ph // 2
+            pb = ph - pt
+            pl = pw // 2
+            pr = pw - pl
+            x = F.pad(x, (pl, pr, pt, pb), mode='replicate')
+        return x
+
     def forward(self, x):
         # x[0]: img; x[1]: cond
         if self.weighting_network:
@@ -100,18 +129,19 @@ class HDRUNet3T1(nn.Module):
 
         out = out + fea3
 
-        out = self.act(self.up_conv1(out)) + fea2
+        out = self._align_to(self.act(self.up_conv1(out)), fea2) + fea2
         out, _ = self.recon_trunk4((out, cond3))
 
-        out = self.act(self.up_conv2(out)) + fea1
+        out = self._align_to(self.act(self.up_conv2(out)), fea1) + fea1
         out, _ = self.recon_trunk5((out, cond2))
 
-        out = self.act(self.up_conv3(out)) + fea0
+        out = self._align_to(self.act(self.up_conv3(out)), fea0) + fea0
         out = self.SFT_layer2((out, cond1))
 
         out = self.act(self.HR_conv2(out))
 
         out = self.conv_last(out)
+        out = self._align_to(out, mask_out)
         out = mask_out + out
         return out, x[0]
 

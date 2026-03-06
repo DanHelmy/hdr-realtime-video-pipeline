@@ -1,7 +1,7 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v1.0-blue)
-![Status](https://img.shields.io/badge/status-first%20public%20build-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.1-blue)
+![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
 ---
@@ -36,13 +36,28 @@ Open a video, and it plays — SDR input on the left, real-time HDR output on th
 
 ---
 
-## GUI
+## GUI (v1.1)
 
 ```bash
 python src/gui.py
 ```
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
+
+### New in v1.1
+
+- **Drag-and-drop video support**
+- **Live precision switching** (FP16, FP32, INT8 PTQ/QAT/full) at any time, even mid-playback
+- **Side-by-side SDR/HDR or single view**
+- **Real-time metrics panel** (FPS, latency, GPU/CPU memory, model size)
+- **Dark theme** (auto-applied)
+- **Native HDR display via mpv** (BT.2020/PQ, D3D11, tone-mapping on SDR monitors)
+- **Resolution presets** (Native, 720p, 540p) and upscaling (Film Bicubic, FSRCNN x2)
+- **Pre-compile kernels** for any resolution/precision
+- **Clear kernel cache** tool
+- **Audio support** (auto-detect, attach external audio)
+- **Compile progress dialogs** (inline and subprocess, zero GPU interference)
+- **Timeline preview and seek bar**
 
 ### Features
 
@@ -55,16 +70,13 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Seek bar** | Drag to scrub — works while playing or paused |
 | **Live metrics** | FPS, latency, frame count, GPU/CPU memory, model size |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
-| **Fullscreen** | **F11** or double-click to toggle; **Escape** to exit |
 | **HDR display** | True BT.2020/PQ HDR10 via embedded mpv (auto tone-maps on SDR monitors) |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|---|---|
-| **F11** | Toggle fullscreen |
-| **Escape** | Exit fullscreen |
+| **Resolution presets** | Native, 720p, 540p; upscaling with Film Bicubic or FSRCNN x2 |
+| **Audio support** | Auto-detect, attach external audio |
+| **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
+| **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
+| **Dark theme** | Modern dark UI, auto-applied |
 
 ### Tools Menu
 
