@@ -1,0 +1,8 @@
+{
+  "precision": "INT8 Mixed (QAT)",
+  "resolution": "720p",
+  "upscale": "Spline36 (GPU)",
+  "view": "Side by Side",
+  "show_metrics": true,
+  "volume_percent": 100
+}

@@ -49,10 +49,15 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 - **Drag-and-drop video support**
 - **Live precision switching** (FP16, FP32, INT8 PTQ/QAT/full) at any time, even mid-playback
 - **Side-by-side SDR/HDR or single view**
-- **Real-time metrics panel** (FPS, latency, GPU/CPU memory, model size)
+- **Real-time metrics panel** (FPS, latency, app VRAM/CPU memory, model size)
 - **Dark theme** (auto-applied)
 - **Native HDR display via mpv** (BT.2020/PQ, D3D11, tone-mapping on SDR monitors)
-- **Resolution presets** (Native, 720p, 540p) and upscaling (Film Bicubic, Lanczos, Spline36)
+- **Resolution presets** (`1080p`, `720p`, `540p`, and auto `Source` fallback for small videos)
+- **GPU scaler kernels** (`Bicubic (GPU)`, `Lanczos (GPU)`, `Spline36 (GPU)`) with live switching
+- **Frame-accurate seek improvements** (paused seek is queued and applied on Resume)
+- **Master volume slider + low-FPS auto-mute with smooth restore**
+- **Borderless full-window mode** (`F11`, `Esc`) and **Space** play/pause shortcut
+- **Persistent GUI settings** in `.gui_prefs.json` (precision/resolution/upscale/view/metrics/volume)
 - **Pre-compile kernels** for any resolution/precision
 - **Clear kernel cache** tool
 - **Audio support** (auto-detect, attach external audio)
@@ -67,16 +72,26 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Side-by-side view** | SDR input vs HDR output, or HDR-only / SDR-only |
 | **Live precision switching** | FP16, FP32, INT8 variants — switch mid-playback |
 | **Playback controls** | Play / Pause / Resume / Stop |
-| **Seek bar** | Drag to scrub — works while playing or paused |
-| **Live metrics** | FPS, latency, frame count, GPU/CPU memory, model size |
+| **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
+| **Live metrics** | FPS, latency, frame count, app VRAM/CPU memory, model size |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **HDR display** | True BT.2020/PQ HDR10 via embedded mpv (auto tone-maps on SDR monitors) |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
-| **Resolution presets** | Native, 720p, 540p; upscaling with Film Bicubic, Lanczos, or Spline36 |
+| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output with selectable GPU kernel |
 | **Audio support** | Auto-detect, attach external audio |
+| **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
+| **Keyboard shortcuts** | `F11` borderless full-window, `Esc` exit borderless mode, `Space` pause/resume |
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
 | **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
 | **Dark theme** | Modern dark UI, auto-applied |
+
+### GUI Launch Flags
+
+`src/gui.py` also accepts startup flags (used by restart/apply flows):
+
+```bash
+python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --upscale "Lanczos (GPU)" --view "HDR Only" --autoplay 1 --start-frame 1200
+```
 
 ### Tools Menu
 
