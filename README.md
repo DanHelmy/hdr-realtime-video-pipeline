@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v1.0-blue)
+![Version](https://img.shields.io/badge/version-v1.1-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -32,11 +32,11 @@ pip install -r requirements.txt
 python src/gui.py
 ```
 
-Open a video, and it plays — SDR input on the left, real-time HDR output on the right.
+Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side tab).
 
 ---
 
-## GUI (v1.0)
+## GUI (v1.1)
 
 ```bash
 python src/gui.py
@@ -44,20 +44,23 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v1.0
+### New in v1.1
 
 - **Drag-and-drop video support**
 - **Live precision switching** (FP16, FP32, INT8 PTQ/QAT/full) at any time, even mid-playback
-- **Side-by-side SDR/HDR or single view**
+- **Tabbed video workspace**: `SDR`, `HDR`, and `Side by Side`
+- **Pop/Dock windows** for SDR and HDR panes (multi-monitor friendly)
 - **Real-time metrics panel** (FPS, latency, app VRAM/CPU memory, model size)
 - **Dark theme** (auto-applied)
-- **Native HDR display via mpv** (BT.2020/PQ, D3D11, tone-mapping on SDR monitors)
+- **Native mpv rendering for both SDR and HDR panes**
+- **SDR path tagged as Rec.709**, **HDR path tagged as BT.2020/PQ** (display target auto-detected by mpv)
 - **Resolution presets** (`1080p`, `720p`, `540p`, and auto `Source` fallback for small videos)
-- **GPU scaler kernels** (`Bicubic (GPU)`, `Lanczos (GPU)`, `Spline36 (GPU)`) with live switching
 - **Frame-accurate seek improvements** (paused seek is queued and applied on Resume)
 - **Master volume slider + low-FPS auto-mute with smooth restore**
+- **Audio track selector** (multi-audio stream switching)
+- **Hide-cursor-on-idle option**
 - **Borderless full-window mode** (`F11`, `Esc`) and **Space** play/pause shortcut
-- **Persistent GUI settings** in `.gui_prefs.json` (precision/resolution/upscale/view/metrics/volume)
+- **Persistent GUI settings** in `.gui_prefs.json` (precision/resolution/metrics/volume/audio/cursor)
 - **Pre-compile kernels** for any resolution/precision
 - **Clear kernel cache** tool
 - **Audio support** (auto-detect, attach external audio)
@@ -69,18 +72,20 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | Feature | Description |
 |---|---|
 | **Open any video** | Browse or drag-and-drop — playback starts automatically |
-| **Side-by-side view** | SDR input vs HDR output, or HDR-only / SDR-only |
+| **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
+| **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |
 | **Live precision switching** | FP16, FP32, INT8 variants — switch mid-playback |
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Live metrics** | FPS, latency, frame count, app VRAM/CPU memory, model size |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
-| **HDR display** | True BT.2020/PQ HDR10 via embedded mpv (auto tone-maps on SDR monitors) |
+| **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
-| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output with selectable GPU kernel |
-| **Audio support** | Auto-detect, attach external audio |
+| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using the built-in best scaler |
+| **Audio support** | Auto-detect, attach external audio, and choose audio track |
 | **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
 | **Keyboard shortcuts** | `F11` borderless full-window, `Esc` exit borderless mode, `Space` pause/resume |
+| **Cursor idle hide** | Optional auto-hide cursor during playback |
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
 | **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
 | **Dark theme** | Modern dark UI, auto-applied |
@@ -90,7 +95,7 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 `src/gui.py` also accepts startup flags (used by restart/apply flows):
 
 ```bash
-python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --upscale "Lanczos (GPU)" --view "HDR Only" --autoplay 1 --start-frame 1200
+python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200
 ```
 
 ### Tools Menu
@@ -98,9 +103,13 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --upscale
 - **Pre-compile Kernels** — compile for any resolution(s) ahead of time
 - **Clear Kernel Cache** — force recompilation (e.g. after a PyTorch / driver update)
 
-### HDR Display
+### mpv Display / Color Path
 
-The HDR output is rendered through an embedded **mpv** player using the D3D11 GPU API with BT.2020 primaries and PQ transfer function. On HDR monitors with Windows "Use HDR" enabled, you get true HDR10 output. On SDR monitors, mpv automatically tone-maps.
+Both SDR and HDR panes are rendered through embedded **mpv** (D3D11):
+
+- **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
+- **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
+- Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
 
 > **Requires** `libmpv-2.dll` in the `src/` folder.
 > Download from [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
