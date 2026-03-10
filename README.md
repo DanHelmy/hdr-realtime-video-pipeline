@@ -148,7 +148,7 @@ pip install -r requirements.txt
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
-**AMD ROCm-Windows (Python 3.12):**
+**AMD ROCm-Windows (Python 3.11/3.12/3.13):**
 ```cmd
 pip install --no-cache-dir ^
     https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl ^

@@ -1,6 +1,6 @@
 {
   "precision": "INT8 Mixed (QAT)",
-  "resolution": "720p",
+  "resolution": "540p",
   "view": "Tabbed",
   "show_metrics": true,
   "volume_percent": 100,
