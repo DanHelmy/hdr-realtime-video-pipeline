@@ -1,5 +1,5 @@
-"""
-Standalone Triton kernel compiler — runs in a clean process with zero
+﻿"""
+Standalone Triton kernel compiler - runs in a clean process with zero
 GPU overhead (no GUI, no mpv, no display) so that torch.compile
 max-autotune benchmarks are accurate.
 
@@ -16,12 +16,12 @@ Usage:
     # Clear cache first then compile:
     python src/compile_kernels.py --clear-cache 1920x1080
 
-The GUI's "Tools → Pre-compile Kernels" runs this script as a subprocess
+The GUI's "Tools -> Pre-compile Kernels" runs this script as a subprocess
 and monitors its stdout for progress.
 
 Exit codes:
-    0  — success
-    1  — error (message on stderr)
+    0  - success
+    1  - error (message on stderr)
 """
 
 import argparse
@@ -30,8 +30,23 @@ import pathlib
 import sys
 import time
 
-# Force UTF-8 stdout/stderr on Windows — model code prints Unicode
-# characters (→, ×, etc.) that crash under the default cp1252 encoding.
+# Pin caches to a stable user path (avoid Temp churn/permissions).
+def _default_cache_root():
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        return os.path.join(local_app, "HDRTVNetCache")
+    return os.path.join(os.path.expanduser("~"), ".cache", "hdrtvnet")
+
+_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", _default_cache_root())
+try:
+    os.makedirs(_cache_root, exist_ok=True)
+except Exception:
+    pass
+
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "torchinductor"))
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
+# Force UTF-8 stdout/stderr on Windows - model code prints Unicode
+# characters (->, x, etc.) that crash under the default cp1252 encoding.
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -50,7 +65,7 @@ def _weight(name):
     return os.path.join(_HERE, "models", "weights", name)
 
 
-# Precision → (precision_str, default_model_path)
+# Precision -> (precision_str, default_model_path)
 _PRECISION_MAP = {
     "fp16": ("fp16", _weight("Ensemble_AGCM_LE.pth")),
     "fp32": ("fp32", _weight("Ensemble_AGCM_LE.pth")),
@@ -59,8 +74,11 @@ _PRECISION_MAP = {
 }
 
 
-# ── Marker file (shared with gui.py) ────────────────────────
-_TRITON_CACHE = pathlib.Path.home() / ".triton" / "cache"
+# -- Marker file (shared with gui.py) -----------------------------------------
+_TRITON_CACHE = (
+    pathlib.Path(os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton"))
+    / "cache"
+)
 
 
 def _mark_compiled(w: int, h: int, precision: str):
@@ -84,7 +102,10 @@ def _clear_caches():
 
     cleared = []
 
-    triton_dir = pathlib.Path.home() / ".triton" / "cache"
+    triton_root = pathlib.Path(
+        os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton")
+    )
+    triton_dir = triton_root / "cache"
     if triton_dir.exists():
         shutil.rmtree(triton_dir, ignore_errors=True)
         cleared.append(str(triton_dir))
@@ -163,7 +184,7 @@ def main():
     import torch
     from models.hdrtvnet_torch import HDRTVNetTorch
 
-    print(f"[compile] Loading model: {args.precision} — {os.path.basename(model_path)}")
+    print(f"[compile] Loading model: {args.precision} - {os.path.basename(model_path)}")
     sys.stdout.flush()
 
     processor = HDRTVNetTorch(
@@ -176,7 +197,7 @@ def main():
     )
 
     if not (hasattr(processor, "_compiled") and processor._compiled):
-        print("[compile] WARNING: torch.compile not active — nothing to compile.")
+        print("[compile] WARNING: torch.compile not active - nothing to compile.")
         sys.exit(0)
 
     total = len(parsed_res)
@@ -198,3 +219,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

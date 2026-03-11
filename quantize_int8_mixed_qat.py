@@ -7,7 +7,7 @@ error.  Uses Straight-Through Estimator (STE) for gradient flow through
 the non-differentiable round/clamp operations.
 
 The output checkpoint is fully compatible with the existing inference
-loader — same format as quantize_int8_mixed.py produces.
+loader " same format as quantize_int8_mixed.py produces.
 
 Usage
 -----
@@ -42,6 +42,7 @@ import torch.optim as optim
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE
+from models.hdrtvnet_modules.HG_Composite_arch import HG_Composite
 from models.hdrtvnet_torch import (
     W8A8Conv2d, W8A8Linear, W8Conv2d, W8Linear,
     _quantize_model_mixed, _quantize_model_mixed_v2, calibrate_w8a8,
@@ -91,7 +92,7 @@ def fake_quantize_asymmetric(x, scale, zero_point):
 
 
 # ===================================================================
-# QAT wrapper layers — same interface as W8A8/W8 but with learnable scales
+# QAT wrapper layers " same interface as W8A8/W8 but with learnable scales
 # ===================================================================
 
 class QATConv2d(nn.Module):
@@ -286,7 +287,7 @@ class QATLinear(nn.Module):
 
 
 # ===================================================================
-# Model conversion: PTQ → QAT → PTQ
+# Model conversion: PTQ ' QAT ' PTQ
 # ===================================================================
 
 def convert_to_qat(model):
@@ -411,11 +412,11 @@ def load_image_pair(sdr_path, hdr_path, max_long_edge=960):
         sdr = cv2.resize(sdr, (new_w, new_h), interpolation=cv2.INTER_AREA)
         hdr = cv2.resize(hdr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # SDR: uint8 [0,255] → float [0,1]
+    # SDR: uint8 [0,255] ' float [0,1]
     sdr = cv2.cvtColor(sdr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     sdr_t = torch.from_numpy(np.transpose(sdr, (2, 0, 1))).unsqueeze(0)
 
-    # HDR: uint16 [0,65535] → float [0,1]
+    # HDR: uint16 [0,65535] ' float [0,1]
     hdr = cv2.cvtColor(hdr, cv2.COLOR_BGR2RGB).astype(np.float32) / 65535.0
     hdr_t = torch.from_numpy(np.transpose(hdr, (2, 0, 1))).unsqueeze(0)
 
@@ -437,9 +438,43 @@ def random_crop_pair(sdr_t, hdr_t, crop_size=256):
 def prepare_model_input(img_tensor, device, dtype):
     """Prepare (input, condition) tuple for the model."""
     img_dev = img_tensor.to(device=device, dtype=dtype)
-    cond = F.interpolate(img_dev, scale_factor=0.25, mode="bilinear",
-                         align_corners=False)
+    try:
+        cond = F.interpolate(img_dev, scale_factor=0.25, mode="bicubic",
+                             align_corners=False, antialias=True)
+    except TypeError:
+        cond = F.interpolate(img_dev, scale_factor=0.25, mode="bicubic",
+                             align_corners=False)
     return (img_dev, cond)
+
+
+# ===================================================================
+# Model helpers
+# ===================================================================
+
+def _build_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module:
+    if use_hg:
+        model = HG_Composite(
+            classifier="color_condition", cond_c=6, in_nc=3, out_nc=3,
+            nf=32, act_type="relu", weighting_network=False,
+            hg_nf=64, mask_r=0.75,
+        )
+    else:
+        model = Ensemble_AGCM_LE(
+            classifier="color_condition", cond_c=6, in_nc=3, out_nc=3,
+            nf=32, act_type="relu", weighting_network=False,
+        )
+    state = torch.load(model_path, map_location="cpu", weights_only=True)
+    cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
+    if use_hg:
+        model.base.load_state_dict(cleaned, strict=True)
+        hg_state = torch.load(hg_weights, map_location="cpu")
+        if isinstance(hg_state, dict) and "state_dict" in hg_state:
+            hg_state = hg_state["state_dict"]
+        model.hg.load_state_dict(hg_state, strict=True)
+    else:
+        model.load_state_dict(cleaned, strict=True)
+    model.eval()
+    return model
 
 
 # ===================================================================
@@ -449,8 +484,16 @@ def prepare_model_input(img_tensor, device, dtype):
 def train_qat(model, pairs, device, compute_dtype, args):
     """Fine-tune with QAT fake-quantization."""
     model.train()
+    # ROCm: BatchNorm training can trigger MIOpen HIPRTC compile failures.
+    # Freeze BN to inference behavior for stability while keeping QAT active.
+    if hasattr(torch.version, "hip") and torch.version.hip is not None:
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad = False
 
-    # All parameters are trainable — QAT layers have learnable scales
+    # All parameters are trainable " QAT layers have learnable scales
     # and weights; non-QAT layers (e.g. PReLU) also benefit from fine-tuning.
     qat_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -479,8 +522,12 @@ def train_qat(model, pairs, device, compute_dtype, args):
 
             # Forward
             output, _ = model(inp)
+            if not torch.isfinite(output).all():
+                output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
 
             loss = criterion(output, target)
+            if not torch.isfinite(loss):
+                continue
 
             # Backward
             optimizer.zero_grad(set_to_none=True)
@@ -533,6 +580,11 @@ def main():
                         help="Compute precision")
     parser.add_argument("--channel-threshold", type=int, default=32,
                         help="Max channel count for W8A8 layers")
+    parser.add_argument("--hg-weights",
+                        default="Source Pipeline/pretrained_models/HG_weights.pth",
+                        help="Path to HG weights (HG_weights.pth)")
+    parser.add_argument("--use-hg", default="1", choices=["1", "0"],
+                        help="Use HG refinement (1) or base AGCM+LE only (0)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=5,
@@ -544,7 +596,7 @@ def main():
     parser.add_argument("--max-images", type=int, default=0,
                         help="Max training images (0 = all)")
     parser.add_argument("--max-long-edge", type=int, default=960,
-                        help="Resize images so longest edge ≤ this")
+                        help="Resize images so longest edge  this")
 
     # Validation
     parser.add_argument("--num-validate", type=int, default=8,
@@ -563,20 +615,14 @@ def main():
 
     print(f"Device: {device}, Precision: {args.precision}")
 
+    use_hg = str(args.use_hg).strip() != "0"
+
     # ------------------------------------------------------------------
     # 1. Load model (either from PTQ checkpoint or from scratch)
     # ------------------------------------------------------------------
     if args.from_scratch:
         print(f"\nLoading FP32 model from {args.fp32_model} ...")
-        model = Ensemble_AGCM_LE(
-            classifier="color_condition", cond_c=6, in_nc=3, out_nc=3,
-            nf=32, act_type="relu", weighting_network=False,
-        )
-        state = torch.load(args.fp32_model, map_location="cpu", weights_only=True)
-        cleaned = {(k[7:] if k.startswith("module.") else k): v
-                   for k, v in state.items()}
-        model.load_state_dict(cleaned, strict=True)
-        model.eval()
+        model = _build_fp32_model(args.fp32_model, args.hg_weights, use_hg)
 
         print(f"Applying mixed PTQ (channel_threshold={args.channel_threshold}) ...")
         _quantize_model_mixed(model, compute_dtype, args.channel_threshold)
@@ -621,19 +667,33 @@ def main():
             raise ValueError(f"{args.ptq_checkpoint} is not a valid checkpoint")
 
         arch = checkpoint.get("architecture", {})
+        use_hg = bool(arch.get("use_hg", True))
         compute_dtype_str = checkpoint.get("compute_dtype", "torch.float16")
         compute_dtype = torch.float16 if "16" in compute_dtype_str else torch.float32
         channel_threshold = checkpoint.get("channel_threshold", 32)
 
-        model = Ensemble_AGCM_LE(
-            classifier=arch.get("classifier", "color_condition"),
-            cond_c=arch.get("cond_c", 6),
-            in_nc=arch.get("in_nc", 3),
-            out_nc=arch.get("out_nc", 3),
-            nf=arch.get("nf", 32),
-            act_type=arch.get("act_type", "relu"),
-            weighting_network=arch.get("weighting_network", False),
-        )
+        if use_hg:
+            model = HG_Composite(
+                classifier=arch.get("classifier", "color_condition"),
+                cond_c=arch.get("cond_c", 6),
+                in_nc=arch.get("in_nc", 3),
+                out_nc=arch.get("out_nc", 3),
+                nf=arch.get("nf", 32),
+                act_type=arch.get("act_type", "relu"),
+                weighting_network=arch.get("weighting_network", False),
+                hg_nf=arch.get("hg_nf", 64),
+                mask_r=arch.get("mask_r", 0.75),
+            )
+        else:
+            model = Ensemble_AGCM_LE(
+                classifier=arch.get("classifier", "color_condition"),
+                cond_c=arch.get("cond_c", 6),
+                in_nc=arch.get("in_nc", 3),
+                out_nc=arch.get("out_nc", 3),
+                nf=arch.get("nf", 32),
+                act_type=arch.get("act_type", "relu"),
+                weighting_network=arch.get("weighting_network", False),
+            )
 
         # Support both v1 (channel-threshold) and v2 (sensitivity-based) checkpoints
         w8a8_layers = checkpoint.get("w8a8_layers", None)
@@ -725,6 +785,9 @@ def main():
             "nf": 32,
             "act_type": "relu",
             "weighting_network": False,
+            "use_hg": use_hg,
+            "hg_nf": 64,
+            "mask_r": 0.75,
         },
     }
     # Propagate v2 metadata from source checkpoint
@@ -736,26 +799,19 @@ def main():
 
     orig_kb = os.path.getsize(args.fp32_model) / 1024
     quant_kb = os.path.getsize(args.output) / 1024
-    print(f"\n  Saved → {args.output}")
+    print(f"\n  Saved -> {args.output}")
     print(f"  Original : {orig_kb:,.1f} KB")
     print(f"  Quantized: {quant_kb:,.1f} KB")
     if quant_kb > 0:
         print(f"  Ratio    : {orig_kb / quant_kb:.2f}x")
 
     # ------------------------------------------------------------------
-    # 7. Quality validation — FP16 reference vs QAT INT8
+    # 7. Quality validation " FP16 reference vs QAT INT8
     # ------------------------------------------------------------------
     print(f"\nValidation ({device}, {args.precision}):")
 
     # Load FP16 reference model
-    ref_model = Ensemble_AGCM_LE(
-        classifier="color_condition", cond_c=6, in_nc=3, out_nc=3,
-        nf=32, act_type="relu", weighting_network=False,
-    )
-    ref_state = torch.load(args.fp32_model, map_location="cpu", weights_only=True)
-    ref_cleaned = {(k[7:] if k.startswith("module.") else k): v
-                   for k, v in ref_state.items()}
-    ref_model.load_state_dict(ref_cleaned, strict=True)
+    ref_model = _build_fp32_model(args.fp32_model, args.hg_weights, use_hg)
     ref_model = ref_model.to(dtype=compute_dtype, device=device).eval()
 
     val_pairs = pairs[:args.num_validate]
@@ -799,10 +855,11 @@ def main():
 
         avg = np.mean(times)
         std = np.std(times)
-        print(f"  Eager : {avg:.1f} ± {std:.1f} ms")
+        print(f"  Eager : {avg:.1f} +/- {std:.1f} ms")
 
     print("\nDone!")
 
 
 if __name__ == "__main__":
     main()
+

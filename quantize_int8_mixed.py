@@ -37,6 +37,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE
+from models.hdrtvnet_modules.HG_Composite_arch import HG_Composite
 from models.hdrtvnet_torch import (
     W8A8Conv2d, W8A8Linear, W8Conv2d, W8Linear,
     _quantize_model_mixed, _quantize_model_mixed_v2, calibrate_w8a8,
@@ -47,20 +48,42 @@ from models.hdrtvnet_torch import (
 # Helpers
 # ===================================================================
 
-def load_fp32_model(model_path: str) -> nn.Module:
-    """Load the FP32 Ensemble_AGCM_LE model."""
-    model = Ensemble_AGCM_LE(
-        classifier="color_condition",
-        cond_c=6,
-        in_nc=3,
-        out_nc=3,
-        nf=32,
-        act_type="relu",
-        weighting_network=False,
-    )
+def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module:
+    """Load the FP32 model (HG composite or base AGCM+LE)."""
+    if use_hg:
+        model = HG_Composite(
+            classifier="color_condition",
+            cond_c=6,
+            in_nc=3,
+            out_nc=3,
+            nf=32,
+            act_type="relu",
+            weighting_network=False,
+            hg_nf=64,
+            mask_r=0.75,
+        )
+    else:
+        model = Ensemble_AGCM_LE(
+            classifier="color_condition",
+            cond_c=6,
+            in_nc=3,
+            out_nc=3,
+            nf=32,
+            act_type="relu",
+            weighting_network=False,
+        )
     state = torch.load(model_path, map_location="cpu", weights_only=True)
     cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
-    model.load_state_dict(cleaned, strict=True)
+    if use_hg:
+        model.base.load_state_dict(cleaned, strict=True)
+    else:
+        model.load_state_dict(cleaned, strict=True)
+
+    if use_hg:
+        hg_state = torch.load(hg_weights, map_location="cpu")
+        if isinstance(hg_state, dict) and "state_dict" in hg_state:
+            hg_state = hg_state["state_dict"]
+        model.hg.load_state_dict(hg_state, strict=True)
     model.eval()
     return model
 
@@ -100,8 +123,12 @@ def load_calibration_images(calib_dir: str, max_images: int = 16,
 def prepare_model_input(img_tensor, device, dtype):
     """Prepare (input, condition) tuple for the model."""
     img_dev = img_tensor.to(device=device, dtype=dtype)
-    cond = F.interpolate(img_dev, scale_factor=0.25, mode="bilinear",
-                         align_corners=False)
+    try:
+        cond = F.interpolate(img_dev, scale_factor=0.25, mode="bicubic",
+                             align_corners=False, antialias=True)
+    except TypeError:
+        cond = F.interpolate(img_dev, scale_factor=0.25, mode="bicubic",
+                             align_corners=False)
     return (img_dev, cond)
 
 
@@ -218,6 +245,9 @@ def main():
                         help="Output path for quantized checkpoint")
     parser.add_argument("--precision", default="fp16", choices=["fp16", "fp32"],
                         help="Compute precision for runtime dequantization")
+    parser.add_argument("--save-fp16", action="store_true",
+                        help="Save checkpoint with FP16 compute buffers even "
+                             "if calibration ran in FP32 (useful for CPU runs)")
     parser.add_argument("--sensitivity-threshold", type=float, default=1e-6,
                         help="Max per-layer MSE for W8A8 assignment. "
                              "Lower = more conservative (fewer W8A8 layers)")
@@ -225,12 +255,27 @@ def main():
                         help="Images for sensitivity analysis")
     parser.add_argument("--calibration-dir", default="dataset/test_sdr",
                         help="Directory of SDR images for calibration")
+    parser.add_argument("--hg-weights",
+                        default="Source Pipeline/pretrained_models/HG_weights.pth",
+                        help="Path to HG weights (HG_weights.pth)")
+    parser.add_argument("--use-hg", default="1", choices=["1", "0"],
+                        help="Use HG refinement (1) or base AGCM+LE only (0)")
     parser.add_argument("--num-calibrate", type=int, default=16,
                         help="Number of images for activation scale calibration")
     parser.add_argument("--num-validate", type=int, default=8,
                         help="Number of images for quality validation")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
                         help="Device (auto = GPU if available)")
+    parser.add_argument("--full-cpu", action="store_true",
+                        help="Run all phases on CPU (avoids ROCm issues)")
+    parser.add_argument("--sensitivity-device", default="auto",
+                        choices=["auto", "cuda", "cpu"],
+                        help="Device for sensitivity sweep (auto: "
+                             "use CPU on ROCm to avoid MIOpen issues)")
+    parser.add_argument("--calibration-device", default="auto",
+                        choices=["auto", "cuda", "cpu"],
+                        help="Device for activation calibration (auto: "
+                             "use CPU on ROCm to avoid MIOpen issues)")
     # Legacy mode
     parser.add_argument("--legacy", action="store_true",
                         help="Use v1 channel-threshold heuristic (no sensitivity)")
@@ -242,13 +287,42 @@ def main():
     device_str = args.device
     if device_str == "auto":
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.full_cpu:
+        device_str = "cpu"
+        compute_dtype = torch.float32
     device = torch.device(device_str)
+    if device.type == "cpu":
+        compute_dtype = torch.float32
+
+    sens_device = device
+    if args.sensitivity_device != "auto":
+        sens_device = torch.device(args.sensitivity_device)
+    else:
+        if device.type == "cuda" and torch.version.hip is not None:
+            sens_device = torch.device("cpu")
+            print("  [info] ROCm detected: running sensitivity on CPU "
+                  "to avoid MIOpen kernel issues.")
+
+    sens_dtype = compute_dtype if sens_device.type != "cpu" else torch.float32
+
+    calib_device = device
+    if args.calibration_device != "auto":
+        calib_device = torch.device(args.calibration_device)
+    else:
+        if device.type == "cuda" and torch.version.hip is not None:
+            calib_device = torch.device("cpu")
+            print("  [info] ROCm detected: running calibration on CPU "
+                  "to avoid MIOpen kernel issues.")
+
+    calib_dtype = compute_dtype if calib_device.type != "cpu" else torch.float32
+
+    use_hg = str(args.use_hg).strip() != "0"
 
     # ------------------------------------------------------------------
     # 1. Load FP32 model
     # ------------------------------------------------------------------
     print(f"Loading FP32 model from {args.model} ...")
-    model = load_fp32_model(args.model)
+    model = load_fp32_model(args.model, args.hg_weights, use_hg)
 
     # ------------------------------------------------------------------
     # 2. Quantization strategy
@@ -267,19 +341,35 @@ def main():
         print(f"{'='*60}")
 
         # Move to device for sensitivity sweep
-        model = model.to(dtype=compute_dtype, device=device)
+        model = model.to(dtype=sens_dtype, device=sens_device)
         model.eval()
 
         calib_images = load_calibration_images(
             args.calibration_dir, max(args.num_calibrate, args.num_sensitivity)
         )
         print(f"  Loaded {len(calib_images)} images")
-        sens_inputs = [prepare_model_input(img, device, compute_dtype)
+        sens_inputs = [prepare_model_input(img, sens_device, sens_dtype)
                        for img in calib_images[:args.num_sensitivity]]
 
         t0 = time.perf_counter()
-        sensitivities = compute_layer_sensitivity(model, sens_inputs,
-                                                  args.num_sensitivity)
+        try:
+            sensitivities = compute_layer_sensitivity(
+                model, sens_inputs, args.num_sensitivity
+            )
+        except RuntimeError as exc:
+            if sens_device.type != "cpu":
+                print("  [warn] Sensitivity sweep failed on GPU; "
+                      "retrying on CPU.")
+                sens_device = torch.device("cpu")
+                sens_dtype = torch.float32
+                model = model.to(dtype=sens_dtype, device=sens_device)
+                sens_inputs = [prepare_model_input(img, sens_device, sens_dtype)
+                               for img in calib_images[:args.num_sensitivity]]
+                sensitivities = compute_layer_sensitivity(
+                    model, sens_inputs, args.num_sensitivity
+                )
+            else:
+                raise exc
         dt = time.perf_counter() - t0
         print(f"  Sweep took {dt:.1f}s")
 
@@ -304,7 +394,7 @@ def main():
         print(f"  W8A16 (weight-only): {len(w8a16_layers)} layers")
 
         # Re-load FP32 model (clean weights for quantization)
-        model = load_fp32_model(args.model)
+        model = load_fp32_model(args.model, args.hg_weights, use_hg)
         use_asymmetric = True
 
         print(f"\n{'='*60}")
@@ -354,17 +444,35 @@ def main():
     )
     print(f"  Loaded {len(calib_images)} calibration images")
 
-    calib_inputs = [prepare_model_input(img, device, compute_dtype)
+    # Calibration can be run on a different device (CPU on ROCm)
+    if calib_device != device or calib_dtype != compute_dtype:
+        model = model.to(dtype=calib_dtype, device=calib_device)
+        model.eval()
+
+    calib_inputs = [prepare_model_input(img, calib_device, calib_dtype)
                     for img in calib_images]
     calibrate_w8a8(model, calib_inputs)
+
+    # Move back to main device for validation/speed
+    if calib_device != device or calib_dtype != compute_dtype:
+        model = model.to(dtype=compute_dtype, device=device)
+        model.eval()
 
     # ------------------------------------------------------------------
     # 4. Save quantized + calibrated checkpoint
     # ------------------------------------------------------------------
+    save_dtype = compute_dtype
+    if args.save_fp16:
+        save_dtype = torch.float16
+        if compute_dtype != save_dtype:
+            print("  [info] Saving checkpoint with FP16 compute buffers "
+                  "after FP32 calibration.")
+            model = model.to(dtype=save_dtype, device=device)
+
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     save_data = {
         "state_dict": model.state_dict(),
-        "compute_dtype": str(compute_dtype),
+        "compute_dtype": str(save_dtype),
         "quantization": "w8a8_mixed",
         "architecture": {
             "classifier": "color_condition",
@@ -374,6 +482,9 @@ def main():
             "nf": 32,
             "act_type": "relu",
             "weighting_network": False,
+            "use_hg": use_hg,
+            "hg_nf": 64,
+            "mask_r": 0.75,
         },
     }
 
@@ -401,7 +512,7 @@ def main():
     val_images = calib_images[:args.num_validate]
     print(f"  {len(val_images)} images")
 
-    fp32_model = load_fp32_model(args.model)
+    fp32_model = load_fp32_model(args.model, args.hg_weights, use_hg)
     fp32_model = fp32_model.to(dtype=compute_dtype, device=device).eval()
 
     psnrs = []

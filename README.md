@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v1.1-blue)
+![Version](https://img.shields.io/badge/version-v1.2-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -36,7 +36,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## GUI (v1.1)
+## GUI (v1.2)
 
 ```bash
 python src/gui.py
@@ -44,28 +44,14 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v1.1
+### New in v1.2
 
-- **Drag-and-drop video support**
-- **Live precision switching** (FP16, FP32, INT8 PTQ/QAT/full) at any time, even mid-playback
-- **Tabbed video workspace**: `SDR`, `HDR`, and `Side by Side`
-- **Pop/Dock windows** for SDR and HDR panes (multi-monitor friendly)
-- **Real-time metrics panel** (FPS, latency, app VRAM/CPU memory, model size)
-- **Dark theme** (auto-applied)
-- **Native mpv rendering for both SDR and HDR panes**
-- **SDR path tagged as Rec.709**, **HDR path tagged as BT.2020/PQ** (display target auto-detected by mpv)
-- **Resolution presets** (`1080p`, `720p`, `540p`, and auto `Source` fallback for small videos)
-- **Frame-accurate seek improvements** (paused seek is queued and applied on Resume)
-- **Master volume slider + low-FPS auto-mute with smooth restore**
-- **Audio track selector** (multi-audio stream switching)
-- **Hide-cursor-on-idle option**
-- **Borderless full-window mode** (`F11`, `Esc`) and **Space** play/pause shortcut
-- **Persistent GUI settings** in `.gui_prefs.json` (precision/resolution/metrics/volume/audio/cursor)
-- **Pre-compile kernels** for any resolution/precision
-- **Clear kernel cache** tool
-- **Audio support** (auto-detect, attach external audio)
-- **Compile progress dialogs** (inline and subprocess, zero GPU interference)
-- **Timeline preview and seek bar**
+- **Film grain toggle** (mpv shader, auto-download; restores grain lost to upscalers)
+- **Upscale options simplified**: default **EWA LanczosSharp** (EWA Lanczos removed), plus **FSR**
+- **Film grain + upscale settings persist** in `.gui_prefs.json`
+- **A/V relock polish** for UI transitions and pop/dock workflows
+
+**Note:** QAT variants have been temporarily removed until the next update. All weights have been retrained (including the **+HG** option).
 
 ### Features
 
@@ -75,13 +61,15 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
 | **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |
 | **Live precision switching** | FP16, FP32, INT8 variants — switch mid-playback |
+| **HG toggle** | Enable/disable HG refinement (loads HG or no-HG INT8 weights) |
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Live metrics** | FPS, latency, frame count, app VRAM/CPU memory, model size |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
-| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using the built-in best scaler |
+| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp** or **FSR** |
+| **Film grain** | Optional film grain restoration (mpv shader) |
 | **Audio support** | Auto-detect, attach external audio, and choose audio track |
 | **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
 | **Keyboard shortcuts** | `F11` borderless full-window, `Esc` exit borderless mode, `Space` pause/resume |
@@ -89,13 +77,14 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
 | **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
 | **Dark theme** | Modern dark UI, auto-applied |
+| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, upscale, film grain, metrics, volume, audio, cursor) |
 
 ### GUI Launch Flags
 
 `src/gui.py` also accepts startup flags (used by restart/apply flows):
 
 ```bash
-python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200
+python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200 --use-hg 1 --film-grain 1
 ```
 
 ### Tools Menu
@@ -210,9 +199,10 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 |---|---|---|
 | **FP16** | Half-precision (default on GPU) | — |
 | **FP32** | Full precision | — |
-| **INT8 Full (W8A8)** | Weights + activations quantized | 3.11× |
-| **INT8 Mixed** | 1×1 convs W8A8, 3×3 convs W8A16 | 2.94× |
-| **INT8 Mixed (QAT)** | Mixed + quantization-aware fine-tuning | 2.93× |
+| **INT8 Full** | W8A8 quantization (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Mixed** | Mixed W8A8/W8A16 (HG optional) | ~4.0× vs FP16+HG |
+
+**Note:** QAT variants are temporarily removed in v1.2 (weights retrained, including **+HG**). They will return in a future update.
 
 INT8 modes include **pre-dequantization** for GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing): INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage.
 
@@ -232,9 +222,11 @@ python src/main.py --no-compile
 # FP32 precision
 python src/main.py --precision fp32
 
-# INT8 quantized models
+# INT8 quantized models (HG on/off)
 python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full.pt
-python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
+python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt --use-hg 0
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt --use-hg 0
 
 # Headless benchmark
 python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
@@ -254,6 +246,7 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 | `--channels-last` | Force channels_last memory format (auto on NVIDIA) |
 | `--cuda-graphs` | Enable CUDA graph replay for static shapes |
 | `--predequantize auto\|on\|off` | Pre-dequantize INT8 weights to FP16 at load time (auto = enabled on GPUs without INT8 tensor cores) |
+| `--use-hg 1\|0` | Enable HG refinement (1 = on, 0 = off) |
 | `--cache-resolution WxH` | Pre-compile Triton kernels for this resolution at startup (default: auto = video resolution) |
 | `--prefetch N` | Video reader prefetch queue size (default: 8) |
 | `--model-stage-timing` | Report pre/run/post timing breakdown |
@@ -276,30 +269,62 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 <details>
 <summary><strong>Quantization details</strong></summary>
 
-### W8A8 (Full INT8)
+**QAT note:** QAT variants are temporarily removed in v1.2 (weights retrained, including **+HG**). The QAT subsections below are kept for reference and will return in a future update.
+
+### HG Weights (Optional)
+HG refinement is optional. If you enable HG (`--use-hg 1`), place the pretrained HG
+weights at:
+
+`Source Pipeline/pretrained_models/HG_weights.pth`
+
+You can override with `--hg-weights` in CLI mode.
+
+### W8A8 (Full INT8, HG optional)
 ```bash
 python quantize_int8_full.py
 ```
 - Both weights and activations quantized to INT8
 - Requires calibration data (uses `dataset/test_sdr/`)
-- **3.11× compression**
+  - **~4.0× compression vs FP16+HG** (HG adds significant weight size)
+  - Outputs:
+    - `src/models/weights/Ensemble_AGCM_LE_int8_full.pt` (HG)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt` (no-HG)
 
-### Mixed W8A8/W8A16
+### W8A8 (Full INT8) + QAT (HG optional) — *temporarily removed in v1.2*
+```bash
+python quantize_int8_full_qat.py
+```
+- Starts from the PTQ full checkpoint and fine-tunes with fake quantization + STE
+- Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
+- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
+  - **~4.0× compression vs FP16+HG**
+  - Outputs:
+    - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt` (HG)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt` (no-HG)
+- Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
+
+### Mixed W8A8/W8A16 (HG optional)
 ```bash
 python quantize_int8_mixed.py
 ```
 - Memory-bound 1×1 convs → W8A8 (INT8 activations help bandwidth)
 - Compute-bound 3×3 convs → W8A16 (weight-only saves storage)
-- **2.94× compression**
+  - **~4.0× compression vs FP16+HG**
+  - Outputs:
+    - `src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt` (HG)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt` (no-HG)
 
-### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training)
+### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training, HG optional) — *temporarily removed in v1.2*
 ```bash
 python quantize_int8_mixed_qat.py
 ```
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
-- **2.93× compression**
+  - **~4.0× compression vs FP16+HG**
+  - Outputs:
+    - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt` (HG)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt` (no-HG)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
 ### Pre-Dequantization
@@ -307,7 +332,7 @@ python quantize_int8_mixed_qat.py
 On GPUs without native INT8 compute, per-inference dequantization adds ~55% overhead. Pre-dequantization converts INT8 weights to FP16 **once at load time**:
 
 ```bash
-python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt --predequantize on
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt --predequantize on
 ```
 
 **Result:** Same FP16 speed + 2.94× compressed storage.

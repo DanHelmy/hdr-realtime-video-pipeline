@@ -3,6 +3,29 @@ import argparse
 import os
 import time
 
+# Pin caches to a stable user path (avoid Temp churn/permissions).
+def _default_cache_root():
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        return os.path.join(local_app, "HDRTVNetCache")
+    return os.path.join(os.path.expanduser("~"), ".cache", "hdrtvnet")
+
+_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", _default_cache_root())
+try:
+    os.makedirs(_cache_root, exist_ok=True)
+except Exception:
+    pass
+
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    os.path.join(_cache_root, "torchinductor"),
+)
+os.environ.setdefault(
+    "TRITON_CACHE_DIR",
+    os.path.join(_cache_root, "triton"),
+)
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+
 import numpy as np
 import psutil
 import torch
@@ -11,7 +34,7 @@ from video_source import VideoSource
 from timer import FPSTimer
 from models.hdrtvnet_torch import HDRTVNetTorch
 
-VIDEO_PATH = "input2.mp4"
+VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
 MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
 
 TARGET_WIDTH = 1920
@@ -86,6 +109,16 @@ def parse_args():
         default="auto",
         choices=["auto", "fp16", "fp32", "int8-full", "int8-mixed"],
         help="Inference precision: int8-full = W8A8 (all layers), int8-mixed = selective W8A8/W8A16"
+    )
+    parser.add_argument(
+        "--use-hg",
+        default="1",
+        help="Enable HG (1/0). Default: 1"
+    )
+    parser.add_argument(
+        "--hg-weights",
+        default=None,
+        help="Path to HG_weights.pth (overrides default path)"
     )
     parser.add_argument(
         "--no-compile",
@@ -201,17 +234,36 @@ def main():
         _proc_w, _proc_h = _vid_w, _vid_h
 
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
-    processor = HDRTVNetTorch(
-        args.model,
-        device=args.device,
-        precision=args.precision,
-        compile_model=not args.no_compile,
-        force_compile=args.force_compile,
-        compile_mode=args.compile_mode,
-        use_cuda_graphs=args.cuda_graphs,
-        force_channels_last=args.channels_last,
-        predequantize=predeq,
-    )
+    try:
+        processor = HDRTVNetTorch(
+            args.model,
+            device=args.device,
+            precision=args.precision,
+            compile_model=not args.no_compile,
+            force_compile=args.force_compile,
+            compile_mode=args.compile_mode,
+            use_cuda_graphs=args.cuda_graphs,
+            force_channels_last=args.channels_last,
+            predequantize=predeq,
+            hg_weights=args.hg_weights,
+            use_hg=str(args.use_hg).strip() != "0",
+        )
+    except TypeError as exc:
+        # Backward-compat for older HDRTVNetTorch without HG args.
+        if "hg_weights" in str(exc) or "use_hg" in str(exc):
+            processor = HDRTVNetTorch(
+                args.model,
+                device=args.device,
+                precision=args.precision,
+                compile_model=not args.no_compile,
+                force_compile=args.force_compile,
+                compile_mode=args.compile_mode,
+                use_cuda_graphs=args.cuda_graphs,
+                force_channels_last=args.channels_last,
+                predequantize=predeq,
+            )
+        else:
+            raise
     # Pre-compile Triton kernels for the actual processing resolution so
     # video playback starts immediately.  If --cache-resolution is set,
     # use that instead (for manual override).  Triton caches to disk, so

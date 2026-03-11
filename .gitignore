@@ -40,8 +40,12 @@ benchmark_*.py
 # Pipeline weights — tracked
 !src/models/weights/Ensemble_AGCM_LE.pth
 !src/models/weights/Ensemble_AGCM_LE_int8_full.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt
 
 # Calibration / training dataset (download separately)
 dataset/

@@ -26,7 +26,30 @@ import numpy as np
 import cv2
 import psutil
 
-# ── Inductor FX-graph cache (must be set BEFORE importing torch) ─────
+# ── Inductor/Triton cache dirs (must be set BEFORE importing torch) ───
+# Pin caches to a stable user path to avoid Temp churn/permissions.
+def _default_cache_root():
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        return os.path.join(local_app, "HDRTVNetCache")
+    return os.path.join(os.path.expanduser("~"), ".cache", "hdrtvnet")
+
+_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", _default_cache_root())
+try:
+    os.makedirs(_cache_root, exist_ok=True)
+except Exception:
+    pass
+
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    os.path.join(_cache_root, "torchinductor"),
+)
+os.environ.setdefault(
+    "TRITON_CACHE_DIR",
+    os.path.join(_cache_root, "triton"),
+)
+
+# ── Inductor FX-graph cache ──────────────────────────────────────────
 # Ensures that torch.compile autotune decisions are persisted to disk
 # and shared across processes, so the worker never re-benchmarks kernels
 # that the subprocess already compiled.
@@ -55,11 +78,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog, QCheckBox,
     QGroupBox, QSplitter, QDialog, QMessageBox, QProgressBar,
-    QTextEdit, QInputDialog, QSlider, QStyle, QStackedWidget, QTabWidget,
+    QProgressDialog,
+    QTextEdit, QSlider, QStyle, QStackedWidget, QTabWidget,
+    QGraphicsOpacityEffect,
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QProcess, QTimer, QRect, QEvent, QPoint,
-    qInstallMessageHandler,
+    Qt, QThread, pyqtSignal, QProcess, QTimer, QRect, QEvent, QPoint, QObject,
+    qInstallMessageHandler, QPropertyAnimation, QEasingCurve,
 )
 from PyQt6.QtGui import QImage, QPixmap, QFont, QPalette, QColor, QCursor
 from PyQt6.QtCore import QUrl
@@ -78,6 +103,9 @@ from video_source import VideoSource
 _ROOT = os.path.dirname(_HERE)
 _MPV_DIAG = os.environ.get("HDRTVNET_MPV_DIAG", "1").strip().lower() in {"1", "true", "yes", "on"}
 _PREFS_PATH = os.path.join(_ROOT, ".gui_prefs.json")
+_HG_WEIGHTS_PATH = os.path.join(
+    _ROOT, "Source Pipeline", "pretrained_models", "HG_weights.pth"
+)
 
 
 def _weight(name):
@@ -222,6 +250,133 @@ def _limited_playback_fps(src_fps: float) -> float:
     return max(1.0, fps)
 
 
+def _select_hdr_scale_kernel(proc_w: int, proc_h: int,
+                             out_w: int, out_h: int,
+                             upscale_choice: str | None = None) -> str:
+    """Pick mpv scale kernel for HDR output."""
+    if proc_w == out_w and proc_h == out_h:
+        return "bicubic"
+    if upscale_choice:
+        return _normalize_upscale_choice(upscale_choice)
+    return BEST_MPV_SCALE
+
+
+def _select_hdr_scale_antiring(proc_w: int, proc_h: int,
+                               out_w: int, out_h: int,
+                               scale_kernel: str | None = None) -> float:
+    """Tune antiring strength by processing resolution and kernel."""
+    if proc_w == out_w and proc_h == out_h:
+        return 0.0
+    k = str(scale_kernel or "").strip().lower()
+    if k == "fsr":
+        return 0.0
+    if proc_h <= 540 or proc_w <= 960:
+        base = 0.60
+    elif proc_h <= 720 or proc_w <= 1280:
+        base = 0.45
+    else:
+        base = 0.15
+    if "lanczossharp" in k or k == "ewa_lanczos":
+        return min(0.8, base + 0.05)
+    return base
+
+
+def _select_mpv_cas_strength(proc_w: int, proc_h: int,
+                             out_w: int, out_h: int,
+                             using_fsr: bool = False,
+                             scale_kernel: str | None = None) -> float:
+    """Select CAS sharpening strength for HDR upscale."""
+    if proc_w >= out_w and proc_h >= out_h:
+        return 0.0
+    if using_fsr:
+        if proc_h <= 540 or proc_w <= 960:
+            return 0.30
+        if proc_h <= 720 or proc_w <= 1280:
+            return 0.25
+        return 0.18
+    if proc_h <= 540 or proc_w <= 960:
+        base = 0.12
+    elif proc_h <= 720 or proc_w <= 1280:
+        base = 0.14
+    else:
+        base = 0.12
+    k = str(scale_kernel or "").strip().lower()
+    if "lanczossharp" in k or k == "ewa_lanczos":
+        return max(0.0, base - 0.02)
+    return base
+
+
+BEST_UPSCALE_MODE = "On (Best)"
+BEST_MPV_SCALE = "ewa_lanczossharp"
+BEST_CV2_INTERP = cv2.INTER_LANCZOS4
+UPSCALE_SHARPEN_STRENGTH = 0.0
+UPSCALE_SHARPEN_SIGMA = 1.0
+FSR_SHADER_PATH = os.path.join(
+    _ROOT, "assets", "shaders", "FSR.glsl"
+)
+FSR_SHADER_URL = (
+    "https://gist.githubusercontent.com/agyild/"
+    "82219c545228d70c5604f865ce0b0ce5/raw/"
+    "2623d743b9c23f500ba086f05b385dcb1557e15d/FSR.glsl"
+)
+FILMGRAIN_SHADER_PATH = os.path.join(
+    _ROOT, "assets", "shaders", "filmgrain.glsl"
+)
+FILMGRAIN_SHADER_URL = (
+    "https://raw.githubusercontent.com/haasn/gentoo-conf/"
+    "xor/home/nand/.mpv/shaders/filmgrain.glsl"
+)
+UPSCALER_CHOICES = ["EWA LanczosSharp", "FSR"]
+DEFAULT_UPSCALER = "EWA LanczosSharp"
+
+
+def _normalize_upscale_choice(choice: str) -> str:
+    c = str(choice or "").strip().lower()
+    if "fsr" in c:
+        return "fsr"
+    return BEST_MPV_SCALE
+
+
+def _ensure_fsr_shader() -> bool:
+    """Ensure the FSR shader exists on disk (download on demand)."""
+    if os.path.isfile(FSR_SHADER_PATH):
+        return True
+    try:
+        os.makedirs(os.path.dirname(FSR_SHADER_PATH), exist_ok=True)
+        import urllib.request
+        with urllib.request.urlopen(FSR_SHADER_URL, timeout=10) as resp:
+            data = resp.read()
+        if data:
+            with open(FSR_SHADER_PATH, "wb") as f:
+                f.write(data)
+            return True
+    except Exception as exc:
+        print(f"[fsr] download failed: {exc}")
+    return os.path.isfile(FSR_SHADER_PATH)
+
+
+def _ensure_filmgrain_shader() -> bool:
+    """Ensure the film grain shader exists on disk (download on demand)."""
+    if os.path.isfile(FILMGRAIN_SHADER_PATH):
+        return True
+    try:
+        os.makedirs(os.path.dirname(FILMGRAIN_SHADER_PATH), exist_ok=True)
+        import urllib.request
+        with urllib.request.urlopen(FILMGRAIN_SHADER_URL, timeout=10) as resp:
+            data = resp.read()
+        if data:
+            with open(FILMGRAIN_SHADER_PATH, "wb") as f:
+                f.write(data)
+            return True
+    except Exception as exc:
+        print(f"[filmgrain] download failed: {exc}")
+    return os.path.isfile(FILMGRAIN_SHADER_PATH)
+
+
+def _normalize_shader_paths(paths: list[str]) -> list[str]:
+    return [p for p in paths if p]
+
+
 def _letterbox_bgr(frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     """Resize with preserved aspect ratio and black padding to exact output size."""
     h, w = frame.shape[:2]
@@ -241,6 +396,16 @@ def _letterbox_bgr(frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     return canvas
 
 
+def _apply_upscale_sharpen(img: np.ndarray,
+                           strength: float = UPSCALE_SHARPEN_STRENGTH,
+                           sigma: float = UPSCALE_SHARPEN_SIGMA) -> np.ndarray:
+    """Mild unsharp mask after upscaling."""
+    if strength <= 0.0:
+        return img
+    blur = cv2.GaussianBlur(img, (0, 0), sigma)
+    return cv2.addWeighted(img, 1.0 + strength, blur, -strength, 0)
+
+
 # ── Precision configurations ─────────────────────────────────
 PRECISIONS = {
     "FP16": {
@@ -254,16 +419,49 @@ PRECISIONS = {
     "INT8 Mixed (PTQ)": {
         "precision": "int8-mixed",
         "model": _weight("Ensemble_AGCM_LE_int8_mixed.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg.pt"),
     },
     "INT8 Mixed (QAT)": {
         "precision": "int8-mixed",
         "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
     },
-    "INT8 Full (W8A8)": {
+    "INT8 Full (PTQ)": {
         "precision": "int8-full",
         "model": _weight("Ensemble_AGCM_LE_int8_full.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+    },
+    "INT8 Full (QAT)": {
+        "precision": "int8-full",
+        "model": _weight("Ensemble_AGCM_LE_int8_full_qat.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_nohg.pt"),
     },
 }
+
+
+def _select_model_path(precision_key: str, use_hg: bool) -> str:
+    cfg = PRECISIONS.get(precision_key, {})
+    model_path = cfg.get("model", "")
+    if cfg.get("precision", "").startswith("int8") and not use_hg:
+        model_path = cfg.get("model_nohg") or model_path
+    return model_path
+
+
+def _precision_is_available(precision_key: str) -> bool:
+    cfg = PRECISIONS.get(precision_key, {})
+    model_path = cfg.get("model")
+    if model_path and os.path.isfile(model_path):
+        return True
+    if cfg.get("precision", "").startswith("int8"):
+        alt_path = cfg.get("model_nohg")
+        if alt_path and os.path.isfile(alt_path):
+            return True
+    return False
+
+
+def _available_precision_keys() -> list[str]:
+    keys = [k for k in PRECISIONS.keys() if _precision_is_available(k)]
+    return keys or list(PRECISIONS.keys())
 
 MAX_W, MAX_H = 1920, 1080
 
@@ -274,9 +472,6 @@ RESOLUTION_SCALES = {
     "540p":  (960,  540),
 }
 
-BEST_UPSCALE_MODE = "On (Best)"
-BEST_MPV_SCALE = "lanczos"
-BEST_CV2_INTERP = cv2.INTER_LANCZOS4
 
 
 # ╔═══════════════════════════════════════════════════════════════╗
@@ -380,14 +575,37 @@ class MpvHDRWidget(QWidget):
         props = {"t_trc": t_trc, "t_prim": t_prim}
         return hdr_info, aux, props
 
+    def _set_glsl_shaders(self, shader_paths: list[str]) -> bool:
+        """Apply a list of GLSL shaders to mpv with a robust setter."""
+        p = self._player
+        if p is None:
+            return False
+        paths = _normalize_shader_paths(shader_paths)
+        try:
+            try:
+                p.glsl_shaders = paths
+                return True
+            except Exception:
+                pass
+            joined = os.pathsep.join(paths)
+            p.command("set", "glsl-shaders", joined)
+            return True
+        except Exception as exc:
+            self._last_scale_error = str(exc)
+            print(f"[mpv] glsl-shaders set failed: {exc}")
+            return False
+
     @staticmethod
     def _kernel_antiring(scale_kernel: str) -> tuple[str, float]:
         """Return normalized kernel name and anti-ringing strength."""
         k = str(scale_kernel or "bicubic").strip().lower()
         if not k:
             k = "bicubic"
-        if k in {"lanczos", "spline36"}:
-            return k, 0.80
+        if k in {"fsr"}:
+            return "fsr", 0.0
+        # Slightly stronger antiring for lanczossharp to tame halos.
+        if k in {"ewa_lanczossharp", "ewa_lanczos"}:
+            return "ewa_lanczossharp", 0.20
         return k, 0.0
 
     def _attach_audio_async(self, audio_path: str):
@@ -486,7 +704,9 @@ class MpvHDRWidget(QWidget):
     def start_playback(self, width: int, height: int, fps: float = 30.0,
                        scale_kernel: str = "bicubic",
                        scale_antiring: float | None = None,
+                       cas_strength: float | None = None,
                        audio_path: str | None = None,
+                       film_grain: bool = False,
                        force_hdr_metadata: bool = True):
         """Create an mpv instance and begin reading frames."""
         self.stop_playback()
@@ -505,7 +725,10 @@ class MpvHDRWidget(QWidget):
             "height": int(height),
             "fps": float(self._fps),
             "scale_kernel": str(kernel_name),
+            "scale_antiring": None if scale_antiring is None else float(scale_antiring),
+            "cas_strength": None if cas_strength is None else float(cas_strength),
             "audio_path": audio_path,
+            "film_grain": bool(film_grain),
             "force_hdr_metadata": self._force_hdr_metadata,
         }
 
@@ -529,6 +752,20 @@ class MpvHDRWidget(QWidget):
         frame_bytes = width * height * 6          # RGB48LE
         max_demux = str(frame_bytes)
 
+        use_fsr = (kernel_name == "fsr" and _ensure_fsr_shader())
+        if kernel_name == "fsr" and not use_fsr:
+            print(f"[mpv] FSR shader unavailable (download failed). "
+                  f"Falling back to {BEST_MPV_SCALE}.")
+            kernel_name = BEST_MPV_SCALE
+            if self._last_playback_cfg is not None:
+                self._last_playback_cfg["scale_kernel"] = str(kernel_name)
+        use_fsr = (kernel_name == "fsr")
+        use_film_grain = bool(film_grain and _ensure_filmgrain_shader())
+        if film_grain and not use_film_grain:
+            print("[mpv] film grain shader unavailable (download failed).")
+            if self._last_playback_cfg is not None:
+                self._last_playback_cfg["film_grain"] = False
+
         mpv_kwargs = dict(
             wid=wid,
             vo="gpu",
@@ -549,23 +786,34 @@ class MpvHDRWidget(QWidget):
             demuxer_max_bytes=max_demux,    # ~2 frames (not 0!)
             demuxer_readahead_secs=0,
             video_sync="desync",            # avoid VO clock drift vs worker
-            scale=str(kernel_name),         # GPU scaler kernel in mpv
-            cscale=str(kernel_name),
+            scale="bilinear" if use_fsr else str(kernel_name),
+            cscale="bilinear" if use_fsr else str(kernel_name),
             scale_antiring=str(antiring),
             cscale_antiring=str(antiring),
         )
+        shader_paths = []
+        if use_fsr:
+            shader_paths.append(FSR_SHADER_PATH)
+        if use_film_grain:
+            shader_paths.append(FILMGRAIN_SHADER_PATH)
         if self._force_hdr_metadata:
+            vf_chain = "format=colorlevels=full:primaries=bt.2020:gamma=pq"
+            if cas_strength is not None and cas_strength > 0.0:
+                vf_chain += f",cas={cas_strength}"
             mpv_kwargs.update(
                 # HDR path: declare input as BT.2020/PQ, but do not force
                 # output target. mpv will auto-detect display capabilities.
                 target_colorspace_hint="no",
-                vf="format=colorlevels=full:primaries=bt.2020:gamma=pq",
+                vf=vf_chain,
             )
         else:
+            vf_chain = "format=colorlevels=full:primaries=bt.709:gamma=bt.1886"
+            if cas_strength is not None and cas_strength > 0.0:
+                vf_chain += f",cas={cas_strength}"
             # SDR path: tag input as Rec.709 and let mpv choose output target.
             mpv_kwargs.update(
                 target_colorspace_hint="no",
-                vf="format=colorlevels=full:primaries=bt.709:gamma=bt.1886",
+                vf=vf_chain,
             )
         use_external_audio = bool(audio_path and os.path.isfile(audio_path))
         if not use_external_audio:
@@ -575,6 +823,8 @@ class MpvHDRWidget(QWidget):
 
         self._player = player
         player.play(pipe_url)
+        if shader_paths:
+            self._set_glsl_shaders(shader_paths)
         if use_external_audio:
             # Some python-mpv builds don't expose --audio-file as an init
             # option; runtime audio-add is broadly compatible.
@@ -656,7 +906,8 @@ class MpvHDRWidget(QWidget):
         except Exception:
             if not self._seek_warned:
                 self._seek_warned = True
-                print("[mpv] seek command failed; keeping video-only seek.")
+                # Seek may fail briefly during mpv init; ignore silently.
+                pass
 
     def set_muted(self, muted: bool):
         """Mute/unmute mpv audio."""
@@ -712,18 +963,116 @@ class MpvHDRWidget(QWidget):
         except Exception:
             return False
 
-    def set_scale_kernel(self, scale_kernel: str) -> bool:
+    def set_scale_kernel(self, scale_kernel: str,
+                         scale_antiring: float | None = None) -> bool:
         """Update mpv luma/chroma scaling kernels at runtime."""
         p = self._player
         if p is None:
             return False
+        self._last_scale_error = None
         kernel, antiring = self._kernel_antiring(scale_kernel)
+        if scale_antiring is not None:
+            antiring = max(0.0, min(1.0, float(scale_antiring)))
+        film_on = False
+        if self._last_playback_cfg is not None:
+            film_on = bool(self._last_playback_cfg.get("film_grain", False))
         try:
-            p.command("set", "scale", kernel)
-            p.command("set", "cscale", kernel)
+            use_fsr = (kernel == "fsr" and _ensure_fsr_shader())
+            if kernel == "fsr" and not use_fsr:
+                kernel = BEST_MPV_SCALE
+            if use_fsr:
+                p.command("set", "scale", "bilinear")
+                p.command("set", "cscale", "bilinear")
+            else:
+                p.command("set", "scale", kernel)
+                p.command("set", "cscale", kernel)
+            use_film_grain = bool(film_on and _ensure_filmgrain_shader())
+            if film_on and not use_film_grain:
+                print("[mpv] film grain shader unavailable (download failed).")
+            shader_paths = []
+            if use_fsr:
+                shader_paths.append(FSR_SHADER_PATH)
+            if use_film_grain:
+                shader_paths.append(FILMGRAIN_SHADER_PATH)
+            if not self._set_glsl_shaders(shader_paths):
+                raise RuntimeError("Failed to set glsl-shaders.")
             p.command("set", "scale-antiring", str(antiring))
             p.command("set", "cscale-antiring", str(antiring))
+            if self._last_playback_cfg is not None:
+                self._last_playback_cfg["scale_kernel"] = str(kernel)
+                self._last_playback_cfg["scale_antiring"] = float(antiring)
+                self._last_playback_cfg["film_grain"] = bool(use_film_grain)
             return True
+        except Exception as exc:
+            self._last_scale_error = str(exc)
+            print(f"[mpv] scale hot-swap failed: {exc}")
+            return False
+
+    def set_cas_strength(self, cas_strength: float | None) -> bool:
+        """Update mpv CAS filter at runtime."""
+        p = self._player
+        if p is None:
+            return False
+        try:
+            cas_val = float(cas_strength or 0.0)
+        except Exception:
+            cas_val = 0.0
+        if self._force_hdr_metadata:
+            vf_chain = "format=colorlevels=full:primaries=bt.2020:gamma=pq"
+        else:
+            vf_chain = "format=colorlevels=full:primaries=bt.709:gamma=bt.1886"
+        if cas_val > 0.0:
+            vf_chain += f",cas={cas_val}"
+        try:
+            p.command("set", "vf", vf_chain)
+            if self._last_playback_cfg is not None:
+                self._last_playback_cfg["cas_strength"] = float(cas_val)
+            return True
+        except Exception as exc:
+            self._last_scale_error = str(exc)
+            print(f"[mpv] cas hot-swap failed: {exc}")
+            return False
+
+    def set_film_grain(self, enabled: bool) -> bool:
+        """Enable/disable film grain shader at runtime."""
+        p = self._player
+        if p is None:
+            return False
+        use_film = bool(enabled and _ensure_filmgrain_shader())
+        if enabled and not use_film:
+            print("[mpv] film grain shader unavailable (download failed).")
+        use_fsr = False
+        if self._last_playback_cfg is not None:
+            k = str(self._last_playback_cfg.get("scale_kernel", "")).lower()
+            use_fsr = (k == "fsr" and _ensure_fsr_shader())
+        shader_paths = []
+        if use_fsr:
+            shader_paths.append(FSR_SHADER_PATH)
+        if use_film:
+            shader_paths.append(FILMGRAIN_SHADER_PATH)
+        try:
+            if not self._set_glsl_shaders(shader_paths):
+                raise RuntimeError("Failed to set glsl-shaders.")
+            if self._last_playback_cfg is not None:
+                self._last_playback_cfg["film_grain"] = bool(use_film)
+            return True
+        except Exception as exc:
+            self._last_scale_error = str(exc)
+            print(f"[mpv] film grain hot-swap failed: {exc}")
+            return False
+
+    def is_fsr_active(self) -> bool:
+        """Return True if FSR shader is currently active in mpv."""
+        p = self._player
+        if p is None:
+            return False
+        try:
+            val = getattr(p, "glsl_shaders", None)
+            if not val:
+                return False
+            if isinstance(val, (list, tuple)):
+                return any("fsr" in str(v).lower() for v in val)
+            return "fsr" in str(val).lower()
         except Exception:
             return False
 
@@ -768,7 +1117,8 @@ class MpvHDRWidget(QWidget):
             return
         # Defensive copy: ignore stale/unknown keys from older runs.
         allowed = {"width", "height", "fps", "scale_kernel", "scale_antiring",
-                   "audio_path", "force_hdr_metadata"}
+                   "cas_strength",
+                   "audio_path", "force_hdr_metadata", "film_grain"}
         safe_cfg = {k: v for k, v in cfg.items() if k in allowed}
         self.start_playback(**safe_cfg)
 
@@ -804,14 +1154,18 @@ class PipelineWorker(QThread):
         super().__init__(parent)
         self._video_path = None
         self._precision_key = "FP16"
+        self._use_hg = True
         self._processor = None
         self._stop_flag = False
         self._pause_event = threading.Event()
         self._pause_event.set()  # not paused
         self._pending_precision = None
         self._mpv_widget: MpvHDRWidget | None = None
+        self._sdr_mpv_widget: MpvHDRWidget | None = None
         self._hdr_queue: _queue.Queue | None = None
+        self._sdr_queue: _queue.Queue | None = None
         self._hdr_thread: threading.Thread | None = None
+        self._sdr_thread: threading.Thread | None = None
         self._proc_w: int = MAX_W
         self._proc_h: int = MAX_H
         self._output_w: int = MAX_W       # display / mpv resolution
@@ -826,6 +1180,11 @@ class PipelineWorker(QThread):
         self._sobel_x: torch.Tensor | None = None
         self._sobel_y: torch.Tensor | None = None
         self._input_is_hdr: bool = False
+        self._sdr_delay_frame: np.ndarray | None = None
+        self._hdr_drop_until_frame: int = 0
+        self._sdr_drop_until_frame: int = 0
+        self._frame_idx: int = 0
+        self._hold_until_t: float = 0.0
         # App-level dedicated GPU memory (VRAM) from Windows perf counters.
         self._app_vram_mb: float = 0.0
         self._app_vram_poll_stop = threading.Event()
@@ -834,7 +1193,8 @@ class PipelineWorker(QThread):
     # ── public API (called from main thread) ──
 
     def configure(self, video_path, precision_key, proc_w=MAX_W, proc_h=MAX_H,
-                  output_w=MAX_W, output_h=MAX_H, input_is_hdr=False):
+                  output_w=MAX_W, output_h=MAX_H, input_is_hdr=False,
+                  use_hg=True):
         self._video_path = video_path
         self._precision_key = precision_key
         self._proc_w = proc_w
@@ -843,6 +1203,11 @@ class PipelineWorker(QThread):
         self._output_h = output_h
         self._reset_enhance_history()
         self._input_is_hdr = bool(input_is_hdr)
+        self._use_hg = bool(use_hg)
+        # Drop a couple of frames on startup to avoid mpv buffer lag.
+        self._hdr_drop_until_frame = 2
+        self._sdr_drop_until_frame = 2
+        self._hold_until_t = time.perf_counter() + 0.5
 
     def request_precision_change(self, key):
         self._pending_precision = key
@@ -850,6 +1215,25 @@ class PipelineWorker(QThread):
     def request_resolution_change(self, proc_w: int, proc_h: int):
         """Request a processing-resolution change (thread-safe)."""
         self._pending_resolution = (proc_w, proc_h)
+
+    def flush_hdr_queue(self, drop_frames: int = 2):
+        """Flush mpv queues and drop a couple of frames to re-align output."""
+        if self._hdr_queue is not None:
+            try:
+                while True:
+                    self._hdr_queue.get_nowait()
+            except _queue.Empty:
+                pass
+        if self._sdr_queue is not None:
+            try:
+                while True:
+                    self._sdr_queue.get_nowait()
+            except _queue.Empty:
+                pass
+        self._hdr_drop_until_frame = max(self._hdr_drop_until_frame,
+                                         self._frame_idx + max(0, int(drop_frames)))
+        self._sdr_drop_until_frame = max(self._sdr_drop_until_frame,
+                                         self._frame_idx + max(0, int(drop_frames)))
 
     def _reset_enhance_history(self):
         self._enh_prev_luma = None
@@ -960,6 +1344,10 @@ class PipelineWorker(QThread):
         """Set the MpvHDRWidget reference for feeding HDR frames."""
         self._mpv_widget = widget
 
+    def set_sdr_mpv_widget(self, widget):
+        """Set the MpvHDRWidget reference for feeding SDR frames."""
+        self._sdr_mpv_widget = widget
+
     def set_sdr_visible(self, visible: bool):
         """Tell the worker whether the SDR QLabel is on-screen."""
         self._sdr_visible = visible
@@ -1021,10 +1409,19 @@ class PipelineWorker(QThread):
             os.close(saved_stderr_fd)
 
     def _load_model(self, key):
-        cfg = PRECISIONS[key]
-        path = cfg["model"]
+        cfg = PRECISIONS.get(key, {})
+        path = _select_model_path(key, self._use_hg)
         if not os.path.isfile(path):
-            self.status_message.emit(f"ERROR: weights not found — {path}")
+            if key in PRECISIONS and PRECISIONS[key].get("precision", "").startswith("int8"):
+                alt = PRECISIONS[key].get("model_nohg" if self._use_hg else "model")
+                note = ""
+                if alt and alt != path:
+                    note = f" (alt: {alt})"
+                self.status_message.emit(
+                    f"ERROR: weights not found — {path}{note}"
+                )
+            else:
+                self.status_message.emit(f"ERROR: weights not found — {path}")
             return False
 
         cw, ch = self._proc_w, self._proc_h
@@ -1061,6 +1458,7 @@ class PipelineWorker(QThread):
             compile_model=True,
             compile_mode="max-autotune",
             predequantize="auto",
+            use_hg=self._use_hg,
         )
 
         # ── Silent in-process warmup ───────────────────────────────
@@ -1230,9 +1628,13 @@ class PipelineWorker(QThread):
                     break
             if item is None:
                 break
-            # item is a GPU fp16 tensor (1,3,H,W) — all heavy work here
+            if isinstance(item, tuple) and len(item) == 2:
+                present_t, tensor = item
+            else:
+                present_t, tensor = None, item
+            # tensor is a GPU fp16 tensor (1,3,H,W) — all heavy work here
             with torch.inference_mode():
-                raw_cpu = (item.squeeze(0)
+                raw_cpu = (tensor.squeeze(0)
                            .clamp_(0.0, 1.0)
                            .permute(1, 2, 0)
                            .contiguous()
@@ -1241,7 +1643,49 @@ class PipelineWorker(QThread):
             hdr_u16 = (raw_cpu.astype(np.float32).__imul__(65535)
                        ).__add__(0.5)
             np.clip(hdr_u16, 0, 65535, out=hdr_u16)
+            if present_t is not None:
+                now = time.perf_counter()
+                if now < present_t:
+                    time.sleep(present_t - now)
             mpv_widget.feed_frame(hdr_u16.astype(np.uint16).data)
+
+    def _sdr_feeder_fn(self, sdr_q: _queue.Queue, mpv_widget: MpvHDRWidget):
+        """Drains *sdr_q*, converts uint8 BGR → uint16 RGB48LE,
+        and feeds them to the mpv widget on the shared presentation clock."""
+        while True:
+            try:
+                item = sdr_q.get(timeout=0.2)
+            except _queue.Empty:
+                continue
+            if item is None:                 # poison pill → exit
+                break
+            # If producer is ahead, skip stale entries and keep latest frame.
+            while True:
+                try:
+                    newer = sdr_q.get_nowait()
+                    if newer is None:
+                        item = None
+                        break
+                    item = newer
+                except _queue.Empty:
+                    break
+            if item is None:
+                break
+            if isinstance(item, tuple) and len(item) == 2:
+                present_t, frame = item
+            else:
+                present_t, frame = None, item
+            try:
+                rgb16 = np.ascontiguousarray(
+                    frame[:, :, ::-1].astype(np.uint16) * 257
+                )
+                if present_t is not None:
+                    now = time.perf_counter()
+                    if now < present_t:
+                        time.sleep(present_t - now)
+                mpv_widget.feed_frame(rgb16.data)
+            except Exception:
+                pass
 
     def _start_hdr_feeder(self):
         """Spin up background thread for async HDR extraction."""
@@ -1270,6 +1714,36 @@ class PipelineWorker(QThread):
             t.join(timeout=3)
         self._hdr_queue = None
         self._hdr_thread = None
+
+    def _start_sdr_feeder(self):
+        """Spin up background thread for async SDR feeding."""
+        if self._sdr_mpv_widget is None or self._sdr_queue is not None:
+            return
+        self._sdr_queue = _queue.Queue(maxsize=1)
+        self._sdr_thread = threading.Thread(
+            target=self._sdr_feeder_fn,
+            args=(self._sdr_queue, self._sdr_mpv_widget),
+            daemon=True,
+        )
+        self._sdr_thread.start()
+
+    def _stop_sdr_feeder(self):
+        """Shut down the SDR feeder thread."""
+        q = self._sdr_queue
+        if q is not None:
+            try:
+                q.put_nowait(None)      # poison pill
+            except _queue.Full:
+                try:
+                    q.get_nowait()
+                except _queue.Empty:
+                    pass
+                q.put(None)
+        t = self._sdr_thread
+        if t is not None:
+            t.join(timeout=3)
+        self._sdr_queue = None
+        self._sdr_thread = None
 
     # ── main loop ──
 
@@ -1307,10 +1781,12 @@ class PipelineWorker(QThread):
                 break
             _t.sleep(0.05)
 
-        # Start async HDR feeder if mpv is active
+        # Start async feeders if mpv is active
         mpv_w = self._mpv_widget
         if mpv_w is not None and not self._input_is_hdr:
             self._start_hdr_feeder()
+        if self._sdr_mpv_widget is not None:
+            self._start_sdr_feeder()
         self._start_app_vram_poll()
 
         # Keep prefetch shallow to improve frame-accurate seek behavior.
@@ -1337,6 +1813,8 @@ class PipelineWorker(QThread):
         lower_res_processing = (proc_w != out_w or proc_h != out_h)
 
         while not self._stop_flag:
+            if self._sdr_mpv_widget is not None and self._sdr_queue is None:
+                self._start_sdr_feeder()
             # Hot-swap precision
             pending = self._pending_precision
             if (not self._input_is_hdr) and pending and pending != self._precision_key:
@@ -1371,6 +1849,11 @@ class PipelineWorker(QThread):
                 force_position_emit = True
                 seek_frame_ready_pending = True
                 next_frame_t = time.perf_counter()
+                self._sdr_delay_frame = None
+                if seek_to <= 1:
+                    self._hdr_drop_until_frame = 2
+                    self._sdr_drop_until_frame = 2
+                    self._hold_until_t = time.perf_counter() + 0.5
                 # Discard stale FPS history so metrics/auto-mute re-lock quickly.
                 frame_times.clear()
                 presented_times.clear()
@@ -1395,12 +1878,16 @@ class PipelineWorker(QThread):
             elif now - next_frame_t > (frame_interval_s * 2.0):
                 # After long stalls (seek/pause/compile hiccup), resync.
                 next_frame_t = now
+            if self._hold_until_t and now < self._hold_until_t:
+                time.sleep(min(frame_interval_s, self._hold_until_t - now))
+            present_t = max(next_frame_t, time.perf_counter())
 
             ret, frame = source.read()
             if not ret:
                 break
 
             frame_idx += 1
+            self._frame_idx = frame_idx
 
             # FPS limiter via frame skipping (keeps wall-clock speed).
             if (not seek_frame_ready_pending) and frame_stride > 1 and (frame_idx % frame_stride) != 0:
@@ -1429,8 +1916,34 @@ class PipelineWorker(QThread):
                     rgb16 = np.ascontiguousarray(
                         output[:, :, ::-1].astype(np.uint16) * 257
                     )
+                    if present_t is not None:
+                        now_t = time.perf_counter()
+                        if now_t < present_t:
+                            time.sleep(present_t - now_t)
                     mpv_w.feed_frame(rgb16.data)
-                elif self._sdr_visible:
+                if (
+                    self._sdr_mpv_widget is not None
+                    and self._sdr_queue is not None
+                    and self._sdr_visible
+                ):
+                    if frame_idx < self._sdr_drop_until_frame:
+                        # Let mpv settle at the start; skip early SDR frames.
+                        pass
+                    else:
+                        self._sdr_drop_until_frame = 0
+                    if self._sdr_drop_until_frame == 0:
+                        try:
+                            self._sdr_queue.put_nowait((present_t, display_frame))
+                        except _queue.Full:
+                            try:
+                                self._sdr_queue.get_nowait()
+                            except _queue.Empty:
+                                pass
+                            try:
+                                self._sdr_queue.put_nowait((present_t, display_frame))
+                            except _queue.Full:
+                                pass
+                if self._sdr_visible:
                     need_hdr_cpu = True
             else:
                 # ── Fast path: preprocess → infer → mpv ─────────────────────
@@ -1447,18 +1960,48 @@ class PipelineWorker(QThread):
                              else raw_out)
                     if lower_res_processing:
                         t_raw = self._enhance_best_gpu(t_raw)
-                    try:
-                        self._hdr_queue.put_nowait(t_raw.clone())
-                    except _queue.Full:
-                        # Keep newest frame to avoid persistent HDR lag buildup.
+                    if frame_idx < self._hdr_drop_until_frame:
+                        # Let mpv settle at the start; skip early HDR frames.
+                        pass
+                    else:
+                        self._hdr_drop_until_frame = 0
+                    if self._hdr_drop_until_frame == 0:
                         try:
-                            self._hdr_queue.get_nowait()
-                        except _queue.Empty:
-                            pass
-                        try:
-                            self._hdr_queue.put_nowait(t_raw.clone())
+                            self._hdr_queue.put_nowait((present_t, t_raw.clone()))
                         except _queue.Full:
-                            pass
+                            # Keep newest frame to avoid persistent HDR lag buildup.
+                            try:
+                                self._hdr_queue.get_nowait()
+                            except _queue.Empty:
+                                pass
+                            try:
+                                self._hdr_queue.put_nowait((present_t, t_raw.clone()))
+                            except _queue.Full:
+                                pass
+
+                if (
+                    self._sdr_mpv_widget is not None
+                    and self._sdr_queue is not None
+                    and self._sdr_visible
+                ):
+                    if frame_idx < self._sdr_drop_until_frame:
+                        # Let mpv settle at the start; skip early SDR frames.
+                        pass
+                    else:
+                        self._sdr_drop_until_frame = 0
+                    if self._sdr_drop_until_frame == 0:
+                        try:
+                            self._sdr_queue.put_nowait((present_t, display_frame))
+                        except _queue.Full:
+                            # Keep newest frame to avoid persistent SDR lag buildup.
+                            try:
+                                self._sdr_queue.get_nowait()
+                            except _queue.Empty:
+                                pass
+                            try:
+                                self._sdr_queue.put_nowait((present_t, display_frame))
+                            except _queue.Full:
+                                pass
 
                 # Only run the expensive postprocess (GPU→CPU D2H) when
                 # the QLabel HDR fallback is the display path.
@@ -1470,6 +2013,7 @@ class PipelineWorker(QThread):
                         if out_w > output.shape[1] or out_h > output.shape[0]:
                             interp = BEST_CV2_INTERP
                             output = cv2.resize(output, (out_w, out_h), interpolation=interp)
+                            output = _apply_upscale_sharpen(output)
                         else:
                             output = cv2.resize(output, (out_w, out_h), interpolation=cv2.INTER_AREA)
                 elif use_cuda:
@@ -1498,9 +2042,12 @@ class PipelineWorker(QThread):
                 # QLabel fallback — both SDR + HDR frames needed
                 self.frame_ready.emit(display_frame, output)
             elif self._sdr_visible:
-                # mpv handles HDR; SDR QLabel still visible
+                # mpv handles HDR; SDR QLabel still visible.
                 self.frame_ready.emit(display_frame, display_frame)
             # else: both outputs are handled directly by mpv panes
+
+            if self._hold_until_t and time.perf_counter() >= self._hold_until_t:
+                self._hold_until_t = 0.0
 
             # Re-pause: if user paused and no further seek pending,
             # block again now that this seek frame has been emitted.
@@ -1526,8 +2073,11 @@ class PipelineWorker(QThread):
                     model_mb = 0.0
                     prec_label = "Bypass (HDR input)"
                 else:
-                    model_mb = os.path.getsize(
-                        PRECISIONS[self._precision_key]["model"]) / (1024 * 1024)
+                    model_path = _select_model_path(self._precision_key, self._use_hg)
+                    model_mb = os.path.getsize(model_path) / (1024 * 1024)
+                    if self._use_hg and self._precision_key in ("FP16", "FP32"):
+                        if os.path.isfile(_HG_WEIGHTS_PATH):
+                            model_mb += os.path.getsize(_HG_WEIGHTS_PATH) / (1024 * 1024)
                     prec_label = self._precision_key
                 self.metrics_updated.emit({
                     "fps": fps,
@@ -1543,9 +2093,28 @@ class PipelineWorker(QThread):
         source.release()
         self._source = None
         self._stop_hdr_feeder()
+        self._stop_sdr_feeder()
         self._stop_app_vram_poll()
         self.playback_finished.emit()
         self.status_message.emit("Playback finished.")
+
+
+class _KernelCacheClearWorker(QObject):
+    finished = pyqtSignal(bool)
+
+    def __init__(self, dirs):
+        super().__init__()
+        self._dirs = dirs
+
+    def run(self):
+        import shutil
+        ok = True
+        for d in self._dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                ok = False
+        self.finished.emit(ok)
 
 
 # ╔═══════════════════════════════════════════════════════════════╗
@@ -1661,6 +2230,71 @@ class _CompileDialog(QDialog):
 # ║  Pre-compile Dialog (subprocess-based, clean GPU)              ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+class _PrecompileOptionsDialog(QDialog):
+    """Collect precision + resolution choices before launching compile."""
+
+    def __init__(
+        self,
+        initial_precision: str,
+        initial_resolution: str,
+        precision_keys: list[str],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Pre-compile Kernels")
+        self.setMinimumSize(420, 260)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+
+        self._precision_combo = QComboBox()
+        self._precision_combo.addItems(precision_keys)
+        if initial_precision in precision_keys:
+            self._precision_combo.setCurrentText(initial_precision)
+
+        self._res_combo = QComboBox()
+        res_options = [
+            ("1080p (1920x1080)", f"{MAX_W}x{MAX_H}", "1080p"),
+            ("720p (1280x720)", "1280x720", "720p"),
+            ("540p (960x540)", "960x540", "540p"),
+        ]
+        for label, res_value, _res_key in res_options:
+            self._res_combo.addItem(label, res_value)
+        if initial_resolution:
+            for i, (_label, _value, res_key) in enumerate(res_options):
+                if initial_resolution == res_key:
+                    self._res_combo.setCurrentIndex(i)
+                    break
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel("Precision:"))
+        layout.addWidget(self._precision_combo)
+
+        layout.addWidget(QLabel("Resolution to compile:"))
+        layout.addWidget(self._res_combo)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("Start")
+        btn_cancel = QPushButton("Cancel")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        layout.addLayout(btn_row)
+
+    def selected_resolutions(self) -> list[str]:
+        return [str(self._res_combo.currentData())]
+
+    def selected_precision(self) -> str:
+        return self._precision_combo.currentText()
+
+
 class _PrecompileDialog(QDialog):
     """Modal dialog that launches ``compile_kernels.py`` in a separate
     process (zero GPU interference) and streams stdout into a log view."""
@@ -1745,6 +2379,10 @@ class _PrecompileDialog(QDialog):
             env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+        if os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+            env.insert("TORCHINDUCTOR_CACHE_DIR", os.environ["TORCHINDUCTOR_CACHE_DIR"])
+        if os.environ.get("TRITON_CACHE_DIR"):
+            env.insert("TRITON_CACHE_DIR", os.environ["TRITON_CACHE_DIR"])
         self._process.setProcessEnvironment(env)
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.finished.connect(self._on_finished)
@@ -1795,28 +2433,77 @@ class _PrecompileDialog(QDialog):
 # (resolution, precision) pairs have been compiled via a clean subprocess.
 # Cleared automatically when the user clears kernel caches.
 import pathlib as _pathlib
+import hashlib as _hashlib
 
-_TRITON_CACHE = _pathlib.Path.home() / ".triton" / "cache"
+_TRITON_CACHE = (
+    _pathlib.Path(os.environ.get("TRITON_CACHE_DIR", _pathlib.Path.home() / ".triton"))
+    / "cache"
+)
 
 
 def _compiled_marker_path() -> _pathlib.Path:
     return _TRITON_CACHE / "hdrtvnet_compiled.txt"
 
 
-def _is_compiled(w: int, h: int, precision: str) -> bool:
-    """Check if clean-compiled kernels exist for this resolution+precision."""
+_MODEL_HASH_CACHE: dict[str, str] = {}
+
+
+def _model_hash(path: str) -> str:
+    if not path:
+        return "missing"
+    cached = _MODEL_HASH_CACHE.get(path)
+    if cached:
+        return cached
+    try:
+        data = _pathlib.Path(path).read_bytes()
+    except Exception:
+        digest = "missing"
+    else:
+        digest = _hashlib.sha256(data).hexdigest()
+    _MODEL_HASH_CACHE[path] = digest
+    return digest
+
+
+def _compiled_key(
+    w: int,
+    h: int,
+    precision: str,
+    model_path: str,
+    use_hg: bool,
+    compile_mode: str = "max-autotune",
+) -> str:
+    mh = _model_hash(model_path)
+    return f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{mh}"
+
+
+def _is_compiled(
+    w: int,
+    h: int,
+    precision: str,
+    model_path: str,
+    use_hg: bool,
+    compile_mode: str = "max-autotune",
+) -> bool:
+    """Check if clean-compiled kernels exist for this config."""
     mp = _compiled_marker_path()
     if mp.is_file():
-        key = f"{w}x{h}_{precision}"
+        key = _compiled_key(w, h, precision, model_path, use_hg, compile_mode)
         return key in mp.read_text(encoding="utf-8").splitlines()
     return False
 
 
-def _mark_compiled(w: int, h: int, precision: str):
-    """Record that kernels for this resolution+precision were compiled cleanly."""
+def _mark_compiled(
+    w: int,
+    h: int,
+    precision: str,
+    model_path: str,
+    use_hg: bool,
+    compile_mode: str = "max-autotune",
+):
+    """Record that kernels for this config were compiled cleanly."""
     mp = _compiled_marker_path()
     mp.parent.mkdir(parents=True, exist_ok=True)
-    key = f"{w}x{h}_{precision}"
+    key = _compiled_key(w, h, precision, model_path, use_hg, compile_mode)
     existing = set()
     if mp.is_file():
         existing = set(mp.read_text(encoding="utf-8").splitlines())
@@ -1831,7 +2518,8 @@ def _precision_to_compile_arg(gui_precision: str) -> str:
         "FP32": "fp32",
         "INT8 Mixed (PTQ)": "int8-mixed",
         "INT8 Mixed (QAT)": "int8-mixed",
-        "INT8 Full (W8A8)": "int8-full",
+        "INT8 Full (PTQ)": "int8-full",
+        "INT8 Full (QAT)": "int8-full",
     }.get(str(gui_precision), "fp16")
 
 
@@ -1842,7 +2530,9 @@ def _precision_to_compile_arg(gui_precision: str) -> str:
 class MainWindow(QMainWindow):
     def __init__(self, initial_video=None, initial_resolution=None,
                  initial_precision=None, initial_view=None,
-                 initial_autoplay=False, initial_start_frame=None):
+                 initial_use_hg=None,
+                 initial_autoplay=False, initial_start_frame=None,
+                 initial_upscale=None, initial_film_grain=None):
         super().__init__()
         self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
         self.setMinimumSize(1024, 600)
@@ -1859,6 +2549,9 @@ class MainWindow(QMainWindow):
         self._active_precision = None
         self._active_resolution = None
         self._active_use_mpv = False
+        self._sdr_mpv_feed_from_worker = False
+        self._active_use_hg = True
+        self._active_film_grain = False
         self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
         self._last_seek_frame = 0
         self._post_seek_resync_frames = 0
@@ -1868,12 +2561,19 @@ class MainWindow(QMainWindow):
         self._audio_track_lock_until = 0.0
         self._audio_resync_pending = False
         self._audio_fps_recovered = True
+        self._audio_drift_check_stride = 10
         self._startup_audio_gate_active = False
         self._startup_audio_gate_count = 0
+        self._user_pause_override_startup = False
+        self._first_seek_done = False
+        self._ui_resync_gate_strict = False
         self._target_playback_fps = 24.0
         self._resume_audio_after_seek = False
         self._seek_resume_target = 0
         self._seek_resume_started_t = 0.0
+        self._precision_swap_pending: str | None = None
+        self._precision_pause_armed = False
+        self._precision_swap_timer: QTimer | None = None
         self._audio_player = None
         self._audio_output = None
         self._audio_available = _HAS_QT_AUDIO
@@ -1889,6 +2589,9 @@ class MainWindow(QMainWindow):
         self._audio_fade_timer: QTimer | None = None
         self._audio_fade_steps = 8
         self._audio_fade_step_idx = 0
+        self._proc_priority_saved = None
+        self._app_active = True
+        self._deferred_mpv_refresh = False
         self._cursor_idle_timer: QTimer | None = None
         self._cursor_idle_enabled = True
         self._cursor_hidden = False
@@ -1897,11 +2600,25 @@ class MainWindow(QMainWindow):
         self._last_sdr_frame: np.ndarray | None = None
         self._source_proc_dims: tuple[int, int] | None = None
         self._borderless_full_window = False
+        self._mpv_start_resync_t = 0.0
+        self._ui_hidden = False
+        self._ui_overlay_btn: QPushButton | None = None
+        self._ui_overlay_timer: QTimer | None = None
+        self._ui_overlay_hide_ms = 1200
+        self._ui_anim_effects: dict[QWidget, QGraphicsOpacityEffect] = {}
+        self._ui_anim_running: dict[QWidget, QPropertyAnimation] = {}
+        self._ui_anim_duration_ms = 0
+        self._layout_freeze_depth = 0
         self._saved_window_geometry: QRect | None = None
         self._saved_window_state = Qt.WindowState.WindowNoState
         self._window_toggle_last_t = 0.0
         self._window_toggle_cooldown_s = 0.25
         self._window_refresh_timer: QTimer | None = None
+        self._overlay_reposition_timer: QTimer | None = None
+        self._ui_pause_timer: QTimer | None = None
+        self._ui_pause_duration_ms = 180
+        self._periodic_relock_timer: QTimer | None = None
+        self._periodic_relock_ms = 3000
         self._act_borderless_full_window = None
         self._root_layout: QVBoxLayout | None = None
         self._immersive_saved_margins: tuple[int, int, int, int] | None = None
@@ -1927,7 +2644,14 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._init_audio_backend()
-        self._load_user_settings(initial_resolution, initial_precision, initial_view)
+        self._load_user_settings(
+            initial_resolution,
+            initial_precision,
+            initial_view,
+            initial_use_hg,
+            initial_upscale,
+            initial_film_grain,
+        )
         self._init_cursor_idle_tracking()
 
         # Auto-open video passed via --video (used by restart)
@@ -1941,6 +2665,9 @@ class MainWindow(QMainWindow):
                 mapped_resolution = legacy_resolution_map.get(initial_resolution, initial_resolution)
                 if mapped_resolution in RESOLUTION_SCALES or mapped_resolution == "Source":
                     self._cmb_res.setCurrentText(mapped_resolution)
+                if isinstance(initial_upscale, str) and initial_upscale in UPSCALER_CHOICES:
+                    if hasattr(self, "_cmb_upscale"):
+                        self._cmb_upscale.setCurrentText(initial_upscale)
                 if initial_view == "Tabbed":
                     self._cmb_view.setCurrentText("Tabbed")
                 self._set_video(initial_video, auto_play=bool(initial_autoplay))
@@ -1993,15 +2720,35 @@ class MainWindow(QMainWindow):
 
         row1.addWidget(QLabel("Precision:"))
         self._cmb_prec = QComboBox()
-        self._cmb_prec.addItems(PRECISIONS.keys())
+        self._cmb_prec.addItems(_available_precision_keys())
         self._cmb_prec.setFixedWidth(170)
         row1.addWidget(self._cmb_prec)
+        self._chk_hg = QCheckBox("Use HG")
+        self._chk_hg.setChecked(True)
+        self._chk_hg.setToolTip("Enable highlight refinement (HG).")
+        row1.addWidget(self._chk_hg)
 
         row1.addWidget(QLabel("Resolution:"))
         self._cmb_res = QComboBox()
         self._cmb_res.addItems(RESOLUTION_SCALES.keys())
         self._cmb_res.setFixedWidth(100)
         row1.addWidget(self._cmb_res)
+
+        row1.addWidget(QLabel("Upscale:"))
+        self._cmb_upscale = QComboBox()
+        self._cmb_upscale.addItems(UPSCALER_CHOICES)
+        self._cmb_upscale.setFixedWidth(130)
+        self._cmb_upscale.setToolTip(
+            "Upscale kernel for 540p/720p. 1080p stays native (no upscale)."
+        )
+        row1.addWidget(self._cmb_upscale)
+
+        self._chk_film_grain = QCheckBox("Film Grain")
+        self._chk_film_grain.setToolTip("Restore film grain using mpv shader.")
+        if not _HAS_MPV:
+            self._chk_film_grain.setEnabled(False)
+            self._chk_film_grain.setToolTip("Requires mpv (libmpv-2.dll).")
+        row1.addWidget(self._chk_film_grain)
 
         self._btn_apply_settings = QPushButton("Apply")
         self._btn_apply_settings.setFixedWidth(90)
@@ -2017,6 +2764,10 @@ class MainWindow(QMainWindow):
         self._btn_pop_hdr.setFixedWidth(88)
         row1.addWidget(self._btn_pop_sdr)
         row1.addWidget(self._btn_pop_hdr)
+        self._btn_toggle_ui = QPushButton("Hide UI")
+        self._btn_toggle_ui.setFixedWidth(90)
+        self._btn_toggle_ui.setEnabled(False)
+        row1.addWidget(self._btn_toggle_ui)
 
         root.addWidget(self._row1_widget)
 
@@ -2147,6 +2898,8 @@ class MainWindow(QMainWindow):
         self._video_tabs.addTab(self._sdr_tab_host, "SDR")
         self._video_tabs.addTab(self._hdr_tab_host, "HDR")
         self._video_tabs.addTab(self._side_tab_host, "Side by Side")
+        # Default to HDR tab unless user prefs override it later.
+        self._video_tabs.setCurrentIndex(1)
         if _HAS_MPV and self._disp_sdr_mpv is not None:
             self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_mpv)
         if _HAS_MPV and self._disp_hdr_mpv is not None:
@@ -2163,7 +2916,7 @@ class MainWindow(QMainWindow):
 
         self._m = {}
         mono = QFont("Consolas", 9)
-        for key in ("fps", "latency", "frame", "res", "gpu", "cpu", "model", "prec"):
+        for key in ("fps", "latency", "frame", "res", "gpu", "cpu", "model", "prec", "upscale"):
             lbl = QLabel(f"{key}: —")
             lbl.setFont(mono)
             ml.addWidget(lbl)
@@ -2197,14 +2950,29 @@ class MainWindow(QMainWindow):
         )
         self._sync_upscale_controls()
 
+        # ---- Overlay UI toggle (shown on mouse move when UI hidden) ----
+        self._ui_overlay_btn = QPushButton("Show UI", self)
+        self._ui_overlay_btn.setFixedSize(110, 30)
+        self._ui_overlay_btn.setStyleSheet(
+            "QPushButton { background: rgba(30,30,30,210); color: #eee; "
+            "border: 1px solid #666; border-radius: 6px; }"
+            "QPushButton:hover { background: rgba(50,50,50,230); }"
+        )
+        self._ui_overlay_btn.clicked.connect(self._toggle_ui_visibility)
+        self._ui_overlay_btn.hide()
+
 
     # ── Signal wiring ────────────────────────────────────────
 
     def _connect_signals(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(self._on_app_state_changed)
+
         self._btn_file.clicked.connect(self._open_file)
         self._btn_play.clicked.connect(self._play)
         self._btn_pause.clicked.connect(self._toggle_pause)
-        self._btn_stop.clicked.connect(self._stop)
+        self._btn_stop.clicked.connect(self._stop_and_restart)
         self._btn_apply_settings.clicked.connect(self._apply_runtime_settings)
         self._chk_metrics.toggled.connect(
             lambda on: self._grp_metrics.setVisible(on))
@@ -2214,13 +2982,19 @@ class MainWindow(QMainWindow):
         self._sld_volume.valueChanged.connect(self._on_volume_changed)
         self._cmb_audio_track.currentIndexChanged.connect(self._on_audio_track_changed)
         self._cmb_prec.currentTextChanged.connect(self._on_precision)
+        self._chk_hg.stateChanged.connect(self._on_hg_toggle)
         self._cmb_prec.currentTextChanged.connect(lambda _v: self._save_user_settings())
         self._cmb_res.currentTextChanged.connect(self._on_resolution)
         self._cmb_res.currentTextChanged.connect(lambda _v: self._save_user_settings())
+        self._cmb_upscale.currentTextChanged.connect(self._on_upscale_changed)
+        self._cmb_upscale.currentTextChanged.connect(lambda _v: self._save_user_settings())
+        if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+            self._chk_film_grain.stateChanged.connect(self._on_film_grain_changed)
         self._cmb_view.currentTextChanged.connect(self._on_view)
         self._cmb_view.currentTextChanged.connect(lambda _v: self._save_user_settings())
         self._btn_pop_sdr.clicked.connect(self._toggle_sdr_popout)
         self._btn_pop_hdr.clicked.connect(self._toggle_hdr_popout)
+        self._btn_toggle_ui.clicked.connect(self._toggle_ui_visibility)
         if self._video_tabs is not None:
             self._video_tabs.currentChanged.connect(self._on_video_tab_changed)
 
@@ -2239,8 +3013,20 @@ class MainWindow(QMainWindow):
             self._disp_hdr_mpv.hdr_info_ready.connect(self._on_hdr_info)
 
     def _sync_upscale_controls(self):
-        """No-op (upscale is fixed internally)."""
-        return
+        """Enable/disable upscale selector based on resolution preset."""
+        if not hasattr(self, "_cmb_upscale") or self._cmb_upscale is None:
+            return
+        scale_key = self._cmb_res.currentText()
+        allow = (scale_key in {"540p", "720p"})
+        self._cmb_upscale.blockSignals(True)
+        if allow:
+            self._cmb_upscale.setEnabled(True)
+            if self._cmb_upscale.currentText() not in UPSCALER_CHOICES:
+                self._cmb_upscale.setCurrentText(DEFAULT_UPSCALER)
+        else:
+            self._cmb_upscale.setCurrentText(DEFAULT_UPSCALER)
+            self._cmb_upscale.setEnabled(False)
+        self._cmb_upscale.blockSignals(False)
 
     def _refresh_resolution_options_for_video(self, path: str):
         """Show only processing presets that do not exceed source resolution."""
@@ -2313,6 +3099,20 @@ class MainWindow(QMainWindow):
         self._cmb_view.blockSignals(prev)
         self._on_view(mode)
 
+    def _set_process_priority(self, high: bool):
+        try:
+            p = psutil.Process(os.getpid())
+            if high:
+                if self._proc_priority_saved is None:
+                    self._proc_priority_saved = p.nice()
+                p.nice(psutil.HIGH_PRIORITY_CLASS)
+            else:
+                if self._proc_priority_saved is not None:
+                    p.nice(self._proc_priority_saved)
+                self._proc_priority_saved = None
+        except Exception:
+            pass
+
     @staticmethod
     def _rehost_widget(widget: QWidget, host_layout: QVBoxLayout):
         old_parent = widget.parentWidget()
@@ -2324,96 +3124,125 @@ class MainWindow(QMainWindow):
     def _on_video_tab_changed(self, index: int):
         if self._video_tabs is None or index < 0:
             return
-        label = self._video_tabs.tabText(index)
-        if label == "Side by Side":
-            # Side-by-side needs both panes docked in the split hosts.
-            if self._sdr_float_window is not None:
-                self._dock_video_pane("sdr")
-            if self._hdr_float_window is not None:
-                self._dock_video_pane("hdr")
-            if self._side_sdr_host is not None and self._disp_sdr.parentWidget() is not self._side_sdr_host:
-                self._rehost_widget(self._disp_sdr, self._side_sdr_host.layout())
-            if self._side_hdr_host is not None and self._disp_hdr.parentWidget() is not self._side_hdr_host:
-                self._rehost_widget(self._disp_hdr, self._side_hdr_host.layout())
-        else:
-            # Single tabs own their respective panes when not popped out.
-            if self._sdr_float_window is None and self._sdr_tab_host is not None:
-                if self._disp_sdr.parentWidget() is not self._sdr_tab_host:
-                    self._rehost_widget(self._disp_sdr, self._sdr_tab_host.layout())
-            if self._hdr_float_window is None and self._hdr_tab_host is not None:
-                if self._disp_hdr.parentWidget() is not self._hdr_tab_host:
-                    self._rehost_widget(self._disp_hdr, self._hdr_tab_host.layout())
-        self._schedule_window_state_refresh(40)
+        self._pause_for_ui_transition()
+        def _apply_tab_switch():
+            label = self._video_tabs.tabText(index)
+            if label == "Side by Side":
+                # Side-by-side needs both panes docked in the split hosts.
+                if self._sdr_float_window is not None:
+                    self._dock_video_pane("sdr")
+                if self._hdr_float_window is not None:
+                    self._dock_video_pane("hdr")
+                if self._side_sdr_host is not None and self._disp_sdr.parentWidget() is not self._side_sdr_host:
+                    self._rehost_widget(self._disp_sdr, self._side_sdr_host.layout())
+                if self._side_hdr_host is not None and self._disp_hdr.parentWidget() is not self._side_hdr_host:
+                    self._rehost_widget(self._disp_hdr, self._side_hdr_host.layout())
+            else:
+                # Single tabs own their respective panes when not popped out.
+                if self._sdr_float_window is None and self._sdr_tab_host is not None:
+                    if self._disp_sdr.parentWidget() is not self._sdr_tab_host:
+                        self._rehost_widget(self._disp_sdr, self._sdr_tab_host.layout())
+                if self._hdr_float_window is None and self._hdr_tab_host is not None:
+                    if self._disp_hdr.parentWidget() is not self._hdr_tab_host:
+                        self._rehost_widget(self._disp_hdr, self._hdr_tab_host.layout())
+            self._save_user_settings()
+        self._with_layout_freeze(_apply_tab_switch, refresh_delay=40)
+        if self._playing:
+            self._relock_timeline(delay_ms=140, drop_frames=3)
+
+    def _on_app_state_changed(self, state: Qt.ApplicationState):
+        active = (state == Qt.ApplicationState.ApplicationActive)
+        if self._app_active == active:
+            return
+        self._app_active = active
+        if self._playing:
+            self._set_process_priority(True)
+            if active:
+                self._pause_for_ui_transition()
 
     def _toggle_sdr_popout(self):
         if self._sdr_float_window is not None:
             self._dock_video_pane("sdr")
             return
-        win = DetachedVideoWindow("sdr", "SDR View")
-        win.closed.connect(self._on_video_window_closed)
-        self._rehost_widget(self._disp_sdr, win.layout())
-        win.move(self.frameGeometry().topLeft() + QPoint(40, 40))
-        win.show()
-        win.raise_()
-        win.activateWindow()
-        self._sdr_float_window = win
-        self._btn_pop_sdr.setText("Dock SDR")
-        self._schedule_window_state_refresh(40)
+        def _apply_pop():
+            win = DetachedVideoWindow("sdr", "SDR View")
+            win.closed.connect(self._on_video_window_closed)
+            self._rehost_widget(self._disp_sdr, win.layout())
+            win.move(self.frameGeometry().topLeft() + QPoint(40, 40))
+            win.show()
+            win.raise_()
+            win.activateWindow()
+            self._sdr_float_window = win
+            self._btn_pop_sdr.setText("Dock SDR")
+        self._with_layout_freeze(_apply_pop, refresh_delay=40)
+        if self._playing:
+            self._relock_timeline(delay_ms=160, drop_frames=3)
 
     def _toggle_hdr_popout(self):
         if self._hdr_float_window is not None:
             self._dock_video_pane("hdr")
             return
-        win = DetachedVideoWindow("hdr", "HDR View")
-        win.closed.connect(self._on_video_window_closed)
-        self._rehost_widget(self._disp_hdr, win.layout())
-        win.move(self.frameGeometry().topLeft() + QPoint(80, 80))
-        win.show()
-        win.raise_()
-        win.activateWindow()
-        self._hdr_float_window = win
-        self._btn_pop_hdr.setText("Dock HDR")
-        self._schedule_window_state_refresh(40)
+        def _apply_pop():
+            win = DetachedVideoWindow("hdr", "HDR View")
+            win.closed.connect(self._on_video_window_closed)
+            self._rehost_widget(self._disp_hdr, win.layout())
+            win.move(self.frameGeometry().topLeft() + QPoint(80, 80))
+            win.show()
+            win.raise_()
+            win.activateWindow()
+            self._hdr_float_window = win
+            self._btn_pop_hdr.setText("Dock HDR")
+        self._with_layout_freeze(_apply_pop, refresh_delay=40)
+        if self._playing:
+            self._relock_timeline(delay_ms=160, drop_frames=3)
+            # Follow-up relock after next position update to prevent stale-frame audio lag.
+            QTimer.singleShot(520, lambda: self._relock_timeline(drop_frames=1))
 
     def _dock_video_pane(self, key: str, from_signal: bool = False):
-        side_mode = (
-            self._video_tabs is not None
-            and self._video_tabs.currentIndex() >= 0
-            and self._video_tabs.tabText(self._video_tabs.currentIndex()) == "Side by Side"
-        )
-        if key == "sdr":
-            win = self._sdr_float_window
-            if win is None:
-                return
-            if side_mode and self._side_sdr_host is not None:
-                self._rehost_widget(self._disp_sdr, self._side_sdr_host.layout())
-            elif self._sdr_tab_host is not None:
-                self._rehost_widget(self._disp_sdr, self._sdr_tab_host.layout())
-            if not from_signal:
-                try:
-                    win.closed.disconnect(self._on_video_window_closed)
-                except Exception:
-                    pass
-                win.close()
-            self._sdr_float_window = None
-            self._btn_pop_sdr.setText("Pop SDR")
-        elif key == "hdr":
-            win = self._hdr_float_window
-            if win is None:
-                return
-            if side_mode and self._side_hdr_host is not None:
-                self._rehost_widget(self._disp_hdr, self._side_hdr_host.layout())
-            elif self._hdr_tab_host is not None:
-                self._rehost_widget(self._disp_hdr, self._hdr_tab_host.layout())
-            if not from_signal:
-                try:
-                    win.closed.disconnect(self._on_video_window_closed)
-                except Exception:
-                    pass
-                win.close()
-            self._hdr_float_window = None
-            self._btn_pop_hdr.setText("Pop HDR")
-        self._schedule_window_state_refresh(40)
+        def _apply_dock():
+            side_mode = (
+                self._video_tabs is not None
+                and self._video_tabs.currentIndex() >= 0
+                and self._video_tabs.tabText(self._video_tabs.currentIndex()) == "Side by Side"
+            )
+            if key == "sdr":
+                win = self._sdr_float_window
+                if win is None:
+                    return
+                if side_mode and self._side_sdr_host is not None:
+                    self._rehost_widget(self._disp_sdr, self._side_sdr_host.layout())
+                elif self._sdr_tab_host is not None:
+                    self._rehost_widget(self._disp_sdr, self._sdr_tab_host.layout())
+                if not from_signal:
+                    try:
+                        win.closed.disconnect(self._on_video_window_closed)
+                    except Exception:
+                        pass
+                    win.close()
+                self._sdr_float_window = None
+                self._btn_pop_sdr.setText("Pop SDR")
+            elif key == "hdr":
+                win = self._hdr_float_window
+                if win is None:
+                    return
+                if side_mode and self._side_hdr_host is not None:
+                    self._rehost_widget(self._disp_hdr, self._side_hdr_host.layout())
+                elif self._hdr_tab_host is not None:
+                    self._rehost_widget(self._disp_hdr, self._hdr_tab_host.layout())
+                if not from_signal:
+                    try:
+                        win.closed.disconnect(self._on_video_window_closed)
+                    except Exception:
+                        pass
+                    win.close()
+                self._hdr_float_window = None
+                self._btn_pop_hdr.setText("Pop HDR")
+        self._with_layout_freeze(_apply_dock, refresh_delay=40)
+        if self._playing:
+            self._relock_timeline(delay_ms=160, drop_frames=3)
+            if str(key).lower() == "hdr":
+                # Follow-up relock after next position update to prevent stale-frame audio lag.
+                QTimer.singleShot(520, lambda: self._relock_timeline(drop_frames=1))
 
     def _on_video_window_closed(self, key: str):
         if self._ui_closing:
@@ -2436,6 +3265,50 @@ class MainWindow(QMainWindow):
             "hdr": self._grp_hdr,
         }
 
+        def _ensure_effect(widget: QWidget) -> QGraphicsOpacityEffect:
+            eff = self._ui_anim_effects.get(widget)
+            if eff is None:
+                eff = QGraphicsOpacityEffect(widget)
+                eff.setOpacity(1.0)
+                widget.setGraphicsEffect(eff)
+                self._ui_anim_effects[widget] = eff
+            return eff
+
+        def _animate_widget(widget: QWidget, show: bool):
+            if widget is None:
+                return
+            if self._ui_anim_duration_ms <= 0:
+                widget.setVisible(bool(show))
+                eff = self._ui_anim_effects.get(widget)
+                if eff is not None:
+                    eff.setOpacity(1.0)
+                return
+            anim = self._ui_anim_running.get(widget)
+            if anim is not None:
+                anim.stop()
+            eff = _ensure_effect(widget)
+            anim = QPropertyAnimation(eff, b"opacity", self)
+            anim.setDuration(max(60, int(self._ui_anim_duration_ms)))
+            anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+            if show:
+                widget.setVisible(True)
+                eff.setOpacity(0.0)
+                anim.setStartValue(0.0)
+                anim.setEndValue(1.0)
+            else:
+                eff.setOpacity(1.0)
+                anim.setStartValue(1.0)
+                anim.setEndValue(0.0)
+
+            def _done():
+                if not show:
+                    widget.setVisible(False)
+                    eff.setOpacity(1.0)
+
+            anim.finished.connect(_done)
+            self._ui_anim_running[widget] = anim
+            anim.start()
+
         if enabled:
             self._immersive_saved_vis = {k: w.isVisible() for k, w in targets.items()}
             m = self._root_layout.contentsMargins()
@@ -2444,7 +3317,8 @@ class MainWindow(QMainWindow):
             self._immersive_saved_view_mode = self._cmb_view.currentText()
 
             for w in targets.values():
-                w.setVisible(False)
+                if w is not None and w.isVisible():
+                    _animate_widget(w, False)
             self._root_layout.setContentsMargins(0, 0, 0, 0)
             self._root_layout.setSpacing(0)
             if self._video_tabs is not None:
@@ -2452,7 +3326,9 @@ class MainWindow(QMainWindow):
             return
 
         for key, w in targets.items():
-            w.setVisible(self._immersive_saved_vis.get(key, True))
+            want = self._immersive_saved_vis.get(key, True)
+            if w is not None:
+                _animate_widget(w, bool(want))
 
         if self._immersive_saved_margins is not None:
             l, t, r, b = self._immersive_saved_margins
@@ -2463,6 +3339,62 @@ class MainWindow(QMainWindow):
             self._video_tabs.tabBar().setVisible(True)
         if self._immersive_saved_view_mode:
             self._set_view_mode_silently(self._immersive_saved_view_mode)
+
+    def _position_ui_overlay(self):
+        if self._ui_overlay_btn is None:
+            return
+        margin = 16
+        w = self._ui_overlay_btn.width()
+        h = self._ui_overlay_btn.height()
+        x = max(margin, self.width() - w - margin)
+        y = margin
+        self._ui_overlay_btn.move(x, y)
+
+    def _show_ui_overlay_temporarily(self):
+        if self._ui_overlay_btn is None:
+            return
+        if not self._ui_hidden:
+            self._ui_overlay_btn.hide()
+            return
+        if self._row3_widget is not None:
+            self._row3_widget.setVisible(True)
+        self._position_ui_overlay()
+        self._ui_overlay_btn.show()
+        self._ui_overlay_btn.raise_()
+        if self._ui_overlay_timer is None:
+            self._ui_overlay_timer = QTimer(self)
+            self._ui_overlay_timer.setSingleShot(True)
+            self._ui_overlay_timer.timeout.connect(self._hide_ui_overlay)
+        self._ui_overlay_timer.stop()
+        self._ui_overlay_timer.start(int(self._ui_overlay_hide_ms))
+
+    def _hide_ui_overlay(self):
+        if self._ui_overlay_btn is not None:
+            self._ui_overlay_btn.hide()
+
+    def _toggle_ui_visibility(self):
+        if not self._playing:
+            return
+        self._pause_for_ui_transition()
+        self._ui_hidden = not self._ui_hidden
+        self._set_immersive_video_ui(self._ui_hidden)
+        if self._ui_hidden:
+            self.menuBar().setVisible(False)
+            self.statusBar().setVisible(False)
+            self._show_ui_overlay_temporarily()
+        else:
+            self.menuBar().setVisible(True)
+            self.statusBar().setVisible(True)
+            if self._row3_widget is not None:
+                self._row3_widget.setVisible(True)
+            if self._ui_overlay_btn is not None:
+                self._ui_overlay_btn.hide()
+        if self._btn_toggle_ui is not None:
+            self._btn_toggle_ui.setText("Show UI" if self._ui_hidden else "Hide UI")
+        # Layout changes can momentarily stall video presentation.
+        # Re-anchor audio to the current timeline after the UI toggle.
+        if self._playing:
+            self._relock_timeline(delay_ms=120, drop_frames=2)
 
     def _set_pause_button_labels(self, paused: bool):
         if paused:
@@ -2477,10 +3409,131 @@ class MainWindow(QMainWindow):
         self._window_refresh_timer.setSingleShot(True)
         self._window_refresh_timer.timeout.connect(self._refresh_mpv_after_window_state_change)
 
+    def _begin_layout_freeze(self):
+        return
+
+    def _end_layout_freeze(self, refresh_delay: int | None = 40):
+        if refresh_delay is not None:
+            self._schedule_window_state_refresh(refresh_delay)
+
+    def _with_layout_freeze(self, fn, refresh_delay: int | None = 40):
+        fn()
+        if refresh_delay is not None:
+            self._schedule_window_state_refresh(refresh_delay)
+
     def _schedule_window_state_refresh(self, delay_ms: int = 140):
         self._ensure_window_refresh_timer()
         self._window_refresh_timer.stop()
         self._window_refresh_timer.start(max(0, int(delay_ms)))
+
+    def _ensure_overlay_reposition_timer(self):
+        if self._overlay_reposition_timer is not None:
+            return
+        self._overlay_reposition_timer = QTimer(self)
+        self._overlay_reposition_timer.setSingleShot(True)
+        self._overlay_reposition_timer.timeout.connect(self._position_ui_overlay)
+
+    def _schedule_overlay_position(self, delay_ms: int = 16):
+        self._position_ui_overlay()
+
+    def _ensure_ui_pause_timer(self):
+        if self._ui_pause_timer is not None:
+            return
+        self._ui_pause_timer = QTimer(self)
+        self._ui_pause_timer.setSingleShot(True)
+
+    def _ensure_periodic_relock_timer(self):
+        if self._periodic_relock_timer is not None:
+            return
+        self._periodic_relock_timer = QTimer(self)
+        self._periodic_relock_timer.setSingleShot(False)
+        self._periodic_relock_timer.timeout.connect(self._periodic_relock_tick)
+
+    def _periodic_relock_tick(self):
+        if not self._playing:
+            return
+        if self._worker is None or self._worker.is_paused:
+            return
+        if self._startup_sync_pending:
+            return
+        if not self._active_use_mpv:
+            return
+        # Light-touch resync to keep HDR/SDR aligned over time (video-only).
+        fps = getattr(self, "_vid_fps", 30.0)
+        target_sec = float(self._last_seek_frame) / max(fps, 1e-6)
+        if self._audio_available and self._audio_player is not None:
+            try:
+                target_sec = float(self._audio_player.position()) / 1000.0
+            except Exception:
+                target_sec = float(self._last_seek_frame) / max(fps, 1e-6)
+        if self._worker is not None:
+            self._worker.flush_hdr_queue(drop_frames=1)
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.seek_seconds(target_sec)
+        if self._disp_sdr_mpv is not None:
+            self._disp_sdr_mpv.seek_seconds(target_sec)
+
+    def _start_periodic_relock(self):
+        self._ensure_periodic_relock_timer()
+        if self._periodic_relock_timer is None:
+            return
+        self._periodic_relock_timer.stop()
+        self._periodic_relock_timer.start(int(self._periodic_relock_ms))
+
+    def _stop_periodic_relock(self):
+        if self._periodic_relock_timer is not None:
+            self._periodic_relock_timer.stop()
+
+    def _pause_for_ui_transition(self, duration_ms: int | None = None,
+                                 wait_for_stable: bool = True):
+        if not self._playing:
+            return
+        if self._worker is not None and self._worker.is_paused:
+            return
+        if self._ui_pause_timer is not None and self._ui_pause_timer.isActive():
+            self._ui_pause_timer.stop()
+        delay = int(duration_ms if duration_ms is not None else self._ui_pause_duration_ms)
+        # FSR shader refresh can stall mpv a bit longer during UI changes.
+        if self._active_mpv_scale_kernel == "fsr":
+            delay += 140
+        delay = max(60, delay)
+
+        if self._worker is not None:
+            self._worker.pause()
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.set_paused(True)
+        if self._disp_sdr_mpv is not None:
+            self._disp_sdr_mpv.set_paused(True)
+        if self._audio_available:
+            self._set_audio_paused(True)
+
+        self._ensure_ui_pause_timer()
+        if self._ui_pause_timer is None:
+            return
+
+        def _resume():
+            if not self._playing:
+                return
+            if self._worker is not None and self._worker.is_paused:
+                self._worker.resume()
+            if self._disp_hdr_mpv is not None:
+                self._disp_hdr_mpv.set_paused(False)
+            if self._disp_sdr_mpv is not None:
+                self._disp_sdr_mpv.set_paused(False)
+            if self._audio_available and not self._startup_sync_pending:
+                # Keep audio paused until FPS stabilizes after the UI change.
+                self._startup_audio_gate_active = True
+                self._startup_audio_gate_count = 0
+                self._ui_resync_gate_strict = True
+                now_t = time.perf_counter()
+                self._audio_seek_guard_until = max(self._audio_seek_guard_until, now_t + 0.8)
+
+        try:
+            self._ui_pause_timer.timeout.disconnect()
+        except Exception:
+            pass
+        self._ui_pause_timer.timeout.connect(_resume)
+        self._ui_pause_timer.start(delay)
 
     def _resync_audio_to_current_timeline(self):
         if not self._playing:
@@ -2488,11 +3541,109 @@ class MainWindow(QMainWindow):
         fps = getattr(self, "_vid_fps", 30.0)
         sec = float(self._last_seek_frame) / max(fps, 1e-6)
         if self._audio_available:
-            self._seek_audio_seconds(sec)
+            self._force_audio_seek(sec)
             if not self._worker.is_paused and not self._startup_sync_pending:
                 self._set_audio_paused(False)
-        elif self._disp_hdr_mpv is not None:
+        if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.seek_seconds(sec)
+        if self._disp_sdr_mpv is not None:
+            self._disp_sdr_mpv.seek_seconds(sec)
+
+    def _relock_timeline(self, delay_ms: int = 0, drop_frames: int = 2):
+        """Force a timeline relock (audio + HDR queue) after UI actions."""
+        if not self._playing:
+            return
+        def _do():
+            if not self._playing:
+                return
+            if self._worker is not None:
+                self._worker.flush_hdr_queue(drop_frames=drop_frames)
+            self._resync_audio_to_current_timeline()
+        if delay_ms > 0:
+            QTimer.singleShot(int(delay_ms), _do)
+        else:
+            _do()
+
+    def _force_audio_seek(self, sec: float):
+        """Aggressive audio resync: double-seek to reduce drift after UI changes."""
+        if not self._audio_available:
+            return
+        self._seek_audio_seconds(sec)
+        def _second_seek():
+            self._seek_audio_seconds(sec)
+        QTimer.singleShot(20, _second_seek)
+
+    def _schedule_precision_audio_resync(self, delay_ms: int = 240):
+        if not self._playing:
+            return
+        # Precision swaps can stall inference; pause briefly, then re-anchor audio.
+        self._audio_resync_pending = True
+        self._audio_fps_recovered = False
+        if self._audio_available:
+            self._set_audio_paused(True)
+        now_t = time.perf_counter()
+        self._audio_seek_guard_until = max(self._audio_seek_guard_until, now_t + 0.6)
+
+        def _finish():
+            if not self._playing:
+                return
+            self._audio_fps_recovered = True
+            self._resync_audio_to_current_timeline()
+
+        QTimer.singleShot(max(0, int(delay_ms)), _finish)
+
+    def _pause_for_precision_swap(self, key: str, timeout_ms: int = 20000):
+        if not self._playing or self._worker is None:
+            return
+        # Track which precision we are waiting to stabilize.
+        self._precision_swap_pending = key
+        # Only auto-resume if we weren't already paused by the user.
+        self._precision_pause_armed = not self._worker.is_paused
+
+        if self._precision_pause_armed:
+            self._worker.pause()
+            if self._disp_hdr_mpv is not None:
+                self._disp_hdr_mpv.set_paused(True)
+            if self._disp_sdr_mpv is not None:
+                self._disp_sdr_mpv.set_paused(True)
+            if self._audio_available:
+                self._set_audio_paused(True)
+
+        # Safety timeout in case we miss the "Ready" status message.
+        if self._precision_swap_timer is None:
+            self._precision_swap_timer = QTimer(self)
+            self._precision_swap_timer.setSingleShot(True)
+        else:
+            self._precision_swap_timer.stop()
+
+        def _timeout_resume():
+            self._resume_after_precision_swap(force=True)
+
+        try:
+            self._precision_swap_timer.timeout.disconnect()
+        except Exception:
+            pass
+        self._precision_swap_timer.timeout.connect(_timeout_resume)
+        self._precision_swap_timer.start(int(timeout_ms))
+
+    def _resume_after_precision_swap(self, force: bool = False):
+        if self._precision_swap_pending is None:
+            return
+        if self._precision_swap_timer is not None:
+            self._precision_swap_timer.stop()
+        if self._precision_pause_armed:
+            if self._worker is not None and self._worker.is_paused:
+                self._worker.resume()
+            if self._disp_hdr_mpv is not None:
+                self._disp_hdr_mpv.set_paused(False)
+            if self._disp_sdr_mpv is not None:
+                self._disp_sdr_mpv.set_paused(False)
+            if self._audio_available and not self._startup_sync_pending:
+                # Keep audio paused until FPS stabilizes after the precision swap.
+                self._startup_audio_gate_active = True
+                self._startup_audio_gate_count = 0
+        self._precision_swap_pending = None
+        self._precision_pause_armed = False
 
     def _toggle_borderless_full_window(self):
         now_t = time.perf_counter()
@@ -2507,82 +3658,117 @@ class MainWindow(QMainWindow):
     def _enter_borderless_full_window(self):
         if self._borderless_full_window:
             return
-        self._saved_window_geometry = self.geometry()
-        self._saved_window_state = self._without_fullscreen(self.windowState())
+        self._pause_for_ui_transition()
+        def _apply_full():
+            self._saved_window_geometry = self.geometry()
+            self._saved_window_state = self._without_fullscreen(self.windowState())
+            # Borderless fullscreen geometry: hides taskbar/top bar without
+            # using true fullscreen (keeps "zoom" feel).
+            self.menuBar().setVisible(True)
+            self.statusBar().setVisible(True)
+            self._ui_hidden = False
+            self._set_immersive_video_ui(False)
+            if self._btn_toggle_ui is not None:
+                self._btn_toggle_ui.setText("Hide UI")
+            self.setWindowState(self._without_fullscreen(self.windowState()))
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+            self.show()
+            self.setGeometry(self._current_screen_geometry())
 
-        self.menuBar().setVisible(False)
-        self.statusBar().setVisible(False)
-        self._set_immersive_video_ui(True)
-
-        self.setWindowState(self._without_fullscreen(self.windowState()))
-        self.setWindowState(Qt.WindowState.WindowNoState)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.show()
-        self.setGeometry(self._safe_borderless_geometry())
-
-        self._borderless_full_window = True
-        if self._act_borderless_full_window is not None:
-            self._act_borderless_full_window.setChecked(True)
-        self._schedule_window_state_refresh()
-        QTimer.singleShot(180, self._resync_audio_to_current_timeline)
+            self._borderless_full_window = True
+            if self._act_borderless_full_window is not None:
+                self._act_borderless_full_window.setChecked(True)
+            self._schedule_overlay_position(0)
+        self._with_layout_freeze(_apply_full, refresh_delay=140)
+        self._relock_timeline(delay_ms=180, drop_frames=3)
 
     def _exit_borderless_full_window(self):
         if not self._borderless_full_window:
             return
-        restore_state = self._without_fullscreen(self._saved_window_state)
-        restore_geom = self._saved_window_geometry
+        self._pause_for_ui_transition()
+        def _apply_exit():
+            restore_state = self._without_fullscreen(self._saved_window_state)
+            restore_geom = self._saved_window_geometry
+            self._borderless_full_window = False
+            if self._act_borderless_full_window is not None:
+                self._act_borderless_full_window.setChecked(False)
 
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
-        self.show()
-        self.menuBar().setVisible(True)
-        self.statusBar().setVisible(True)
-        self._set_immersive_video_ui(False)
-
-        self._borderless_full_window = False
-        if self._act_borderless_full_window is not None:
-            self._act_borderless_full_window.setChecked(False)
-
-        self.setWindowState(self._without_fullscreen(self.windowState()))
-        self.setWindowState(Qt.WindowState.WindowNoState)
-        if restore_geom is not None:
-            self.setGeometry(restore_geom)
-        if bool(restore_state & Qt.WindowState.WindowMaximized):
-            self.showMaximized()
-        else:
-            self.showNormal()
-
-        self._schedule_window_state_refresh()
-        QTimer.singleShot(180, self._resync_audio_to_current_timeline)
+            self.setWindowState(self._without_fullscreen(self.windowState()))
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)
+            self.show()
+            self.menuBar().setVisible(True)
+            self.statusBar().setVisible(True)
+            self._set_immersive_video_ui(False)
+            self._ui_hidden = False
+            if self._btn_toggle_ui is not None:
+                self._btn_toggle_ui.setText("Hide UI")
+            if restore_geom is not None:
+                self.setGeometry(restore_geom)
+            if bool(restore_state & Qt.WindowState.WindowMaximized):
+                self.showMaximized()
+            else:
+                self.showNormal()
+            self._schedule_overlay_position(0)
+        self._with_layout_freeze(_apply_exit, refresh_delay=140)
+        self._relock_timeline(delay_ms=180, drop_frames=3)
 
     def _should_use_mpv_pipeline(self) -> bool:
         return self._disp_hdr_mpv is not None
 
-    def _load_user_settings(self, initial_resolution, initial_precision, initial_view):
+    def _load_user_settings(self, initial_resolution, initial_precision,
+                            initial_view, initial_use_hg,
+                            initial_upscale, initial_film_grain):
         """Load persisted GUI preferences unless explicitly overridden by CLI."""
-        if not os.path.isfile(_PREFS_PATH):
-            return
-        try:
-            with open(_PREFS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return
+        data = {}
+        if os.path.isfile(_PREFS_PATH):
+            try:
+                with open(_PREFS_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
 
         if initial_precision is None:
             p = data.get("precision")
-            if p in PRECISIONS:
+            if p in _available_precision_keys():
                 self._cmb_prec.setCurrentText(p)
         if initial_resolution is None:
             r = data.get("resolution")
-            if r == "Native":
-                r = "1080p"
             if r in RESOLUTION_SCALES or r == "Source":
                 self._cmb_res.setCurrentText(r)
+        if hasattr(self, "_cmb_upscale"):
+            if isinstance(initial_upscale, str) and initial_upscale in UPSCALER_CHOICES:
+                self._cmb_upscale.setCurrentText(initial_upscale)
+            else:
+                um = data.get("upscale_mode")
+                if isinstance(um, str) and um in UPSCALER_CHOICES:
+                    self._cmb_upscale.setCurrentText(um)
+        if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+            if initial_film_grain is None:
+                fg = data.get("film_grain")
+                if isinstance(fg, bool):
+                    self._chk_film_grain.setChecked(fg)
+            else:
+                self._chk_film_grain.setChecked(str(initial_film_grain).strip() == "1")
         if initial_view is None:
             v = data.get("view")
             if v == "Tabbed":
                 self._cmb_view.setCurrentText("Tabbed")
+        # Restore last active tab (defaults to HDR if missing).
+        if self._video_tabs is not None:
+            saved_tab = data.get("active_tab", "HDR")
+            for i in range(self._video_tabs.count()):
+                if self._video_tabs.tabText(i) == saved_tab:
+                    self._video_tabs.setCurrentIndex(i)
+                    break
+            else:
+                # If saved tab not found, default to HDR.
+                for i in range(self._video_tabs.count()):
+                    if self._video_tabs.tabText(i) == "HDR":
+                        self._video_tabs.setCurrentIndex(i)
+                        break
+        self._chk_hg.setChecked(bool(data.get("use_hg", True)))
+        if initial_use_hg is not None:
+            self._chk_hg.setChecked(str(initial_use_hg).strip() == "1")
 
         m = data.get("show_metrics")
         if isinstance(m, bool):
@@ -2599,16 +3785,23 @@ class MainWindow(QMainWindow):
         if isinstance(hc, bool):
             self._chk_hide_cursor.setChecked(hc)
 
+        self._sync_upscale_controls()
+
     def _save_user_settings(self):
         data = {
             "precision": self._cmb_prec.currentText(),
             "resolution": self._cmb_res.currentText(),
+            "upscale_mode": self._cmb_upscale.currentText() if hasattr(self, "_cmb_upscale") else DEFAULT_UPSCALER,
             "view": self._cmb_view.currentText(),
             "show_metrics": self._chk_metrics.isChecked(),
+            "use_hg": self._chk_hg.isChecked(),
+            "film_grain": bool(getattr(self, "_chk_film_grain", None) and self._chk_film_grain.isChecked()),
             "volume_percent": int(self._volume_percent),
             "audio_track": int(self._selected_audio_track),
             "hide_cursor_idle": bool(self._cursor_idle_enabled),
         }
+        if self._video_tabs is not None and self._video_tabs.currentIndex() >= 0:
+            data["active_tab"] = self._video_tabs.tabText(self._video_tabs.currentIndex())
         try:
             with open(_PREFS_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -2907,6 +4100,8 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         et = event.type()
+        if et == QEvent.Type.Resize:
+            self._position_ui_overlay()
         if et in (
             QEvent.Type.MouseMove,
             QEvent.Type.MouseButtonPress,
@@ -2916,6 +4111,8 @@ class MainWindow(QMainWindow):
         ):
             self._show_cursor()
             self._arm_cursor_idle_timer()
+            if self._ui_hidden:
+                self._show_ui_overlay_temporarily()
         return super().eventFilter(obj, event)
 
     def _on_audio_track_changed(self, index: int):
@@ -2976,6 +4173,10 @@ class MainWindow(QMainWindow):
         """Unpause worker/mpv/audio together after startup warm sync."""
         if not self._playing or not self._startup_sync_pending:
             return
+        if self._user_pause_override_startup:
+            # User explicitly paused during startup; do not auto-resume.
+            self._startup_sync_pending = False
+            return
         self._startup_sync_pending = False
         if self._audio_available:
             self._seek_audio_seconds(0.0)
@@ -2988,13 +4189,26 @@ class MainWindow(QMainWindow):
             self._disp_sdr_mpv.set_paused(False)
         if self._startup_audio_gate_active:
             self._arm_mute_until_fps_recovery()
+        # Force an initial timeline relock so audio isn't ahead if user never seeks.
+        self._relock_timeline(delay_ms=160, drop_frames=3)
+        # Follow-up relock after startup UI interactions to keep HDR aligned.
+        QTimer.singleShot(520, lambda: self._relock_timeline(drop_frames=2))
 
     def _has_pending_setting_changes(self) -> bool:
         if not self._playing:
             return False
+        upscale_changed = False
+        if hasattr(self, "_cmb_upscale") and self._cmb_res.currentText() in {"540p", "720p"}:
+            upscale_changed = (self._cmb_upscale.currentText() != self._active_upscale_mode)
+        film_grain_changed = False
+        if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+            film_grain_changed = (self._chk_film_grain.isChecked() != self._active_film_grain)
         return (
             self._cmb_prec.currentText() != self._active_precision
             or self._cmb_res.currentText() != self._active_resolution
+            or self._chk_hg.isChecked() != self._active_use_hg
+            or upscale_changed
+            or film_grain_changed
         )
 
     def _update_apply_button_state(self):
@@ -3093,11 +4307,18 @@ class MainWindow(QMainWindow):
 
         pending = getattr(self, '_pending_mpv_start', None)
         if pending and self._disp_hdr_mpv is not None:
-            pw, ph, fps, scale_kernel, audio_path, force_hdr_metadata = pending
+            (pw, ph, fps, scale_kernel, scale_antiring,
+             cas_strength, audio_path, film_grain, force_hdr_metadata) = pending
             self._disp_hdr_mpv.start_playback(
-                pw, ph, fps=fps, scale_kernel=scale_kernel, audio_path=audio_path,
+                pw, ph, fps=fps, scale_kernel=scale_kernel,
+                scale_antiring=scale_antiring,
+                cas_strength=cas_strength,
+                audio_path=audio_path,
+                film_grain=film_grain,
                 force_hdr_metadata=force_hdr_metadata,
             )
+            # Anchor mpv timeline at 0 on startup to avoid initial drift.
+            self._disp_hdr_mpv.seek_seconds(0.0)
             if not self._audio_available:
                 self._apply_selected_audio_track_mpv_async()
             self._apply_volume_to_backends()
@@ -3116,42 +4337,27 @@ class MainWindow(QMainWindow):
             )
             if self._startup_sync_pending:
                 self._disp_sdr_mpv.set_paused(True)
+            self._worker.set_sdr_mpv_widget(self._disp_sdr_mpv)
+            self._sdr_mpv_feed_from_worker = True
             self._pending_sdr_mpv_start = None
 
     def _precompile_kernels(self):
         """Open the pre-compile dialog — runs compile_kernels.py as a
         completely separate process with zero GPU interference."""
 
-        # Ask for resolutions
-        text, ok = QInputDialog.getText(
-            self, "Pre-compile Kernels",
-            "Enter resolutions to compile (e.g. 1920x1080 1440x1080):",
-            text="1920x1080",
+        opts = _PrecompileOptionsDialog(
+            initial_precision=self._cmb_prec.currentText(),
+            initial_resolution=self._cmb_res.currentText(),
+            precision_keys=_available_precision_keys(),
+            parent=self,
         )
-        if not ok or not text.strip():
+        if opts.exec() != QDialog.DialogCode.Accepted:
             return
 
-        resolutions = text.strip().split()
-        # Validate
-        for r in resolutions:
-            try:
-                w, h = r.lower().split("x")
-                int(w); int(h)
-            except (ValueError, AttributeError):
-                QMessageBox.warning(
-                    self, "Invalid Resolution",
-                    f"'{r}' is not a valid resolution.\n"
-                    "Use WxH format (e.g. 1920x1080).",
-                )
-                return
-
-        # Map GUI precision name → compile_kernels.py precision arg
-        gui_prec = self._cmb_prec.currentText()
+        gui_prec = opts.selected_precision()
+        resolutions = opts.selected_resolutions()
         prec_arg = _precision_to_compile_arg(gui_prec)
-
-        # For QAT / PTQ / INT8-full, pass the specific model path
-        cfg = PRECISIONS.get(gui_prec, {})
-        model_path = cfg.get("model")
+        model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
 
         dlg = _PrecompileDialog(
             resolutions, precision=prec_arg, model_path=model_path,
@@ -3161,15 +4367,22 @@ class MainWindow(QMainWindow):
         if dlg.succeeded:
             for r in resolutions:
                 w, h = r.lower().split("x")
-                _mark_compiled(int(w), int(h), prec_arg)
+                _mark_compiled(
+                    int(w), int(h), prec_arg,
+                    model_path=model_path,
+                    use_hg=self._chk_hg.isChecked(),
+                )
 
     def _clear_kernel_cache(self):
         """Delete cached Triton / TorchInductor kernels."""
-        import shutil, pathlib, getpass, tempfile
+        import pathlib, getpass, tempfile
 
         dirs = []
-        triton_dir = pathlib.Path.home() / ".triton" / "cache"
-        if triton_dir.exists():
+        triton_root = pathlib.Path(
+            os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton")
+        )
+        triton_dir = triton_root / "cache"
+        if triton_dir.is_dir() and any(triton_dir.iterdir()):
             dirs.append(triton_dir)
 
         inductor_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
@@ -3179,7 +4392,7 @@ class MainWindow(QMainWindow):
                 f"torchinductor_{getpass.getuser()}",
             )
         inductor_path = pathlib.Path(inductor_dir)
-        if inductor_path.exists():
+        if inductor_path.is_dir() and any(inductor_path.iterdir()):
             dirs.append(inductor_path)
 
         if not dirs:
@@ -3188,6 +4401,20 @@ class MainWindow(QMainWindow):
                 "No Triton / Inductor kernel cache found.",
             )
             return
+
+        if self._worker is not None and self._worker.isRunning():
+            msg = (
+                "Kernel cache cannot be cleared while playback is running.\n\n"
+                "Stop playback and clear cache now?"
+            )
+            btn = QMessageBox.question(
+                self, "Clear Kernel Cache", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if btn != QMessageBox.StandardButton.Yes:
+                return
+            self._worker.stop()
+            self._worker.wait(10000)
 
         msg = (
             "This will delete cached Triton and TorchInductor kernels:\n\n"
@@ -3200,12 +4427,41 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if btn == QMessageBox.StandardButton.Yes:
-            for d in dirs:
-                shutil.rmtree(d, ignore_errors=True)
-            QMessageBox.information(
-                self, "Kernel Cache",
-                "Cache cleared.  Kernels will recompile on next play.",
+            dlg = QProgressDialog(
+                "Clearing kernel cache...", None, 0, 0, self
             )
+            dlg.setWindowTitle("Clear Kernel Cache")
+            dlg.setMinimumDuration(0)
+            dlg.setCancelButton(None)
+            dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dlg.show()
+
+            self._cache_clear_thread = QThread(self)
+            self._cache_clear_worker = _KernelCacheClearWorker(dirs)
+            self._cache_clear_worker.moveToThread(self._cache_clear_thread)
+
+            def _on_finished(ok: bool):
+                dlg.close()
+                self._cache_clear_worker = None
+                self._cache_clear_thread = None
+                if ok:
+                    QMessageBox.information(
+                        self, "Kernel Cache",
+                        "Cache cleared. Kernels will recompile on next play.",
+                    )
+                else:
+                    QMessageBox.warning(
+                        self, "Kernel Cache",
+                        "Cache clear completed with errors. "
+                        "Some cache files may remain.",
+                    )
+
+            self._cache_clear_thread.started.connect(self._cache_clear_worker.run)
+            self._cache_clear_worker.finished.connect(_on_finished)
+            self._cache_clear_worker.finished.connect(self._cache_clear_thread.quit)
+            self._cache_clear_worker.finished.connect(self._cache_clear_worker.deleteLater)
+            self._cache_clear_thread.finished.connect(self._cache_clear_thread.deleteLater)
+            self._cache_clear_thread.start()
 
     def _open_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -3229,6 +4485,8 @@ class MainWindow(QMainWindow):
                 resolution=self._cmb_res.currentText(),
                 precision=self._cmb_prec.currentText(),
                 view=self._cmb_view.currentText(),
+                upscale=self._cmb_upscale.currentText() if hasattr(self, "_cmb_upscale") else None,
+                film_grain=self._chk_film_grain.isChecked() if hasattr(self, "_chk_film_grain") else None,
                 autoplay=auto_play,
             )
             return
@@ -3251,6 +4509,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._play)
 
     def _restart_with_video(self, path, resolution=None, precision=None, view=None,
+                            use_hg=None, upscale=None, film_grain=None,
                             autoplay=False, start_frame=None):
         """Restart the GUI process with a new video.
 
@@ -3286,6 +4545,12 @@ class MainWindow(QMainWindow):
             args += ["--precision", precision]
         if view == "Tabbed":
             args += ["--view", view]
+        if use_hg is not None:
+            args += ["--use-hg", "1" if use_hg else "0"]
+        if isinstance(upscale, str) and upscale in UPSCALER_CHOICES:
+            args += ["--upscale", upscale]
+        if film_grain is not None:
+            args += ["--film-grain", "1" if film_grain else "0"]
         if autoplay:
             args += ["--autoplay", "1"]
         if start_frame is not None:
@@ -3323,6 +4588,17 @@ class MainWindow(QMainWindow):
         else:
             pw, ph = ow, oh
 
+        # Select upscale kernel choice (only allowed for 540p/720p presets)
+        upscale_choice = DEFAULT_UPSCALER
+        if scale_key in {"540p", "720p"}:
+            upscale_choice = self._cmb_upscale.currentText() or DEFAULT_UPSCALER
+        # Resolve FSR availability up-front so we don't report it if it can't load.
+        if _normalize_upscale_choice(upscale_choice) == "fsr" and not _ensure_fsr_shader():
+            self.statusBar().showMessage(
+                "FSR shader unavailable (download failed). Falling back to EWA LanczosSharp."
+            )
+            upscale_choice = "EWA LanczosSharp"
+
         # Set up seek slider
         self._vid_fps = vfps if vfps > 0 else 30.0
         display_fps = _limited_playback_fps(self._vid_fps)
@@ -3349,15 +4625,18 @@ class MainWindow(QMainWindow):
         # benchmarks have zero GPU interference from Qt / D3D11 / mpv.
         # If the Triton + Inductor cache is already warm from a previous
         # compile, the subprocess finishes in seconds and auto-closes.
-        cfg = PRECISIONS.get(gui_prec, {})
-        model_path = cfg.get("model")
+        model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
         dlg = _PrecompileDialog(
             [f"{pw}x{ph}"], precision=prec_arg,
             model_path=model_path, parent=self,
         )
         dlg.exec()                        # modal — blocks until done
         if dlg.succeeded:
-            _mark_compiled(pw, ph, prec_arg)
+            _mark_compiled(
+                pw, ph, prec_arg,
+                model_path=model_path,
+                use_hg=self._chk_hg.isChecked(),
+            )
         else:
             # Compile failed or user closed early — don't start playback
             return
@@ -3367,10 +4646,13 @@ class MainWindow(QMainWindow):
         self._playing = True
         self._active_precision = self._cmb_prec.currentText()
         self._active_resolution = self._cmb_res.currentText()
+        self._active_use_hg = self._chk_hg.isChecked()
+        self._active_upscale_mode = upscale_choice
         # Keep mpv initialized whenever available so view switches are UI-only.
         use_mpv_pipeline = (self._disp_hdr_mpv is not None)
         self._active_use_mpv = use_mpv_pipeline
         self._startup_sync_pending = bool(use_mpv_pipeline)
+        self._mpv_start_resync_t = 0.0
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_stack.setCurrentWidget(
                 self._disp_sdr_mpv if use_mpv_pipeline else self._disp_sdr_cpu
@@ -3384,6 +4666,8 @@ class MainWindow(QMainWindow):
         self._btn_pause.setEnabled(True)
         self._btn_stop.setEnabled(True)
         self._btn_file.setEnabled(False)
+        if self._btn_toggle_ui is not None:
+            self._btn_toggle_ui.setEnabled(True)
         self._cmb_prec.setEnabled(True)
         self._set_pause_button_labels(False)
 
@@ -3394,8 +4678,34 @@ class MainWindow(QMainWindow):
         self._pending_sdr_mpv_start = None
         if use_mpv_pipeline and self._disp_hdr_mpv is not None:
             mpv_audio_path = None if self._audio_available else self._video_path
+            self._active_mpv_scale_kernel = _select_hdr_scale_kernel(
+                pw, ph, ow, oh, upscale_choice
+            )
+            self._active_mpv_scale_antiring = _select_hdr_scale_antiring(
+                pw, ph, ow, oh, self._active_mpv_scale_kernel
+            )
+            using_fsr = (self._active_mpv_scale_kernel == "fsr")
+            self._active_mpv_cas = _select_mpv_cas_strength(
+                pw, ph, ow, oh, using_fsr, self._active_mpv_scale_kernel
+            )
+            self._active_film_grain = bool(
+                hasattr(self, "_chk_film_grain") and self._chk_film_grain.isChecked()
+            )
+            if self._active_film_grain and not _ensure_filmgrain_shader():
+                self.statusBar().showMessage(
+                    "Film grain shader unavailable (download failed)."
+                )
+                self._active_film_grain = False
+                if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+                    self._chk_film_grain.blockSignals(True)
+                    self._chk_film_grain.setChecked(False)
+                    self._chk_film_grain.blockSignals(False)
             self._pending_mpv_start = (
-                pw, ph, float(display_fps), BEST_MPV_SCALE, mpv_audio_path,
+                pw, ph, float(display_fps), self._active_mpv_scale_kernel,
+                self._active_mpv_scale_antiring,
+                self._active_mpv_cas,
+                mpv_audio_path,
+                self._active_film_grain,
                 True,
             )
             if self._disp_sdr_mpv is not None:
@@ -3404,12 +4714,15 @@ class MainWindow(QMainWindow):
                 )
         else:
             self._worker.set_mpv_widget(None)
+            self._worker.set_sdr_mpv_widget(None)
+            self._sdr_mpv_feed_from_worker = False
 
         self._worker.configure(
             self._video_path, self._cmb_prec.currentText(),
             proc_w=pw, proc_h=ph,
             output_w=ow, output_h=oh,
             input_is_hdr=False,
+            use_hg=self._chk_hg.isChecked(),
         )
 
         # Show loading dialog (in-process model load + cache warmup is fast
@@ -3418,6 +4731,7 @@ class MainWindow(QMainWindow):
         self._compile_dlg.show()
 
         self._worker.start()
+        self._set_process_priority(True)
         if pw != ow or ph != oh:
             upscale_backend = "mpv GPU" if use_mpv_pipeline else "CPU fallback"
             self.statusBar().showMessage(
@@ -3453,13 +4767,15 @@ class MainWindow(QMainWindow):
             self._seek_audio_seconds(target / max(self._vid_fps, 1e-6))
             if self._disp_hdr_mpv is not None and not self._audio_available:
                 self._disp_hdr_mpv.seek_seconds(target / max(self._vid_fps, 1e-6))
-            self._startup_seek_frame = None
+        self._startup_seek_frame = None
         self._arm_cursor_idle_timer()
+        self._start_periodic_relock()
 
     def _toggle_pause(self):
         if not self._playing:
             return
         if self._worker.is_paused:
+            self._user_pause_override_startup = False
             queued = self._pending_seek_on_resume
             if queued is not None:
                 self._worker.request_seek(int(queued))
@@ -3487,6 +4803,29 @@ class MainWindow(QMainWindow):
                 self._disp_sdr_mpv.set_paused(False)
             if not self._resume_audio_after_seek:
                 self._set_audio_paused(False)
+            if self._active_use_mpv:
+                self._relock_timeline(delay_ms=60, drop_frames=2)
+                if queued is None:
+                    def _resume_video_resync():
+                        if not self._playing or self._worker.is_paused:
+                            return
+                        fps = getattr(self, '_vid_fps', 30.0)
+                        target_frame = int(self._last_seek_frame)
+                        if self._audio_available and self._audio_player is not None:
+                            try:
+                                have_ms = int(self._audio_player.position())
+                                target_frame = int(round((have_ms / 1000.0) * max(fps, 1e-6)))
+                            except Exception:
+                                target_frame = int(self._last_seek_frame)
+                        if abs(target_frame - int(self._last_seek_frame)) >= 2:
+                            self._worker.request_seek(int(target_frame))
+                            if self._disp_hdr_mpv is not None and not self._audio_available:
+                                self._disp_hdr_mpv.seek_seconds(int(target_frame) / max(fps, 1e-6))
+                            self._audio_seek_guard_until = time.perf_counter() + 1.0
+                            self._audio_resync_pending = True
+                            self._audio_fps_recovered = False
+                            self._post_seek_resync_frames = 60
+                    QTimer.singleShot(80, _resume_video_resync)
             self._arm_cursor_idle_timer()
         else:
             self._worker.pause()
@@ -3496,6 +4835,8 @@ class MainWindow(QMainWindow):
             if self._disp_sdr_mpv is not None:
                 self._disp_sdr_mpv.set_paused(True)
             self._set_audio_paused(True)
+            if self._startup_sync_pending:
+                self._user_pause_override_startup = True
             if self._cursor_idle_timer is not None:
                 self._cursor_idle_timer.stop()
             self._show_cursor()
@@ -3508,16 +4849,65 @@ class MainWindow(QMainWindow):
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.stop_playback()
         self._stop_audio_playback()
+        self._set_process_priority(False)
+        # Clear the current video so user must choose a file again.
+        self._video_path = None
+        self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
+        if self._lbl_file is not None:
+            self._lbl_file.setText("No video selected")
+        if self._lbl_duration is not None:
+            self._lbl_duration.setText("0:00")
         self._reset_controls()
+
+    def _restart_app_clean(self):
+        self.statusBar().showMessage("Restarting app …")
+        self._save_user_settings()
+        # Clean shutdown
+        if self._playing:
+            self._worker.stop()
+            self._worker.wait(5000)
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.stop_playback()
+        if self._disp_sdr_mpv is not None:
+            self._disp_sdr_mpv.stop_playback()
+        self._stop_audio_playback()
+
+        # Hide the parent window so the user doesn't see two GUIs
+        self.hide()
+        QApplication.instance().processEvents()
+
+        import subprocess as _sp
+        args = [sys.executable, sys.argv[0]]
+        rc = _sp.call(args)
+        sys.exit(rc)
+
+    def _stop_and_restart(self):
+        self._stop()
+        self._restart_app_clean()
 
     # ── Slots: settings ──────────────────────────────────────
 
     def _on_precision(self, key):
+        self._chk_hg.setEnabled(True)
         if self._playing:
             self._update_apply_button_state()
 
     def _on_resolution(self, scale_key):
         self._sync_upscale_controls()
+        if self._playing:
+            self._update_apply_button_state()
+
+    def _on_upscale_changed(self, _mode: str):
+        self._sync_upscale_controls()
+        if self._playing:
+            self._update_apply_button_state()
+
+    def _on_film_grain_changed(self, _state):
+        if self._playing:
+            self._update_apply_button_state()
+        self._save_user_settings()
+
+    def _on_hg_toggle(self, _state):
         if self._playing:
             self._update_apply_button_state()
 
@@ -3530,39 +4920,169 @@ class MainWindow(QMainWindow):
 
         new_prec = self._cmb_prec.currentText()
         new_res = self._cmb_res.currentText()
+        current_upscale = self._cmb_upscale.currentText() if hasattr(self, "_cmb_upscale") else DEFAULT_UPSCALER
+        new_upscale = DEFAULT_UPSCALER
+        if new_res in {"540p", "720p"}:
+            new_upscale = current_upscale or DEFAULT_UPSCALER
+        upscale_changed = (new_upscale != self._active_upscale_mode)
+        film_grain_changed = False
+        if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+            film_grain_changed = (self._chk_film_grain.isChecked() != self._active_film_grain)
         needs_restart = (new_res != self._active_resolution)
+        if self._chk_hg.isChecked() != self._active_use_hg:
+            needs_restart = True
         notices: list[str] = []
 
+        def _apply_mpv_hot_swap(action, pause_ms: int = 260,
+                                relock_ms: int = 260,
+                                relock_drop: int = 2) -> bool:
+            if self._worker is not None and not self._worker.is_paused:
+                self._pause_for_ui_transition(duration_ms=pause_ms, wait_for_stable=True)
+            ok = bool(action())
+            if ok and self._playing:
+                self._relock_timeline(delay_ms=relock_ms, drop_frames=relock_drop)
+            return ok
+
         if needs_restart:
+            self._save_user_settings()
             self._restart_with_video(
                 self._video_path,
                 resolution=new_res,
                 precision=new_prec,
                 view=self._cmb_view.currentText(),
+                use_hg=self._chk_hg.isChecked(),
+                upscale=current_upscale,
+                film_grain=self._chk_film_grain.isChecked() if hasattr(self, "_chk_film_grain") else None,
                 autoplay=True,
                 start_frame=int(self._seek_slider.value()),
             )
             return
 
+        def _apply_film_grain_toggle() -> bool:
+            if not film_grain_changed:
+                return True
+            if not self._active_use_mpv or self._disp_hdr_mpv is None:
+                self.statusBar().showMessage(
+                    "Film grain requires mpv; keeping previous setting."
+                )
+                if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+                    self._chk_film_grain.blockSignals(True)
+                    self._chk_film_grain.setChecked(self._active_film_grain)
+                    self._chk_film_grain.blockSignals(False)
+                return False
+            enabled = bool(self._chk_film_grain.isChecked())
+            if enabled and not _ensure_filmgrain_shader():
+                self.statusBar().showMessage(
+                    "Film grain shader unavailable (download failed)."
+                )
+                if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+                    self._chk_film_grain.blockSignals(True)
+                    self._chk_film_grain.setChecked(False)
+                    self._chk_film_grain.blockSignals(False)
+                return False
+            # Match upscale behavior: brief pause + relock around shader swap.
+            ok = _apply_mpv_hot_swap(
+                lambda: self._disp_hdr_mpv.set_film_grain(enabled)
+            )
+            if ok:
+                self._active_film_grain = enabled
+                self._save_user_settings()
+                self.statusBar().showMessage(
+                    "Film grain enabled." if enabled else "Film grain disabled."
+                )
+            else:
+                self.statusBar().showMessage(
+                    "Film grain hot-swap failed; keeping previous setting."
+                )
+                if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
+                    self._chk_film_grain.blockSignals(True)
+                    self._chk_film_grain.setChecked(self._active_film_grain)
+                    self._chk_film_grain.blockSignals(False)
+            return ok
+
+        if upscale_changed:
+            if not self._active_use_mpv or self._disp_hdr_mpv is None:
+                self.statusBar().showMessage(
+                    "Upscale mode change requires mpv GPU pipeline; keeping previous setting."
+                )
+                if hasattr(self, "_cmb_upscale"):
+                    self._cmb_upscale.blockSignals(True)
+                    self._cmb_upscale.setCurrentText(self._active_upscale_mode)
+                    self._cmb_upscale.blockSignals(False)
+                return
+            # Pause both SDR/HDR + audio briefly so the hot-swap doesn't
+            # desync the two pipelines.
+            cur_pw, cur_ph = self._last_res if self._last_res else (MAX_W, MAX_H)
+            ow, oh = self._cur_output_w, self._cur_output_h
+            kernel = _select_hdr_scale_kernel(cur_pw, cur_ph, ow, oh, new_upscale)
+            antiring = _select_hdr_scale_antiring(cur_pw, cur_ph, ow, oh, kernel)
+            def _apply_upscale_hot_swap() -> bool:
+                if not self._disp_hdr_mpv.set_scale_kernel(kernel, antiring):
+                    return False
+                self._active_mpv_scale_kernel = kernel
+                self._active_mpv_scale_antiring = antiring
+                self._active_mpv_cas = _select_mpv_cas_strength(
+                    cur_pw, cur_ph, ow, oh, using_fsr=(kernel == "fsr"),
+                    scale_kernel=kernel
+                )
+                self._disp_hdr_mpv.set_cas_strength(self._active_mpv_cas)
+                self._active_upscale_mode = new_upscale
+                def _announce():
+                    fsr = self._disp_hdr_mpv.is_fsr_active()
+                    mode_label = "FSR" if fsr else "EWA LanczosSharp"
+                    self.statusBar().showMessage(
+                        f"Upscale hot-swap: {mode_label} ({'shader active' if fsr else 'kernel active'})"
+                    )
+                QTimer.singleShot(80, _announce)
+                self._save_user_settings()
+                return True
+
+            if not _apply_mpv_hot_swap(_apply_upscale_hot_swap):
+                err = getattr(self._disp_hdr_mpv, "_last_scale_error", None)
+                if err:
+                    self.statusBar().showMessage(f"Upscale hot-swap failed: {err}")
+                else:
+                    self.statusBar().showMessage("Upscale hot-swap failed; keeping previous setting.")
+            _apply_film_grain_toggle()
+            self._update_apply_button_state()
+            return
+
         if new_prec != self._active_precision:
             cur_pw, cur_ph = self._last_res if self._last_res else (MAX_W, MAX_H)
             target_prec_arg = _precision_to_compile_arg(new_prec)
-            if not _is_compiled(cur_pw, cur_ph, target_prec_arg):
+            target_model_path = _select_model_path(new_prec, self._chk_hg.isChecked())
+            if not _is_compiled(
+                cur_pw, cur_ph, target_prec_arg,
+                model_path=target_model_path,
+                use_hg=self._chk_hg.isChecked(),
+            ):
                 self.statusBar().showMessage(
                     f"Precision {new_prec} not precompiled at {cur_pw}x{cur_ph}; restarting for clean compile."
                 )
+                self._save_user_settings()
                 self._restart_with_video(
                     self._video_path,
                     resolution=new_res,
                     precision=new_prec,
                     view=self._cmb_view.currentText(),
+                    use_hg=self._chk_hg.isChecked(),
+                    upscale=current_upscale,
+                    film_grain=self._chk_film_grain.isChecked() if hasattr(self, "_chk_film_grain") else None,
                     autoplay=True,
                     start_frame=int(self._seek_slider.value()),
                 )
                 return
+            self._pause_for_precision_swap(new_prec)
             self._worker.request_precision_change(new_prec)
+            if self._playing:
+                self._schedule_precision_audio_resync()
             notices.append(f"Applying precision change: {new_prec}")
             self._active_precision = new_prec
+
+        _apply_film_grain_toggle()
+
+        self._active_use_hg = self._chk_hg.isChecked()
+        self._active_upscale_mode = new_upscale
 
         self._active_resolution = new_res
         self._save_user_settings()
@@ -3591,14 +5111,44 @@ class MainWindow(QMainWindow):
             if self._last_sdr_frame is not None:
                 if self._disp_sdr_cpu is not None:
                     self._disp_sdr_cpu.update_frame(self._last_sdr_frame)
+            # Any view change can desync; relock the timeline.
+            self._relock_timeline(delay_ms=140, drop_frames=3)
 
     def _refresh_mpv_after_window_state_change(self):
         if not self._playing:
             return
+        paused = bool(self._worker is not None and self._worker.is_paused)
+        if paused:
+            # Defer full mpv refresh while paused to avoid blackscreen.
+            self._deferred_mpv_refresh = True
+            if self._disp_hdr_mpv is not None:
+                self._disp_hdr_mpv.set_cas_strength(self._active_mpv_cas)
+                self._disp_hdr_mpv.set_film_grain(self._active_film_grain)
+            if self._disp_sdr_mpv is not None:
+                self._disp_sdr_mpv.set_cas_strength(0.0)
+            return
+        self._deferred_mpv_refresh = False
         if self._disp_hdr_mpv is not None:
-            self._disp_hdr_mpv.set_scale_kernel(BEST_MPV_SCALE)
+            self._disp_hdr_mpv.refresh_surface()
+            if paused:
+                self._disp_hdr_mpv.set_paused(True)
         if self._disp_sdr_mpv is not None:
-            self._disp_sdr_mpv.set_scale_kernel("bicubic")
+            self._disp_sdr_mpv.refresh_surface()
+            if paused:
+                self._disp_sdr_mpv.set_paused(True)
+        # Re-assert colorspace/vf after UI reparent/fullscreen to avoid grey output.
+        def _reapply_colorspace(attempts_left: int = 3):
+            ok = True
+            if self._disp_hdr_mpv is not None:
+                ok = bool(self._disp_hdr_mpv.set_cas_strength(self._active_mpv_cas)) and ok
+                ok = bool(self._disp_hdr_mpv.set_film_grain(self._active_film_grain)) and ok
+            if self._disp_sdr_mpv is not None:
+                ok = bool(self._disp_sdr_mpv.set_cas_strength(0.0)) and ok
+            if (not ok) and attempts_left > 0:
+                QTimer.singleShot(120, lambda: _reapply_colorspace(attempts_left - 1))
+        _reapply_colorspace(3)
+        # Relock video/audio after any window/layout refresh.
+        self._relock_timeline(drop_frames=3)
 
     # ── Slots: seek / position ────────────────────────────────
 
@@ -3619,6 +5169,14 @@ class MainWindow(QMainWindow):
             self._seek_slider.setValue(current_frame)
         fps = getattr(self, '_vid_fps', 30.0)
         self._lbl_time.setText(self._fmt_time(current_frame / fps))
+
+        # On startup or when returning to the beginning, re-anchor mpv to 0
+        # to eliminate initial HDR lag.
+        if self._disp_hdr_mpv is not None and current_frame <= 1:
+            now_t = time.perf_counter()
+            if (now_t - self._mpv_start_resync_t) > 0.8:
+                self._mpv_start_resync_t = now_t
+                self._disp_hdr_mpv.seek_seconds(0.0)
 
         if self._resume_audio_after_seek and not self._worker.is_paused:
             settled = abs(int(current_frame) - int(self._seek_resume_target)) <= 1
@@ -3644,7 +5202,7 @@ class MainWindow(QMainWindow):
             if self._post_seek_resync_frames > 0:
                 self._post_seek_resync_frames -= 1
                 self._audio_player.setPlaybackRate(1.0)
-            elif (current_frame % 48 == 0) and (not self._worker.is_paused):
+            elif (current_frame % self._audio_drift_check_stride == 0) and (not self._worker.is_paused):
                 # One-shot sync only after FPS recovery. Do not keep correcting
                 # until another low-FPS mute/seek event re-arms this gate.
                 if (
@@ -3730,6 +5288,16 @@ class MainWindow(QMainWindow):
         self._seek_resume_started_t = time.perf_counter()
         if self._disp_hdr_mpv is not None and not self._audio_available:
             self._disp_hdr_mpv.seek_seconds(target_frame / max(fps, 1e-6))
+        if not getattr(self, "_first_seek_done", False):
+            self._first_seek_done = True
+            def _second_seek():
+                if not self._playing:
+                    return
+                self._worker.request_seek(target_frame)
+                self._seek_audio_seconds(target_frame / max(fps, 1e-6))
+                if self._disp_hdr_mpv is not None and not self._audio_available:
+                    self._disp_hdr_mpv.seek_seconds(target_frame / max(fps, 1e-6))
+            QTimer.singleShot(90, _second_seek)
 
     def _on_hdr_info(self, info: dict):
         """Update the HDR Info panel from mpv metadata."""
@@ -3767,6 +5335,7 @@ class MainWindow(QMainWindow):
             self._disp_sdr_mpv is not None
             and self._playing
             and self._active_use_mpv
+            and not self._sdr_mpv_feed_from_worker
         ):
             try:
                 rgb16 = np.ascontiguousarray(
@@ -3777,7 +5346,7 @@ class MainWindow(QMainWindow):
                 pass
         if self._disp_sdr_cpu is not None and self._disp_sdr_cpu.isVisible():
             self._disp_sdr_cpu.update_frame(sdr_show)
-        # HDR QLabel fallback (mpv gets fed directly from the worker)
+        # QLabel fallbacks (mpv panes are fed directly from the worker)
         if self._disp_hdr_cpu is not None and self._disp_hdr_cpu.isVisible():
             self._disp_hdr_cpu.update_frame(hdr)
 
@@ -3790,29 +5359,53 @@ class MainWindow(QMainWindow):
         self._m["cpu"].setText(f"CPU: {m['cpu_mb']:.0f} MB")
         self._m["model"].setText(f"Model: {m['model_mb']:.2f} MB")
         self._m["prec"].setText(f"Prec: {m['precision']}")
+        upscale_label = "—"
+        if self._last_res and self._cur_output_w and self._cur_output_h:
+            proc_w, proc_h = self._last_res
+            if proc_w == self._cur_output_w and proc_h == self._cur_output_h:
+                upscale_label = "None (native)"
+            else:
+                fsr_active = False
+                if self._disp_hdr_mpv is not None and self._active_use_mpv:
+                    fsr_active = self._disp_hdr_mpv.is_fsr_active()
+                if fsr_active:
+                    upscale_label = "FSR"
+                elif self._active_mpv_scale_kernel:
+                    upscale_label = str(self._active_mpv_scale_kernel)
+        self._m["upscale"].setText(f"Upscale: {upscale_label}")
         fps_now = float(m.get("fps", 0.0))
         self._update_auto_mute_from_fps(fps_now)
         if self._startup_audio_gate_active:
             gate_trip = max(1.0, self._target_playback_fps - 0.3)
+            gate_need = 4 if self._ui_resync_gate_strict else 2
             if fps_now >= gate_trip:
                 self._startup_audio_gate_count += 1
             else:
                 self._startup_audio_gate_count = 0
-            if self._startup_audio_gate_count >= 2:
+            if self._startup_audio_gate_count >= gate_need:
                 self._startup_audio_gate_active = False
                 self._startup_audio_gate_count = 0
+                self._ui_resync_gate_strict = False
                 if self._scrub_muted:
                     self._scrub_muted = False
                     self._apply_volume_to_backends()
                 if self._audio_available and not self._worker.is_paused and not self._startup_sync_pending:
                     fps = getattr(self, "_vid_fps", 30.0)
-                    self._seek_audio_seconds(float(self._last_seek_frame) / max(fps, 1e-6))
+                    cur_frame = int(m.get("frame", self._last_seek_frame))
+                    sec = float(cur_frame) / max(fps, 1e-6)
+                    self._force_audio_seek(sec)
                     self._set_audio_paused(False)
     def _on_status_message(self, text: str):
         """Forward worker status to status bar *and* compile dialog."""
         self.statusBar().showMessage(text)
         if self._compile_dlg is not None:
             self._compile_dlg.set_status(text)
+        if self._precision_swap_pending is not None and text.startswith("Ready — "):
+            ready_key = text.split("Ready — ", 1)[-1].strip()
+            if ready_key == self._precision_swap_pending:
+                self._resume_after_precision_swap()
+        if self._precision_swap_pending is not None and text.startswith("ERROR:"):
+            self._resume_after_precision_swap(force=True)
 
     def _on_finished(self):
         if self._disp_hdr_mpv is not None:
@@ -3820,6 +5413,7 @@ class MainWindow(QMainWindow):
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.stop_playback()
         self._stop_audio_playback()
+        self._set_process_priority(False)
         self._reset_controls()
         self.statusBar().showMessage("Playback finished.")
         if self._disp_sdr_cpu is not None:
@@ -3832,11 +5426,20 @@ class MainWindow(QMainWindow):
     def _reset_controls(self):
         self._playing = False
         self._active_use_mpv = False
+        self._sdr_mpv_feed_from_worker = False
+        self._active_mpv_scale_kernel = BEST_MPV_SCALE
+        self._active_mpv_scale_antiring = 0.15
+        self._active_mpv_cas = 0.0
+        self._active_upscale_mode = DEFAULT_UPSCALER
+        self._active_film_grain = False
         self._startup_sync_pending = False
         self._auto_muted_low_fps = False
         self._scrub_muted = False
+        self._ui_hidden = False
         self._low_fps_count = 0
         self._high_fps_count = 0
+        self._user_pause_override_startup = False
+        self._deferred_mpv_refresh = False
         if self._audio_fade_timer is not None:
             self._audio_fade_timer.stop()
         self._apply_volume_to_backends()
@@ -3855,6 +5458,10 @@ class MainWindow(QMainWindow):
             self._window_refresh_timer.stop()
         if self._cursor_idle_timer is not None:
             self._cursor_idle_timer.stop()
+        if self._periodic_relock_timer is not None:
+            self._periodic_relock_timer.stop()
+        if self._periodic_relock_timer is not None:
+            self._periodic_relock_timer.stop()
         self._show_cursor()
         if self._compile_dlg is not None:
             self._compile_dlg.close()
@@ -3864,6 +5471,13 @@ class MainWindow(QMainWindow):
         self._btn_pause.setEnabled(False)
         self._btn_stop.setEnabled(False)
         self._btn_file.setEnabled(True)
+        if self._btn_toggle_ui is not None:
+            self._btn_toggle_ui.setEnabled(False)
+            self._btn_toggle_ui.setText("Hide UI")
+        if self._ui_overlay_btn is not None:
+            self._ui_overlay_btn.hide()
+        if self._row3_widget is not None:
+            self._row3_widget.setVisible(True)
         self._set_pause_button_labels(False)
         self._btn_apply_settings.setEnabled(False)
         if _HAS_MPV and self._disp_sdr_mpv is not None:
@@ -3915,6 +5529,7 @@ class MainWindow(QMainWindow):
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.stop_playback()
         self._stop_audio_playback()
+        self._set_process_priority(False)
         super().closeEvent(event)
 
     def keyPressEvent(self, event):
@@ -3987,12 +5602,18 @@ def main():
                         help="Initial resolution preset (1080p/720p/540p/Source)")
     parser.add_argument("--precision", default=None,
                         help="Initial precision preset (GUI label)")
+    parser.add_argument("--use-hg", default=None,
+                        help="Enable HG (1/0). Default from saved settings.")
     parser.add_argument("--view", default=None,
                         help="Initial view mode (Tabbed)")
     parser.add_argument("--autoplay", default="0",
                         help="Auto-start playback after loading video (0/1)")
     parser.add_argument("--start-frame", default=None,
                         help="Initial frame index to seek to after startup")
+    parser.add_argument("--upscale", default=None,
+                        help="Initial upscale mode (GUI label)")
+    parser.add_argument("--film-grain", default=None,
+                        help="Enable film grain shader (0/1)")
     args, _unknown = parser.parse_known_args()
 
     os.chdir(_ROOT)
@@ -4004,8 +5625,11 @@ def main():
         initial_resolution=args.resolution,
         initial_precision=args.precision,
         initial_view=args.view,
+        initial_use_hg=args.use_hg,
         initial_autoplay=(str(args.autoplay).strip() == "1"),
         initial_start_frame=args.start_frame,
+        initial_upscale=args.upscale,
+        initial_film_grain=args.film_grain,
     )
     win.show()
     sys.exit(app.exec())
