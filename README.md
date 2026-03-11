@@ -117,7 +117,7 @@ All 1080p videos reuse the same cached kernels regardless of content, codec, or 
 
 ### Requirements
 
-- Python 3.10+
+- Python 3.10+ (3.12 for AMD Windows)
 - PyTorch 2.0+ (CUDA or ROCm build)
 - OpenCV, NumPy
 
