@@ -272,12 +272,25 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 **QAT note:** QAT variants are temporarily removed in v1.2 (weights retrained, including **+HG**). The QAT subsections below are kept for reference and will return in a future update.
 
 ### HG Weights (Optional)
-HG refinement is optional. If you enable HG (`--use-hg 1`), place the pretrained HG
-weights at:
+HG refinement is optional. `HG_weights.pth` is not included in this GitHub repo
+because it is too large for normal GitHub tracking.
 
-`Source Pipeline/pretrained_models/HG_weights.pth`
+Download it from:
 
-You can override with `--hg-weights` in CLI mode.
+`https://drive.google.com/drive/folders/1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link`
+
+Steps:
+1. Open the Google Drive folder above.
+2. Download `HG_weights.pth`.
+3. Place it at:
+
+`src/models/weights/HG_weights.pth`
+
+You can also override the location in CLI mode:
+
+```bash
+python src/main.py --hg-weights "FULL/PATH/TO/HG_weights.pth"
+```
 
 ### W8A8 (Full INT8, HG optional)
 ```bash

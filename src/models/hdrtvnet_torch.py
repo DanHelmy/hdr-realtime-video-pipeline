@@ -16,7 +16,7 @@ from models.hdrtvnet_modules.HG_Composite_arch import HG_Composite
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DEFAULT_HG_WEIGHTS = os.path.join(
-    _ROOT, "Source Pipeline", "pretrained_models", "HG_weights.pth"
+    _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
 
 _HAS_COMPILE = hasattr(torch, "compile")          # PyTorch >= 2.0
@@ -551,6 +551,7 @@ class HDRTVNetTorch:
         self._dtype = {"fp16": torch.float16}.get(
             self.precision, torch.float32
         )
+        self._hg_weights_explicit = hg_weights is not None
         self._hg_weights = hg_weights or _DEFAULT_HG_WEIGHTS
         self._use_hg = bool(use_hg)
         self._is_flat_model = False  # True for old-style FX quantized models
@@ -692,6 +693,14 @@ class HDRTVNetTorch:
         arch = checkpoint.get("architecture", {})
         compute_dtype_str = checkpoint.get("compute_dtype", "torch.float16")
         compute_dtype = torch.float16 if "16" in compute_dtype_str else torch.float32
+        if self.device.type != "cuda" and compute_dtype == torch.float16:
+            # CPU kernels do not reliably support FP16 for all ops used here
+            # (e.g., bicubic antialias in preprocess). Force FP32 on CPU.
+            print(
+                "WARNING: INT8 checkpoint requests FP16 compute on CPU; "
+                "falling back to FP32 compute for compatibility."
+            )
+            compute_dtype = torch.float32
         self._dtype = compute_dtype
         quant_type = checkpoint.get("quantization", "w8_weight_only")
         state_dict = checkpoint.get("state_dict", {})
@@ -700,16 +709,6 @@ class HDRTVNetTorch:
         except Exception:
             sd_numel = 0
 
-        if (
-            arch.get("use_hg", True) is False
-            and sd_numel
-            and sd_numel < 5_000_000
-        ):
-            print(
-                "WARNING: INT8 no-HG checkpoint is very small; this looks like a"
-                " tiny/stub model and will perform worse than FP16. "
-                "Regenerate a full-size no-HG INT8 checkpoint for fair speed."
-            )
         if compute_dtype == torch.float32 and self.device.type == "cuda":
             print(
                 "WARNING: INT8 checkpoint uses FP32 compute_dtype; this is slower"
@@ -745,6 +744,20 @@ class HDRTVNetTorch:
                 act_type=arch.get("act_type", "relu"),
                 weighting_network=arch.get("weighting_network", False),
             )
+        # Sanity-check no-HG INT8 checkpoints against expected parameter count.
+        if (not use_hg) and sd_numel:
+            try:
+                expected_numel = sum(
+                    v.numel() for v in model.state_dict().values() if hasattr(v, "numel")
+                )
+            except Exception:
+                expected_numel = 0
+            if expected_numel and sd_numel < (0.5 * expected_numel):
+                print(
+                    "WARNING: INT8 no-HG checkpoint is much smaller than expected; "
+                    "this may be an incomplete/stub model. "
+                    "Regenerate a full-size no-HG INT8 checkpoint for fair speed."
+                )
 
         # Replace Conv2d / Linear with correct quantized equivalents
         if quant_type == "w8a8_mixed":
@@ -813,6 +826,34 @@ class HDRTVNetTorch:
             print(f"Loaded {label} INT8 model (compute_dtype={compute_dtype})")
         return model
 
+    def _resolve_hg_weights(self, model_path):
+        """Find HG_weights.pth from common locations."""
+        candidates = []
+        seen = set()
+
+        def _add(path):
+            if not path:
+                return
+            abs_path = os.path.abspath(os.path.expanduser(str(path)))
+            if abs_path in seen:
+                return
+            seen.add(abs_path)
+            candidates.append(abs_path)
+
+        # User override (if provided) first.
+        _add(self._hg_weights)
+        # Adjacent to the selected model checkpoint.
+        _add(os.path.join(os.path.dirname(os.path.abspath(model_path)), "HG_weights.pth"))
+        # Repo-default runtime path.
+        _add(_DEFAULT_HG_WEIGHTS)
+        # Relative path from current working directory (when launched outside repo root).
+        _add(os.path.join(os.getcwd(), "src", "models", "weights", "HG_weights.pth"))
+
+        for path in candidates:
+            if os.path.isfile(path):
+                return path, candidates
+        return None, candidates
+
     def _load_model(self, model_path):
         # INT8 quantized models use a different loading path
         if self.precision in ("int8-full", "int8-mixed"):
@@ -823,7 +864,35 @@ class HDRTVNetTorch:
             model = torch.jit.load(model_path, map_location=self.device)
             model.eval()
         else:
-            if self._use_hg:
+            use_hg = bool(self._use_hg)
+            hg_weights_path = None
+            searched_hg_paths = []
+            if use_hg:
+                hg_weights_path, searched_hg_paths = self._resolve_hg_weights(model_path)
+                if hg_weights_path:
+                    self._hg_weights = hg_weights_path
+                elif self._hg_weights_explicit:
+                    searched = "\n".join(f"  - {p}" for p in searched_hg_paths)
+                    raise FileNotFoundError(
+                        f"HG weights not found: {self._hg_weights}\n"
+                        "  Searched paths:\n"
+                        f"{searched}\n"
+                        "  Check --hg-weights or disable HG with --use-hg 0."
+                    )
+                else:
+                    searched = "\n".join(f"  - {p}" for p in searched_hg_paths)
+                    print(
+                        "WARNING: HG weights not found; continuing with no-HG model.\n"
+                        "  Searched paths:\n"
+                        f"{searched}\n"
+                        "  To enable HG, place HG_weights.pth under "
+                        "src/models/weights/ or pass --hg-weights."
+                    )
+                    use_hg = False
+
+            self._use_hg = use_hg
+
+            if use_hg:
                 model = HG_Composite(
                     classifier="color_condition",
                     cond_c=6,
@@ -843,13 +912,7 @@ class HDRTVNetTorch:
                     cleaned[key[7:] if key.startswith("module.") else key] = value
                 model.base.load_state_dict(cleaned, strict=True)
 
-                if not os.path.isfile(self._hg_weights):
-                    raise FileNotFoundError(
-                        f"HG weights not found: {self._hg_weights}\n"
-                        "  Download HG_weights.pth and set --hg-weights or "
-                        "place it under Source Pipeline/pretrained_models/"
-                    )
-                hg_state = torch.load(self._hg_weights, map_location=self.device)
+                hg_state = torch.load(hg_weights_path, map_location=self.device)
                 if isinstance(hg_state, dict) and "state_dict" in hg_state:
                     hg_state = hg_state["state_dict"]
                 model.hg.load_state_dict(hg_state, strict=True)
@@ -1096,6 +1159,3 @@ class HDRTVNetTorch:
 
     def end_profiling(self):
         return None
-
-
-

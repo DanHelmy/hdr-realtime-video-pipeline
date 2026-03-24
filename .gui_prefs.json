@@ -1,7 +1,7 @@
 {
   "precision": "FP16",
   "resolution": "720p",
-  "upscale_mode": "FSR",
+  "upscale_mode": "SSimSuperRes",
   "view": "Tabbed",
   "show_metrics": true,
   "use_hg": false,

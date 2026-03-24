@@ -104,8 +104,13 @@ _ROOT = os.path.dirname(_HERE)
 _MPV_DIAG = os.environ.get("HDRTVNET_MPV_DIAG", "1").strip().lower() in {"1", "true", "yes", "on"}
 _PREFS_PATH = os.path.join(_ROOT, ".gui_prefs.json")
 _HG_WEIGHTS_PATH = os.path.join(
-    _ROOT, "Source Pipeline", "pretrained_models", "HG_weights.pth"
+    _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
+# Keep wall-clock playback close to target by dropping decode frames when
+# inference falls behind. This favors cadence over full-frame coverage.
+_REALTIME_CATCHUP_ENABLED = True
+_REALTIME_SKIP_LAG_FRAMES = 1.1
+_REALTIME_MAX_CATCHUP_SKIP = 6
 
 
 def _weight(name):
@@ -265,19 +270,21 @@ def _select_hdr_scale_antiring(proc_w: int, proc_h: int,
                                out_w: int, out_h: int,
                                scale_kernel: str | None = None) -> float:
     """Tune antiring strength by processing resolution and kernel."""
-    if proc_w == out_w and proc_h == out_h:
+    if proc_w >= out_w and proc_h >= out_h:
         return 0.0
     k = str(scale_kernel or "").strip().lower()
     if k == "fsr":
         return 0.0
+    if "ssim" in k:
+        return 0.0
     if proc_h <= 540 or proc_w <= 960:
-        base = 0.60
+        base = 0.30
     elif proc_h <= 720 or proc_w <= 1280:
-        base = 0.45
+        base = 0.22
     else:
-        base = 0.15
+        base = 0.10
     if "lanczossharp" in k or k == "ewa_lanczos":
-        return min(0.8, base + 0.05)
+        return max(0.0, base - 0.05)
     return base
 
 
@@ -289,20 +296,19 @@ def _select_mpv_cas_strength(proc_w: int, proc_h: int,
     if proc_w >= out_w and proc_h >= out_h:
         return 0.0
     if using_fsr:
-        if proc_h <= 540 or proc_w <= 960:
-            return 0.30
-        if proc_h <= 720 or proc_w <= 1280:
-            return 0.25
-        return 0.18
+        return 0.0
+    k = str(scale_kernel or "").strip().lower()
+    if "ssim" in k:
+        return 0.0
     if proc_h <= 540 or proc_w <= 960:
-        base = 0.12
+        base = 0.22
     elif proc_h <= 720 or proc_w <= 1280:
-        base = 0.14
+        base = 0.20
     else:
-        base = 0.12
+        base = 0.16
     k = str(scale_kernel or "").strip().lower()
     if "lanczossharp" in k or k == "ewa_lanczos":
-        return max(0.0, base - 0.02)
+        return base + 0.02
     return base
 
 
@@ -326,7 +332,15 @@ FILMGRAIN_SHADER_URL = (
     "https://raw.githubusercontent.com/haasn/gentoo-conf/"
     "xor/home/nand/.mpv/shaders/filmgrain.glsl"
 )
-UPSCALER_CHOICES = ["EWA LanczosSharp", "FSR"]
+SSIM_SUPERRES_SHADER_PATH = os.path.join(
+    _ROOT, "assets", "shaders", "SSimSuperRes.glsl"
+)
+SSIM_SUPERRES_SHADER_URL = (
+    "https://gist.githubusercontent.com/igv/"
+    "2364ffa6e81540f29cb7ab4c9bc05b6b/raw/"
+    "15d93440d0a24fc4b8770070be6a9fa2af6f200b/SSimSuperRes.glsl"
+)
+UPSCALER_CHOICES = ["EWA LanczosSharp", "FSR", "SSimSuperRes"]
 DEFAULT_UPSCALER = "EWA LanczosSharp"
 
 
@@ -334,6 +348,8 @@ def _normalize_upscale_choice(choice: str) -> str:
     c = str(choice or "").strip().lower()
     if "fsr" in c:
         return "fsr"
+    if "ssim" in c:
+        return "ssim_superres"
     return BEST_MPV_SCALE
 
 
@@ -371,6 +387,24 @@ def _ensure_filmgrain_shader() -> bool:
     except Exception as exc:
         print(f"[filmgrain] download failed: {exc}")
     return os.path.isfile(FILMGRAIN_SHADER_PATH)
+
+
+def _ensure_ssim_superres_shader() -> bool:
+    """Ensure the SSimSuperRes shader exists on disk (download on demand)."""
+    if os.path.isfile(SSIM_SUPERRES_SHADER_PATH):
+        return True
+    try:
+        os.makedirs(os.path.dirname(SSIM_SUPERRES_SHADER_PATH), exist_ok=True)
+        import urllib.request
+        with urllib.request.urlopen(SSIM_SUPERRES_SHADER_URL, timeout=10) as resp:
+            data = resp.read()
+        if data:
+            with open(SSIM_SUPERRES_SHADER_PATH, "wb") as f:
+                f.write(data)
+            return True
+    except Exception as exc:
+        print(f"[ssim] download failed: {exc}")
+    return os.path.isfile(SSIM_SUPERRES_SHADER_PATH)
 
 
 def _normalize_shader_paths(paths: list[str]) -> list[str]:
@@ -603,6 +637,9 @@ class MpvHDRWidget(QWidget):
             k = "bicubic"
         if k in {"fsr"}:
             return "fsr", 0.0
+        if k in {"ssim_superres", "ssim"}:
+            # SSimSuperRes is a shader; use a neutral base scaler.
+            return "spline36", 0.0
         # Slightly stronger antiring for lanczossharp to tame halos.
         if k in {"ewa_lanczossharp", "ewa_lanczos"}:
             return "ewa_lanczossharp", 0.20
@@ -759,7 +796,15 @@ class MpvHDRWidget(QWidget):
             kernel_name = BEST_MPV_SCALE
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["scale_kernel"] = str(kernel_name)
+        use_ssim = (kernel_name == "ssim_superres" and _ensure_ssim_superres_shader())
+        if kernel_name == "ssim_superres" and not use_ssim:
+            print("[mpv] SSimSuperRes shader unavailable (download failed). "
+                  f"Falling back to {BEST_MPV_SCALE}.")
+            kernel_name = BEST_MPV_SCALE
+            if self._last_playback_cfg is not None:
+                self._last_playback_cfg["scale_kernel"] = str(kernel_name)
         use_fsr = (kernel_name == "fsr")
+        use_ssim = (kernel_name == "ssim_superres")
         use_film_grain = bool(film_grain and _ensure_filmgrain_shader())
         if film_grain and not use_film_grain:
             print("[mpv] film grain shader unavailable (download failed).")
@@ -794,6 +839,8 @@ class MpvHDRWidget(QWidget):
         shader_paths = []
         if use_fsr:
             shader_paths.append(FSR_SHADER_PATH)
+        if use_ssim:
+            shader_paths.append(SSIM_SUPERRES_SHADER_PATH)
         if use_film_grain:
             shader_paths.append(FILMGRAIN_SHADER_PATH)
         if self._force_hdr_metadata:
@@ -970,6 +1017,7 @@ class MpvHDRWidget(QWidget):
         if p is None:
             return False
         self._last_scale_error = None
+        requested_kernel = str(scale_kernel or "").strip().lower()
         kernel, antiring = self._kernel_antiring(scale_kernel)
         if scale_antiring is not None:
             antiring = max(0.0, min(1.0, float(scale_antiring)))
@@ -980,6 +1028,9 @@ class MpvHDRWidget(QWidget):
             use_fsr = (kernel == "fsr" and _ensure_fsr_shader())
             if kernel == "fsr" and not use_fsr:
                 kernel = BEST_MPV_SCALE
+            use_ssim = (requested_kernel == "ssim_superres" and _ensure_ssim_superres_shader())
+            if requested_kernel == "ssim_superres" and not use_ssim:
+                use_ssim = False
             if use_fsr:
                 p.command("set", "scale", "bilinear")
                 p.command("set", "cscale", "bilinear")
@@ -992,6 +1043,8 @@ class MpvHDRWidget(QWidget):
             shader_paths = []
             if use_fsr:
                 shader_paths.append(FSR_SHADER_PATH)
+            if use_ssim:
+                shader_paths.append(SSIM_SUPERRES_SHADER_PATH)
             if use_film_grain:
                 shader_paths.append(FILMGRAIN_SHADER_PATH)
             if not self._set_glsl_shaders(shader_paths):
@@ -999,7 +1052,10 @@ class MpvHDRWidget(QWidget):
             p.command("set", "scale-antiring", str(antiring))
             p.command("set", "cscale-antiring", str(antiring))
             if self._last_playback_cfg is not None:
-                self._last_playback_cfg["scale_kernel"] = str(kernel)
+                if use_ssim:
+                    self._last_playback_cfg["scale_kernel"] = "ssim_superres"
+                else:
+                    self._last_playback_cfg["scale_kernel"] = str(kernel)
                 self._last_playback_cfg["scale_antiring"] = float(antiring)
                 self._last_playback_cfg["film_grain"] = bool(use_film_grain)
             return True
@@ -1189,6 +1245,7 @@ class PipelineWorker(QThread):
         self._app_vram_mb: float = 0.0
         self._app_vram_poll_stop = threading.Event()
         self._app_vram_poll_thread: threading.Thread | None = None
+        self._realtime_drop_frames: int = 0
 
     # ── public API (called from main thread) ──
 
@@ -1204,6 +1261,7 @@ class PipelineWorker(QThread):
         self._reset_enhance_history()
         self._input_is_hdr = bool(input_is_hdr)
         self._use_hg = bool(use_hg)
+        self._realtime_drop_frames = 0
         # Drop a couple of frames on startup to avoid mpv buffer lag.
         self._hdr_drop_until_frame = 2
         self._sdr_drop_until_frame = 2
@@ -1873,14 +1931,13 @@ class PipelineWorker(QThread):
 
             # Playback pacing: cap processing to the video FPS.
             now = time.perf_counter()
+            lag_s = 0.0
             if now < next_frame_t:
                 time.sleep(next_frame_t - now)
-            elif now - next_frame_t > (frame_interval_s * 2.0):
-                # After long stalls (seek/pause/compile hiccup), resync.
-                next_frame_t = now
+            else:
+                lag_s = now - next_frame_t
             if self._hold_until_t and now < self._hold_until_t:
                 time.sleep(min(frame_interval_s, self._hold_until_t - now))
-            present_t = max(next_frame_t, time.perf_counter())
 
             ret, frame = source.read()
             if not ret:
@@ -1889,10 +1946,37 @@ class PipelineWorker(QThread):
             frame_idx += 1
             self._frame_idx = frame_idx
 
+            # Real-time catch-up: if inference is behind wall clock, drop a few
+            # decode frames and process the newest one to preserve cadence.
+            if (
+                _REALTIME_CATCHUP_ENABLED
+                and (not seek_frame_ready_pending)
+                and lag_s > (frame_interval_s * _REALTIME_SKIP_LAG_FRAMES)
+            ):
+                skip_n = min(
+                    _REALTIME_MAX_CATCHUP_SKIP,
+                    max(0, int(lag_s / frame_interval_s)),
+                )
+                while skip_n > 0:
+                    ret_skip, frame_skip = source.read()
+                    if not ret_skip:
+                        ret = False
+                        break
+                    frame = frame_skip
+                    frame_idx += 1
+                    self._frame_idx = frame_idx
+                    self._realtime_drop_frames += 1
+                    next_frame_t += frame_interval_s
+                    skip_n -= 1
+                if not ret:
+                    break
+
             # FPS limiter via frame skipping (keeps wall-clock speed).
             if (not seek_frame_ready_pending) and frame_stride > 1 and (frame_idx % frame_stride) != 0:
                 next_frame_t += frame_interval_s
                 continue
+
+            present_t = max(next_frame_t, time.perf_counter())
 
             t0 = time.perf_counter()
 
@@ -2088,6 +2172,7 @@ class PipelineWorker(QThread):
                     "model_mb": model_mb,
                     "precision": prec_label,
                     "proc_res": f"{proc_w}\u00d7{proc_h}",
+                    "realtime_drops": int(self._realtime_drop_frames),
                 })
 
         source.release()
@@ -2300,7 +2385,8 @@ class _PrecompileDialog(QDialog):
     process (zero GPU interference) and streams stdout into a log view."""
 
     def __init__(self, resolutions: list[str], precision: str = "fp16",
-                 model_path: str | None = None, clear_cache: bool = False,
+                 model_path: str | None = None, use_hg: bool = True,
+                 hg_weights: str | None = None, clear_cache: bool = False,
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pre-compile Kernels")
@@ -2314,6 +2400,8 @@ class _PrecompileDialog(QDialog):
         self._resolutions = resolutions
         self._precision = precision
         self._model_path = model_path
+        self._use_hg = bool(use_hg)
+        self._hg_weights = hg_weights
         self._clear_cache = clear_cache
         self._process: QProcess | None = None
         self._finished_ok = False
@@ -2366,6 +2454,9 @@ class _PrecompileDialog(QDialog):
         args += ["--precision", self._precision]
         if self._model_path:
             args += ["--model", self._model_path]
+        args += ["--use-hg", "1" if self._use_hg else "0"]
+        if self._hg_weights:
+            args += ["--hg-weights", self._hg_weights]
         if self._clear_cache:
             args += ["--clear-cache"]
 
@@ -2574,6 +2665,7 @@ class MainWindow(QMainWindow):
         self._precision_swap_pending: str | None = None
         self._precision_pause_armed = False
         self._precision_swap_timer: QTimer | None = None
+        self._last_user_pause_t = 0.0
         self._audio_player = None
         self._audio_output = None
         self._audio_available = _HAS_QT_AUDIO
@@ -2614,6 +2706,7 @@ class MainWindow(QMainWindow):
         self._window_toggle_last_t = 0.0
         self._window_toggle_cooldown_s = 0.25
         self._window_refresh_timer: QTimer | None = None
+        self._window_refresh_soft_only = False
         self._overlay_reposition_timer: QTimer | None = None
         self._ui_pause_timer: QTimer | None = None
         self._ui_pause_duration_ms = 180
@@ -3412,17 +3505,25 @@ class MainWindow(QMainWindow):
     def _begin_layout_freeze(self):
         return
 
-    def _end_layout_freeze(self, refresh_delay: int | None = 40):
+    def _end_layout_freeze(self, refresh_delay: int | None = 40,
+                           refresh_soft_only: bool = False):
         if refresh_delay is not None:
-            self._schedule_window_state_refresh(refresh_delay)
+            self._schedule_window_state_refresh(
+                refresh_delay, soft_only=refresh_soft_only
+            )
 
-    def _with_layout_freeze(self, fn, refresh_delay: int | None = 40):
+    def _with_layout_freeze(self, fn, refresh_delay: int | None = 40,
+                            refresh_soft_only: bool = False):
         fn()
         if refresh_delay is not None:
-            self._schedule_window_state_refresh(refresh_delay)
+            self._schedule_window_state_refresh(
+                refresh_delay, soft_only=refresh_soft_only
+            )
 
-    def _schedule_window_state_refresh(self, delay_ms: int = 140):
+    def _schedule_window_state_refresh(self, delay_ms: int = 140,
+                                       soft_only: bool = False):
         self._ensure_window_refresh_timer()
+        self._window_refresh_soft_only = bool(soft_only)
         self._window_refresh_timer.stop()
         self._window_refresh_timer.start(max(0, int(delay_ms)))
 
@@ -3679,7 +3780,9 @@ class MainWindow(QMainWindow):
             if self._act_borderless_full_window is not None:
                 self._act_borderless_full_window.setChecked(True)
             self._schedule_overlay_position(0)
-        self._with_layout_freeze(_apply_full, refresh_delay=140)
+        self._with_layout_freeze(
+            _apply_full, refresh_delay=140, refresh_soft_only=True
+        )
         self._relock_timeline(delay_ms=180, drop_frames=3)
 
     def _exit_borderless_full_window(self):
@@ -3709,7 +3812,9 @@ class MainWindow(QMainWindow):
             else:
                 self.showNormal()
             self._schedule_overlay_position(0)
-        self._with_layout_freeze(_apply_exit, refresh_delay=140)
+        self._with_layout_freeze(
+            _apply_exit, refresh_delay=140, refresh_soft_only=True
+        )
         self._relock_timeline(delay_ms=180, drop_frames=3)
 
     def _should_use_mpv_pipeline(self) -> bool:
@@ -4361,6 +4466,8 @@ class MainWindow(QMainWindow):
 
         dlg = _PrecompileDialog(
             resolutions, precision=prec_arg, model_path=model_path,
+            use_hg=self._chk_hg.isChecked(),
+            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
             clear_cache=False, parent=self,
         )
         dlg.exec()          # modal — blocks until user closes
@@ -4628,7 +4735,10 @@ class MainWindow(QMainWindow):
         model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
         dlg = _PrecompileDialog(
             [f"{pw}x{ph}"], precision=prec_arg,
-            model_path=model_path, parent=self,
+            model_path=model_path,
+            use_hg=self._chk_hg.isChecked(),
+            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+            parent=self,
         )
         dlg.exec()                        # modal — blocks until done
         if dlg.succeeded:
@@ -4811,13 +4921,16 @@ class MainWindow(QMainWindow):
                             return
                         fps = getattr(self, '_vid_fps', 30.0)
                         target_frame = int(self._last_seek_frame)
+                        resume_dt = time.perf_counter() - float(self._last_user_pause_t or 0.0)
                         if self._audio_available and self._audio_player is not None:
                             try:
                                 have_ms = int(self._audio_player.position())
                                 target_frame = int(round((have_ms / 1000.0) * max(fps, 1e-6)))
                             except Exception:
                                 target_frame = int(self._last_seek_frame)
-                        if abs(target_frame - int(self._last_seek_frame)) >= 2:
+                        if resume_dt < 0.6:
+                            return
+                        if abs(target_frame - int(self._last_seek_frame)) >= 6:
                             self._worker.request_seek(int(target_frame))
                             if self._disp_hdr_mpv is not None and not self._audio_available:
                                 self._disp_hdr_mpv.seek_seconds(int(target_frame) / max(fps, 1e-6))
@@ -4829,6 +4942,7 @@ class MainWindow(QMainWindow):
             self._arm_cursor_idle_timer()
         else:
             self._worker.pause()
+            self._last_user_pause_t = time.perf_counter()
             self._set_pause_button_labels(True)
             if self._disp_hdr_mpv is not None:
                 self._disp_hdr_mpv.set_paused(True)
@@ -5028,10 +5142,10 @@ class MainWindow(QMainWindow):
                 self._disp_hdr_mpv.set_cas_strength(self._active_mpv_cas)
                 self._active_upscale_mode = new_upscale
                 def _announce():
-                    fsr = self._disp_hdr_mpv.is_fsr_active()
-                    mode_label = "FSR" if fsr else "EWA LanczosSharp"
+                    mode_label = str(self._active_upscale_mode or "")
+                    using_shader = (kernel == "fsr" or "ssim" in str(kernel).lower())
                     self.statusBar().showMessage(
-                        f"Upscale hot-swap: {mode_label} ({'shader active' if fsr else 'kernel active'})"
+                        f"Upscale hot-swap: {mode_label} ({'shader active' if using_shader else 'kernel active'})"
                     )
                 QTimer.singleShot(80, _announce)
                 self._save_user_settings()
@@ -5117,6 +5231,8 @@ class MainWindow(QMainWindow):
     def _refresh_mpv_after_window_state_change(self):
         if not self._playing:
             return
+        soft_only = bool(self._window_refresh_soft_only)
+        self._window_refresh_soft_only = False
         paused = bool(self._worker is not None and self._worker.is_paused)
         if paused:
             # Defer full mpv refresh while paused to avoid blackscreen.
@@ -5128,11 +5244,11 @@ class MainWindow(QMainWindow):
                 self._disp_sdr_mpv.set_cas_strength(0.0)
             return
         self._deferred_mpv_refresh = False
-        if self._disp_hdr_mpv is not None:
+        if (not soft_only) and self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.refresh_surface()
             if paused:
                 self._disp_hdr_mpv.set_paused(True)
-        if self._disp_sdr_mpv is not None:
+        if (not soft_only) and self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.refresh_surface()
             if paused:
                 self._disp_sdr_mpv.set_paused(True)
@@ -5371,7 +5487,10 @@ class MainWindow(QMainWindow):
                 if fsr_active:
                     upscale_label = "FSR"
                 elif self._active_mpv_scale_kernel:
-                    upscale_label = str(self._active_mpv_scale_kernel)
+                    if str(self._active_mpv_scale_kernel).lower().startswith("ssim"):
+                        upscale_label = "SSimSuperRes"
+                    else:
+                        upscale_label = str(self._active_mpv_scale_kernel)
         self._m["upscale"].setText(f"Upscale: {upscale_label}")
         fps_now = float(m.get("fps", 0.0))
         self._update_auto_mute_from_fps(fps_now)

@@ -35,8 +35,8 @@ benchmark_*.py
 
 # Large model artifacts (prefer release assets or Git LFS)
 *.onnx
-*.pth
 *.pt
+src/models/weights/HG_weights.pth
 # Pipeline weights — tracked
 !src/models/weights/Ensemble_AGCM_LE.pth
 !src/models/weights/Ensemble_AGCM_LE_int8_full.pt

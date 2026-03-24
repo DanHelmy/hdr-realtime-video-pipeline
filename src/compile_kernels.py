@@ -146,6 +146,17 @@ def main():
         help="Model weights path (default: auto based on precision)",
     )
     parser.add_argument(
+        "--use-hg",
+        default="1",
+        choices=["1", "0"],
+        help="Enable HG refinement (1/0). Default: 1",
+    )
+    parser.add_argument(
+        "--hg-weights",
+        default=None,
+        help="Path to HG_weights.pth (overrides default path)",
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
         help="Delete kernel caches before compiling",
@@ -179,6 +190,9 @@ def main():
     if not os.path.isfile(model_path):
         print(f"ERROR: Model weights not found: {model_path}", file=sys.stderr)
         sys.exit(1)
+    if args.hg_weights and not os.path.isfile(args.hg_weights):
+        print(f"ERROR: HG weights not found: {args.hg_weights}", file=sys.stderr)
+        sys.exit(1)
 
     # Import heavy dependencies only after arg parsing
     import torch
@@ -194,6 +208,8 @@ def main():
         compile_model=True,
         compile_mode="max-autotune",
         predequantize="auto",
+        hg_weights=args.hg_weights,
+        use_hg=str(args.use_hg).strip() != "0",
     )
 
     if not (hasattr(processor, "_compiled") and processor._compiled):
