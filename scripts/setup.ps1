@@ -77,9 +77,10 @@ $selection = Resolve-Backend -RequestedBackend $Backend
 $target = [string]$selection.Backend
 
 Write-Step "Backend selection: $target ($($selection.Reason))"
-if ($selection.Gpus -and $selection.Gpus.Count -gt 0) {
+$gpuList = @(@($selection.Gpus) | Where-Object { $_ -and $_.ToString().Trim().Length -gt 0 })
+if ($gpuList.Count -gt 0) {
     Write-Host "[setup] Detected GPU(s):"
-    foreach ($name in $selection.Gpus) {
+    foreach ($name in $gpuList) {
         Write-Host "  - $name"
     }
 }
