@@ -16,26 +16,22 @@ Windows-only project with **NVIDIA CUDA**, **AMD ROCm-Windows**, and **CPU** bac
 
 ---
 
-## Manual Downloads (Do This First)
+## How To Run (Clone Workflow)
 
-Download required runtime files from the shared Google Drive assets folder:
+No manual asset download is required before setup.
+
+1. Clone the repo.
+2. Run `setup.bat` (double-click or terminal).
+3. Run `run_gui.bat` to start the app.
+
+If required files are missing (`libmpv-2.dll`, `HG_weights.pth`), the app shows a blocking dialog with:
+- an **Open Google Drive** button
+- exact placement paths
+- an **OK** button to re-check files (no restart required)
+
+Google Drive assets link:
 
 `https://drive.google.com/drive/folders/1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link`
-
-Place these files before first run:
-
-1. `HG_weights.pth` -> `src/models/weights/HG_weights.pth`
-2. `libmpv-2.dll` -> `src/libmpv-2.dll`
-
-Startup behavior for clone users:
-- The app now checks these files on launch.
-- If either file is missing, a blocking dialog appears with:
-  - Google Drive download button
-  - exact placement instructions
-  - OK button (re-checks files without restart)
-
-Optional download:
-- Install **GNU Octave** (and add to `PATH`) if you want HDR-VDP3 metrics.
 
 ---
 

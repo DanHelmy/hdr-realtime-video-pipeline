@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import glob
 import os
+import shutil
+import webbrowser
 
 import numpy as np
+from PyQt6.QtWidgets import QCheckBox, QMessageBox
 
 from gui_mpv_widget import MpvHDRWidget
 from gui_scaling import (
@@ -31,6 +35,27 @@ _MPV_DIAG = os.environ.get("HDRTVNET_MPV_DIAG", "1").strip().lower() in {
     "yes",
     "on",
 }
+_OCTAVE_DOWNLOAD_URL = "https://octave.org/download#ms-windows"
+
+
+def _octave_executable() -> str | None:
+    for name in ("octave-cli", "octave", "octave-cli.exe", "octave.exe"):
+        p = shutil.which(name)
+        if p:
+            return p
+    if os.name == "nt":
+        patterns = [
+            r"C:\Program Files\GNU Octave\Octave-*\mingw64\bin\octave-cli.exe",
+            r"C:\Program Files\GNU Octave\Octave-*\mingw64\bin\octave.exe",
+            r"C:\Program Files\Octave\Octave-*\mingw64\bin\octave-cli.exe",
+            r"C:\Program Files\Octave\Octave-*\mingw64\bin\octave.exe",
+        ]
+        for pat in patterns:
+            hits = sorted(glob.glob(pat), reverse=True)
+            for hit in hits:
+                if os.path.isfile(hit):
+                    return hit
+    return None
 
 
 class CompareViewMixin:
@@ -89,6 +114,8 @@ class CompareViewMixin:
         if self._compare_snapshot_pending:
             self.statusBar().showMessage("Compare snapshot already in progress ...")
             return
+
+        self._warn_if_octave_missing_for_compare()
 
         # Pause first to freeze playback context for deterministic compare.
         if not self._worker.is_paused:
@@ -175,3 +202,45 @@ class CompareViewMixin:
         dlg.activateWindow()
 
         self.statusBar().showMessage(f"Compare view ready at frame {frame_idx}.")
+
+    def _warn_if_octave_missing_for_compare(self):
+        if getattr(self, "_compare_octave_warning_shown", False):
+            return
+        self._compare_octave_warning_shown = True
+        if getattr(self, "_suppress_octave_compare_warning", False):
+            return
+        if _octave_executable():
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("GNU Octave Not Detected")
+        box.setText(
+            "GNU Octave was not detected.\n\n"
+            "Compare will still open, but HDR-VDP3 score will be unavailable "
+            "until Octave is installed.\n\n"
+            f"Download GNU Octave:\n{_OCTAVE_DOWNLOAD_URL}",
+        )
+        never_warn = QCheckBox("Do not show this warning again")
+        box.setCheckBox(never_warn)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        open_btn = box.addButton(
+            "Open Octave Download Page",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        while True:
+            box.exec()
+            if box.clickedButton() is open_btn:
+                try:
+                    webbrowser.open(_OCTAVE_DOWNLOAD_URL, new=2)
+                except Exception:
+                    pass
+                continue
+            break
+
+        if never_warn.isChecked():
+            self._suppress_octave_compare_warning = True
+            try:
+                self._save_user_settings()
+            except Exception:
+                pass

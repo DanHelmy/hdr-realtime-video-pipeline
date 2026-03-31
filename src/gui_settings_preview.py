@@ -183,6 +183,9 @@ class SettingsPreviewMixin:
         self._suppress_hip_sdk_warning = bool(
             data.get("suppress_hip_sdk_warning", False)
         )
+        self._suppress_octave_compare_warning = bool(
+            data.get("suppress_octave_compare_warning", False)
+        )
 
         gt_path = None
         # Do not persist HDR GT across app sessions; only accept explicit CLI pass-through.
@@ -218,6 +221,9 @@ class SettingsPreviewMixin:
             ),
             "suppress_hip_sdk_warning": bool(
                 getattr(self, "_suppress_hip_sdk_warning", False)
+            ),
+            "suppress_octave_compare_warning": bool(
+                getattr(self, "_suppress_octave_compare_warning", False)
             ),
             "last_open_dir": self._last_open_dir
             if os.path.isdir(self._last_open_dir)

@@ -135,6 +135,8 @@ class StateInitMixin:
         self._predequantize_mode = "auto"
         self._suppress_hip_sdk_warning = False
         self._startup_hip_sdk_warning_shown = False
+        self._suppress_octave_compare_warning = False
+        self._compare_octave_warning_shown = False
         self._autotune_warning_needed = False
         self._hdr_ground_truth_path = None
         self._objective_metrics_enabled = False
