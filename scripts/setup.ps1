@@ -99,3 +99,6 @@ Write-Step "Running $targetScript ..."
 & $targetScript @forwardParams
 
 Write-Step "Done."
+if (-not $RunGui) {
+    Write-Host "[setup] Next step: run .\run_gui.bat"
+}

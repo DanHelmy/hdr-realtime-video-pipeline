@@ -55,8 +55,8 @@ $hipDetectScript = @'
 import os
 import sys
 
-repo_root = os.environ.get("HDRTVNET_REPO_ROOT", "")
-src_dir = os.path.join(repo_root, "src")
+repo_root = os.environ.get('HDRTVNET_REPO_ROOT', '')
+src_dir = os.path.join(repo_root, 'src')
 if src_dir and src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
@@ -92,7 +92,7 @@ if (-not $hipSdkDetected) {
 
 Write-Step "Setup complete."
 Write-Host "[setup-amd] Python: $pyMm"
-Write-Host "[setup-amd] Launch with: .\venv\Scripts\python.exe src\gui.py"
+Write-Host "[setup-amd] Launch with: .\run_gui.bat"
 
 if ($RunGui) {
     Write-Step "Launching GUI..."

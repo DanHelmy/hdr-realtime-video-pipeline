@@ -48,7 +48,7 @@ if (-not $SkipPipUpgrade) {
 $pyVersion = (& $venvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
 Write-Step "Setup complete."
 Write-Host "[setup-cpu] Python: $pyVersion"
-Write-Host "[setup-cpu] Launch with: .\venv\Scripts\python.exe src\gui.py"
+Write-Host "[setup-cpu] Launch with: .\run_gui.bat"
 
 if ($RunGui) {
     Write-Step "Launching GUI..."

@@ -51,7 +51,7 @@ if (-not $SkipPipUpgrade) {
 
 Write-Step "Setup complete."
 Write-Host "[setup-nvidia] Python: $pyMm"
-Write-Host "[setup-nvidia] Launch with: .\venv\Scripts\python.exe src\gui.py"
+Write-Host "[setup-nvidia] Launch with: .\run_gui.bat"
 
 if ($RunGui) {
     Write-Step "Launching GUI..."
