@@ -56,6 +56,8 @@ from gui_scaling import (
 from gui_widgets import _KernelCacheClearWorker
 from windows_runtime import default_cache_root
 
+from hip_sdk_detection import detect_hip_sdk_windows
+
 try:
     from models.hdrtvnet_torch import _HAS_COMPILE, _HAS_HIP_SDK, _HAS_TRITON, _IS_ROCM
 except Exception:
@@ -279,7 +281,13 @@ class PlaybackRuntimeMixin:
             return
         if not torch.cuda.is_available():
             return
-        if _HAS_HIP_SDK:
+        hip_sdk_available = bool(_HAS_HIP_SDK)
+        if not hip_sdk_available:
+            try:
+                hip_sdk_available, _ = detect_hip_sdk_windows()
+            except Exception:
+                hip_sdk_available = False
+        if hip_sdk_available:
             return
 
         box = QMessageBox(self)
