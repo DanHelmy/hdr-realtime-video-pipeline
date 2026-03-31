@@ -201,6 +201,9 @@ pip install -r requirements/requirements-nvidia.txt
 ```bash
 pip install -r requirements/requirements-amd.txt
 ```
+Recommended for best compatibility/performance:
+- Install AMD HIP SDK: `https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html`
+- Default install path expected by warning checks: `C:\Program Files\AMD\ROCm`
 
 **CPU only:**
 ```bash

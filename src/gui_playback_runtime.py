@@ -56,8 +56,6 @@ from gui_scaling import (
 from gui_widgets import _KernelCacheClearWorker
 from windows_runtime import default_cache_root
 
-from hip_sdk_detection import detect_hip_sdk_windows
-
 try:
     from models.hdrtvnet_torch import _HAS_COMPILE, _HAS_HIP_SDK, _HAS_TRITON, _IS_ROCM
 except Exception:
@@ -76,6 +74,7 @@ _ASSETS_DRIVE_URL = (
     "https://drive.google.com/drive/folders/"
     "1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link"
 )
+_HIP_SDK_URL = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
 
 
 def _env_enabled(name: str, default: str = "1") -> bool:
@@ -281,28 +280,35 @@ class PlaybackRuntimeMixin:
             return
         if not torch.cuda.is_available():
             return
-        hip_sdk_available = bool(_HAS_HIP_SDK)
-        if not hip_sdk_available:
-            try:
-                hip_sdk_available, _ = detect_hip_sdk_windows()
-            except Exception:
-                hip_sdk_available = False
-        if hip_sdk_available:
+        hip_sdk_path = r"C:\Program Files\AMD\ROCm"
+        if os.path.isdir(hip_sdk_path):
             return
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("AMD HIP SDK Not Detected")
         box.setText(
-            "ROCm-Windows was detected, but AMD HIP SDK was not found.\n\n"
+            f"ROCm-Windows was detected, but AMD HIP SDK was not found at:\n{hip_sdk_path}\n\n"
             "The app can still run, but max-autotune compile may be skipped and "
             "playback performance can be lower.\n\n"
-            "Install HIP SDK for best performance.",
+            f"Install HIP SDK for best performance:\n{_HIP_SDK_URL}",
         )
         never_warn = QCheckBox("Do not show this warning again")
         box.setCheckBox(never_warn)
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.exec()
+        open_btn = box.addButton(
+            "Open HIP SDK Page",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        while True:
+            box.exec()
+            if box.clickedButton() is open_btn:
+                try:
+                    webbrowser.open(_HIP_SDK_URL, new=2)
+                except Exception:
+                    pass
+                continue
+            break
 
         if never_warn.isChecked():
             self._suppress_hip_sdk_warning = True

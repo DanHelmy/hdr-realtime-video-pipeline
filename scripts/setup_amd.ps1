@@ -49,45 +49,14 @@ if (-not $SkipPipUpgrade) {
 }
 & $venvPython -m pip install -r $reqFile
 
-$hipSdkDetected = $false
-$hipSdkRoot = ""
-$hipDetectScript = @'
-import os
-import sys
-
-repo_root = os.environ.get('HDRTVNET_REPO_ROOT', '')
-src_dir = os.path.join(repo_root, 'src')
-if src_dir and src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
-
-from hip_sdk_detection import detect_hip_sdk_windows
-
-found, root = detect_hip_sdk_windows()
-if found:
-    if root:
-        print(root)
-    raise SystemExit(0)
-raise SystemExit(1)
-'@
-try {
-    $env:HDRTVNET_REPO_ROOT = $repoRoot
-    $hipDetectOut = @(& $venvPython -c $hipDetectScript 2>$null)
-    if ($LASTEXITCODE -eq 0) {
-        $hipSdkDetected = $true
-        if ($hipDetectOut.Count -gt 0 -and $hipDetectOut[0]) {
-            $hipSdkRoot = [string]$hipDetectOut[0]
-        }
-    }
-} catch {
-    $hipSdkDetected = $false
-} finally {
-    Remove-Item Env:HDRTVNET_REPO_ROOT -ErrorAction SilentlyContinue
-}
-if ($hipSdkDetected -and $hipSdkRoot) {
-    Write-Host "[setup-amd] HIP SDK detected at: $hipSdkRoot"
+$hipSdkPath = "C:\Program Files\AMD\ROCm"
+$hipSdkUrl = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+$hipSdkDetected = Test-Path $hipSdkPath
+if ($hipSdkDetected) {
+    Write-Host "[setup-amd] HIP SDK detected at: $hipSdkPath"
 }
 if (-not $hipSdkDetected) {
-    Write-Warning "HIP SDK headers not detected (checked ROCm env vars, standard install path, pip-installed ROCm SDK folders, and hipcc-derived roots). App can still run, but max-autotune compile performance may be lower."
+    Write-Warning "HIP SDK not detected in '$hipSdkPath'. App can still run, but max-autotune compile performance may be lower. Download: $hipSdkUrl"
 }
 
 Write-Step "Setup complete."
