@@ -3,14 +3,12 @@ import argparse
 import os
 import time
 
-# Pin caches to a stable user path (avoid Temp churn/permissions).
-def _default_cache_root():
-    local_app = os.environ.get("LOCALAPPDATA")
-    if local_app:
-        return os.path.join(local_app, "HDRTVNetCache")
-    return os.path.join(os.path.expanduser("~"), ".cache", "hdrtvnet")
+from windows_runtime import default_cache_root, ensure_windows_supported
 
-_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", _default_cache_root())
+# Pin caches to a stable user path (avoid Temp churn/permissions).
+ensure_windows_supported("HDRTVNet++ CLI")
+
+_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", default_cache_root())
 try:
     os.makedirs(_cache_root, exist_ok=True)
 except Exception:

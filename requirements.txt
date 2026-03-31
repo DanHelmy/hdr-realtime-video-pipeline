@@ -1,7 +1,0 @@
-opencv-python
-numpy
-torch
-torchvision
-psutil
-PyQt6
-python-mpv

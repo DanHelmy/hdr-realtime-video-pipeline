@@ -1,0 +1,5 @@
+opencv-python
+numpy
+psutil
+PyQt6
+python-mpv

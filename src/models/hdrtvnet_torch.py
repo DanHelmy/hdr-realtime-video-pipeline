@@ -1,5 +1,8 @@
 import math
 import os
+import shutil
+import sys
+import threading
 import time
 
 import numpy as np
@@ -31,20 +34,83 @@ except ImportError:
     _HAS_TRITON = False
 
 # Auto-detect HIP SDK on ROCm-Windows (needed for Triton codegen).
-# Checks HIP_PATH env or the standard AMD ROCm install directory.
+# Checks:
+#   - HIP_PATH / ROCM_PATH / ROCM_HOME env vars
+#   - standard AMD ROCm install directory
+#   - Python-packaged ROCm SDK layouts (e.g. _rocm_sdk_devel/_core)
+#   - hipcc location-derived roots
+def _has_hip_headers(root: str) -> bool:
+    if not root:
+        return False
+    root = str(root).strip().strip('"')
+    if not root:
+        return False
+    candidates = (
+        os.path.join(root, "include", "hip"),
+        os.path.join(root, "hip", "include", "hip"),
+    )
+    return any(os.path.isdir(p) for p in candidates)
+
+
+def _candidate_hip_roots_windows():
+    roots = []
+
+    # Explicit env vars first.
+    for env_key in ("HIP_PATH", "ROCM_PATH", "ROCM_HOME"):
+        v = os.environ.get(env_key, "")
+        if v:
+            roots.append(v)
+
+    # Standard ROCm install path.
+    rocm_root = r"C:\Program Files\AMD\ROCm"
+    roots.append(rocm_root)
+    if os.path.isdir(rocm_root):
+        try:
+            for entry in os.listdir(rocm_root):
+                roots.append(os.path.join(rocm_root, entry))
+        except Exception:
+            pass
+
+    # Python install roots (works when ROCm SDK is pip-installed).
+    for base in {sys.prefix, getattr(sys, "base_prefix", sys.prefix)}:
+        if not base:
+            continue
+        roots.append(os.path.join(base, "Lib", "site-packages", "_rocm_sdk_devel"))
+        roots.append(os.path.join(base, "Lib", "site-packages", "_rocm_sdk_core"))
+
+    # Derive likely roots from hipcc path if available on PATH.
+    hipcc = shutil.which("hipcc")
+    if hipcc:
+        hipcc_dir = os.path.dirname(os.path.abspath(hipcc))
+        roots.append(hipcc_dir)
+        roots.append(os.path.dirname(hipcc_dir))
+        # Common pip layout: <python>\Scripts\hipcc.exe -> <python>\Lib\site-packages\_rocm_sdk_*
+        if os.path.basename(hipcc_dir).lower() == "scripts":
+            py_root = os.path.dirname(hipcc_dir)
+            roots.append(os.path.join(py_root, "Lib", "site-packages", "_rocm_sdk_devel"))
+            roots.append(os.path.join(py_root, "Lib", "site-packages", "_rocm_sdk_core"))
+
+    # De-duplicate while preserving order.
+    uniq = []
+    seen = set()
+    for r in roots:
+        try:
+            nr = os.path.normcase(os.path.normpath(str(r).strip().strip('"')))
+        except Exception:
+            continue
+        if not nr or nr in seen:
+            continue
+        seen.add(nr)
+        uniq.append(r)
+    return uniq
+
+
 def _detect_hip_sdk():
     if os.name != "nt" or not _IS_ROCM:
         return False  # only relevant on ROCm-Windows
-    hip_path = os.environ.get("HIP_PATH", "")
-    if hip_path and os.path.isdir(os.path.join(hip_path, "include", "hip")):
-        return True
-    # Check standard install locations
-    rocm_root = r"C:\Program Files\AMD\ROCm"
-    if os.path.isdir(rocm_root):
-        for entry in os.listdir(rocm_root):
-            candidate = os.path.join(rocm_root, entry, "include", "hip")
-            if os.path.isdir(candidate):
-                return True
+    for root in _candidate_hip_roots_windows():
+        if _has_hip_headers(root):
+            return True
     return False
 
 _HAS_HIP_SDK = _detect_hip_sdk()
@@ -688,7 +754,8 @@ class HDRTVNetTorch:
         if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
             raise ValueError(
                 f"{model_path} is not an INT8 checkpoint.\n"
-                "  Re-run: python quantize_int8_full.py or quantize_int8_mixed.py"
+                "  Re-run: python scripts/quantize/quantize_int8_full.py or "
+                "python scripts/quantize/quantize_int8_mixed.py"
             )
         arch = checkpoint.get("architecture", {})
         compute_dtype_str = checkpoint.get("compute_dtype", "torch.float16")
@@ -1145,17 +1212,45 @@ class HDRTVNetTorch:
         if not self._compiled:
             return
 
-        print(f"Warming up torch.compile cache for {width}x{height} - "
-              "this may take several minutes on first run...")
+        print(
+            f"Warming up torch.compile cache for {width}x{height} - "
+            "this may take several minutes on first run...",
+            flush=True,
+        )
         t0 = time.perf_counter()
+        heartbeat_stop = threading.Event()
 
-        dummy = np.zeros((height, width, 3), dtype=np.uint8)
-        self.process(dummy)  # triggers full compile ' Triton disk cache
-        if self._use_cuda:
-            torch.cuda.synchronize()
+        def _heartbeat():
+            # Keep the compile dialog alive with periodic progress notes.
+            while not heartbeat_stop.wait(10.0):
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"[compile] still compiling {width}x{height} "
+                    f"({elapsed:.0f}s elapsed) ...",
+                    flush=True,
+                )
+
+        heartbeat = threading.Thread(
+            target=_heartbeat,
+            name="hdrtvnet-warmup-heartbeat",
+            daemon=True,
+        )
+        heartbeat.start()
+
+        try:
+            dummy = np.zeros((height, width, 3), dtype=np.uint8)
+            self.process(dummy)  # triggers full compile -> Triton disk cache
+            if self._use_cuda:
+                torch.cuda.synchronize()
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=0.5)
 
         elapsed = time.perf_counter() - t0
-        print(f"Compile cache warm - {width}x{height} ready ({elapsed:.1f}s)")
+        print(
+            f"Compile cache warm - {width}x{height} ready ({elapsed:.1f}s)",
+            flush=True,
+        )
 
     def end_profiling(self):
         return None

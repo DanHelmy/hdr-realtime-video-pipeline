@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v1.2-blue)
+![Version](https://img.shields.io/badge/version-v2.0-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,7 +12,30 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using a deep learning model (HDRTVNet++). It runs entirely on the GPU with `torch.compile` optimizations and includes a full-featured desktop GUI.
 
-Supports **NVIDIA CUDA**, **AMD ROCm**, and **CPU** backends.
+Windows-only project with **NVIDIA CUDA**, **AMD ROCm-Windows**, and **CPU** backends.
+
+---
+
+## Manual Downloads (Do This First)
+
+Download required runtime files from the shared Google Drive assets folder:
+
+`https://drive.google.com/drive/folders/1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link`
+
+Place these files before first run:
+
+1. `HG_weights.pth` -> `src/models/weights/HG_weights.pth`
+2. `libmpv-2.dll` -> `src/libmpv-2.dll`
+
+Startup behavior for clone users:
+- The app now checks these files on launch.
+- If either file is missing, a blocking dialog appears with:
+  - Google Drive download button
+  - exact placement instructions
+  - Restart App button
+
+Optional download:
+- Install **GNU Octave** (and add to `PATH`) if you want HDR-VDP3 metrics.
 
 ---
 
@@ -22,21 +45,20 @@ Supports **NVIDIA CUDA**, **AMD ROCm**, and **CPU** backends.
 # 1. Clone and set up
 git clone https://github.com/DanHelmy/hdr-realtime-video-pipeline.git
 cd hdr-realtime-video-pipeline
-python -m venv venv
-venv\Scripts\activate          # Windows
-pip install -r requirements.txt
 
-# 2. Install PyTorch for your GPU (see "PyTorch GPU Backends" below)
+# 2. Double-click setup.bat
+# (or run it in terminal)
+.\setup.bat
 
 # 3. Launch the GUI
-python src/gui.py
+.\run_gui.bat
 ```
 
 Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side tab).
 
 ---
 
-## GUI (v1.2)
+## GUI (v2.0)
 
 ```bash
 python src/gui.py
@@ -44,31 +66,35 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v1.2
+### New in v2.0
 
-- **Film grain toggle** (mpv shader, auto-download; restores grain lost to upscalers)
-- **Upscale options simplified**: default **EWA LanczosSharp** (EWA Lanczos removed), plus **FSR**
-- **Film grain + upscale settings persist** in `.gui_prefs.json`
-- **A/V relock polish** for UI transitions and pop/dock workflows
-
-**Note:** QAT variants have been temporarily removed until the next update. All weights have been retrained (including the **+HG** option).
+- **Modular GUI refactor**: `gui.py` now composes focused mixins/modules (`gui_ui_builder.py`, `gui_signal_wiring.py`, `gui_playback_runtime.py`, `gui_pipeline_worker_*.py`, etc.)
+- **QAT precision modes restored** in GUI:
+  - `INT8 Mixed (QAT)`
+  - `INT8 Full (QAT)`
+- **Compare precision refresh**: re-run frame-compare at the same anchor frame with a different precision directly from the compare dialog
+- **Upscaler set expanded**: **EWA LanczosSharp**, **FSR**, and **SSimSuperRes**
+- **A/V relock and mute policy polish** for seek/pause/pop-dock transitions and low-FPS recovery
+- **Unified runtime cache root** for Triton/TorchInductor/HDR-VDP3 (`HDRTVNET_CACHE_DIR` override supported)
 
 ### Features
 
 | Feature | Description |
 |---|---|
 | **Open any video** | Browse or drag-and-drop — playback starts automatically |
+| **Modular codebase** | GUI and worker logic split into maintainable mixins/modules for easier iteration |
 | **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
 | **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |
-| **Live precision switching** | FP16, FP32, INT8 variants — switch mid-playback |
+| **Live precision switching** | FP16, FP32, INT8 PTQ/QAT variants — switch mid-playback |
 | **HG toggle** | Enable/disable HG refinement (loads HG or no-HG INT8 weights) |
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
-| **Live metrics** | FPS, latency, frame count, app VRAM/CPU memory, model size |
+| **Performance metrics panel** | FPS, latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
+| **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
-| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp** or **FSR** |
+| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
 | **Film grain** | Optional film grain restoration (mpv shader) |
 | **Audio support** | Auto-detect, attach external audio, and choose audio track |
 | **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
@@ -77,15 +103,28 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
 | **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
 | **Dark theme** | Modern dark UI, auto-applied |
-| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, upscale, film grain, metrics, volume, audio, cursor) |
+| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, view/tab, upscale, film grain, metrics visibility, HG toggle, volume, audio track, cursor hide, last-open directory) |
 
 ### GUI Launch Flags
 
 `src/gui.py` also accepts startup flags (used by restart/apply flows):
 
 ```bash
-python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200 --use-hg 1 --film-grain 1
+python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200 --use-hg 1 --film-grain 1 --hdr-gt hdr_reference.mkv
 ```
+
+### Objective Metrics (PSNR / SSSIM / DeltaEITP / HDR-VDP3)
+
+- Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
+- In `v2.0`, objective scoring is compare-driven by default (instead of a continuously updating runtime panel) for cleaner playback behavior.
+- Ground-truth should be the same content/timing as the input clip for valid measurements.
+- `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
+  - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
+  - First HDR-VDP3 run auto-downloads toolbox files to a user cache folder:
+    - `%LOCALAPPDATA%\HDRTVNetCache\hdrvdp\`
+  - Requires **GNU Octave** installed and available in `PATH`.
+- You can still override with your own command using env var `HDRTVNET_HDRVDP3_CMD`.
+  - Template placeholders: `{test}` / `{pred}` and `{reference}` / `{ref}`.
 
 ### Tools Menu
 
@@ -101,15 +140,14 @@ Both SDR and HDR panes are rendered through embedded **mpv** (D3D11):
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
 
 > **Requires** `libmpv-2.dll` in the `src/` folder.
-> Download from [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
-> (the `mpv-dev-x86_64-*-git-*.7z` archive). If the DLL is missing, the GUI
-> falls back to a standard QLabel preview.
+> Download it from the shared Google Drive assets folder above (same folder as
+> `HG_weights.pth`).  
+> Fallback source: [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
+> (`mpv-dev-x86_64-*-git-*.7z`).
 
 ### First Run
 
 The first time you play a video at a given resolution, `torch.compile` with `max-autotune` needs to compile Triton kernels. This takes **2–5 minutes** and runs in a clean subprocess with a progress dialog. The compiled kernels are **cached to disk**, so subsequent runs at the same resolution load in **~5–10 seconds**.
-
-All 1080p videos reuse the same cached kernels regardless of content, codec, or duration. A different resolution (different aspect ratio) triggers a one-time recompile.
 
 ---
 
@@ -124,40 +162,49 @@ All 1080p videos reuse the same cached kernels regardless of content, codec, or 
 ### Setup
 
 ```bash
-python -m venv venv
-venv\Scripts\activate       # Windows
-source venv/bin/activate    # Linux/macOS
-pip install -r requirements.txt
+# Auto-detect backend and install (double-clickable):
+.\setup.bat
+
+# Optional manual override:
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend nvidia
+# or: -Backend amd
+# or: -Backend cpu
 ```
+
+Optional flags:
+- `-RecreateVenv` to rebuild `venv` from scratch
+- `-RunGui` to auto-launch after setup
 
 ### PyTorch GPU Backends
 
+This repo now provides backend-specific requirement files under `requirements/`:
+
+- `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`cu124`)
+- `requirements/requirements-amd.txt` -> common deps + ROCm-Windows SDK/PyTorch wheels (+ `triton-windows`)
+- `requirements/requirements-common.txt` -> shared app deps only (use with manual CPU PyTorch install)
+
+Equivalent setup scripts:
+- `setup.bat` (double-click entry point)
+- `scripts/setup.ps1` (auto-detect + override support)
+- `run_gui.bat` (double-click GUI launcher)
+- `scripts/setup_nvidia.ps1`
+- `scripts/setup_amd.ps1`
+- `scripts/setup_cpu.ps1`
+- `scripts/run_gui.ps1`
+
 **NVIDIA (CUDA):**
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements/requirements-nvidia.txt
 ```
 
 **AMD ROCm-Windows (Python 3.12):**
-```cmd
-pip install --no-cache-dir ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_devel-7.2.0.dev0-py3-none-win_amd64.whl ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz
-
-pip install --no-cache-dir ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchaudio-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ^
-    https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl
-```
-
-**AMD ROCm-Linux:**
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+pip install -r requirements/requirements-amd.txt
 ```
 
 **CPU only:**
 ```bash
+pip install -r requirements/requirements-common.txt
 pip install torch torchvision
 ```
 
@@ -165,14 +212,7 @@ pip install torch torchvision
 
 **NVIDIA CUDA**: Works automatically (Triton included with modern PyTorch).
 
-**AMD ROCm-Windows**: Auto-detects HIP SDK. Install `triton-windows` and copy HIP headers:
-```bash
-pip install triton-windows
-xcopy /E /I "C:\Program Files\AMD\ROCm\7.1\include\hip" "venv\Lib\site-packages\_rocm_sdk_devel\include\hip"
-```
-If auto-detection fails, use `--force-compile` in CLI mode.
-
-**AMD ROCm-Linux**: Works automatically like NVIDIA.
+**AMD ROCm-Windows**: Auto-detects HIP SDK. `requirements/requirements-amd.txt` already includes `triton-windows`.
 
 ---
 
@@ -199,10 +239,10 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 |---|---|---|
 | **FP16** | Half-precision (default on GPU) | — |
 | **FP32** | Full precision | — |
-| **INT8 Full** | W8A8 quantization (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Mixed** | Mixed W8A8/W8A16 (HG optional) | ~4.0× vs FP16+HG |
-
-**Note:** QAT variants are temporarily removed in v1.2 (weights retrained, including **+HG**). They will return in a future update.
+| **INT8 Full (PTQ)** | W8A8 quantization (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Full (QAT)** | W8A8 + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16 (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Mixed (QAT)** | Mixed W8A8/W8A16 + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
 
 INT8 modes include **pre-dequantization** for GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing): INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage.
 
@@ -225,6 +265,8 @@ python src/main.py --precision fp32
 # INT8 quantized models (HG on/off)
 python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full.pt
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
+python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
 python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt --use-hg 0
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt --use-hg 0
 
@@ -269,15 +311,15 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 <details>
 <summary><strong>Quantization details</strong></summary>
 
-**QAT note:** QAT variants are temporarily removed in v1.2 (weights retrained, including **+HG**). The QAT subsections below are kept for reference and will return in a future update.
+### HG Weights (Required Download)
+`HG_weights.pth` is not included in this GitHub repo because it is too large for
+normal GitHub tracking. For clone users, startup checks require this file.
 
-### HG Weights (Optional)
-HG refinement is optional. `HG_weights.pth` is not included in this GitHub repo
-because it is too large for normal GitHub tracking.
-
-Download it from:
+Download it from the shared Google Drive assets folder:
 
 `https://drive.google.com/drive/folders/1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link`
+
+This folder also contains `libmpv-2.dll`.
 
 Steps:
 1. Open the Google Drive folder above.
@@ -294,18 +336,18 @@ python src/main.py --hg-weights "FULL/PATH/TO/HG_weights.pth"
 
 ### W8A8 (Full INT8, HG optional)
 ```bash
-python quantize_int8_full.py
+python scripts/quantize/quantize_int8_full.py
 ```
 - Both weights and activations quantized to INT8
-- Requires calibration data (uses `dataset/test_sdr/`)
+- Requires calibration data (default: `dataset/train_sdr/`)
   - **~4.0× compression vs FP16+HG** (HG adds significant weight size)
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_full.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt` (no-HG)
 
-### W8A8 (Full INT8) + QAT (HG optional) — *temporarily removed in v1.2*
+### W8A8 (Full INT8) + QAT (HG optional)
 ```bash
-python quantize_int8_full_qat.py
+python scripts/quantize/quantize_int8_full_qat.py
 ```
 - Starts from the PTQ full checkpoint and fine-tunes with fake quantization + STE
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
@@ -318,7 +360,7 @@ python quantize_int8_full_qat.py
 
 ### Mixed W8A8/W8A16 (HG optional)
 ```bash
-python quantize_int8_mixed.py
+python scripts/quantize/quantize_int8_mixed.py
 ```
 - Memory-bound 1×1 convs → W8A8 (INT8 activations help bandwidth)
 - Compute-bound 3×3 convs → W8A16 (weight-only saves storage)
@@ -327,9 +369,9 @@ python quantize_int8_mixed.py
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt` (no-HG)
 
-### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training, HG optional) — *temporarily removed in v1.2*
+### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training, HG optional)
 ```bash
-python quantize_int8_mixed_qat.py
+python scripts/quantize/quantize_int8_mixed_qat.py
 ```
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth

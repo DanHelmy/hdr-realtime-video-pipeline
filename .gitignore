@@ -1,3 +1,4 @@
+# Ignore GUI preferences file
 venv/
 .venv/
 __pycache__/
@@ -43,6 +44,7 @@ src/models/weights/HG_weights.pth
 !src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt
@@ -52,3 +54,10 @@ dataset/
 
 # Source Pipeline (upstream reference, not part of this project)
 Source Pipeline/
+
+# Auto-downloaded HDR-VDP3 toolbox cache
+third_party/hdrvdp/
+
+# Keep dependency manifests tracked
+!requirements/
+!requirements/*.txt

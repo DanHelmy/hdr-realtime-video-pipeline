@@ -16,6 +16,9 @@ Usage:
     # Clear cache first then compile:
     python src/compile_kernels.py --clear-cache 1920x1080
 
+    # Force compile when HIP SDK auto-detection misses on ROCm-Windows:
+    python src/compile_kernels.py --force-compile 1920x1080
+
 The GUI's "Tools -> Pre-compile Kernels" runs this script as a subprocess
 and monitors its stdout for progress.
 
@@ -26,18 +29,15 @@ Exit codes:
 
 import argparse
 import os
-import pathlib
 import sys
 import time
 
-# Pin caches to a stable user path (avoid Temp churn/permissions).
-def _default_cache_root():
-    local_app = os.environ.get("LOCALAPPDATA")
-    if local_app:
-        return os.path.join(local_app, "HDRTVNetCache")
-    return os.path.join(os.path.expanduser("~"), ".cache", "hdrtvnet")
+from windows_runtime import default_cache_root, ensure_windows_supported
 
-_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", _default_cache_root())
+# Pin caches to a stable user path (avoid Temp churn/permissions).
+ensure_windows_supported("HDRTVNet++ kernel compiler")
+
+_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", default_cache_root())
 try:
     os.makedirs(_cache_root, exist_ok=True)
 except Exception:
@@ -74,23 +74,26 @@ _PRECISION_MAP = {
 }
 
 
-# -- Marker file (shared with gui.py) -----------------------------------------
-_TRITON_CACHE = (
-    pathlib.Path(os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton"))
-    / "cache"
-)
+def _mark_compiled(
+    w: int,
+    h: int,
+    precision: str,
+    *,
+    model_path: str,
+    use_hg: bool,
+    predequantize_mode: str,
+):
+    """Record that kernels for this exact compile config were compiled."""
+    from gui_compile_cache import _mark_compiled as _mark_compiled_cache
 
-
-def _mark_compiled(w: int, h: int, precision: str):
-    """Record that kernels for this resolution+precision were compiled."""
-    mp = _TRITON_CACHE / "hdrtvnet_compiled.txt"
-    mp.parent.mkdir(parents=True, exist_ok=True)
-    key = f"{w}x{h}_{precision}"
-    existing = set()
-    if mp.is_file():
-        existing = set(mp.read_text(encoding="utf-8").splitlines())
-    existing.add(key)
-    mp.write_text("\n".join(sorted(existing)) + "\n", encoding="utf-8")
+    _mark_compiled_cache(
+        w,
+        h,
+        precision,
+        model_path=model_path,
+        use_hg=bool(use_hg),
+        predequantize_mode=str(predequantize_mode or "auto"),
+    )
 
 
 def _clear_caches():
@@ -103,7 +106,7 @@ def _clear_caches():
     cleared = []
 
     triton_root = pathlib.Path(
-        os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton")
+        os.environ.get("TRITON_CACHE_DIR", os.path.join(default_cache_root(), "triton"))
     )
     triton_dir = triton_root / "cache"
     if triton_dir.exists():
@@ -161,6 +164,20 @@ def main():
         action="store_true",
         help="Delete kernel caches before compiling",
     )
+    parser.add_argument(
+        "--force-compile",
+        action="store_true",
+        help="Force torch.compile on ROCm-Windows even if HIP SDK auto-detection fails",
+    )
+    parser.add_argument(
+        "--predequantize",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help=(
+            "INT8 pre-dequantization mode: "
+            "'auto' (default), 'on' (force), 'off' (disable)."
+        ),
+    )
     args = parser.parse_args()
 
     # Parse resolutions first (fail fast on bad input)
@@ -201,13 +218,16 @@ def main():
     print(f"[compile] Loading model: {args.precision} - {os.path.basename(model_path)}")
     sys.stdout.flush()
 
+    predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
+
     processor = HDRTVNetTorch(
         model_path,
         device="auto",
         precision=prec_str,
         compile_model=True,
+        force_compile=bool(args.force_compile),
         compile_mode="max-autotune",
-        predequantize="auto",
+        predequantize=predeq,
         hg_weights=args.hg_weights,
         use_hg=str(args.use_hg).strip() != "0",
     )
@@ -227,7 +247,14 @@ def main():
         sys.stdout.flush()
 
         # Write marker so the GUI knows this resolution is compiled
-        _mark_compiled(w, h, args.precision)
+        _mark_compiled(
+            w,
+            h,
+            args.precision,
+            model_path=model_path,
+            use_hg=str(args.use_hg).strip() != "0",
+            predequantize_mode=args.predequantize,
+        )
 
     print("[compile] All resolutions compiled successfully.")
     sys.stdout.flush()
