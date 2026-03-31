@@ -229,23 +229,23 @@ class PlaybackRuntimeMixin:
                 "Download from Google Drive, place files exactly at:\n\n"
                 "1) libmpv-2.dll -> src/libmpv-2.dll\n"
                 "2) HG_weights.pth -> src/models/weights/HG_weights.pth\n\n"
-                "Then click Restart App.\n"
-                "If files are still missing after restart, this warning will appear again.\n\n"
+                "Then click OK to re-check.\n"
+                "If files are still missing, this warning will appear again.\n\n"
                 f"Missing right now:\n{missing_lines}"
             )
             open_btn = box.addButton(
                 "Open Google Drive",
                 QMessageBox.ButtonRole.ActionRole,
             )
-            restart_btn = box.addButton(
-                "Restart App",
+            ok_btn = box.addButton(
+                "OK",
                 QMessageBox.ButtonRole.AcceptRole,
             )
             exit_btn = box.addButton(
                 "Exit",
                 QMessageBox.ButtonRole.RejectRole,
             )
-            box.setDefaultButton(restart_btn)
+            box.setDefaultButton(ok_btn)
             box.setEscapeButton(exit_btn)
             box.exec()
 
@@ -258,9 +258,9 @@ class PlaybackRuntimeMixin:
                 missing = self._missing_required_clone_assets()
                 continue
 
-            if clicked is restart_btn:
-                self._restart_app_clean()
-                return False
+            if clicked is ok_btn:
+                missing = self._missing_required_clone_assets()
+                continue
 
             self.close()
             return False

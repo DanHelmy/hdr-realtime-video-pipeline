@@ -32,7 +32,7 @@ Startup behavior for clone users:
 - If either file is missing, a blocking dialog appears with:
   - Google Drive download button
   - exact placement instructions
-  - Restart App button
+  - OK button (re-checks files without restart)
 
 Optional download:
 - Install **GNU Octave** (and add to `PATH`) if you want HDR-VDP3 metrics.

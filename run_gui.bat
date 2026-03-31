@@ -7,9 +7,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT_DIR%scripts\run_gui.p
 set "RC=%ERRORLEVEL%"
 
 if "%HDRTVNET_NO_PAUSE%"=="" (
-  echo.
-  if not "%RC%"=="0" echo GUI launch failed with exit code %RC%.
-  pause
+  if not "%RC%"=="0" (
+    echo.
+    echo GUI launch failed with exit code %RC%.
+    pause
+  )
 )
 
 exit /b %RC%
