@@ -155,7 +155,7 @@ The first time you play a video at a given resolution, `torch.compile` with `max
 
 ### Requirements
 
-- Python 3.10+ (3.12 for AMD Windows)
+- Python 3.12 (setup scripts target 3.12 for all backends)
 - PyTorch 2.0+ (CUDA or ROCm build)
 - OpenCV, NumPy
 
@@ -192,7 +192,7 @@ Equivalent setup scripts:
 - `scripts/setup_cpu.ps1`
 - `scripts/run_gui.ps1`
 
-**NVIDIA (CUDA):**
+**NVIDIA (CUDA, Python 3.12):**
 ```bash
 pip install -r requirements/requirements-nvidia.txt
 ```

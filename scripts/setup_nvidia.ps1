@@ -24,18 +24,23 @@ if ($RecreateVenv -and (Test-Path $venvDir)) {
 }
 
 if (-not (Test-Path $venvPython)) {
-    Write-Step "Creating virtual environment..."
+    Write-Step "Creating virtual environment (Python 3.12 required for setup consistency)..."
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3 -m venv $venvDir
+        & py -3.12 -m venv $venvDir
     } elseif (Get-Command python -ErrorAction SilentlyContinue) {
         & python -m venv $venvDir
     } else {
-        throw "No Python launcher found. Install Python 3 first."
+        throw "No Python launcher found. Install Python 3.12 first."
     }
 }
 
 if (-not (Test-Path $venvPython)) {
     throw "Failed to create venv at $venvDir"
+}
+
+$pyMm = (& $venvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
+if ($pyMm -ne "3.12") {
+    throw "NVIDIA setup requires Python 3.12, but venv has $pyMm. Re-run with Python 3.12 (recommended: py -3.12) and use -RecreateVenv."
 }
 
 Write-Step "Installing NVIDIA dependencies..."
@@ -44,9 +49,8 @@ if (-not $SkipPipUpgrade) {
 }
 & $venvPython -m pip install -r $reqFile
 
-$pyVersion = (& $venvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
 Write-Step "Setup complete."
-Write-Host "[setup-nvidia] Python: $pyVersion"
+Write-Host "[setup-nvidia] Python: $pyMm"
 Write-Host "[setup-nvidia] Launch with: .\venv\Scripts\python.exe src\gui.py"
 
 if ($RunGui) {
