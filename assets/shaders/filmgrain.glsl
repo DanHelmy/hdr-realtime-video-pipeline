@@ -2,7 +2,7 @@
 //!BIND HOOKED
 //!DESC gaussian film grain
 
-#define INTENSITY 0.02
+#define INTENSITY 0.01
 
 float permute(float x)
 {
