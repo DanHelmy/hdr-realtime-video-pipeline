@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -243,6 +243,7 @@ class CompareFrameDialog(QDialog):
         self._split_compare.setStretchFactor(1, 1)
         self._split_compare.setStretchFactor(2, 1)
         root.addWidget(self._split_compare, 1)
+        self._reset_splitter_on_show = True
 
         self._grp_acc = QGroupBox("Accuracy Metrics")
         acc_grid = QGridLayout(self._grp_acc)
@@ -267,6 +268,23 @@ class CompareFrameDialog(QDialog):
         self._lbl_note = QLabel("")
         self._lbl_note.setStyleSheet("color: #9ecbff;")
         root.addWidget(self._lbl_note)
+
+    def _reset_compare_splitter_sizes(self):
+        if not hasattr(self, "_split_compare") or self._split_compare is None:
+            return
+        if self._split_compare.count() < 3:
+            return
+        total = int(self._split_compare.size().width())
+        if total <= 0:
+            total = max(3, int(self.size().width()) - 20)
+        one = max(1, total // 3)
+        self._split_compare.setSizes([one, one, max(1, total - (2 * one))])
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if bool(getattr(self, "_reset_splitter_on_show", False)):
+            self._reset_splitter_on_show = False
+            QTimer.singleShot(0, self._reset_compare_splitter_sizes)
 
     def _emit_precision_request(self):
         if self._precision_sync_guard:
@@ -384,6 +402,7 @@ class CompareFrameDialog(QDialog):
         self._lbl_note.setText(str(note or ""))
 
     def closeEvent(self, event):
+        self._reset_splitter_on_show = True
         self._disp_sdr.stop()
         self._disp_gt.stop()
         self._disp_algo.stop()
