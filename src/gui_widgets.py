@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -176,6 +177,11 @@ class CompareFrameDialog(QDialog):
 
     def __init__(self, mpv_available: bool, mpv_widget_factory, best_mpv_scale: str, parent=None):
         super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        self.setSizeGripEnabled(True)
         self.setWindowTitle("Frame Compare")
         self.resize(1500, 760)
 
@@ -207,8 +213,6 @@ class CompareFrameDialog(QDialog):
             lambda _text: self._emit_precision_request()
         )
 
-        row = QHBoxLayout()
-        row.setSpacing(6)
         self._disp_sdr = _CompareVideoPane(
             "SDR",
             force_hdr_metadata=False,
@@ -230,10 +234,15 @@ class CompareFrameDialog(QDialog):
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
         )
-        row.addWidget(self._disp_sdr, 1)
-        row.addWidget(self._disp_gt, 1)
-        row.addWidget(self._disp_algo, 1)
-        root.addLayout(row, 1)
+        self._split_compare = QSplitter(Qt.Orientation.Horizontal)
+        self._split_compare.setChildrenCollapsible(False)
+        self._split_compare.addWidget(self._disp_sdr)
+        self._split_compare.addWidget(self._disp_gt)
+        self._split_compare.addWidget(self._disp_algo)
+        self._split_compare.setStretchFactor(0, 1)
+        self._split_compare.setStretchFactor(1, 1)
+        self._split_compare.setStretchFactor(2, 1)
+        root.addWidget(self._split_compare, 1)
 
         self._grp_acc = QGroupBox("Accuracy Metrics")
         acc_grid = QGridLayout(self._grp_acc)
