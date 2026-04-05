@@ -132,6 +132,7 @@ class StateInitMixin:
         self._compare_snapshot_pending = False
         self._source_proc_dims = None
         self._last_open_dir = root_dir
+        self._last_export_dir = root_dir
         self._predequantize_mode = "auto"
         self._suppress_hip_sdk_warning = False
         self._startup_hip_sdk_warning_shown = False
@@ -172,6 +173,9 @@ class StateInitMixin:
         self._periodic_relock_first_ms = max(
             120, int(os.environ.get("HDRTVNET_PERIODIC_RELOCK_FIRST_MS", "450"))
         )
+        self._periodic_relock_drift_s = max(
+            0.0, float(os.environ.get("HDRTVNET_PERIODIC_RELOCK_DRIFT_S", "0.045"))
+        )
         self._playhead_relock_token = 0
         self._pending_playhead_relock_on_unmute = False
         self._pending_playhead_relock_pre_delay_ms = -1
@@ -192,6 +196,12 @@ class StateInitMixin:
         self._sdr_float_window = None
         self._hdr_float_window = None
         self._ui_closing = False
+        self._export_thread = None
+        self._export_worker = None
+        self._export_progress_dlg = None
+        self._export_compile_dlg = None
+        self._export_interaction_locked = False
+        self._export_saved_enabled_states = {}
         try:
             self._startup_seek_frame = (
                 int(initial_start_frame) if initial_start_frame is not None else None

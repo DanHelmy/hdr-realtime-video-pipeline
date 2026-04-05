@@ -526,6 +526,8 @@ class WindowingMixin:
             return
         if not self._active_use_mpv:
             return
+        if self._audio_available and self._audio_player is not None:
+            return
         # Light-touch resync to keep HDR/SDR aligned over time (video-only).
         fps = getattr(self, "_vid_fps", 30.0)
         target_sec = float(self._last_seek_frame) / max(fps, 1e-6)
@@ -541,6 +543,29 @@ class WindowingMixin:
                 target_sec = float(self._audio_player.position()) / 1000.0
             except Exception:
                 target_sec = float(self._last_seek_frame) / max(fps, 1e-6)
+
+        drift_threshold_s = float(getattr(self, "_periodic_relock_drift_s", 0.045))
+        hdr_drift = None
+        sdr_drift = None
+        if self._disp_hdr_mpv is not None:
+            try:
+                hdr_t = self._disp_hdr_mpv.get_time_seconds()
+                if hdr_t is not None:
+                    hdr_drift = abs(float(hdr_t) - target_sec)
+            except Exception:
+                hdr_drift = None
+        if self._disp_sdr_mpv is not None:
+            try:
+                sdr_t = self._disp_sdr_mpv.get_time_seconds()
+                if sdr_t is not None:
+                    sdr_drift = abs(float(sdr_t) - target_sec)
+            except Exception:
+                sdr_drift = None
+
+        drifts = [d for d in (hdr_drift, sdr_drift) if d is not None]
+        if drifts and max(drifts) <= max(0.0, drift_threshold_s):
+            return
+
         if self._worker is not None:
             self._worker.flush_hdr_queue(drop_frames=1)
         if self._disp_hdr_mpv is not None:
@@ -553,6 +578,8 @@ class WindowingMixin:
         if self._periodic_relock_timer is None:
             return
         self._periodic_relock_timer.stop()
+        if self._audio_available and self._audio_player is not None:
+            return
         period_ms = int(getattr(self, "_periodic_relock_ms", 1200))
         first_ms = int(getattr(self, "_periodic_relock_first_ms", 450))
         self._periodic_relock_timer.start(max(200, period_ms))

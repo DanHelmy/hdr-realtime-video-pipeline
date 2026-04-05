@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from gui_mpv_widget import MpvHDRWidget
+from timer import sleep_until
 
 
 class PipelineWorkerFeedersMixin:
@@ -33,10 +34,18 @@ class PipelineWorkerFeedersMixin:
                     break
             if item is None:
                 break
-            if isinstance(item, tuple) and len(item) == 2:
+            ready_event = None
+            if isinstance(item, tuple) and len(item) == 3:
+                present_t, tensor, ready_event = item
+            elif isinstance(item, tuple) and len(item) == 2:
                 present_t, tensor = item
             else:
                 present_t, tensor = None, item
+            if ready_event is not None:
+                try:
+                    ready_event.synchronize()
+                except Exception:
+                    pass
             with torch.inference_mode():
                 raw_cpu = (tensor.squeeze(0)
                            .clamp_(0.0, 1.0)
@@ -49,7 +58,7 @@ class PipelineWorkerFeedersMixin:
             if present_t is not None:
                 now = time.perf_counter()
                 if now < present_t:
-                    time.sleep(present_t - now)
+                    sleep_until(present_t)
             mpv_widget.feed_frame(hdr_u16.astype(np.uint16).data)
 
     def _sdr_feeder_fn(self, sdr_q: _queue.Queue, mpv_widget: MpvHDRWidget):
@@ -83,7 +92,7 @@ class PipelineWorkerFeedersMixin:
                 if present_t is not None:
                     now = time.perf_counter()
                     if now < present_t:
-                        time.sleep(present_t - now)
+                        sleep_until(present_t)
                 mpv_widget.feed_frame(rgb16.data)
             except Exception:
                 pass

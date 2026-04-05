@@ -47,15 +47,16 @@ class UiBuilderMixin:
     def _build_menu_bar(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
-        file_menu.addAction("📂  &Open Video …", self._open_file)
+        file_menu.addAction("&Open Video ...", self._open_file)
+        file_menu.addAction("&Export Video ...", self._open_export_dialog)
         file_menu.addSeparator()
         file_menu.addAction("E&xit", self.close)
 
         tools_menu = menu_bar.addMenu("&Tools")
-        tools_menu.addAction("INT8 &Pre-dequantization ...", self._choose_predequantize_mode)
-        tools_menu.addAction("⚙  &Pre-compile Kernels …", self._precompile_kernels)
+        tools_menu.addAction("\U0001F9EE  INT8 &Pre-dequantization ...", self._choose_predequantize_mode)
+        tools_menu.addAction("\u2699  &Pre-compile Kernels ...", self._precompile_kernels)
         tools_menu.addSeparator()
-        tools_menu.addAction("🗑  Clear &Kernel Cache …", self._clear_kernel_cache)
+        tools_menu.addAction("\U0001F5D1  Clear &Kernel Cache ...", self._clear_kernel_cache)
 
         view_menu = menu_bar.addMenu("&View")
         self._act_borderless_full_window = view_menu.addAction(
@@ -301,7 +302,16 @@ class UiBuilderMixin:
 
         self._m = {}
         mono = QFont("Consolas", 9)
-        perf_keys = ("fps", "latency", "frame", "res", "gpu", "cpu", "model", "prec", "upscale")
+        perf_keys = (
+            "fps",
+            "latency",
+            "frame",
+            "res",
+            "gpu",
+            "cpu",
+            "model",
+            "prec",
+        )
         for idx, key in enumerate(perf_keys):
             lbl = QLabel(f"{key}: —")
             lbl.setFont(mono)
@@ -346,3 +356,4 @@ class UiBuilderMixin:
         )
         self._ui_overlay_btn.clicked.connect(self._toggle_ui_visibility)
         self._ui_overlay_btn.hide()
+

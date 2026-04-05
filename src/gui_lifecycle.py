@@ -9,6 +9,10 @@ class LifecycleMixin:
     """UI lifecycle and top-level event handlers for MainWindow."""
 
     def _reset_controls(self):
+        try:
+            self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
+        except Exception:
+            pass
         self._playing = False
         self._compare_snapshot_pending = False
         self._active_use_mpv = False
@@ -99,6 +103,25 @@ class LifecycleMixin:
         self._hdr_labels["transfer"].setText("Transfer: \u2014")
         self._hdr_labels["peak"].setText("Peak: \u2014")
         self._hdr_labels["vo"].setText("VO: \u2014")
+        if hasattr(self, "_m") and isinstance(getattr(self, "_m", None), dict):
+            reset_map = {
+                "fps": "FPS: —",
+                "latency": "Latency: —",
+                "frame": "Frame: —",
+                "res": "Res: —",
+                "gpu": "VRAM: —",
+                "cpu": "CPU: —",
+                "model": "Model: —",
+                "prec": "Prec: —",
+            }
+            for key, text in reset_map.items():
+                lbl = self._m.get(key)
+                if lbl is None:
+                    continue
+                try:
+                    lbl.setText(text)
+                except Exception:
+                    continue
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -115,6 +138,13 @@ class LifecycleMixin:
     def closeEvent(self, event):
         self._ui_closing = True
         self._save_user_settings()
+        if self._export_worker is not None:
+            try:
+                self._export_worker.cancel()
+            except Exception:
+                pass
+        if self._export_progress_dlg is not None:
+            self._export_progress_dlg.close()
         if self._window_refresh_timer is not None:
             self._window_refresh_timer.stop()
         if self._cursor_idle_timer is not None:
@@ -131,6 +161,9 @@ class LifecycleMixin:
             self._disp_sdr_mpv.stop_playback()
         self._stop_audio_playback()
         self._set_process_priority(False)
+        if self._export_thread is not None:
+            self._export_thread.quit()
+            self._export_thread.wait(5000)
         super().closeEvent(event)
 
     def keyPressEvent(self, event):

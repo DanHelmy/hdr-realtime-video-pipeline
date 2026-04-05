@@ -200,6 +200,11 @@ class TimelineSeekMixin:
                     self._audio_player.setPlaybackRate(1.0)
 
     def _on_seek_pressed(self):
+        if bool(getattr(self, "_export_interaction_locked", False)):
+            self.statusBar().showMessage(
+                "Seeking is locked while export is running. Finish or cancel the export first."
+            )
+            return
         if not self._playing:
             return
         self._scrub_unmute_seq += 1
@@ -211,6 +216,8 @@ class TimelineSeekMixin:
             self._apply_volume_to_backends()
 
     def _on_seek(self, frame_number: int):
+        if bool(getattr(self, "_export_interaction_locked", False)):
+            return
         if not self._playing:
             return
         # Fast click-seek can race sliderPressed; enforce mute/pause here too.
@@ -225,6 +232,11 @@ class TimelineSeekMixin:
         self._lbl_time.setText(self._fmt_time(frame_number / fps))
 
     def _on_seek_released(self):
+        if bool(getattr(self, "_export_interaction_locked", False)):
+            self.statusBar().showMessage(
+                "Seeking is locked while export is running. Finish or cancel the export first."
+            )
+            return
         if not self._playing:
             return
         # Defensive gate for very fast release where press handler may lag.

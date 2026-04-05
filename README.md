@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v2.0-blue)
+![Version](https://img.shields.io/badge/version-v2.1-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -54,7 +54,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## GUI (v2.0)
+## GUI (v2.1)
 
 ```bash
 python src/gui.py
@@ -62,16 +62,19 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v2.0
+### New in v2.1
 
-- **Modular GUI refactor**: `gui.py` now composes focused mixins/modules (`gui_ui_builder.py`, `gui_signal_wiring.py`, `gui_playback_runtime.py`, `gui_pipeline_worker_*.py`, etc.)
-- **QAT precision modes restored** in GUI:
-  - `INT8 Mixed (QAT)`
-  - `INT8 Full (QAT)`
-- **Compare precision refresh**: re-run frame-compare at the same anchor frame with a different precision directly from the compare dialog
-- **Upscaler set expanded**: **EWA LanczosSharp**, **FSR**, and **SSimSuperRes**
-- **A/V relock and mute policy polish** for seek/pause/pop-dock transitions and low-FPS recovery
-- **Unified runtime cache root** for Triton/TorchInductor/HDR-VDP3 (`HDRTVNET_CACHE_DIR` override supported)
+- **Separate export workflow** under `File > Export Video...` with independent export precision/model settings
+- **Export defaults to source-native resolution and FPS**, with optional resize/FPS override and aspect-ratio-safe fit/pad behavior
+- **Export format locked to ProRes 422 HQ (`.mov`) + PCM audio** for high-quality mezzanine output
+- **Export advanced options**: experimental max-autotune compile reuse and INT8 pre-dequantization override
+- **Max-autotune export now uses the same Stop-button behavior before export begins**, avoiding stale GPU/runtime state during compile/warmup
+- **Playback compile startup skips the clean precompile subprocess on exact cache hits**
+- **Export max-autotune now reuses the same compile cache/dialog flow as playback**
+- **Mixed INT8 upgraded to true 3-way mixed precision**: `W8A8` + `W8A16` + selected full `FP16` sensitive layers
+- **QAT improved for reproducibility and quality selection**: seeded/deterministic defaults, highlight-aware monitor selection, and early stopping
+- **Paused precision / pre-dequantize swaps redraw the current frame in place** without needing Resume
+- **Modular GUI refactor remains in place**: `gui.py` composes focused mixins/modules (`gui_ui_builder.py`, `gui_signal_wiring.py`, `gui_playback_runtime.py`, `gui_pipeline_worker_*.py`, etc.)
 
 ### Features
 
@@ -85,6 +88,7 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **HG toggle** | Enable/disable HG refinement (loads HG or no-HG INT8 weights) |
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
+| **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
@@ -92,10 +96,12 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
 | **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
 | **Film grain** | Optional film grain restoration (mpv shader) |
+| **Video export** | Separate export dialog with native resolution/FPS defaults, independent model preset selection, and ProRes 422 HQ output |
 | **Audio support** | Auto-detect, attach external audio, and choose audio track |
 | **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
 | **Keyboard shortcuts** | `F11` borderless full-window, `Esc` exit borderless mode, `Space` pause/resume |
 | **Cursor idle hide** | Optional auto-hide cursor during playback |
+| **INT8 pre-dequantization control** | Tools-menu toggle for `Auto` / `On` / `Off` on INT8 runtimes |
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
 | **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
 | **Dark theme** | Modern dark UI, auto-applied |
@@ -124,8 +130,25 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 
 ### Tools Menu
 
+- **INT8 Pre-dequantization** — choose `Auto`, `On`, or `Off` for INT8 runtime loading behavior
 - **Pre-compile Kernels** — compile for any resolution(s) ahead of time
 - **Clear Kernel Cache** — force recompilation (e.g. after a PyTorch / driver update)
+
+### Video Export
+
+- Open **File -> Export Video...** to export with settings that are independent from the playback controls
+- Export defaults to the source clip's **native resolution** and **native FPS**
+- You can override resolution/FPS and keep aspect ratio locked; mismatched aspect ratios are fit into the target frame with padding
+- Export supports any available model preset (`FP16`, `FP32`, `INT8 PTQ/QAT`, HG on/off) directly from the export dialog
+- Output is intentionally limited to **ProRes 422 HQ (`.mov`) + PCM audio**
+  - This is a high-quality mezzanine format that avoids recompressing already-compressed sources back into delivery codecs like H.265 during intermediate work
+- HDR input sources are rejected immediately when selected in the export dialog
+- Export has an **Advanced** tab for:
+  - experimental max-autotune compile reuse
+  - INT8 pre-dequantize override (`Auto` / `Force On` / `Force Off`)
+- Starting a normal export keeps playback paused/locked for the export run
+- Starting an export with **experimental max-autotune** may trigger the same full **Stop** behavior first so compile/warmup can run cleanly
+- Canceling an export tears down the export model/runtime and releases GPU resources without requiring an app close
 
 ### mpv Display / Color Path
 
@@ -143,7 +166,12 @@ Both SDR and HDR panes are rendered through embedded **mpv** (D3D11):
 
 ### First Run
 
-The first time you play a video at a given resolution, `torch.compile` with `max-autotune` needs to compile Triton kernels. This takes **2–5 minutes** and runs in a clean subprocess with a progress dialog. The compiled kernels are **cached to disk**, so subsequent runs at the same resolution load in **~5–10 seconds**.
+The first time you play a video at a given resolution/precision/HG/pre-dequantize combination, `torch.compile` with `max-autotune` may need to compile Triton kernels. This takes **2–5 minutes** and runs in a clean subprocess with a progress dialog.
+
+Compiled kernels are **cached to disk**, so:
+
+- subsequent playback on an exact cache hit skips the clean precompile subprocess
+- export max-autotune reuses the same compile cache and only compiles cleanly on a real cache miss
 
 ---
 
@@ -240,8 +268,8 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 | **FP32** | Full precision | — |
 | **INT8 Full (PTQ)** | W8A8 quantization (HG optional) | ~4.0× vs FP16+HG |
 | **INT8 Full (QAT)** | W8A8 + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16 (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Mixed (QAT)** | Mixed W8A8/W8A16 + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16/FP16-sensitive layers (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Mixed (QAT)** | Mixed W8A8/W8A16/FP16-sensitive layers + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
 
 INT8 modes include **pre-dequantization** for GPUs without INT8 tensor cores (AMD RDNA3, NVIDIA pre-Turing): INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage.
 
@@ -357,24 +385,29 @@ python scripts/quantize/quantize_int8_full_qat.py
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt` (no-HG)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
-### Mixed W8A8/W8A16 (HG optional)
+### Mixed W8A8/W8A16/FP16-Sensitive Layers (HG optional)
 ```bash
 python scripts/quantize/quantize_int8_mixed.py
 ```
-- Memory-bound 1×1 convs → W8A8 (INT8 activations help bandwidth)
-- Compute-bound 3×3 convs → W8A16 (weight-only saves storage)
+- Per-layer sensitivity sweep automatically assigns layers across:
+  - `W8A8` for aggressive compression
+  - `W8A16` for safer weight-only quantization
+  - full `FP16` for a curated set of highly sensitive control/output layers
+- Protected AGCM / SFT control layers are automatically kept out of the most aggressive bucket
+- FP16-sensitive exemptions are enabled by default in mixed mode
   - **~4.0× compression vs FP16+HG**
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt` (no-HG)
 
-### Mixed W8A8/W8A16 + QAT (Quantization-Aware Training, HG optional)
+### Mixed W8A8/W8A16/FP16 + QAT (Quantization-Aware Training, HG optional)
 ```bash
 python scripts/quantize/quantize_int8_mixed_qat.py
 ```
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
-- Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
-- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
+- Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth while preserving the FP16-sensitive exemptions
+- QAT now defaults to deterministic/repeatable training (`--seed`, deterministic mode), highlight-aware monitor selection, and early stopping
+- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 + teacher + highlight-aware losses)
   - **~4.0× compression vs FP16+HG**
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt` (HG)

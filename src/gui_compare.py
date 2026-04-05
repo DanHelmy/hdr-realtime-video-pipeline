@@ -108,6 +108,11 @@ class CompareViewMixin:
         precision_key: str | None = None,
         frame_number: int | None = None,
     ):
+        if bool(getattr(self, "_export_interaction_locked", False)):
+            self.statusBar().showMessage(
+                "Compare is locked while export is running. Finish or cancel the export first."
+            )
+            return
         if not self._playing:
             self.statusBar().showMessage("Start playback first, then use Compare.")
             return

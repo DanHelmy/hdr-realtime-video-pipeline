@@ -47,6 +47,52 @@ from models.hdrtvnet_torch import (
 )
 
 
+def _expand_base_optional_layer_names(*names):
+    expanded = []
+    for name in names:
+        if name.startswith("base."):
+            expanded.append(name)
+            expanded.append(name[len("base."):])
+        elif name.startswith("hg."):
+            expanded.append(name)
+        else:
+            expanded.append(name)
+            expanded.append(f"base.{name}")
+    return tuple(dict.fromkeys(expanded))
+
+
+AGCM_CONTROL_LAYER_NAMES = _expand_base_optional_layer_names(
+    "AGCM.cond_scale_first",
+    "AGCM.cond_shift_first",
+    "AGCM.cond_scale_HR",
+    "AGCM.cond_shift_HR",
+    "AGCM.cond_scale_last",
+    "AGCM.cond_shift_last",
+)
+
+FP16_SENSITIVE_LAYER_NAMES = _expand_base_optional_layer_names(
+    *AGCM_CONTROL_LAYER_NAMES,
+    "AGCM.classifier.model.0",
+    "AGCM.classifier.model.4",
+    "AGCM.classifier.model.8",
+    "AGCM.classifier.model.12",
+    "AGCM.classifier.model.16",
+    "AGCM.classifier.model.20",
+    "AGCM.conv_first",
+    "AGCM.HRconv",
+    "AGCM.conv_last",
+    "LE.cond_first.0",
+    "LE.cond_first.2",
+    "LE.cond_first.4",
+    "LE.HR_conv1",
+    "LE.HR_conv2",
+    "LE.conv_last",
+    "hg.conv1.0",
+    "hg.conv10",
+    "hg.conv_last",
+)
+
+
 # ===================================================================
 # Helpers
 # ===================================================================
@@ -136,34 +182,161 @@ def prepare_model_input(img_tensor, device, dtype):
     return (img_dev, cond)
 
 
+def masked_mean_abs(diff, mask):
+    """Masked mean absolute value with safe zero-mask handling."""
+    if mask.shape[1] == 1 and diff.shape[1] != 1:
+        mask = mask.expand(-1, diff.shape[1], -1, -1)
+    weight = mask.to(dtype=diff.dtype)
+    denom = weight.sum().clamp(min=1.0)
+    return (diff.abs() * weight).sum() / denom
+
+
+def build_highlight_neutral_mask(target, highlight_threshold, neutral_threshold):
+    """Weight bright, near-neutral highlights more strongly."""
+    highlight_threshold = float(np.clip(highlight_threshold, 0.0, 0.999999))
+    neutral_threshold = max(float(neutral_threshold), 1e-6)
+    peak = target.amax(dim=1, keepdim=True)
+    floor = target.amin(dim=1, keepdim=True)
+    chroma = peak - floor
+    highlight_weight = ((peak - highlight_threshold) /
+                        max(1.0 - highlight_threshold, 1e-6)).clamp_(0.0, 1.0)
+    neutral_weight = ((neutral_threshold - chroma) /
+                      neutral_threshold).clamp_(0.0, 1.0)
+    return highlight_weight * neutral_weight
+
+
+def make_stability_probe_input(inp, perturbation=1.0 / 255.0,
+                               exposure_delta=0.01):
+    """Create a tiny deterministic input variation as a temporal proxy."""
+    img = inp[0]
+    h, w = img.shape[-2:]
+    y = torch.linspace(-1.0, 1.0, steps=h, device=img.device,
+                       dtype=img.dtype).view(1, 1, h, 1)
+    x = torch.linspace(-1.0, 1.0, steps=w, device=img.device,
+                       dtype=img.dtype).view(1, 1, 1, w)
+    pattern = 0.5 * (x + y)
+    probe = (img * (1.0 + exposure_delta) + perturbation * pattern).clamp_(0.0, 1.0)
+    try:
+        cond = F.interpolate(probe, scale_factor=0.25, mode="bicubic",
+                             align_corners=False, antialias=True)
+    except TypeError:
+        cond = F.interpolate(probe, scale_factor=0.25, mode="bicubic",
+                             align_corners=False)
+    return (probe, cond)
+
+
+def apply_protected_layer_prefs(w8a8_layers, w8a16_layers, args):
+    """Keep the most color-sensitive control layers in W8A16."""
+    protected = set()
+    w8a8_set = set(w8a8_layers)
+    if str(args.protect_agcm_controls).strip() != "0":
+        protected.update(name for name in AGCM_CONTROL_LAYER_NAMES
+                         if name in w8a8_set)
+    if str(args.protect_sft_controls).strip() != "0":
+        protected.update(name for name in w8a8_layers
+                         if "SFT_scale" in name or "SFT_shift" in name)
+    if not protected:
+        return w8a8_layers, w8a16_layers, []
+
+    filtered_w8a8 = [name for name in w8a8_layers if name not in protected]
+    filtered_w8a16 = sorted(set(w8a16_layers) | protected)
+    return filtered_w8a8, filtered_w8a16, sorted(protected)
+
+
+def parse_layer_list(layer_spec: str):
+    if not layer_spec:
+        return []
+    return sorted({name.strip() for name in str(layer_spec).split(",") if name.strip()})
+
+
+def resolve_fp16_layer_prefs(candidate_layers, args):
+    candidate_set = set(candidate_layers)
+    fp16_layers = set()
+    if str(args.fp16_sensitive_layers).strip() != "0":
+        fp16_layers.update(
+            name for name in FP16_SENSITIVE_LAYER_NAMES if name in candidate_set
+        )
+    fp16_layers.update(
+        name for name in parse_layer_list(args.fp16_layers)
+        if name in candidate_set
+    )
+    return sorted(fp16_layers)
+
+
+def apply_fp16_layer_prefs(w8a8_layers, w8a16_layers, candidate_layers, args):
+    """Move a small whitelist of high-impact layers back to native FP16."""
+    fp16_layers = resolve_fp16_layer_prefs(candidate_layers, args)
+    if not fp16_layers:
+        return w8a8_layers, w8a16_layers, []
+    fp16_set = set(fp16_layers)
+    filtered_w8a8 = [name for name in w8a8_layers if name not in fp16_set]
+    filtered_w8a16 = [name for name in w8a16_layers if name not in fp16_set]
+    return filtered_w8a8, filtered_w8a16, fp16_layers
+
+
 # ===================================================================
 # Per-layer sensitivity analysis
 # ===================================================================
 
-def compute_layer_sensitivity(model, calibration_inputs, num_samples=8):
-    """Measure per-layer quantization sensitivity (output MSE).
+def compute_layer_sensitivity(model, calibration_inputs, num_samples=8, args=None):
+    """Measure per-layer quantization sensitivity with a stability proxy.
 
     For each Conv2d / Linear layer, inject W8A8 quantization noise
     (asymmetric activation + per-channel weight) into that layer alone
     and measure how much the final output changes vs the FP16 reference.
+    The score also includes a tiny input-perturbation response mismatch to
+    better approximate temporal shimmer sensitivity.
 
-    Returns dict: {layer_name: mean_output_mse}.
+    Returns:
+        sensitivities: {layer_name: combined_score}
+        details: {layer_name: component metrics}
     """
     model.eval()
     inputs = calibration_inputs[:num_samples]
+    stability_weight = float(max(getattr(args, "stability_weight", 0.0), 0.0))
+    stability_perturbation = float(
+        max(getattr(args, "stability_perturbation", 1.0 / 255.0), 0.0)
+    )
+    stability_exposure_delta = float(
+        getattr(args, "stability_exposure_delta", 0.01)
+    )
+    highlight_weight = float(max(getattr(args, "highlight_weight", 0.0), 0.0))
+    highlight_chroma_weight = float(
+        max(getattr(args, "highlight_chroma_weight", 0.0), 0.0)
+    )
+    highlight_threshold = float(getattr(args, "highlight_threshold", 0.75))
+    neutral_threshold = float(getattr(args, "neutral_threshold", 0.08))
+    probe_inputs = [
+        make_stability_probe_input(
+            inp,
+            perturbation=stability_perturbation,
+            exposure_delta=stability_exposure_delta,
+        )
+        for inp in inputs
+    ]
 
     # Collect FP16 reference outputs
     ref_outputs = []
+    probe_ref_outputs = []
+    highlight_masks = []
     with torch.inference_mode():
-        for inp in inputs:
+        for inp, probe_inp in zip(inputs, probe_inputs):
             out, _ = model(inp)
             ref_outputs.append(out.clone())
+            probe_out, _ = model(probe_inp)
+            probe_ref_outputs.append(probe_out.clone())
+            highlight_masks.append(
+                build_highlight_neutral_mask(
+                    out.float(), highlight_threshold, neutral_threshold
+                )
+            )
 
     layers = [(n, m) for n, m in model.named_modules()
               if isinstance(m, (nn.Conv2d, nn.Linear))]
     print(f"  Sensitivity sweep: {len(layers)} layers x {len(inputs)} images")
 
     sensitivities = {}
+    details = {}
     nonfinite_count = 0
     for idx, (name, module) in enumerate(layers):
         # Hook: inject W8A8 quant noise (asymmetric act + per-channel weight)
@@ -197,20 +370,65 @@ def compute_layer_sensitivity(model, calibration_inputs, num_samples=8):
 
         h = module.register_forward_hook(_make_hook(module))
 
-        mses = []
+        total_scores = []
+        base_mses = []
+        stability_mses = []
+        highlight_l1s = []
+        highlight_chromas = []
         with torch.inference_mode():
-            for i, inp in enumerate(inputs):
+            for i, (inp, probe_inp) in enumerate(zip(inputs, probe_inputs)):
                 out, _ = model(inp)
-                mse = ((out.float() - ref_outputs[i].float()) ** 2).mean().item()
-                if not np.isfinite(mse):
-                    mse = float("inf")
-                    nonfinite_count += 1
-                mses.append(mse)
+                probe_out, _ = model(probe_inp)
 
-        layer_mse = float(np.mean(mses)) if mses else float("inf")
-        if not np.isfinite(layer_mse):
-            layer_mse = float("inf")
-        sensitivities[name] = layer_mse
+                ref = ref_outputs[i].float()
+                out_f = out.float()
+                probe_ref = probe_ref_outputs[i].float()
+                probe_out_f = probe_out.float()
+                base_mse = ((out_f - ref) ** 2).mean().item()
+                stability_mse = (
+                    ((probe_out_f - out_f) - (probe_ref - ref)) ** 2
+                ).mean().item()
+                highlight_l1 = masked_mean_abs(
+                    out_f - ref, highlight_masks[i]
+                ).item()
+                highlight_chroma = masked_mean_abs(
+                    (out_f - out_f.mean(dim=1, keepdim=True)) -
+                    (ref - ref.mean(dim=1, keepdim=True)),
+                    highlight_masks[i],
+                ).item()
+
+                score = (
+                    base_mse
+                    + stability_weight * stability_mse
+                    + highlight_weight * highlight_l1
+                    + highlight_chroma_weight * highlight_chroma
+                )
+                if not np.isfinite(score):
+                    score = float("inf")
+                    nonfinite_count += 1
+                total_scores.append(score)
+                base_mses.append(base_mse)
+                stability_mses.append(stability_mse)
+                highlight_l1s.append(highlight_l1)
+                highlight_chromas.append(highlight_chroma)
+
+        layer_score = float(np.mean(total_scores)) if total_scores else float("inf")
+        if not np.isfinite(layer_score):
+            layer_score = float("inf")
+        sensitivities[name] = layer_score
+        details[name] = {
+            "score": layer_score,
+            "mse": float(np.mean(base_mses)) if base_mses else float("inf"),
+            "stability": (
+                float(np.mean(stability_mses)) if stability_mses else float("inf")
+            ),
+            "highlight_l1": (
+                float(np.mean(highlight_l1s)) if highlight_l1s else float("inf")
+            ),
+            "highlight_chroma": (
+                float(np.mean(highlight_chromas)) if highlight_chromas else float("inf")
+            ),
+        }
         h.remove()
 
         if (idx + 1) % 32 == 0 or idx + 1 == len(layers):
@@ -219,7 +437,7 @@ def compute_layer_sensitivity(model, calibration_inputs, num_samples=8):
     if nonfinite_count > 0:
         print(f"  [warn] Replaced {nonfinite_count} non-finite sensitivity "
               f"measurements with +inf")
-    return sensitivities
+    return sensitivities, details
 
 
 def select_w8a8_layers_threshold(sensitivities, threshold=1e-6):
@@ -348,9 +566,32 @@ def main():
     parser.add_argument("--sensitivity-threshold", type=float, default=1e-6,
                         help="Per-layer MSE threshold for W8A8 assignment "
                              "(used when --layer-selection threshold)")
-    parser.add_argument("--auto-min-w8a16", type=int, default=0,
+    parser.add_argument("--auto-min-w8a16", type=int, default=8,
                         help="Minimum number of layers to keep as W8A16 in "
-                             "auto mode (0 = allow all-W8A8)")
+                             "auto mode for stability")
+    parser.add_argument("--stability-weight", type=float, default=0.35,
+                        help="Weight for response mismatch under tiny input changes")
+    parser.add_argument("--stability-perturbation", type=float,
+                        default=1.0 / 255.0,
+                        help="Amplitude of the tiny input perturbation used as a stability proxy")
+    parser.add_argument("--stability-exposure-delta", type=float, default=0.01,
+                        help="Small exposure change used alongside the stability probe")
+    parser.add_argument("--highlight-weight", type=float, default=0.10,
+                        help="Extra sensitivity weight on bright near-neutral highlights")
+    parser.add_argument("--highlight-chroma-weight", type=float, default=0.05,
+                        help="Extra sensitivity weight on highlight chroma drift")
+    parser.add_argument("--highlight-threshold", type=float, default=0.75,
+                        help="Target intensity threshold for highlight-aware sensitivity")
+    parser.add_argument("--neutral-threshold", type=float, default=0.08,
+                        help="Max channel spread treated as near-neutral in sensitivity scoring")
+    parser.add_argument("--protect-agcm-controls", default="1", choices=["1", "0"],
+                        help="Keep AGCM cond_scale/cond_shift layers in W8A16")
+    parser.add_argument("--protect-sft-controls", default="0", choices=["1", "0"],
+                        help="Also keep SFT scale/shift layers in W8A16")
+    parser.add_argument("--fp16-sensitive-layers", default="1", choices=["1", "0"],
+                        help="Keep a curated set of the most color-sensitive layers in FP16")
+    parser.add_argument("--fp16-layers", default="",
+                        help="Comma-separated extra layer names to keep in FP16")
     parser.add_argument("--num-sensitivity", type=int, default=8,
                         help="Images for sensitivity analysis")
     parser.add_argument(
@@ -420,12 +661,23 @@ def main():
     # ------------------------------------------------------------------
     selection_mode = "legacy"
     selection_info = None
+    protected_layers_removed = []
+    fp16_layers = []
 
     if args.legacy:
         # v1: simple channel-threshold heuristic
         print(f"\nLegacy mixed INT8 (channel threshold = {args.channel_threshold}):")
+        candidate_layers = [
+            name for name, module in model.named_modules()
+            if isinstance(module, (nn.Conv2d, nn.Linear))
+        ]
+        fp16_layers = resolve_fp16_layer_prefs(candidate_layers, args)
+        if fp16_layers:
+            selection_mode = "legacy+fp16"
+            print(f"  Keeping {len(fp16_layers)} layers in FP16")
         _quantize_model_mixed(model, compute_dtype,
-                              channel_threshold=args.channel_threshold)
+                              channel_threshold=args.channel_threshold,
+                              fp16_layers=fp16_layers)
         w8a8_layers = None
         use_asymmetric = False
     else:
@@ -434,6 +686,10 @@ def main():
         print(f"\n{'='*60}")
         print("Phase 1: Per-layer sensitivity analysis")
         print(f"{'='*60}")
+        print("  Score recipe: "
+              f"mse + {args.stability_weight:.2f}*stability "
+              f"+ {args.highlight_weight:.2f}*highlight "
+              f"+ {args.highlight_chroma_weight:.2f}*highlight_chroma")
 
         # Move to device for sensitivity sweep
         model = model.to(dtype=sens_dtype, device=sens_device)
@@ -451,8 +707,8 @@ def main():
                        for img in calib_images[:args.num_sensitivity]]
 
         t0 = time.perf_counter()
-        sensitivities = compute_layer_sensitivity(
-            model, sens_inputs, args.num_sensitivity
+        sensitivities, sensitivity_details = compute_layer_sensitivity(
+            model, sens_inputs, args.num_sensitivity, args=args
         )
         dt = time.perf_counter() - t0
         print(f"  Sweep took {dt:.1f}s")
@@ -479,6 +735,24 @@ def main():
             )
             selection_info = {"threshold": float(args.sensitivity_threshold)}
 
+        w8a8_layers, w8a16_layers, protected_layers_removed = (
+            apply_protected_layer_prefs(w8a8_layers, w8a16_layers, args)
+        )
+        if protected_layers_removed:
+            selection_mode = (
+                f"{selection_mode}+protected"
+                if "protected" not in selection_mode else selection_mode
+            )
+        candidate_layers = list(sensitivities.keys())
+        w8a8_layers, w8a16_layers, fp16_layers = apply_fp16_layer_prefs(
+            w8a8_layers, w8a16_layers, candidate_layers, args
+        )
+        if fp16_layers:
+            selection_mode = (
+                f"{selection_mode}+fp16"
+                if "fp16" not in selection_mode else selection_mode
+            )
+
         # Print sensitivity results
         print(f"\n{'='*60}")
         print("Phase 2: Layer assignment")
@@ -488,9 +762,14 @@ def main():
             key=lambda x: x[1] if np.isfinite(x[1]) else float("inf"),
         )
         w8a8_set = set(w8a8_layers)
-        print(f"\n  Per-layer sensitivity (MSE, ascending):")
+        fp16_set = set(fp16_layers)
+        print(f"\n  Per-layer sensitivity (combined score, ascending):")
         for name, mse in sorted_sens:
-            tag = "W8A8" if name in w8a8_set else "W8A16"
+            if name in fp16_set:
+                tag = "FP16"
+            else:
+                tag = "W8A8" if name in w8a8_set else "W8A16"
+            comp = sensitivity_details.get(name, {})
             if np.isfinite(mse):
                 psnr_str = (f"{-10 * np.log10(mse):.1f} dB"
                             if mse > 1e-10 else ">100 dB")
@@ -498,10 +777,30 @@ def main():
             else:
                 psnr_str = "nan"
                 mse_str = "nan"
-            print(f"    [{tag:5s}] {name:55s}  MSE={mse_str:>8s}  PSNR={psnr_str}")
+            stab_str = (
+                f"{comp.get('stability', float('nan')):.2e}"
+                if np.isfinite(comp.get("stability", float("nan"))) else "nan"
+            )
+            hi_str = (
+                f"{comp.get('highlight_l1', float('nan')):.2e}"
+                if np.isfinite(comp.get("highlight_l1", float("nan"))) else "nan"
+            )
+            print(f"    [{tag:5s}] {name:55s}  "
+                  f"SCORE={mse_str:>8s}  STAB={stab_str:>8s}  "
+                  f"HI={hi_str:>8s}  PSNR={psnr_str}")
 
         print(f"\n  W8A8  (asymmetric): {len(w8a8_layers)} layers")
         print(f"  W8A16 (weight-only): {len(w8a16_layers)} layers")
+        print(f"  FP16  (native)     : {len(fp16_layers)} layers")
+        if protected_layers_removed:
+            print(f"  Protected control layers demoted to W8A16: "
+                  f"{len(protected_layers_removed)}")
+            for name in protected_layers_removed:
+                print(f"    - {name}")
+        if fp16_layers:
+            print(f"  Full-FP16 exemptions: {len(fp16_layers)}")
+            for name in fp16_layers:
+                print(f"    - {name}")
 
         # Re-load FP32 model (clean weights for quantization)
         model = load_fp32_model(args.model, args.hg_weights, use_hg)
@@ -512,12 +811,15 @@ def main():
         print(f"{'='*60}")
         _quantize_model_mixed_v2(model, compute_dtype,
                                   w8a8_layers=w8a8_layers,
+                                  fp16_layers=fp16_layers,
                                   asymmetric=True)
 
     # List W8A8 layers
     print("\n  W8A8 layers:")
     w8a8_params = 0
     w8_params = 0
+    fp16_params = 0
+    fp16_named_layers = []
     for name, m in model.named_modules():
         if isinstance(m, (W8A8Conv2d, W8A8Linear)):
             asym_tag = " (asymmetric)" if m.is_asymmetric else ""
@@ -535,11 +837,26 @@ def main():
                 w8_params += m.weight_int8.numel()
             else:
                 w8_params += m.weight_int8.numel()
-    total_params = w8a8_params + w8_params
+        elif isinstance(m, (nn.Conv2d, nn.Linear)):
+            n_params = m.weight.numel()
+            fp16_params += n_params
+            fp16_named_layers.append((name, m, n_params))
+    total_params = w8a8_params + w8_params + fp16_params
+    if fp16_named_layers:
+        print("\n  FP16 layers:")
+        for name, m, n_params in fp16_named_layers:
+            if isinstance(m, nn.Conv2d):
+                print(f"    {name}: Conv2d({m.in_channels}->{m.out_channels}, "
+                      f"k={m.kernel_size})  [{n_params} params]")
+            else:
+                print(f"    {name}: Linear({m.in_features}->{m.out_features})"
+                      f"  [{n_params} params]")
     print(f"\n  Composition: W8A8 = {w8a8_params:,} params "
           f"({100*w8a8_params/max(total_params,1):.1f}%), "
           f"W8A16 = {w8_params:,} params "
-          f"({100*w8_params/max(total_params,1):.1f}%)")
+          f"({100*w8_params/max(total_params,1):.1f}%), "
+          f"FP16 = {fp16_params:,} params "
+          f"({100*fp16_params/max(total_params,1):.1f}%)")
 
     # Cast remaining parameters to compute_dtype + move to device
     model = model.to(dtype=compute_dtype, device=device)
@@ -596,6 +913,19 @@ def main():
         "calibration_method": args.calibration_method,
         "calibration_percentile": args.percentile,
         "calibration_percentile_low": args.percentile_low,
+        "selection_recipe": {
+            "stability_weight": args.stability_weight,
+            "stability_perturbation": args.stability_perturbation,
+            "stability_exposure_delta": args.stability_exposure_delta,
+            "highlight_weight": args.highlight_weight,
+            "highlight_chroma_weight": args.highlight_chroma_weight,
+            "highlight_threshold": args.highlight_threshold,
+            "neutral_threshold": args.neutral_threshold,
+            "protect_agcm_controls": str(args.protect_agcm_controls).strip() != "0",
+            "protect_sft_controls": str(args.protect_sft_controls).strip() != "0",
+            "fp16_sensitive_layers": str(args.fp16_sensitive_layers).strip() != "0",
+            "fp16_layers": parse_layer_list(args.fp16_layers),
+        },
         "architecture": {
             "classifier": "color_condition",
             "cond_c": 6,
@@ -612,14 +942,20 @@ def main():
 
     if args.legacy:
         save_data["channel_threshold"] = args.channel_threshold
+        if fp16_layers:
+            save_data["fp16_layers"] = fp16_layers
     else:
         save_data["w8a8_layers"] = w8a8_layers
+        if fp16_layers:
+            save_data["fp16_layers"] = fp16_layers
         save_data["activation_quant"] = "asymmetric"
         save_data["selection_mode"] = selection_mode
-        if selection_mode == "threshold":
+        if selection_mode.startswith("threshold"):
             save_data["sensitivity_threshold"] = args.sensitivity_threshold
         elif selection_info is not None:
             save_data["auto_selection"] = selection_info
+        if protected_layers_removed:
+            save_data["protected_layers_removed"] = protected_layers_removed
 
     torch.save(save_data, args.output)
 

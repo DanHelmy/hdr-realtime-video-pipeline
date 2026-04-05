@@ -4,7 +4,11 @@ import os
 import sys
 from pathlib import Path
 
-from windows_runtime import default_cache_root, ensure_windows_supported
+from windows_runtime import (
+    default_cache_root,
+    enable_high_resolution_timer,
+    ensure_windows_supported,
+)
 
 
 def _prepend_dll_search_path(path: str):
@@ -113,6 +117,7 @@ def _try_preload_bundled_rocm_dlls(search_roots: list[str]):
 def prepare_runtime_environment(current_file: str) -> tuple[str, str]:
     """Configure cache and DLL lookup paths before torch/PyQt are imported."""
     ensure_windows_supported("HDRTVNet++ GUI")
+    enable_high_resolution_timer(1)
     cache_root = os.environ.get("HDRTVNET_CACHE_DIR", default_cache_root())
     try:
         os.makedirs(cache_root, exist_ok=True)

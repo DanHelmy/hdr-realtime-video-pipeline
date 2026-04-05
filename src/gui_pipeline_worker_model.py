@@ -23,7 +23,7 @@ class PipelineWorkerModelMixin:
 
     @staticmethod
     def _silent_warmup(processor, w, h):
-        """Run warmup_compile with all output suppressed."""
+        """Prime either the compiled graph cache or the eager runtime once."""
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
         saved_stdout_fd = os.dup(1)
         saved_stderr_fd = os.dup(2)
@@ -34,7 +34,15 @@ class PipelineWorkerModelMixin:
             os.dup2(devnull_fd, 2)
             sys.stdout = open(os.devnull, "w")
             sys.stderr = open(os.devnull, "w")
-            processor.warmup_compile(w, h)
+            if getattr(processor, "_compiled", False):
+                processor.warmup_compile(w, h)
+            else:
+                import numpy as np
+
+                dummy = np.zeros((max(1, int(h)), max(1, int(w)), 3), dtype=np.uint8)
+                processor.process(dummy)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
         finally:
             sys.stdout.close()
             sys.stderr.close()
@@ -96,12 +104,16 @@ class PipelineWorkerModelMixin:
             use_hg=self._use_hg,
         )
 
-        if compile_model:
-            if announce_ready:
+        if announce_ready:
+            if getattr(self._processor, "_compiled", False):
                 self.status_message.emit(
                     f"Warming up kernels for {cw}x{ch} ({key}) ..."
                 )
-            self._silent_warmup(self._processor, cw, ch)
+            else:
+                self.status_message.emit(
+                    f"Priming model for {cw}x{ch} ({key}) ..."
+                )
+        self._silent_warmup(self._processor, cw, ch)
 
         self._precision_key = key
         if announce_ready:

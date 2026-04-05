@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
-from gui_scaling import BEST_CV2_INTERP, _letterbox_bgr, _apply_upscale_sharpen
+from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _OBJECTIVE_METRIC_SAMPLE_EVERY,
     _OBJECTIVE_HDRVDP3_SAMPLE_EVERY,
@@ -27,7 +26,7 @@ class PipelineWorkerObjectiveMixin:
         gt_frame: np.ndarray | None,
         need_hdr_cpu: bool,
         output: np.ndarray | None,
-        raw_out,
+        prepared_out,
         out_w: int,
         out_h: int,
         psnr_avg,
@@ -45,19 +44,14 @@ class PipelineWorkerObjectiveMixin:
                 metric_pred = None
                 if need_hdr_cpu or self._input_is_hdr:
                     metric_pred = output
-                elif (not self._input_is_hdr) and raw_out is not None:
+                elif (not self._input_is_hdr) and prepared_out is not None:
                     try:
-                        metric_pred = self._processor.postprocess(raw_out)
-                        if (metric_pred.shape[1], metric_pred.shape[0]) != (out_w, out_h):
-                            if out_w > metric_pred.shape[1] or out_h > metric_pred.shape[0]:
-                                metric_pred = cv2.resize(
-                                    metric_pred, (out_w, out_h), interpolation=BEST_CV2_INTERP
-                                )
-                                metric_pred = _apply_upscale_sharpen(metric_pred)
-                            else:
-                                metric_pred = cv2.resize(
-                                    metric_pred, (out_w, out_h), interpolation=cv2.INTER_AREA
-                                )
+                        metric_pred = self._render_hdr_output(
+                            prepared_out,
+                            out_w,
+                            out_h,
+                            copy_input=True,
+                        )
                     except Exception as exc:
                         objective_note = f"Objective metric postprocess failed: {exc}"
                         metric_pred = None

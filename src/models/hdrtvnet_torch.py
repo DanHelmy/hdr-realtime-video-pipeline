@@ -319,16 +319,20 @@ def _is_memory_bound_1x1(module: nn.Conv2d, channel_threshold: int = 32) -> bool
 
 def _quantize_model_mixed(model: nn.Module,
                           compute_dtype: torch.dtype = torch.float16,
-                          channel_threshold: int = 32) -> nn.Module:
+                          channel_threshold: int = 32,
+                          fp16_layers: list = None) -> nn.Module:
     """Selective mixed INT8: W8A8 for memory-bound 1-1 convs, W8A16 otherwise.
 
     Strategy inspired by FSR4's INT8 path (DP4A-based memory compression):
       * SFT 1-1 convs (32 ch) ' W8A8  (INT8 weights + activations)
       * 3-3 convs / large 1-1s  ' W8A16 (INT8 weights only)
       * Linear layers            ' W8A16 (INT8 weights only)
+      * Explicitly exempted layers ' FP16 (leave native Conv2d / Linear)
     """
+    fp16_set = set(fp16_layers or [])
     w8a8_count = 0
     w8_count = 0
+    fp16_count = 0
     for name, module in list(model.named_modules()):
         if isinstance(module, (nn.Conv2d, nn.Linear)):
             parts = name.split(".")
@@ -336,7 +340,9 @@ def _quantize_model_mixed(model: nn.Module,
             for p in parts[:-1]:
                 parent = getattr(parent, p)
 
-            if isinstance(module, nn.Conv2d) and _is_memory_bound_1x1(
+            if name in fp16_set:
+                fp16_count += 1
+            elif isinstance(module, nn.Conv2d) and _is_memory_bound_1x1(
                     module, channel_threshold):
                 setattr(parent, parts[-1], W8A8Conv2d(module, compute_dtype))
                 w8a8_count += 1
@@ -346,15 +352,16 @@ def _quantize_model_mixed(model: nn.Module,
             else:
                 setattr(parent, parts[-1], W8Linear(module, compute_dtype))
                 w8_count += 1
-    total = w8a8_count + w8_count
-    print(f"  Mixed INT8: {w8a8_count} layers -> W8A8, {w8_count} layers -> W8A16 "
-          f"({total} total, {compute_dtype} compute)")
+    total = w8a8_count + w8_count + fp16_count
+    print(f"  Mixed INT8: {w8a8_count} layers -> W8A8, {w8_count} layers -> W8A16, "
+          f"{fp16_count} layers -> FP16 ({total} total, {compute_dtype} compute)")
     return model
 
 
 def _quantize_model_mixed_v2(model: nn.Module,
                               compute_dtype: torch.dtype = torch.float16,
                               w8a8_layers: list = None,
+                              fp16_layers: list = None,
                               asymmetric: bool = True) -> nn.Module:
     """Sensitivity-based mixed INT8: W8A8 for specified layers, W8A16 otherwise.
 
@@ -367,11 +374,14 @@ def _quantize_model_mixed_v2(model: nn.Module,
         model: FP32 model to quantize (modified in-place).
         compute_dtype: Runtime precision for dequantized values.
         w8a8_layers: List of layer names to assign W8A8.
+        fp16_layers: List of layer names to keep as native FP16/FP32 layers.
         asymmetric: Use asymmetric activation quantization for W8A8 layers.
     """
     w8a8_set = set(w8a8_layers or [])
+    fp16_set = set(fp16_layers or [])
     w8a8_count = 0
     w8_count = 0
+    fp16_count = 0
 
     for name, module in list(model.named_modules()):
         if isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -380,7 +390,9 @@ def _quantize_model_mixed_v2(model: nn.Module,
             for p in parts[:-1]:
                 parent = getattr(parent, p)
 
-            if name in w8a8_set:
+            if name in fp16_set:
+                fp16_count += 1
+            elif name in w8a8_set:
                 if isinstance(module, nn.Conv2d):
                     setattr(parent, parts[-1],
                             W8A8Conv2d(module, compute_dtype,
@@ -397,10 +409,11 @@ def _quantize_model_mixed_v2(model: nn.Module,
                 setattr(parent, parts[-1], W8Linear(module, compute_dtype))
                 w8_count += 1
 
-    total = w8a8_count + w8_count
+    total = w8a8_count + w8_count + fp16_count
     mode = "asymmetric" if asymmetric else "symmetric"
     print(f"  Mixed INT8 v2: {w8a8_count} layers -> W8A8 ({mode}), "
-          f"{w8_count} layers -> W8A16 ({total} total, {compute_dtype} compute)")
+          f"{w8_count} layers -> W8A16, {fp16_count} layers -> FP16 "
+          f"({total} total, {compute_dtype} compute)")
     return model
 
 
@@ -751,18 +764,21 @@ class HDRTVNetTorch:
         # Replace Conv2d / Linear with correct quantized equivalents
         if quant_type == "w8a8_mixed":
             w8a8_layers = checkpoint.get("w8a8_layers", None)
+            fp16_layers = checkpoint.get("fp16_layers", None)
             use_asym = checkpoint.get(
                 "activation_quant", "symmetric") == "asymmetric"
             if w8a8_layers is not None:
                 # v2: explicit layer list from sensitivity analysis
                 _quantize_model_mixed_v2(model, compute_dtype,
                                          w8a8_layers=w8a8_layers,
+                                         fp16_layers=fp16_layers,
                                          asymmetric=use_asym)
             else:
                 # v1: channel-threshold heuristic (legacy checkpoints)
                 _quantize_model_mixed(model, compute_dtype,
                                       channel_threshold=checkpoint.get(
-                                          "channel_threshold", 32))
+                                          "channel_threshold", 32),
+                                      fp16_layers=fp16_layers)
         elif quant_type == "w8a8_full":
             use_asym = checkpoint.get(
                 "activation_quant", "symmetric") == "asymmetric"
@@ -806,12 +822,16 @@ class HDRTVNetTorch:
             self._is_w8_model = False  # now a regular FP16 model
             label = {"w8a8_full": "W8A8", "w8a8_mixed": "Mixed W8A8/W8A16"}.get(
                 quant_type, quant_type)
+            if quant_type == "w8a8_mixed" and checkpoint.get("fp16_layers"):
+                label = "Mixed W8A8/W8A16/FP16"
             print(f"Loaded {label} INT8 checkpoint ' pre-dequantized to FP16 "
                   f"(compressed storage, native FP16 speed)")
         else:
             self._is_w8_model = True
             label = {"w8a8_full": "W8A8", "w8a8_mixed": "Mixed W8A8/W8A16"}.get(
                 quant_type, quant_type)
+            if quant_type == "w8a8_mixed" and checkpoint.get("fp16_layers"):
+                label = "Mixed W8A8/W8A16/FP16"
             print(f"Loaded {label} INT8 model (compute_dtype={compute_dtype})")
         return model
 
@@ -1076,7 +1096,7 @@ class HDRTVNetTorch:
 
         # All math on GPU: clamp, scale, quantize, channel-flip (RGB'BGR)
         t = output.squeeze(0)                      # (3,H,W)  fp16/fp32
-        t = t.clamp_(0.0, 1.0).mul_(255.0)        # [0,255] still on GPU
+        t = t.clamp_(0.0, 1.0).mul_(255.0).add_(0.5)  # round-to-nearest
         t = t.to(dtype=torch.uint8)                # quantize on GPU
         t = t.flip(0)                              # RGB'BGR via channel flip
         t = t.permute(1, 2, 0).contiguous()        # CHW ' HWC, contiguous for cv2

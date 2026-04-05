@@ -76,23 +76,6 @@ class WorkerSlotsMixin:
         self._m["cpu"].setText(f"CPU: {m['cpu_mb']:.0f} MB")
         self._m["model"].setText(f"Model: {m['model_mb']:.2f} MB")
         self._m["prec"].setText(f"Prec: {m['precision']}")
-        upscale_label = "-"
-        if self._last_res and self._cur_output_w and self._cur_output_h:
-            proc_w, proc_h = self._last_res
-            if proc_w == self._cur_output_w and proc_h == self._cur_output_h:
-                upscale_label = "None (native)"
-            else:
-                fsr_active = False
-                if self._disp_hdr_mpv is not None and self._active_use_mpv:
-                    fsr_active = self._disp_hdr_mpv.is_fsr_active()
-                if fsr_active:
-                    upscale_label = "FSR"
-                elif self._active_mpv_scale_kernel:
-                    if str(self._active_mpv_scale_kernel).lower().startswith("ssim"):
-                        upscale_label = "SSimSuperRes"
-                    else:
-                        upscale_label = str(self._active_mpv_scale_kernel)
-        self._m["upscale"].setText(f"Upscale: {upscale_label}")
 
         try:
             self._audio_sync_frame_hint = max(

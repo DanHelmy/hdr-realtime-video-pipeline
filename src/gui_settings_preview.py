@@ -175,6 +175,16 @@ class SettingsPreviewMixin:
         else:
             self._last_open_dir = _ROOT
 
+        last_export_dir = data.get("last_export_dir")
+        if (
+            isinstance(last_export_dir, str)
+            and last_export_dir.strip()
+            and os.path.isdir(last_export_dir.strip())
+        ):
+            self._last_export_dir = last_export_dir.strip()
+        else:
+            self._last_export_dir = self._last_open_dir
+
         predeq_mode = str(data.get("predequantize_mode", "auto")).strip().lower()
         if predeq_mode not in {"auto", "on", "off"}:
             predeq_mode = "auto"
@@ -228,6 +238,13 @@ class SettingsPreviewMixin:
             "last_open_dir": self._last_open_dir
             if os.path.isdir(self._last_open_dir)
             else _ROOT,
+            "last_export_dir": self._last_export_dir
+            if os.path.isdir(self._last_export_dir)
+            else (
+                self._last_open_dir
+                if os.path.isdir(self._last_open_dir)
+                else _ROOT
+            ),
         }
         if self._video_tabs is not None and self._video_tabs.currentIndex() >= 0:
             data["active_tab"] = self._video_tabs.tabText(self._video_tabs.currentIndex())

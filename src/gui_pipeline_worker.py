@@ -30,12 +30,14 @@ from gui_pipeline_worker_runtime_metrics import PipelineWorkerRuntimeMetricsMixi
 from gui_pipeline_worker_session import PipelineWorkerSessionMixin
 from gui_pipeline_worker_frame_processing import PipelineWorkerFrameProcessingMixin
 from gui_scaling import _limited_playback_fps
+from timer import sleep_until
 
 # Keep wall-clock playback close to target by dropping decode frames when
 # inference falls behind. This favors cadence over full-frame coverage.
 _REALTIME_CATCHUP_ENABLED = True
 _REALTIME_SKIP_LAG_FRAMES = 1.1
 _REALTIME_MAX_CATCHUP_SKIP = 6
+_PLAYBACK_SOURCE_PREFETCH = 4
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
 
@@ -84,6 +86,8 @@ class PipelineWorker(
         self._pause_event.set()  # not paused
         self._pending_precision = None
         self._pending_predequantize_mode: str | None = None
+        self._paused_control_wake = False
+        self._paused_control_refresh_frame: int | None = None
         self._mpv_widget: MpvHDRWidget | None = None
         self._sdr_mpv_widget: MpvHDRWidget | None = None
         self._hdr_queue: _queue.Queue | None = None
@@ -187,16 +191,27 @@ class PipelineWorker(
 
     def request_precision_change(self, key):
         self._pending_precision = key
+        self._wake_for_paused_control_change()
 
     def request_predequantize_mode(self, mode: str):
         m = str(mode).strip().lower()
         if m not in {"auto", "on", "off"}:
             m = "auto"
         self._pending_predequantize_mode = m
+        self._wake_for_paused_control_change()
 
     def request_resolution_change(self, proc_w: int, proc_h: int):
         """Request a processing-resolution change (thread-safe)."""
         self._pending_resolution = (proc_w, proc_h)
+        self._wake_for_paused_control_change()
+
+    def _wake_for_paused_control_change(self):
+        """Let paused playback process hot-swap work without fully resuming."""
+        if self._user_paused:
+            self._paused_control_wake = True
+            if self._seek_frame is None:
+                self._paused_control_refresh_frame = max(0, int(self._frame_idx))
+            self._pause_event.set()
 
     def flush_hdr_queue(self, drop_frames: int = 2):
         """Flush mpv queues and drop a couple of frames to re-align output."""
@@ -341,15 +356,21 @@ class PipelineWorker(
 
     def pause(self):
         self._user_paused = True
+        self._paused_control_wake = False
+        self._paused_control_refresh_frame = None
         self._pause_event.clear()
 
     def resume(self):
         self._user_paused = False
+        self._paused_control_wake = False
+        self._paused_control_refresh_frame = None
         self._pause_event.set()
 
     def stop(self):
         self._stop_flag = True
         self._user_paused = False
+        self._paused_control_wake = False
+        self._paused_control_refresh_frame = None
         self._pause_event.set()  # unblock if paused
 
     @property
@@ -406,8 +427,9 @@ class PipelineWorker(
             self._start_sdr_feeder()
         self._start_app_vram_poll()
 
-        # Keep prefetch shallow to improve frame-accurate seek behavior.
-        source = VideoSource(self._video_path, prefetch=1)
+        # A small decode-ahead buffer smooths content-dependent decode spikes
+        # without making seeks feel sluggish.
+        source = VideoSource(self._video_path, prefetch=_PLAYBACK_SOURCE_PREFETCH)
         self._source = source
         gt_source: VideoSource | None = None
         total_frames = source.frame_count
@@ -481,6 +503,7 @@ class PipelineWorker(
                 )
                 if not self._load_model(self._precision_key):
                     continue
+                self._reset_enhance_history()
 
             # Hot-swap precision
             pending = self._pending_precision
@@ -488,6 +511,7 @@ class PipelineWorker(
                 self._pending_precision = None
                 if not self._load_model(pending):
                     continue
+                self._reset_enhance_history()
 
             # Hot-swap processing resolution
             pending_res = self._pending_resolution
@@ -496,16 +520,33 @@ class PipelineWorker(
                 new_pw, new_ph = pending_res
                 if (new_pw, new_ph) != (proc_w, proc_h):
                     self.status_message.emit(
-                        f"Switching to {new_pw}×{new_ph} …")
+                        f"Switching to {new_pw}x{new_ph} ..."
+                    )
                     self._proc_w, self._proc_h = new_pw, new_ph
                     proc_w, proc_h = new_pw, new_ph
                     lower_res_processing = (proc_w != out_w or proc_h != out_h)
                     self._reset_enhance_history()
                     self._silent_warmup(self._processor, proc_w, proc_h)
                     self.status_message.emit(
-                        f"Ready — {self._precision_key} @ {proc_w}×{proc_h}")
+                        f"Ready - {self._precision_key} @ {proc_w}x{proc_h}"
+                    )
 
                 self._reset_enhance_history()
+
+            if self._user_paused and self._paused_control_wake and self._seek_frame is None:
+                refresh_frame = self._paused_control_refresh_frame
+                if refresh_frame is not None:
+                    # Render the current paused frame once using the updated
+                    # model/settings so the user sees the change immediately.
+                    self._paused_control_refresh_frame = None
+                    self._seek_frame = max(0, int(refresh_frame))
+                else:
+                    # Paused control-only updates finished with no frame redraw
+                    # needed; return to the paused wait state cleanly.
+                    self._pause_event.clear()
+                    self._paused_control_wake = False
+                    next_frame_t = time.perf_counter()
+                    continue
 
             # Seek gate
             seek_to = self._seek_frame
@@ -523,6 +564,7 @@ class PipelineWorker(
                 seek_frame_ready_pending = True
                 next_frame_t = time.perf_counter()
                 self._sdr_delay_frame = None
+                self._reset_enhance_history()
                 if seek_to <= 1:
                     self._hdr_drop_until_frame = 2
                     self._sdr_drop_until_frame = 2
@@ -543,16 +585,31 @@ class PipelineWorker(
                 frame_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
+            if (
+                self._user_paused
+                and self._paused_control_wake
+                and self._seek_frame is None
+                and not seek_frame_ready_pending
+            ):
+                # A paused hot-swap request woke the loop. Bounce back to the top
+                # so pending precision/resolution/pre-dequantize work is handled
+                # before we decode another frame.
+                continue
 
             # Playback pacing: cap processing to the video FPS.
             now = time.perf_counter()
             lag_s = 0.0
             if now < next_frame_t:
-                time.sleep(next_frame_t - now)
+                sleep_until(next_frame_t)
+                now = time.perf_counter()
             else:
                 lag_s = now - next_frame_t
             if self._hold_until_t and now < self._hold_until_t:
-                time.sleep(min(frame_interval_s, self._hold_until_t - now))
+                hold_deadline = min(
+                    self._hold_until_t,
+                    time.perf_counter() + frame_interval_s,
+                )
+                sleep_until(hold_deadline)
 
             (
                 ret,
@@ -620,7 +677,7 @@ class PipelineWorker(
 
             t0 = time.perf_counter()
 
-            display_frame, output, raw_out, need_hdr_cpu = self._process_frame(
+            display_frame, output, prepared_out, need_hdr_cpu = self._process_frame(
                 frame=frame,
                 frame_idx=frame_idx,
                 present_t=present_t,
@@ -638,6 +695,10 @@ class PipelineWorker(
                 frame_idx=frame_idx,
                 frame=frame,
                 gt_frame=gt_frame,
+                display_frame=display_frame,
+                output=output,
+                prepared_out=prepared_out,
+                need_hdr_cpu=need_hdr_cpu,
                 out_w=out_w,
                 out_h=out_h,
                 lower_res_processing=lower_res_processing,
@@ -651,7 +712,7 @@ class PipelineWorker(
                 gt_frame=gt_frame,
                 need_hdr_cpu=need_hdr_cpu,
                 output=output,
-                raw_out=raw_out,
+                prepared_out=prepared_out,
                 out_w=out_w,
                 out_h=out_h,
                 psnr_avg=psnr_avg,
@@ -666,7 +727,8 @@ class PipelineWorker(
             next_frame_t += frame_interval_s
             frame_ms = (t1 - t0) * 1000.0
             frame_times.append(frame_ms)
-            presented_times.append(t1)
+            presentation_stamp = max(t1, present_t) if mpv_w is not None else t1
+            presented_times.append(presentation_stamp)
             if metrics_warmup_frames > 0:
                 metrics_warmup_frames -= 1
 
@@ -680,16 +742,24 @@ class PipelineWorker(
                 seek_frame_ready_pending = False
 
             # Emit only what the UI actually needs
+            emit_sdr_preview = self._sdr_visible and self._sdr_mpv_widget is None
             if need_hdr_cpu:
                 # QLabel fallback — both SDR + HDR frames needed
                 self.frame_ready.emit(display_frame, output)
-            elif self._sdr_visible:
-                # mpv handles HDR; SDR QLabel still visible.
+            elif emit_sdr_preview:
+                # mpv handles HDR; only update the SDR QLabel when that CPU
+                # preview path is actually active.
                 self.frame_ready.emit(display_frame, display_frame)
             # else: both outputs are handled directly by mpv panes
 
             if self._hold_until_t and time.perf_counter() >= self._hold_until_t:
                 self._hold_until_t = 0.0
+
+            paused_control_refresh_done = bool(
+                self._user_paused
+                and self._paused_control_wake
+                and self._seek_frame is None
+            )
 
             # Re-pause: if user paused and no further seek pending,
             # block again now that this seek frame has been emitted.
@@ -701,6 +771,7 @@ class PipelineWorker(
                 frame_times=frame_times,
                 presented_times=presented_times,
                 metrics_warmup_frames=metrics_warmup_frames,
+                force=paused_control_refresh_done,
                 process=process,
                 use_cuda=use_cuda,
                 proc_w=proc_w,
@@ -713,6 +784,9 @@ class PipelineWorker(
                 hdr_vdp3_avg=hdr_vdp3_avg,
                 hg_weights_path=_HG_WEIGHTS_PATH,
             )
+            if paused_control_refresh_done:
+                self._paused_control_wake = False
+                self._paused_control_refresh_frame = None
 
         source.release()
         self._source = None

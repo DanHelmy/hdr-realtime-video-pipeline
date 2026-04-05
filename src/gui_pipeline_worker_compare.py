@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import cv2
 import numpy as np
 import torch
 
-from gui_scaling import BEST_CV2_INTERP, _letterbox_bgr, _apply_upscale_sharpen
+from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _OBJECTIVE_METRIC_MAX_SIDE,
     _read_video_frame_at,
@@ -26,6 +25,10 @@ class PipelineWorkerCompareMixin:
         frame_idx: int,
         frame: np.ndarray,
         gt_frame: np.ndarray | None,
+        display_frame: np.ndarray | None,
+        output: np.ndarray | None,
+        prepared_out,
+        need_hdr_cpu: bool,
         out_w: int,
         out_h: int,
         lower_res_processing: bool,
@@ -54,6 +57,11 @@ class PipelineWorkerCompareMixin:
         cmp_note = ""
         runtime_precision_key = str(self._precision_key)
         compare_precision_swapped = False
+        use_live_output = (
+            compare_precision_key in (None, "", self._precision_key)
+            and frame_idx == cmp_idx
+        )
+
         if (
             (not self._input_is_hdr)
             and compare_precision_key
@@ -73,43 +81,83 @@ class PipelineWorkerCompareMixin:
                 compare_precision_swapped = (
                     str(self._precision_key) != runtime_precision_key
                 )
+                if compare_precision_swapped:
+                    self._reset_enhance_history()
 
-        cmp_source = _read_video_frame_at(self._video_path, cmp_idx)
-        if cmp_source is None and cmp_idx > 0:
-            cmp_source = _read_video_frame_at(self._video_path, cmp_idx - 1)
-        if cmp_source is None:
-            cmp_source = frame
-            cmp_idx = int(frame_idx)
-            cmp_note = (
-                "Source frame unavailable at requested position; "
-                "using current decoded frame."
-            )
-
-        cmp_sdr = np.ascontiguousarray(_letterbox_bgr(cmp_source, out_w, out_h))
+        cmp_source = frame
+        cmp_sdr = None
         cmp_hdr_algo = None
         cmp_algo_precision = "Bypass" if self._input_is_hdr else str(self._precision_key)
-        if self._input_is_hdr:
+
+        if use_live_output:
+            cmp_sdr = np.ascontiguousarray(
+                display_frame.copy()
+                if display_frame is not None
+                else _letterbox_bgr(frame, out_w, out_h)
+            )
+            if self._input_is_hdr:
+                cmp_hdr_algo = np.ascontiguousarray(
+                    output.copy() if isinstance(output, np.ndarray) else cmp_sdr.copy()
+                )
+            elif need_hdr_cpu and isinstance(output, np.ndarray):
+                cmp_hdr_algo = np.ascontiguousarray(output.copy())
+            elif prepared_out is not None:
+                try:
+                    cmp_hdr_algo = np.ascontiguousarray(
+                        self._render_hdr_output(
+                            prepared_out,
+                            out_w,
+                            out_h,
+                            copy_input=True,
+                        )
+                    )
+                except Exception as exc:
+                    msg = f"HDR Convert snapshot failed ({exc}); using SDR fallback."
+                    cmp_note = f"{cmp_note} {msg}".strip()
+                    cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
+
+        if cmp_sdr is None:
+            cmp_source = _read_video_frame_at(self._video_path, cmp_idx)
+            if cmp_source is None and cmp_idx > 0:
+                cmp_source = _read_video_frame_at(self._video_path, cmp_idx - 1)
+            if cmp_source is None:
+                cmp_source = frame
+                cmp_idx = int(frame_idx)
+                cmp_note = (
+                    "Source frame unavailable at requested position; "
+                    "using current decoded frame."
+                )
+            cmp_sdr = np.ascontiguousarray(_letterbox_bgr(cmp_source, out_w, out_h))
+
+        if cmp_hdr_algo is None and self._input_is_hdr:
             cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
-        else:
+        elif cmp_hdr_algo is None:
             try:
-                cmp_model_inp = _letterbox_bgr(cmp_source, out_w, out_h)
                 if lower_res_processing:
-                    cmp_model_inp = _letterbox_bgr(cmp_model_inp, proc_w, proc_h)
+                    cmp_model_inp = _letterbox_bgr(cmp_source, proc_w, proc_h)
+                else:
+                    cmp_model_inp = cmp_sdr
                 with torch.inference_mode():
                     cmp_tensor, cmp_cond = self._processor.preprocess(cmp_model_inp)
                     cmp_raw_out = self._processor.infer((cmp_tensor, cmp_cond))
-                cmp_hdr_algo = self._processor.postprocess(cmp_raw_out)
-                if (cmp_hdr_algo.shape[1], cmp_hdr_algo.shape[0]) != (out_w, out_h):
-                    if out_w > cmp_hdr_algo.shape[1] or out_h > cmp_hdr_algo.shape[0]:
-                        cmp_hdr_algo = cv2.resize(
-                            cmp_hdr_algo, (out_w, out_h), interpolation=BEST_CV2_INTERP
+
+                if lower_res_processing:
+                    saved_enhance_state = self._capture_enhance_history()
+                    self._reset_enhance_history()
+                    try:
+                        cmp_prepared_out = self._prepare_hdr_output_tensor(
+                            cmp_raw_out, lower_res_processing
                         )
-                        cmp_hdr_algo = _apply_upscale_sharpen(cmp_hdr_algo)
-                    else:
-                        cmp_hdr_algo = cv2.resize(
-                            cmp_hdr_algo, (out_w, out_h), interpolation=cv2.INTER_AREA
-                        )
-                cmp_hdr_algo = np.ascontiguousarray(cmp_hdr_algo)
+                    finally:
+                        self._restore_enhance_history(saved_enhance_state)
+                else:
+                    cmp_prepared_out = self._prepare_hdr_output_tensor(
+                        cmp_raw_out, lower_res_processing
+                    )
+
+                cmp_hdr_algo = np.ascontiguousarray(
+                    self._render_hdr_output(cmp_prepared_out, out_w, out_h)
+                )
             except Exception as exc:
                 cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
                 msg = f"HDR Convert snapshot failed ({exc}); using SDR fallback."
@@ -180,6 +228,8 @@ class PipelineWorkerCompareMixin:
                     f"continuing with {self._precision_key}."
                 )
                 cmp_note = f"{cmp_note} {msg}".strip()
+            else:
+                self._reset_enhance_history()
 
         self.compare_snapshot_ready.emit({
             "frame": int(cmp_idx),

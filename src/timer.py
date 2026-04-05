@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import time
+
 
 class FPSTimer:
     def __init__(self):
@@ -14,3 +17,20 @@ class FPSTimer:
             self.frames = 0
             self.last = now
         return self.fps
+
+
+def sleep_until(
+    deadline_s: float,
+    *,
+    coarse_margin_s: float = 0.0020,
+) -> None:
+    """Sleep toward a deadline without busy-spinning the GIL."""
+    while True:
+        remaining = float(deadline_s) - time.perf_counter()
+        if remaining <= 0.0:
+            return
+        if remaining > coarse_margin_s:
+            time.sleep(remaining - coarse_margin_s)
+            continue
+        # Yield rather than busy-spin so feeder/UI threads can keep running.
+        time.sleep(0)

@@ -37,6 +37,7 @@ from gui_compile_dialogs import (
     _PrecompileOptionsDialog,
     _PrecompileDialog,
 )
+from gui_export import ExportOptionsDialog, VideoExportWorker
 from gui_media_probe import (
     _probe_hdr_input,
     _norm_path,
@@ -90,6 +91,76 @@ def _normalize_predequantize_mode(mode: str) -> str:
 
 class PlaybackRuntimeMixin:
     """Playback, restart/apply settings, and compile/file tool flows for MainWindow."""
+
+    _EXPORT_LOCK_WIDGET_NAMES = (
+        "_btn_file",
+        "_btn_play",
+        "_btn_pause",
+        "_btn_stop",
+        "_btn_compare",
+        "_btn_apply_settings",
+        "_seek_slider",
+        "_cmb_prec",
+        "_chk_hg",
+        "_cmb_res",
+        "_cmb_upscale",
+        "_chk_film_grain",
+        "_btn_hdr_gt",
+        "_sld_volume",
+        "_cmb_audio_track",
+        "_btn_pop_sdr",
+        "_btn_pop_hdr",
+        "_btn_toggle_ui",
+        "_cmb_view",
+    )
+
+    def _export_controls_locked(self) -> bool:
+        return bool(getattr(self, "_export_interaction_locked", False))
+
+    def _show_export_lock_message(self, action: str = "Playback") -> bool:
+        if not self._export_controls_locked():
+            return False
+        self.statusBar().showMessage(
+            f"{action} is locked while export is running. Finish or cancel the export first."
+        )
+        return True
+
+    def _set_export_interaction_locked(self, locked: bool):
+        if bool(locked):
+            if self._export_controls_locked():
+                return
+            saved = {}
+            for name in self._EXPORT_LOCK_WIDGET_NAMES:
+                widget = getattr(self, name, None)
+                if widget is None:
+                    continue
+                try:
+                    saved[name] = bool(widget.isEnabled())
+                    widget.setEnabled(False)
+                except Exception:
+                    continue
+            self._export_saved_enabled_states = saved
+            self._export_interaction_locked = True
+            self.statusBar().showMessage(
+                "Playback controls are locked while export is running."
+            )
+            return
+
+        saved = dict(getattr(self, "_export_saved_enabled_states", {}) or {})
+        self._export_saved_enabled_states = {}
+        self._export_interaction_locked = False
+        for name, was_enabled in saved.items():
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.setEnabled(bool(was_enabled))
+            except Exception:
+                continue
+        if self._playing:
+            self._btn_apply_settings.setEnabled(self._has_pending_setting_changes())
+        else:
+            self._btn_apply_settings.setEnabled(False)
 
     def _can_run_autotune_compile(self) -> bool:
         if not torch.cuda.is_available():
@@ -897,6 +968,8 @@ class PlaybackRuntimeMixin:
             )
 
     def _open_file(self):
+        if self._show_export_lock_message("Open video"):
+            return
         start_dir = self._last_open_dir if os.path.isdir(self._last_open_dir) else _ROOT
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -914,7 +987,285 @@ class PlaybackRuntimeMixin:
                 pass
             self._set_video(path)
 
+    def _open_export_dialog(self):
+        if self._export_thread is not None:
+            QMessageBox.information(
+                self,
+                "Export Running",
+                "An export is already running. Wait for it to finish or cancel it first.",
+            )
+            return
+
+        if self._playing:
+            answer = QMessageBox.question(
+                self,
+                "Export While Playing",
+                "Playback will be paused while the export dialog is open.\n\n"
+                "If you start a normal export, playback will stay paused and "
+                "locked for the export run.\n\n"
+                "If you start an export with experimental max-autotune enabled, "
+                "the app may use the same full Stop behavior before export begins so kernel "
+                "compile/warmup can run cleanly.\n\n"
+                "Export uses the same GPU/model stack as playback, so this keeps "
+                "the export path stable.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        resume_after_dialog = bool(self._playing and not self._worker.is_paused)
+        if resume_after_dialog:
+            self._toggle_pause()
+
+        start_dir = self._last_export_dir if os.path.isdir(self._last_export_dir) else _ROOT
+        config = None
+        try:
+            dlg = ExportOptionsDialog(
+                initial_source_path=self._video_path if self._video_path else None,
+                suggested_dir=start_dir,
+                initial_precision_key=self._cmb_prec.currentText(),
+                initial_use_hg=self._chk_hg.isChecked(),
+                parent=self,
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            config = dlg.export_config()
+            if config is None:
+                return
+
+            try:
+                export_dir = os.path.dirname(config.output_path)
+                if export_dir and os.path.isdir(export_dir):
+                    self._last_export_dir = export_dir
+            except Exception:
+                pass
+            self._save_user_settings()
+        finally:
+            if (
+                config is None
+                and resume_after_dialog
+                and self._playing
+                and self._worker.is_paused
+            ):
+                self._toggle_pause()
+
+        self._start_export_job(config, resume_if_aborted=resume_after_dialog)
+
+    def _prepare_export_compile_cache(self, config) -> bool:
+        if not getattr(config, "use_max_autotune", False):
+            return True
+
+        prec_arg = _precision_to_compile_arg(config.precision_key)
+        model_path = _select_model_path(config.precision_key, config.use_hg)
+        selected_pdq_mode = _normalize_predequantize_mode(
+            getattr(config, "predequantize_mode", "auto")
+        )
+        compile_ready = self._is_compile_ready_for_runtime(
+            int(config.width),
+            int(config.height),
+            prec_arg,
+            model_path=model_path,
+            use_hg=bool(config.use_hg),
+            selected_predequantize_mode=selected_pdq_mode,
+        )
+        self._autotune_warning_needed = not compile_ready
+        if compile_ready:
+            return True
+        if not self._confirm_autotune_precompile_ready():
+            return False
+
+        dlg = _PrecompileDialog(
+            [f"{int(config.width)}x{int(config.height)}"],
+            precision=prec_arg,
+            model_path=model_path,
+            use_hg=bool(config.use_hg),
+            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+            predequantize_mode=selected_pdq_mode,
+            parent=self,
+        )
+        dlg.exec()
+        if dlg.succeeded:
+            return True
+
+        self.statusBar().showMessage("Export kernel compile was canceled.")
+        return False
+
+    def _request_cancel_export(self):
+        if self._export_worker is not None:
+            self._export_worker.cancel()
+        if self._export_progress_dlg is not None:
+            self._export_progress_dlg.setLabelText("Canceling export ...")
+            self._export_progress_dlg.setCancelButton(None)
+        if self._export_compile_dlg is not None:
+            self._export_compile_dlg.set_status("Canceling export ...")
+
+    def _create_export_progress_dialog(self):
+        if self._export_progress_dlg is not None:
+            return self._export_progress_dlg
+
+        progress = QProgressDialog("Preparing export ...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Export Video")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(self._request_cancel_export)
+        progress.show()
+        self._export_progress_dlg = progress
+        return progress
+
+    def _begin_export_job(self, config, resume_if_aborted: bool = False):
+        if self._export_thread is not None:
+            return
+
+        if self._playing and self._worker is not None and not self._worker.is_paused:
+            self._toggle_pause()
+        self._set_export_interaction_locked(True)
+        if not self._prepare_export_compile_cache(config):
+            self._set_export_interaction_locked(False)
+            if (
+                resume_if_aborted
+                and self._playing
+                and self._worker is not None
+                and self._worker.is_paused
+            ):
+                self._toggle_pause()
+            return
+        if config.use_max_autotune:
+            self._export_compile_dlg = _CompileDialog(self)
+            self._export_compile_dlg.set_status("Loading export model ...")
+            self._export_compile_dlg.show()
+        else:
+            self._create_export_progress_dialog()
+
+        thread = QThread(self)
+        worker = VideoExportWorker(config)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.compile_ready.connect(self._on_export_compile_ready)
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.canceled.connect(self._on_export_canceled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.canceled.connect(thread.quit)
+        thread.finished.connect(self._cleanup_export_job)
+
+        self._export_thread = thread
+        self._export_worker = worker
+        thread.start()
+        self.statusBar().showMessage(
+            "Export started. Playback controls are locked until export finishes."
+        )
+
+    def _start_export_job(self, config, resume_if_aborted: bool = False):
+        if self._export_thread is not None:
+            return
+
+        had_active_playback = bool(
+            self._playing and self._worker is not None and self._worker.isRunning()
+        )
+
+        if had_active_playback and getattr(config, "use_max_autotune", False):
+            answer = QMessageBox.question(
+                self,
+                "Export Autotune Needs Full Stop",
+                "Max-autotune export should stop playback first, then start export.\n\n"
+                "This uses the same full Stop behavior before any compile/warmup "
+                "work begins, which avoids MIOpen/ROCm conflicts from leaving the "
+                "playback model and mpv pipeline alive on the GPU.\n\n"
+                "Playback will be stopped now, then export will begin.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                if (
+                    resume_if_aborted
+                    and self._playing
+                    and self._worker is not None
+                    and self._worker.is_paused
+                ):
+                    self._toggle_pause()
+                return
+            self._stop()
+            QTimer.singleShot(
+                0,
+                lambda cfg=config: self._begin_export_job(
+                    cfg, resume_if_aborted=False
+                ),
+            )
+            return
+
+        self._begin_export_job(config, resume_if_aborted=resume_if_aborted)
+
+    def _on_export_compile_ready(self):
+        if self._export_compile_dlg is not None:
+            self._export_compile_dlg.close()
+            self._export_compile_dlg.deleteLater()
+            self._export_compile_dlg = None
+        self._create_export_progress_dialog()
+
+    def _on_export_progress(self, percent: int, message: str):
+        if self._export_progress_dlg is not None:
+            self._export_progress_dlg.setLabelText(message)
+            self._export_progress_dlg.setValue(max(0, min(100, int(percent))))
+        elif self._export_compile_dlg is not None:
+            self._export_compile_dlg.set_status(message)
+        self.statusBar().showMessage(message)
+
+    def _on_export_finished(self, output_path: str):
+        if self._export_progress_dlg is not None:
+            self._export_progress_dlg.setValue(100)
+            self._export_progress_dlg.setLabelText("Export complete.")
+        self.statusBar().showMessage(f"Export finished: {output_path}")
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Finished exporting:\n{output_path}",
+        )
+
+    def _on_export_failed(self, message: str):
+        self.statusBar().showMessage("Export failed.")
+        QMessageBox.warning(
+            self,
+            "Export Failed",
+            str(message or "The export failed."),
+        )
+
+    def _on_export_canceled(self, message: str):
+        self.statusBar().showMessage("Export canceled.")
+        if message:
+            QMessageBox.information(
+                self,
+                "Export Canceled",
+                message,
+            )
+
+    def _cleanup_export_job(self):
+        if self._export_compile_dlg is not None:
+            self._export_compile_dlg.close()
+            self._export_compile_dlg.deleteLater()
+            self._export_compile_dlg = None
+        if self._export_progress_dlg is not None:
+            self._export_progress_dlg.close()
+            self._export_progress_dlg.deleteLater()
+            self._export_progress_dlg = None
+        if self._export_worker is not None:
+            self._export_worker.deleteLater()
+            self._export_worker = None
+        if self._export_thread is not None:
+            self._export_thread.deleteLater()
+            self._export_thread = None
+        self._set_export_interaction_locked(False)
+
     def _set_video(self, path, auto_play: bool = False):
+        if self._show_export_lock_message("Loading a new video"):
+            return
         candidate_hdr = _probe_hdr_input(path)
         if bool(candidate_hdr.get("is_hdr", False)):
             reason = str(candidate_hdr.get("reason", "HDR metadata detected")).strip()
@@ -1055,6 +1406,8 @@ class PlaybackRuntimeMixin:
     # - Slots: playback ---------------------------------------
 
     def _play(self):
+        if self._show_export_lock_message("Playback"):
+            return
         if self._playing or not self._video_path:
             return
 
@@ -1142,29 +1495,40 @@ class PlaybackRuntimeMixin:
         # If the Triton + Inductor cache is already warm from a previous
         # compile, the subprocess finishes in seconds and auto-closes.
         model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
-        self._autotune_warning_needed = self._compile_cache_missing_for_any(
-            [f"{pw}x{ph}"],
+        compile_ready = self._is_compile_ready_for_runtime(
+            pw,
+            ph,
             prec_arg,
             model_path=model_path,
             use_hg=self._chk_hg.isChecked(),
+            selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
         )
-        if not self._confirm_autotune_precompile_ready():
-            return
-        dlg = _PrecompileDialog(
-            [f"{pw}x{ph}"],
-            precision=prec_arg,
-            model_path=model_path,
-            use_hg=self._chk_hg.isChecked(),
-            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
-            predequantize_mode=_normalize_predequantize_mode(
-                getattr(self, "_predequantize_mode", "auto")
-            ),
-            parent=self,
-        )
-        dlg.exec()  # modal - blocks until done
-        if not dlg.succeeded:
-            # Compile failed or user closed early - don't start playback
-            return
+        self._autotune_warning_needed = not compile_ready
+        if not compile_ready:
+            self._autotune_warning_needed = self._compile_cache_missing_for_any(
+                [f"{pw}x{ph}"],
+                prec_arg,
+                model_path=model_path,
+                use_hg=self._chk_hg.isChecked(),
+            )
+        if not compile_ready:
+            if not self._confirm_autotune_precompile_ready():
+                return
+            dlg = _PrecompileDialog(
+                [f"{pw}x{ph}"],
+                precision=prec_arg,
+                model_path=model_path,
+                use_hg=self._chk_hg.isChecked(),
+                hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+                predequantize_mode=_normalize_predequantize_mode(
+                    getattr(self, "_predequantize_mode", "auto")
+                ),
+                parent=self,
+            )
+            dlg.exec()  # modal - blocks until done
+            if not dlg.succeeded:
+                # Compile failed or user closed early - don't start playback
+                return
 
         # Start playback
         self._last_res = (pw, ph)
@@ -1309,6 +1673,8 @@ class PlaybackRuntimeMixin:
         self._start_periodic_relock()
 
     def _toggle_pause(self):
+        if self._show_export_lock_message("Playback"):
+            return
         if not self._playing:
             return
         if self._worker.is_paused:
@@ -1480,6 +1846,8 @@ class PlaybackRuntimeMixin:
             self._update_apply_button_state()
 
     def _apply_runtime_settings(self):
+        if self._show_export_lock_message("Runtime setting changes"):
+            return
         if not self._playing or not self._video_path:
             return
         if not self._has_pending_setting_changes():

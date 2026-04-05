@@ -17,6 +17,7 @@ class PipelineWorkerRuntimeMetricsMixin:
         frame_times,
         presented_times,
         metrics_warmup_frames: int,
+        force: bool = False,
         process,
         use_cuda: bool,
         proc_w: int,
@@ -29,7 +30,12 @@ class PipelineWorkerRuntimeMetricsMixin:
         hdr_vdp3_avg,
         hg_weights_path: str,
     ) -> None:
-        if frame_idx % 2 != 0 or not frame_times or metrics_warmup_frames != 0:
+        if (
+            not force
+            and (frame_idx % 2 != 0 or not frame_times or metrics_warmup_frames != 0)
+        ):
+            return
+        if not frame_times:
             return
 
         avg = sum(frame_times) / len(frame_times)
@@ -51,11 +57,16 @@ class PipelineWorkerRuntimeMetricsMixin:
             model_mb = 0.0
             prec_label = "Bypass (HDR input)"
         else:
-            model_path = _select_model_path(self._precision_key, self._use_hg)
-            model_mb = os.path.getsize(model_path) / (1024 * 1024)
-            if self._use_hg and self._precision_key in ("FP16", "FP32"):
-                if os.path.isfile(hg_weights_path):
-                    model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
+            cache_key = (str(self._precision_key), bool(self._use_hg))
+            if getattr(self, "_metrics_model_size_key", None) != cache_key:
+                model_path = _select_model_path(self._precision_key, self._use_hg)
+                model_mb = os.path.getsize(model_path) / (1024 * 1024)
+                if self._use_hg and self._precision_key in ("FP16", "FP32"):
+                    if os.path.isfile(hg_weights_path):
+                        model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
+                self._metrics_model_size_key = cache_key
+                self._metrics_model_size_mb = model_mb
+            model_mb = float(getattr(self, "_metrics_model_size_mb", 0.0))
             prec_label = self._precision_key
 
         self.metrics_updated.emit({
@@ -66,8 +77,7 @@ class PipelineWorkerRuntimeMetricsMixin:
             "gpu_mb": gpu_mb,
             "model_mb": model_mb,
             "precision": prec_label,
-            "proc_res": f"{proc_w}×{proc_h}",
-            "realtime_drops": int(self._realtime_drop_frames),
+            "proc_res": f"{proc_w}x{proc_h}",
             "psnr_db": psnr_avg.value,
             "sssim": sssim_avg.value,
             "delta_e_itp": deitp_avg.value,

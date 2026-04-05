@@ -22,6 +22,7 @@ Usage
 """
 
 import argparse
+import copy
 import glob
 import os
 import random
@@ -48,6 +49,50 @@ from models.hdrtvnet_torch import (
     W8A8Conv2d, W8A8Linear,
     _quantize_model_w8a8, calibrate_w8a8,
 )
+
+
+def configure_reproducibility(args):
+    """Seed Python/NumPy/PyTorch and prefer deterministic kernels."""
+    seed = int(args.seed)
+    deterministic = str(args.deterministic).strip() != "0"
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    if hasattr(torch.backends, "cudnn"):
+        try:
+            torch.backends.cudnn.deterministic = deterministic
+            torch.backends.cudnn.benchmark = not deterministic
+        except Exception:
+            pass
+
+    try:
+        cuda_backends = getattr(torch.backends, "cuda", None)
+        if cuda_backends is not None and hasattr(cuda_backends, "matmul"):
+            cuda_backends.matmul.allow_tf32 = False
+    except Exception:
+        pass
+
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+    except Exception:
+        pass
+
+    try:
+        torch.use_deterministic_algorithms(deterministic, warn_only=True)
+    except TypeError:
+        torch.use_deterministic_algorithms(deterministic)
+    except Exception:
+        pass
+
+    return seed, deterministic
 
 
 # ===================================================================
@@ -352,7 +397,10 @@ def random_crop_pair(sdr_t, hdr_t, crop_size=256):
 
 def prepare_model_input(img_tensor, device, dtype):
     """Prepare (input, condition) tuple for the model."""
-    img_dev = img_tensor.to(device=device, dtype=dtype)
+    target_dtype = dtype
+    if torch.device(device).type == "cpu" and dtype == torch.float16:
+        target_dtype = torch.float32
+    img_dev = img_tensor.to(device=device, dtype=target_dtype)
     try:
         cond = F.interpolate(img_dev, scale_factor=0.25, mode="bicubic",
                              align_corners=False, antialias=True)
@@ -360,6 +408,122 @@ def prepare_model_input(img_tensor, device, dtype):
         cond = F.interpolate(img_dev, scale_factor=0.25, mode="bicubic",
                              align_corners=False)
     return (img_dev, cond)
+
+
+def masked_mean_abs(diff, mask):
+    """Masked mean absolute value with safe zero-mask handling."""
+    if mask.shape[1] == 1 and diff.shape[1] != 1:
+        mask = mask.expand(-1, diff.shape[1], -1, -1)
+    weight = mask.to(dtype=diff.dtype)
+    denom = weight.sum().clamp(min=1.0)
+    return (diff.abs() * weight).sum() / denom
+
+
+def build_highlight_neutral_mask(target, highlight_threshold, neutral_threshold):
+    """Weight bright, near-neutral highlights more strongly."""
+    highlight_threshold = float(np.clip(highlight_threshold, 0.0, 0.999999))
+    neutral_threshold = max(float(neutral_threshold), 1e-6)
+    peak = target.amax(dim=1, keepdim=True)
+    floor = target.amin(dim=1, keepdim=True)
+    chroma = peak - floor
+    highlight_weight = ((peak - highlight_threshold) /
+                        max(1.0 - highlight_threshold, 1e-6)).clamp_(0.0, 1.0)
+    neutral_weight = ((neutral_threshold - chroma) /
+                      neutral_threshold).clamp_(0.0, 1.0)
+    return highlight_weight * neutral_weight
+
+
+def select_highlight_monitor_pairs(pairs, num_pairs, args):
+    """Pick full-image monitor pairs with the strongest highlight coverage."""
+    if num_pairs <= 0 or not pairs:
+        return [], {
+            "positive_candidates": 0,
+            "avg_highlight_cov": 0.0,
+            "min_highlight_cov": 0.0,
+            "max_highlight_cov": 0.0,
+        }
+
+    scored = []
+    for idx, pair in enumerate(pairs):
+        _, hdr_t = pair
+        mask = build_highlight_neutral_mask(
+            hdr_t.float(), args.highlight_threshold, args.neutral_threshold
+        )
+        scored.append((float(mask.mean().item()), idx, pair))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    selected = scored[:min(num_pairs, len(scored))]
+    coverages = [cov for cov, _, _ in selected]
+    positive_candidates = sum(cov > 0.0 for cov, _, _ in scored)
+    stats = {
+        "positive_candidates": positive_candidates,
+        "avg_highlight_cov": float(np.mean(coverages)) if coverages else 0.0,
+        "min_highlight_cov": float(np.min(coverages)) if coverages else 0.0,
+        "max_highlight_cov": float(np.max(coverages)) if coverages else 0.0,
+    }
+    return [pair for _, _, pair in selected], stats
+
+
+def compute_loss_terms(output, target, args, teacher_output=None):
+    """Composite QAT loss tuned to preserve bright highlight color."""
+    base_l1 = F.l1_loss(output, target)
+    total = base_l1
+    metrics = {
+        "total": float(base_l1.detach().item()),
+        "l1": float(base_l1.detach().item()),
+    }
+
+    if teacher_output is not None and args.teacher_loss_weight > 0:
+        teacher_l1 = F.l1_loss(output, teacher_output.to(dtype=output.dtype))
+        total = total + args.teacher_loss_weight * teacher_l1
+        metrics["teacher_l1"] = float(teacher_l1.detach().item())
+
+    mask = build_highlight_neutral_mask(
+        target, args.highlight_threshold, args.neutral_threshold
+    )
+    metrics["highlight_cov"] = float(mask.mean().detach().item())
+
+    if args.highlight_loss_weight > 0:
+        highlight_l1 = masked_mean_abs(output - target, mask)
+        total = total + args.highlight_loss_weight * highlight_l1
+        metrics["highlight_l1"] = float(highlight_l1.detach().item())
+
+    if args.highlight_chroma_weight > 0:
+        output_chroma = output - output.mean(dim=1, keepdim=True)
+        target_chroma = target - target.mean(dim=1, keepdim=True)
+        highlight_chroma = masked_mean_abs(output_chroma - target_chroma, mask)
+        total = total + args.highlight_chroma_weight * highlight_chroma
+        metrics["highlight_chroma"] = float(highlight_chroma.detach().item())
+
+    metrics["total"] = float(total.detach().item())
+    return total, metrics
+
+
+def accumulate_metrics(metric_sums, metrics):
+    for key, value in metrics.items():
+        metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+
+
+def average_metrics(metric_sums, count):
+    if count <= 0:
+        return {}
+    return {key: value / count for key, value in metric_sums.items()}
+
+
+def format_metrics(metrics):
+    parts = [
+        f"total={metrics.get('total', 0.0):.6f}",
+        f"l1={metrics.get('l1', 0.0):.6f}",
+    ]
+    if "teacher_l1" in metrics:
+        parts.append(f"teacher={metrics['teacher_l1']:.6f}")
+    if "highlight_l1" in metrics:
+        parts.append(f"hi={metrics['highlight_l1']:.6f}")
+    if "highlight_chroma" in metrics:
+        parts.append(f"hi_chroma={metrics['highlight_chroma']:.6f}")
+    if "highlight_cov" in metrics:
+        parts.append(f"hi_cov={metrics['highlight_cov']:.3f}")
+    return ", ".join(parts)
 
 
 # ===================================================================
@@ -396,7 +560,8 @@ def _build_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Modu
 # Training loop
 # ===================================================================
 
-def train_qat(model, pairs, device, compute_dtype, args):
+def train_qat(model, pairs, device, compute_dtype, args,
+              teacher_model=None, teacher_dtype=None, monitor_pairs=None):
     """Fine-tune with QAT fake-quantization."""
     model.train()
     # ROCm: BatchNorm training can trigger MIOpen HIPRTC compile failures.
@@ -409,52 +574,97 @@ def train_qat(model, pairs, device, compute_dtype, args):
                     p.requires_grad = False
     qat_params = [p for p in model.parameters() if p.requires_grad]
 
+    batch_size = max(int(args.batch_size), 1)
+    steps_per_epoch = max((len(pairs) + batch_size - 1) // batch_size, 1)
+
     optimizer = optim.Adam(qat_params, lr=args.lr, weight_decay=0)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * len(pairs), eta_min=args.lr * 0.01
+        optimizer, T_max=args.epochs * steps_per_epoch, eta_min=args.lr * 0.01
     )
 
-    criterion = nn.L1Loss()
-    monitor_count = min(max(args.num_validate, 0), len(pairs))
-    monitor_pairs = pairs[:monitor_count]
+    if monitor_pairs is None:
+        monitor_count = min(max(args.num_validate, 0), len(pairs))
+        monitor_pairs = pairs[:monitor_count]
+    score_name = "monitor total" if (
+        args.teacher_loss_weight > 0
+        or args.highlight_loss_weight > 0
+        or args.highlight_chroma_weight > 0
+    ) else "monitor L1"
+
+    monitor_teacher_outputs = None
+    if monitor_pairs and teacher_model is not None:
+        monitor_teacher_outputs = []
+        with torch.inference_mode():
+            for sdr_t, _ in monitor_pairs:
+                teacher_inp = prepare_model_input(sdr_t, device, teacher_dtype)
+                teacher_output, _ = teacher_model(teacher_inp)
+                if not torch.isfinite(teacher_output).all():
+                    teacher_output = torch.nan_to_num(
+                        teacher_output, nan=0.0, posinf=1.0, neginf=0.0
+                    )
+                monitor_teacher_outputs.append(teacher_output.detach().cpu())
 
     print(f"\n  Training: {args.epochs} epochs, lr={args.lr}, "
-          f"crop={args.crop_size}, {len(pairs)} pairs")
+          f"crop={args.crop_size}, batch={batch_size}, {len(pairs)} pairs")
+    print("  Loss recipe: "
+          f"L1 + {args.teacher_loss_weight:.3f}*teacher "
+          f"+ {args.highlight_loss_weight:.3f}*highlight "
+          f"+ {args.highlight_chroma_weight:.3f}*highlight_chroma")
     if monitor_pairs:
-        print(f"  Model selection: best monitor L1 on {len(monitor_pairs)} "
+        print(f"  Model selection: best {score_name} on {len(monitor_pairs)} "
               f"fixed full-image pairs")
     else:
-        print("  Model selection: best training loss")
+        print("  Model selection: best training total")
 
     best_train_loss = float("inf")
     best_score = float("inf")
     best_epoch = 0
     best_state = None
     monitor_enabled = bool(monitor_pairs)
+    epochs_without_improve = 0
 
-    def compute_monitor_l1():
+    def compute_monitor_metrics():
         nonlocal monitor_enabled
         if not monitor_pairs or not monitor_enabled:
             return None
-        losses = []
+        metric_sums = {}
+        num_items = 0
         was_training = model.training
         model.eval()
         try:
             with torch.inference_mode():
-                for sdr_t, hdr_t in monitor_pairs:
+                for idx, (sdr_t, hdr_t) in enumerate(monitor_pairs):
                     inp = prepare_model_input(sdr_t, device, compute_dtype)
                     target = hdr_t.to(device=device, dtype=compute_dtype)
+                    teacher_output = None
+                    if teacher_model is not None:
+                        if monitor_teacher_outputs is not None:
+                            teacher_output = monitor_teacher_outputs[idx].to(
+                                device=device, dtype=compute_dtype
+                            )
+                        else:
+                            teacher_inp = prepare_model_input(
+                                sdr_t, device, teacher_dtype
+                            )
+                            teacher_output, _ = teacher_model(teacher_inp)
+                            if not torch.isfinite(teacher_output).all():
+                                teacher_output = torch.nan_to_num(
+                                    teacher_output, nan=0.0, posinf=1.0, neginf=0.0
+                                )
                     out, _ = model(inp)
                     if not torch.isfinite(out).all():
                         out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
-                    loss = criterion(out, target)
+                    loss, metrics = compute_loss_terms(
+                        out, target, args, teacher_output=teacher_output
+                    )
                     if torch.isfinite(loss):
-                        losses.append(loss.item())
+                        accumulate_metrics(metric_sums, metrics)
+                        num_items += 1
         except RuntimeError as exc:
             msg = str(exc).lower()
             if "miopen" in msg or "hiprtc" in msg:
                 print("  [warn] Monitor pass disabled due ROCm MIOpen error; "
-                      "falling back to training-loss selection.")
+                      "falling back to training-total selection.")
                 monitor_enabled = False
                 return None
             raise
@@ -465,67 +675,125 @@ def train_qat(model, pairs, device, compute_dtype, args):
                     for m in model.modules():
                         if isinstance(m, nn.BatchNorm2d):
                             m.eval()
-        if not losses:
+        if num_items == 0:
             return None
-        return float(np.mean(losses))
+        return average_metrics(metric_sums, num_items)
 
     for epoch in range(1, args.epochs + 1):
         random.shuffle(pairs)
-        epoch_loss = 0.0
-        num_batches = 0
+        epoch_metrics = {}
+        num_samples = 0
 
-        for sdr_t, hdr_t in pairs:
-            sdr_crop, hdr_crop = random_crop_pair(sdr_t, hdr_t, args.crop_size)
+        for batch_start in range(0, len(pairs), batch_size):
+            batch_pairs = pairs[batch_start:batch_start + batch_size]
+            if not batch_pairs:
+                continue
 
-            inp = prepare_model_input(sdr_crop, device, compute_dtype)
-            target = hdr_crop.to(device=device, dtype=compute_dtype)
+            cropped_groups = {}
+            for sdr_t, hdr_t in batch_pairs:
+                sdr_crop, hdr_crop = random_crop_pair(sdr_t, hdr_t, args.crop_size)
+                shape = tuple(sdr_crop.shape[-2:])
+                cropped_groups.setdefault(shape, []).append((sdr_crop, hdr_crop))
 
-            output, _ = model(inp)
-            if not torch.isfinite(output).all():
-                output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
-            loss = criterion(output, target)
-            if not torch.isfinite(loss):
+            batch_total = sum(len(group) for group in cropped_groups.values())
+            if batch_total <= 0:
                 continue
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            batch_valid = 0
+
+            for group_pairs in cropped_groups.values():
+                sdr_batch = torch.cat([sdr_crop for sdr_crop, _ in group_pairs], dim=0)
+                hdr_batch = torch.cat([hdr_crop for _, hdr_crop in group_pairs], dim=0)
+
+                inp = prepare_model_input(sdr_batch, device, compute_dtype)
+                target = hdr_batch.to(device=device, dtype=compute_dtype)
+                teacher_output = None
+                if teacher_model is not None:
+                    with torch.inference_mode():
+                        teacher_inp = prepare_model_input(
+                            sdr_batch, device, teacher_dtype
+                        )
+                        teacher_output, _ = teacher_model(teacher_inp)
+                        if not torch.isfinite(teacher_output).all():
+                            teacher_output = torch.nan_to_num(
+                                teacher_output, nan=0.0, posinf=1.0, neginf=0.0
+                            )
+
+                output, _ = model(inp)
+                if not torch.isfinite(output).all():
+                    output = torch.nan_to_num(
+                        output, nan=0.0, posinf=1.0, neginf=0.0
+                    )
+                loss, loss_metrics = compute_loss_terms(
+                    output, target, args, teacher_output=teacher_output
+                )
+                if not torch.isfinite(loss):
+                    continue
+
+                group_size = sdr_batch.shape[0]
+                scaled_loss = loss * (group_size / batch_total)
+                scaled_loss.backward()
+                accumulate_metrics(
+                    epoch_metrics,
+                    {key: value * group_size for key, value in loss_metrics.items()},
+                )
+                num_samples += group_size
+                batch_valid += group_size
+
+            if batch_valid == 0:
+                continue
+
             torch.nn.utils.clip_grad_norm_(qat_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
-            epoch_loss += loss.item()
-            num_batches += 1
-
-        avg_loss = epoch_loss / max(num_batches, 1)
+        avg_metrics = average_metrics(epoch_metrics, max(num_samples, 1))
         lr_now = scheduler.get_last_lr()[0]
-        best_train_loss = min(best_train_loss, avg_loss)
-        monitor_l1 = compute_monitor_l1()
-        score = monitor_l1 if monitor_l1 is not None else avg_loss
+        avg_total = avg_metrics.get("total", float("inf"))
+        best_train_loss = min(best_train_loss, avg_total)
+        monitor_metrics = compute_monitor_metrics()
+        score = (
+            monitor_metrics.get("total", avg_total)
+            if monitor_metrics is not None else avg_total
+        )
 
-        if monitor_l1 is None:
-            print(f"  Epoch {epoch:3d}/{args.epochs}: loss={avg_loss:.6f}, "
-                  f"lr={lr_now:.2e}")
+        if monitor_metrics is None:
+            print(f"  Epoch {epoch:3d}/{args.epochs}: "
+                  f"{format_metrics(avg_metrics)}, lr={lr_now:.2e}")
         else:
-            print(f"  Epoch {epoch:3d}/{args.epochs}: loss={avg_loss:.6f}, "
-                  f"monitor_l1={monitor_l1:.6f}, lr={lr_now:.2e}")
+            print(f"  Epoch {epoch:3d}/{args.epochs}: "
+                  f"train[{format_metrics(avg_metrics)}], "
+                  f"monitor[{format_metrics(monitor_metrics)}], "
+                  f"lr={lr_now:.2e}")
 
-        if score < best_score:
+        improved = score < (best_score - args.early_stop_min_delta)
+        if improved:
             best_score = score
             best_epoch = epoch
             best_state = {
                 k: v.detach().cpu().clone()
                 for k, v in model.state_dict().items()
             }
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+            if (args.early_stop_patience > 0 and
+                    epochs_without_improve >= args.early_stop_patience):
+                print("  Early stopping: "
+                      f"no {score_name} improvement > {args.early_stop_min_delta:.1e} "
+                      f"for {epochs_without_improve} epoch(s)")
+                break
 
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
     print(f"  Best training loss: {best_train_loss:.6f}")
     if monitor_pairs and monitor_enabled:
         print(f"  Selected epoch   : {best_epoch} "
-              f"(best monitor L1={best_score:.6f})")
+              f"(best {score_name}={best_score:.6f})")
     else:
         print(f"  Selected epoch   : {best_epoch} "
-              f"(best training loss)")
+              f"(best training total)")
     return model
 
 
@@ -597,10 +865,30 @@ def main():
                         help="Learning rate")
     parser.add_argument("--crop-size", type=int, default=256,
                         help="Random crop size for training patches")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Training batch size for cropped patches")
     parser.add_argument("--max-images", type=int, default=0,
                         help="Max training images (0 = all)")
     parser.add_argument("--max-long-edge", type=int, default=960,
                         help="Resize images so longest edge <= this")
+    parser.add_argument("--teacher-loss-weight", type=float, default=0.05,
+                        help="Weight for staying close to the starting PTQ output")
+    parser.add_argument("--highlight-loss-weight", type=float, default=0.10,
+                        help="Extra L1 weight on bright near-neutral highlights")
+    parser.add_argument("--highlight-chroma-weight", type=float, default=0.05,
+                        help="Extra chroma-preservation weight on bright neutral highlights")
+    parser.add_argument("--highlight-threshold", type=float, default=0.75,
+                        help="Target intensity threshold for highlight-focused losses")
+    parser.add_argument("--neutral-threshold", type=float, default=0.08,
+                        help="Max target channel spread treated as near-neutral")
+    parser.add_argument("--early-stop-patience", type=int, default=2,
+                        help="Stop after this many non-improving epochs (0 disables)")
+    parser.add_argument("--early-stop-min-delta", type=float, default=1e-5,
+                        help="Minimum monitor improvement required to reset early stopping")
+    parser.add_argument("--seed", type=int, default=1234,
+                        help="Random seed for repeatable QAT runs")
+    parser.add_argument("--deterministic", default="1", choices=["1", "0"],
+                        help="Enable deterministic PyTorch behavior where available")
 
     # Validation
     parser.add_argument("--num-validate", type=int, default=8,
@@ -616,8 +904,15 @@ def main():
     if device_str == "auto":
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
+    if device.type == "cpu" and compute_dtype == torch.float16:
+        compute_dtype = torch.float32
+
+    seed, deterministic = configure_reproducibility(args)
 
     print(f"Device: {device}, Precision: {args.precision}")
+    if device.type == "cpu" and args.precision == "fp16":
+        print("Note: fp16 requested on CPU, using fp32 compute fallback")
+    print(f"Reproducibility: seed={seed}, deterministic={deterministic}")
 
     use_hg = str(args.use_hg).strip() != "0"
 
@@ -686,6 +981,8 @@ def main():
         use_hg = bool(arch.get("use_hg", True))
         compute_dtype_str = checkpoint.get("compute_dtype", "torch.float16")
         compute_dtype = torch.float16 if "16" in compute_dtype_str else torch.float32
+        if device.type == "cpu" and compute_dtype == torch.float16:
+            compute_dtype = torch.float32
 
         activation_quant = checkpoint.get("activation_quant", "symmetric")
         use_asym = activation_quant == "asymmetric"
@@ -755,6 +1052,27 @@ def main():
 
     print(f"  {len(pairs)} pairs loaded")
 
+    monitor_pairs, monitor_stats = select_highlight_monitor_pairs(
+        pairs, args.num_validate, args
+    )
+    if monitor_pairs:
+        print("  Highlight-aware monitor selection:")
+        print(f"    using {len(monitor_pairs)} full-image pairs "
+              f"(avg hi_cov={monitor_stats['avg_highlight_cov']:.4f}, "
+              f"max={monitor_stats['max_highlight_cov']:.4f}, "
+              f"positive candidates={monitor_stats['positive_candidates']})")
+        if monitor_stats["max_highlight_cov"] <= 0.0:
+            print("    [warn] No monitor image contained qualifying highlight pixels")
+
+    teacher_model = None
+    teacher_dtype = compute_dtype
+    if args.teacher_loss_weight > 0:
+        print("\nPreparing PTQ teacher model ...")
+        teacher_model = copy.deepcopy(model).to(dtype=teacher_dtype, device=device)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad_(False)
+
     # ------------------------------------------------------------------
     # 3. Convert to QAT mode
     # ------------------------------------------------------------------
@@ -768,7 +1086,11 @@ def main():
     # ------------------------------------------------------------------
     train_dtype = torch.float32
     t0 = time.perf_counter()
-    model = train_qat(model, pairs, device, train_dtype, args)
+    model = train_qat(
+        model, pairs, device, train_dtype, args,
+        teacher_model=teacher_model, teacher_dtype=teacher_dtype,
+        monitor_pairs=monitor_pairs,
+    )
     dt = time.perf_counter() - t0
     print(f"  Training took {dt:.1f}s ({dt / 60:.1f} min)")
 
@@ -795,6 +1117,23 @@ def main():
         "calibration_percentile_low": calibration_percentile_low,
         "qat_epochs": args.epochs,
         "qat_lr": args.lr,
+        "qat_recipe": {
+            "teacher_loss_weight": args.teacher_loss_weight,
+            "highlight_loss_weight": args.highlight_loss_weight,
+            "highlight_chroma_weight": args.highlight_chroma_weight,
+            "highlight_threshold": args.highlight_threshold,
+            "neutral_threshold": args.neutral_threshold,
+            "batch_size": args.batch_size,
+            "early_stop_patience": args.early_stop_patience,
+            "early_stop_min_delta": args.early_stop_min_delta,
+            "monitor_selection": "highlight_coverage_topk",
+            "monitor_avg_highlight_cov": monitor_stats["avg_highlight_cov"],
+            "monitor_max_highlight_cov": monitor_stats["max_highlight_cov"],
+            "monitor_positive_candidates": monitor_stats["positive_candidates"],
+            "seed": seed,
+            "deterministic": deterministic,
+            "teacher_source": "ptq_checkpoint",
+        },
         "architecture": {
             "classifier": "color_condition",
             "cond_c": 6,
@@ -826,7 +1165,7 @@ def main():
     ref_model = _build_fp32_model(args.fp32_model, args.hg_weights, use_hg)
     ref_model = ref_model.to(dtype=compute_dtype, device=device).eval()
 
-    val_pairs = pairs[:args.num_validate]
+    val_pairs = monitor_pairs if monitor_pairs else pairs[:args.num_validate]
     print(f"  {len(val_pairs)} images")
 
     psnrs = []
