@@ -46,6 +46,8 @@ from models.hdrtvnet_torch import (
 )
 from video_source import VideoSource
 
+EXPORT_HDR_TARGET_PEAK_NITS = 1001.0
+
 
 def _ensure_even(value: int) -> int:
     value = max(2, int(value))
@@ -837,7 +839,7 @@ class VideoExportWorker(QObject):
                 "transfer=smpte2084:"
                 "primaries=bt2020:"
                 "range=limited:"
-                "dither=none"
+                f"dither=none:npl={EXPORT_HDR_TARGET_PEAK_NITS:.0f}"
             )
             vf_filters.append("format=yuv422p10le")
             if abs(float(self._config.fps) - src_fps) > 1e-3:
@@ -883,6 +885,8 @@ class VideoExportWorker(QObject):
                 "3",
                 "-pix_fmt",
                 "yuv422p10le",
+                "-bsf:v",
+                "prores_metadata=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
                 "-color_range",
                 "tv",
                 "-colorspace",

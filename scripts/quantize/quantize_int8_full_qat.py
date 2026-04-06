@@ -433,6 +433,43 @@ def build_highlight_neutral_mask(target, highlight_threshold, neutral_threshold)
     return highlight_weight * neutral_weight
 
 
+def build_channel_balance_deltas(tensor):
+    """Per-pixel RGB channel deltas; zero means perfectly neutral."""
+    red = tensor[:, 0:1]
+    green = tensor[:, 1:2]
+    blue = tensor[:, 2:3]
+    return torch.cat((red - green, green - blue, blue - red), dim=1)
+
+
+def sample_training_crop_pair(sdr_t, hdr_t, args):
+    """Pick a crop, biased toward bright neutral highlights when present."""
+    crop_size = int(args.crop_size)
+    _, _, h, w = sdr_t.shape
+    if h <= crop_size and w <= crop_size:
+        return sdr_t, hdr_t
+
+    attempts = max(1, int(getattr(args, "highlight_crop_attempts", 1)))
+    best_score = -1.0
+    best_crop = None
+
+    for _ in range(attempts):
+        top = random.randint(0, max(0, h - crop_size))
+        left = random.randint(0, max(0, w - crop_size))
+        sdr_c = sdr_t[:, :, top:top + crop_size, left:left + crop_size]
+        hdr_c = hdr_t[:, :, top:top + crop_size, left:left + crop_size]
+        mask = build_highlight_neutral_mask(
+            hdr_c.float(), args.highlight_threshold, args.neutral_threshold
+        )
+        score = float(mask.mean().item())
+        if score > best_score:
+            best_score = score
+            best_crop = (sdr_c, hdr_c)
+
+    return best_crop if best_crop is not None else random_crop_pair(
+        sdr_t, hdr_t, crop_size
+    )
+
+
 def select_highlight_monitor_pairs(pairs, num_pairs, args):
     """Pick full-image monitor pairs with the strongest highlight coverage."""
     if num_pairs <= 0 or not pairs:
@@ -473,8 +510,12 @@ def compute_loss_terms(output, target, args, teacher_output=None):
         "l1": float(base_l1.detach().item()),
     }
 
-    if teacher_output is not None and args.teacher_loss_weight > 0:
-        teacher_l1 = F.l1_loss(output, teacher_output.to(dtype=output.dtype))
+    teacher_ref = None
+    if teacher_output is not None:
+        teacher_ref = teacher_output.to(dtype=output.dtype)
+
+    if teacher_ref is not None and args.teacher_loss_weight > 0:
+        teacher_l1 = F.l1_loss(output, teacher_ref)
         total = total + args.teacher_loss_weight * teacher_l1
         metrics["teacher_l1"] = float(teacher_l1.detach().item())
 
@@ -488,12 +529,24 @@ def compute_loss_terms(output, target, args, teacher_output=None):
         total = total + args.highlight_loss_weight * highlight_l1
         metrics["highlight_l1"] = float(highlight_l1.detach().item())
 
+    if teacher_ref is not None and args.highlight_teacher_weight > 0:
+        highlight_teacher = masked_mean_abs(output - teacher_ref, mask)
+        total = total + args.highlight_teacher_weight * highlight_teacher
+        metrics["highlight_teacher"] = float(highlight_teacher.detach().item())
+
     if args.highlight_chroma_weight > 0:
         output_chroma = output - output.mean(dim=1, keepdim=True)
         target_chroma = target - target.mean(dim=1, keepdim=True)
         highlight_chroma = masked_mean_abs(output_chroma - target_chroma, mask)
         total = total + args.highlight_chroma_weight * highlight_chroma
         metrics["highlight_chroma"] = float(highlight_chroma.detach().item())
+
+    if args.highlight_balance_weight > 0:
+        output_balance = build_channel_balance_deltas(output)
+        target_balance = build_channel_balance_deltas(target)
+        highlight_balance = masked_mean_abs(output_balance - target_balance, mask)
+        total = total + args.highlight_balance_weight * highlight_balance
+        metrics["highlight_balance"] = float(highlight_balance.detach().item())
 
     metrics["total"] = float(total.detach().item())
     return total, metrics
@@ -519,8 +572,12 @@ def format_metrics(metrics):
         parts.append(f"teacher={metrics['teacher_l1']:.6f}")
     if "highlight_l1" in metrics:
         parts.append(f"hi={metrics['highlight_l1']:.6f}")
+    if "highlight_teacher" in metrics:
+        parts.append(f"hi_teacher={metrics['highlight_teacher']:.6f}")
     if "highlight_chroma" in metrics:
         parts.append(f"hi_chroma={metrics['highlight_chroma']:.6f}")
+    if "highlight_balance" in metrics:
+        parts.append(f"hi_balance={metrics['highlight_balance']:.6f}")
     if "highlight_cov" in metrics:
         parts.append(f"hi_cov={metrics['highlight_cov']:.3f}")
     return ", ".join(parts)
@@ -588,7 +645,9 @@ def train_qat(model, pairs, device, compute_dtype, args,
     score_name = "monitor total" if (
         args.teacher_loss_weight > 0
         or args.highlight_loss_weight > 0
+        or args.highlight_teacher_weight > 0
         or args.highlight_chroma_weight > 0
+        or args.highlight_balance_weight > 0
     ) else "monitor L1"
 
     monitor_teacher_outputs = None
@@ -609,7 +668,12 @@ def train_qat(model, pairs, device, compute_dtype, args,
     print("  Loss recipe: "
           f"L1 + {args.teacher_loss_weight:.3f}*teacher "
           f"+ {args.highlight_loss_weight:.3f}*highlight "
-          f"+ {args.highlight_chroma_weight:.3f}*highlight_chroma")
+          f"+ {args.highlight_teacher_weight:.3f}*highlight_teacher "
+          f"+ {args.highlight_chroma_weight:.3f}*highlight_chroma "
+          f"+ {args.highlight_balance_weight:.3f}*highlight_balance")
+    print("  Crop sampling: "
+          f"best-of-{max(1, int(args.highlight_crop_attempts))} random crops "
+          "biased toward bright neutral highlights")
     if monitor_pairs:
         print(f"  Model selection: best {score_name} on {len(monitor_pairs)} "
               f"fixed full-image pairs")
@@ -691,7 +755,7 @@ def train_qat(model, pairs, device, compute_dtype, args,
 
             cropped_groups = {}
             for sdr_t, hdr_t in batch_pairs:
-                sdr_crop, hdr_crop = random_crop_pair(sdr_t, hdr_t, args.crop_size)
+                sdr_crop, hdr_crop = sample_training_crop_pair(sdr_t, hdr_t, args)
                 shape = tuple(sdr_crop.shape[-2:])
                 cropped_groups.setdefault(shape, []).append((sdr_crop, hdr_crop))
 
@@ -875,12 +939,18 @@ def main():
                         help="Weight for staying close to the starting PTQ output")
     parser.add_argument("--highlight-loss-weight", type=float, default=0.10,
                         help="Extra L1 weight on bright near-neutral highlights")
+    parser.add_argument("--highlight-teacher-weight", type=float, default=0.10,
+                        help="Extra teacher-anchor weight on bright near-neutral highlights")
     parser.add_argument("--highlight-chroma-weight", type=float, default=0.05,
                         help="Extra chroma-preservation weight on bright neutral highlights")
+    parser.add_argument("--highlight-balance-weight", type=float, default=0.10,
+                        help="Extra RGB balance weight to keep bright neutral highlights from drifting warm/cool")
     parser.add_argument("--highlight-threshold", type=float, default=0.75,
                         help="Target intensity threshold for highlight-focused losses")
     parser.add_argument("--neutral-threshold", type=float, default=0.08,
                         help="Max target channel spread treated as near-neutral")
+    parser.add_argument("--highlight-crop-attempts", type=int, default=4,
+                        help="Random crop attempts per image; keep the crop with the strongest neutral-highlight coverage")
     parser.add_argument("--early-stop-patience", type=int, default=2,
                         help="Stop after this many non-improving epochs (0 disables)")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-5,
@@ -1066,7 +1136,7 @@ def main():
 
     teacher_model = None
     teacher_dtype = compute_dtype
-    if args.teacher_loss_weight > 0:
+    if args.teacher_loss_weight > 0 or args.highlight_teacher_weight > 0:
         print("\nPreparing PTQ teacher model ...")
         teacher_model = copy.deepcopy(model).to(dtype=teacher_dtype, device=device)
         teacher_model.eval()
@@ -1120,10 +1190,13 @@ def main():
         "qat_recipe": {
             "teacher_loss_weight": args.teacher_loss_weight,
             "highlight_loss_weight": args.highlight_loss_weight,
+            "highlight_teacher_weight": args.highlight_teacher_weight,
             "highlight_chroma_weight": args.highlight_chroma_weight,
+            "highlight_balance_weight": args.highlight_balance_weight,
             "highlight_threshold": args.highlight_threshold,
             "neutral_threshold": args.neutral_threshold,
             "batch_size": args.batch_size,
+            "highlight_crop_attempts": args.highlight_crop_attempts,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
             "monitor_selection": "highlight_coverage_topk",
