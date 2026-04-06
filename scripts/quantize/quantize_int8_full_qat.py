@@ -95,6 +95,73 @@ def configure_reproducibility(args):
     return seed, deterministic
 
 
+def _expand_base_optional_layer_names(*names):
+    expanded = []
+    for name in names:
+        if name.startswith("base."):
+            expanded.append(name)
+            expanded.append(name[len("base."):])
+        elif name.startswith("hg."):
+            expanded.append(name)
+        else:
+            expanded.append(name)
+            expanded.append(f"base.{name}")
+    return tuple(dict.fromkeys(expanded))
+
+
+FULL_QAT_SENSITIVE_LAYER_NAMES = _expand_base_optional_layer_names(
+    "AGCM.cond_scale_first",
+    "AGCM.cond_shift_first",
+    "AGCM.cond_scale_HR",
+    "AGCM.cond_shift_HR",
+    "AGCM.cond_scale_last",
+    "AGCM.cond_shift_last",
+    "AGCM.classifier.model.0",
+    "AGCM.classifier.model.4",
+    "AGCM.classifier.model.8",
+    "AGCM.classifier.model.12",
+    "AGCM.classifier.model.16",
+    "AGCM.classifier.model.20",
+    "AGCM.conv_first",
+    "AGCM.HRconv",
+    "AGCM.conv_last",
+    "LE.cond_first.0",
+    "LE.cond_first.2",
+    "LE.cond_first.4",
+    "LE.HR_conv1",
+    "LE.HR_conv2",
+    "LE.conv_last",
+    "hg.conv1.0",
+    "hg.conv10",
+    "hg.conv_last",
+)
+
+
+def parse_layer_list(layer_spec: str):
+    if not layer_spec:
+        return []
+    return sorted({name.strip() for name in str(layer_spec).split(",") if name.strip()})
+
+
+def resolve_frozen_layer_prefs(candidate_layers, args):
+    candidate_set = set(candidate_layers)
+    frozen_layers = set()
+    if str(getattr(args, "freeze_sensitive_layers", "1")).strip() != "0":
+        frozen_layers.update(
+            name for name in FULL_QAT_SENSITIVE_LAYER_NAMES if name in candidate_set
+        )
+    if str(getattr(args, "freeze_sft_controls", "1")).strip() != "0":
+        frozen_layers.update(
+            name for name in candidate_set
+            if "SFT_scale" in name or "SFT_shift" in name
+        )
+    frozen_layers.update(
+        name for name in parse_layer_list(getattr(args, "freeze_layer_names", ""))
+        if name in candidate_set
+    )
+    return sorted(frozen_layers)
+
+
 # ===================================================================
 # Fake-quantization with STE (Straight-Through Estimator)
 # ===================================================================
@@ -346,6 +413,27 @@ def convert_qat_to_ptq(model, compute_dtype=torch.float16):
 
     print(f"  Converted {converted} QAT layers back to PTQ for inference")
     return model
+
+
+def list_quantizable_layer_names(model):
+    return [
+        name for name, module in model.named_modules()
+        if isinstance(module, (nn.Conv2d, nn.Linear, W8A8Conv2d, W8A8Linear,
+                               QATConv2d, QATLinear))
+    ]
+
+
+def freeze_named_qat_layers(model, layer_names):
+    """Freeze selected modules to keep full QAT anchored near the PTQ baseline."""
+    frozen = []
+    target_names = set(layer_names)
+    for name, module in model.named_modules():
+        if name not in target_names:
+            continue
+        for param in module.parameters(recurse=False):
+            param.requires_grad_(False)
+        frozen.append(name)
+    return sorted(set(frozen))
 
 
 # ===================================================================
@@ -629,6 +717,7 @@ def train_qat(model, pairs, device, compute_dtype, args,
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
+    frozen_layer_names = list(getattr(args, "_frozen_qat_layers", []) or [])
     qat_params = [p for p in model.parameters() if p.requires_grad]
 
     batch_size = max(int(args.batch_size), 1)
@@ -665,6 +754,11 @@ def train_qat(model, pairs, device, compute_dtype, args,
 
     print(f"\n  Training: {args.epochs} epochs, lr={args.lr}, "
           f"crop={args.crop_size}, batch={batch_size}, {len(pairs)} pairs")
+    if frozen_layer_names:
+        print("  Strategy: PTQ-anchored full QAT "
+              f"(freezing {len(frozen_layer_names)} sensitive layers)")
+    else:
+        print("  Strategy: adaptive full QAT (all layers trainable)")
     print("  Loss recipe: "
           f"L1 + {args.teacher_loss_weight:.3f}*teacher "
           f"+ {args.highlight_loss_weight:.3f}*highlight "
@@ -925,7 +1019,7 @@ def main():
     # Training
     parser.add_argument("--epochs", type=int, default=5,
                         help="Number of QAT fine-tuning epochs")
-    parser.add_argument("--lr", type=float, default=2e-5,
+    parser.add_argument("--lr", type=float, default=1e-5,
                         help="Learning rate")
     parser.add_argument("--crop-size", type=int, default=256,
                         help="Random crop size for training patches")
@@ -935,15 +1029,15 @@ def main():
                         help="Max training images (0 = all)")
     parser.add_argument("--max-long-edge", type=int, default=960,
                         help="Resize images so longest edge <= this")
-    parser.add_argument("--teacher-loss-weight", type=float, default=0.05,
+    parser.add_argument("--teacher-loss-weight", type=float, default=0.10,
                         help="Weight for staying close to the starting PTQ output")
-    parser.add_argument("--highlight-loss-weight", type=float, default=0.10,
+    parser.add_argument("--highlight-loss-weight", type=float, default=0.08,
                         help="Extra L1 weight on bright near-neutral highlights")
-    parser.add_argument("--highlight-teacher-weight", type=float, default=0.10,
+    parser.add_argument("--highlight-teacher-weight", type=float, default=0.15,
                         help="Extra teacher-anchor weight on bright near-neutral highlights")
     parser.add_argument("--highlight-chroma-weight", type=float, default=0.05,
                         help="Extra chroma-preservation weight on bright neutral highlights")
-    parser.add_argument("--highlight-balance-weight", type=float, default=0.10,
+    parser.add_argument("--highlight-balance-weight", type=float, default=0.12,
                         help="Extra RGB balance weight to keep bright neutral highlights from drifting warm/cool")
     parser.add_argument("--highlight-threshold", type=float, default=0.75,
                         help="Target intensity threshold for highlight-focused losses")
@@ -951,6 +1045,12 @@ def main():
                         help="Max target channel spread treated as near-neutral")
     parser.add_argument("--highlight-crop-attempts", type=int, default=4,
                         help="Random crop attempts per image; keep the crop with the strongest neutral-highlight coverage")
+    parser.add_argument("--freeze-sensitive-layers", default="1", choices=["1", "0"],
+                        help="Freeze a curated set of highlight/color-sensitive layers during full QAT")
+    parser.add_argument("--freeze-sft-controls", default="1", choices=["1", "0"],
+                        help="Also freeze SFT scale/shift control layers during full QAT")
+    parser.add_argument("--freeze-layer-names", default="",
+                        help="Comma-separated extra layer names to freeze during full QAT")
     parser.add_argument("--early-stop-patience", type=int, default=2,
                         help="Stop after this many non-improving epochs (0 disables)")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-5,
@@ -1148,6 +1248,15 @@ def main():
     # ------------------------------------------------------------------
     print("\nConverting to QAT mode ...")
     model = convert_to_qat(model)
+    frozen_qat_layers = resolve_frozen_layer_prefs(
+        list_quantizable_layer_names(model), args
+    )
+    if frozen_qat_layers:
+        frozen_qat_layers = freeze_named_qat_layers(model, frozen_qat_layers)
+        print(f"  Frozen {len(frozen_qat_layers)} sensitive layers to preserve PTQ color behavior")
+        for name in frozen_qat_layers:
+            print(f"    - {name}")
+    args._frozen_qat_layers = frozen_qat_layers
     model = model.float()
     model = model.to(device)
 
@@ -1181,6 +1290,7 @@ def main():
         "state_dict": model.state_dict(),
         "compute_dtype": str(compute_dtype),
         "quantization": "w8a8_full",
+        "qat_strategy": "ptq_anchored_full" if args._frozen_qat_layers else "adaptive_full",
         "activation_quant": activation_quant,
         "calibration_method": calibration_method,
         "calibration_percentile": calibration_percentile,
@@ -1197,6 +1307,9 @@ def main():
             "neutral_threshold": args.neutral_threshold,
             "batch_size": args.batch_size,
             "highlight_crop_attempts": args.highlight_crop_attempts,
+            "freeze_sensitive_layers": str(args.freeze_sensitive_layers).strip() != "0",
+            "freeze_sft_controls": str(args.freeze_sft_controls).strip() != "0",
+            "frozen_qat_layers": list(getattr(args, "_frozen_qat_layers", []) or []),
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
             "monitor_selection": "highlight_coverage_topk",

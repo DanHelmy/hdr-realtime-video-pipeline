@@ -57,11 +57,6 @@ class PipelineWorkerCompareMixin:
         cmp_note = ""
         runtime_precision_key = str(self._precision_key)
         compare_precision_swapped = False
-        use_live_output = (
-            compare_precision_key in (None, "", self._precision_key)
-            and frame_idx == cmp_idx
-        )
-
         if (
             (not self._input_is_hdr)
             and compare_precision_key
@@ -89,33 +84,6 @@ class PipelineWorkerCompareMixin:
         cmp_hdr_algo = None
         cmp_algo_precision = "Bypass" if self._input_is_hdr else str(self._precision_key)
 
-        if use_live_output:
-            cmp_sdr = np.ascontiguousarray(
-                display_frame.copy()
-                if display_frame is not None
-                else _letterbox_bgr(frame, out_w, out_h)
-            )
-            if self._input_is_hdr:
-                cmp_hdr_algo = np.ascontiguousarray(
-                    output.copy() if isinstance(output, np.ndarray) else cmp_sdr.copy()
-                )
-            elif need_hdr_cpu and isinstance(output, np.ndarray):
-                cmp_hdr_algo = np.ascontiguousarray(output.copy())
-            elif prepared_out is not None:
-                try:
-                    cmp_hdr_algo = np.ascontiguousarray(
-                        self._render_hdr_output(
-                            prepared_out,
-                            out_w,
-                            out_h,
-                            copy_input=True,
-                        )
-                    )
-                except Exception as exc:
-                    msg = f"HDR Convert snapshot failed ({exc}); using SDR fallback."
-                    cmp_note = f"{cmp_note} {msg}".strip()
-                    cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
-
         if cmp_sdr is None:
             cmp_source = _read_video_frame_at(self._video_path, cmp_idx)
             if cmp_source is None and cmp_idx > 0:
@@ -141,22 +109,19 @@ class PipelineWorkerCompareMixin:
                     cmp_tensor, cmp_cond = self._processor.preprocess(cmp_model_inp)
                     cmp_raw_out = self._processor.infer((cmp_tensor, cmp_cond))
 
-                if lower_res_processing:
-                    saved_enhance_state = self._capture_enhance_history()
-                    self._reset_enhance_history()
-                    try:
-                        cmp_prepared_out = self._prepare_hdr_output_tensor(
-                            cmp_raw_out, lower_res_processing
-                        )
-                    finally:
-                        self._restore_enhance_history(saved_enhance_state)
-                else:
+                saved_enhance_state = self._capture_enhance_history()
+                self._reset_enhance_history()
+                try:
+                    # Compare snapshots should be deterministic and isolated from
+                    # live playback temporal/enhancement history.
                     cmp_prepared_out = self._prepare_hdr_output_tensor(
-                        cmp_raw_out, lower_res_processing
+                        cmp_raw_out, lower_res_processing, True
                     )
+                finally:
+                    self._restore_enhance_history(saved_enhance_state)
 
                 cmp_hdr_algo = np.ascontiguousarray(
-                    self._render_hdr_output(cmp_prepared_out, out_w, out_h)
+                    self._render_hdr_output(cmp_prepared_out, out_w, out_h, copy_input=True)
                 )
             except Exception as exc:
                 cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())

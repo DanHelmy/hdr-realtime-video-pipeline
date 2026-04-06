@@ -929,6 +929,8 @@ def train_qat(model, pairs, device, compute_dtype, args,
 
     print(f"\n  Training: {args.epochs} epochs, lr={args.lr}, "
           f"crop={args.crop_size}, batch={batch_size}, {len(pairs)} pairs")
+    print("  Strategy: adaptive mixed QAT "
+          "(W8A8 for speed, W8A16/FP16 for highlight-sensitive paths)")
     print("  Loss recipe: "
           f"L1 + {args.teacher_loss_weight:.3f}*teacher "
           f"+ {args.highlight_loss_weight:.3f}*highlight "
@@ -1208,7 +1210,7 @@ def main():
                         help="Random crop attempts per image; keep the crop with the strongest neutral-highlight coverage")
     parser.add_argument("--protect-agcm-controls", default="1", choices=["1", "0"],
                         help="Keep AGCM cond_scale/cond_shift layers in W8A16")
-    parser.add_argument("--protect-sft-controls", default="0", choices=["1", "0"],
+    parser.add_argument("--protect-sft-controls", default="1", choices=["1", "0"],
                         help="Also keep SFT scale/shift layers in W8A16")
     parser.add_argument("--fp16-sensitive-layers", default="1", choices=["1", "0"],
                         help="Keep a curated set of the most color-sensitive layers in FP16")
@@ -1513,6 +1515,7 @@ def main():
         "state_dict": model.state_dict(),
         "compute_dtype": str(compute_dtype),
         "quantization": "w8a8_mixed",
+        "qat_strategy": "adaptive_mixed_precision",
         "channel_threshold": channel_threshold,
         "qat_epochs": args.epochs,
         "qat_lr": args.lr,

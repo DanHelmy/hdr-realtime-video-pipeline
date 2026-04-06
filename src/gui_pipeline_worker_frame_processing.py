@@ -5,9 +5,19 @@ import numpy as np
 import queue as _queue
 import time
 import torch
+import torch.nn.functional as F
 
 from gui_scaling import BEST_CV2_INTERP, _letterbox_bgr, _apply_upscale_sharpen
 from timer import sleep_until
+
+_FLAT_TEMPORAL_ENABLED = True
+_FLAT_TEMPORAL_BRIGHTNESS = 0.80
+_FLAT_TEMPORAL_NEUTRAL = 0.12
+_FLAT_TEMPORAL_DETAIL = 0.028
+_FLAT_TEMPORAL_MOTION = 0.030
+_FLAT_TEMPORAL_BLEND = 0.78
+_SCENE_CUT_DOWNSCALE = (48, 27)
+_SCENE_CUT_THRESHOLD = 18.0
 
 
 class PipelineWorkerFrameProcessingMixin:
@@ -34,15 +44,95 @@ class PipelineWorkerFrameProcessingMixin:
             pass
 
     def _capture_enhance_history(self):
-        return self._enh_prev_luma, self._enh_temporal_detail
+        return (
+            self._enh_prev_luma,
+            self._enh_temporal_detail,
+            self._flat_temporal_prev_rgb,
+            self._flat_temporal_prev_luma,
+            self._flat_temporal_prev_scene,
+        )
 
     def _restore_enhance_history(self, state) -> None:
-        self._enh_prev_luma, self._enh_temporal_detail = state
+        (
+            self._enh_prev_luma,
+            self._enh_temporal_detail,
+            self._flat_temporal_prev_rgb,
+            self._flat_temporal_prev_luma,
+            self._flat_temporal_prev_scene,
+        ) = state
 
-    def _prepare_hdr_output_tensor(self, raw_out, lower_res_processing: bool):
+    def _detect_scene_cut(self, frame_bgr: np.ndarray) -> bool:
+        """Cheap scene-cut detection from downscaled SDR luma."""
+        if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+            self._flat_temporal_prev_scene = None
+            return True
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, _SCENE_CUT_DOWNSCALE, interpolation=cv2.INTER_AREA)
+        prev = getattr(self, "_flat_temporal_prev_scene", None)
+        self._flat_temporal_prev_scene = small
+        if prev is None or prev.shape != small.shape:
+            return True
+        diff = float(np.mean(np.abs(small.astype(np.float32) - prev.astype(np.float32))))
+        return diff > _SCENE_CUT_THRESHOLD
+
+    def _temporally_stabilize_flat_highlights(self, prepared_out, scene_cut: bool):
+        """Reduce boiling in bright flat neutral areas with masked temporal blending."""
+        if not _FLAT_TEMPORAL_ENABLED or prepared_out is None:
+            return prepared_out
+        if not torch.is_tensor(prepared_out) or prepared_out.ndim != 4:
+            return prepared_out
+
+        peak = prepared_out.amax(dim=1, keepdim=True)
+        floor = prepared_out.amin(dim=1, keepdim=True)
+        chroma = peak - floor
+        luma = (
+            0.2126 * prepared_out[:, 0:1, :, :]
+            + 0.7152 * prepared_out[:, 1:2, :, :]
+            + 0.0722 * prepared_out[:, 2:3, :, :]
+        )
+        local_mean = F.avg_pool2d(luma, kernel_size=3, stride=1, padding=1)
+        detail = (luma - local_mean).abs()
+
+        stabilized = prepared_out
+        prev_rgb = getattr(self, "_flat_temporal_prev_rgb", None)
+        prev_luma = getattr(self, "_flat_temporal_prev_luma", None)
+
+        if (
+            not scene_cut
+            and prev_rgb is not None
+            and prev_luma is not None
+            and prev_rgb.shape == prepared_out.shape
+            and prev_luma.shape == luma.shape
+        ):
+            bright_weight = (
+                (peak - _FLAT_TEMPORAL_BRIGHTNESS)
+                / max(1.0 - _FLAT_TEMPORAL_BRIGHTNESS, 1e-6)
+            ).clamp_(0.0, 1.0)
+            neutral_weight = (
+                (_FLAT_TEMPORAL_NEUTRAL - chroma) / _FLAT_TEMPORAL_NEUTRAL
+            ).clamp_(0.0, 1.0)
+            flat_weight = (
+                (_FLAT_TEMPORAL_DETAIL - detail) / _FLAT_TEMPORAL_DETAIL
+            ).clamp_(0.0, 1.0)
+            motion = (luma - prev_luma).abs()
+            stable_weight = (
+                (_FLAT_TEMPORAL_MOTION - motion) / _FLAT_TEMPORAL_MOTION
+            ).clamp_(0.0, 1.0)
+            blend = (
+                bright_weight * neutral_weight * flat_weight * stable_weight
+            ) * _FLAT_TEMPORAL_BLEND
+            stabilized = prepared_out * (1.0 - blend) + prev_rgb * blend
+
+        self._flat_temporal_prev_rgb = stabilized.detach()
+        self._flat_temporal_prev_luma = luma.detach()
+        return stabilized
+
+    def _prepare_hdr_output_tensor(self, raw_out, lower_res_processing: bool, scene_cut: bool):
         prepared = raw_out[0] if isinstance(raw_out, (tuple, list)) else raw_out
         if lower_res_processing:
             prepared = self._enhance_best_gpu(prepared)
+        prepared = self._temporally_stabilize_flat_highlights(prepared, scene_cut)
         return prepared
 
     def _render_hdr_output(
@@ -90,6 +180,7 @@ class PipelineWorkerFrameProcessingMixin:
             model_inp = frame
         else:
             model_inp = _letterbox_bgr(frame, out_w, out_h)
+        scene_cut = self._detect_scene_cut(model_inp)
 
         if self._input_is_hdr:
             need_hdr_cpu = False
@@ -123,7 +214,9 @@ class PipelineWorkerFrameProcessingMixin:
             tensor, cond = self._processor.preprocess(model_inp)
             raw_out = self._processor.infer((tensor, cond))
 
-        prepared_out = self._prepare_hdr_output_tensor(raw_out, lower_res_processing)
+        prepared_out = self._prepare_hdr_output_tensor(
+            raw_out, lower_res_processing, scene_cut
+        )
 
         if mpv_w is not None and self._hdr_queue is not None:
             ready_event = None

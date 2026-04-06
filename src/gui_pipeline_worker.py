@@ -105,6 +105,9 @@ class PipelineWorker(
         self._pending_resolution: tuple[int, int] | None = None
         self._enh_prev_luma: torch.Tensor | None = None
         self._enh_temporal_detail: torch.Tensor | None = None
+        self._flat_temporal_prev_rgb: torch.Tensor | None = None
+        self._flat_temporal_prev_luma: torch.Tensor | None = None
+        self._flat_temporal_prev_scene: np.ndarray | None = None
         self._sobel_x: torch.Tensor | None = None
         self._sobel_y: torch.Tensor | None = None
         self._input_is_hdr: bool = False
@@ -235,6 +238,9 @@ class PipelineWorker(
     def _reset_enhance_history(self):
         self._enh_prev_luma = None
         self._enh_temporal_detail = None
+        self._flat_temporal_prev_rgb = None
+        self._flat_temporal_prev_luma = None
+        self._flat_temporal_prev_scene = None
 
     @staticmethod
     def _box_blur(x: torch.Tensor, k: int = 3) -> torch.Tensor:
@@ -565,6 +571,13 @@ class PipelineWorker(
                 next_frame_t = time.perf_counter()
                 self._sdr_delay_frame = None
                 self._reset_enhance_history()
+                # Reset post-flush frame-drop watermarks to the new timeline
+                # position.  If we keep an old watermark from a later frame,
+                # backward seeks can render correctly but never feed a new HDR
+                # frame to mpv because every post-seek frame still looks "too
+                # early" and gets dropped.
+                self._hdr_drop_until_frame = 0
+                self._sdr_drop_until_frame = 0
                 if seek_to <= 1:
                     self._hdr_drop_until_frame = 2
                     self._sdr_drop_until_frame = 2

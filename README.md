@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v2.1-blue)
+![Version](https://img.shields.io/badge/version-v2.2-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -54,7 +54,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## GUI (v2.1)
+## GUI (v2.2)
 
 ```bash
 python src/gui.py
@@ -62,19 +62,48 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
 
-### New in v2.1
+### New in v2.2
 
-- **Separate export workflow** under `File > Export Video...` with independent export precision/model settings
-- **Export defaults to source-native resolution and FPS**, with optional resize/FPS override and aspect-ratio-safe fit/pad behavior
-- **Export format locked to ProRes 422 HQ (`.mov`) + PCM audio** for high-quality mezzanine output
-- **Export advanced options**: experimental max-autotune compile reuse and INT8 pre-dequantization override
-- **Max-autotune export now uses the same Stop-button behavior before export begins**, avoiding stale GPU/runtime state during compile/warmup
-- **Playback compile startup skips the clean precompile subprocess on exact cache hits**
-- **Export max-autotune now reuses the same compile cache/dialog flow as playback**
-- **Mixed INT8 upgraded to true 3-way mixed precision**: `W8A8` + `W8A16` + selected full `FP16` sensitive layers
-- **QAT improved for reproducibility and quality selection**: seeded/deterministic defaults, highlight-aware monitor selection, and early stopping
+- **Export workflow matured into a production-style path**
+  - separate `File > Export Video...` flow with independent precision/model/HG selection
+  - source-native resolution/FPS defaults
+  - aspect-ratio-safe fit/pad resizing
+  - ProRes 422 HQ (`.mov`) + PCM audio only
+- **Export dialog polish**
+  - HDR sources are rejected immediately when chosen
+  - keep-aspect ratio editing no longer fights typed values
+  - pressing `Enter` in resolution/FPS/path fields no longer starts export accidentally
+  - cancel tears down the export runtime and releases GPU resources more cleanly
+  - progress/finalization reporting is more truthful during long exports
+- **Export HDR metadata/tagging improved**
+  - ProRes exports now use a more reliable BT.2020 / PQ tagging path
+  - export conversion path now targets a `1001 nit` HDR peak expectation
+- **Export now includes default temporal highlight stabilization**
+  - always-on masked temporal blending in bright, flat, near-neutral, low-motion regions
+  - scene-cut-aware reset to avoid carrying history across hard cuts
+- **Experimental max-autotune export reuses the playback compile cache**
+  - export uses the same compile/cache keying and compile dialogs as playback
+  - max-autotune export uses full Stop behavior first to avoid stale GPU/MIOpen state
+- **Playback compile startup is less wasteful**
+  - exact cache hits now skip the clean precompile subprocess instead of needlessly re-running it
+- **Mixed INT8 upgraded to true 3-way mixed precision**
+  - `W8A8` + `W8A16` + selected full `FP16` sensitive layers
+  - mixed scripts now support both `base.*` and no-HG naming schemes for FP16-sensitive defaults
+- **Full and mixed QAT paths now diverge more intentionally**
+  - `INT8 Mixed (QAT)` is the adaptive path that leans on `W8A16` / `FP16` protection for highlight-sensitive layers
+  - `INT8 Full (QAT)` is now a PTQ-anchored full-W8A8 path that freezes curated sensitive layers and SFT control layers during training
+- **QAT reliability and color behavior improved**
+  - seeded/deterministic defaults for repeatable runs
+  - highlight-aware monitor selection instead of arbitrary first-image validation
+  - early stopping
+  - new highlight-teacher / highlight-balance losses to keep bright neutral highlights closer to GT/PTQ and avoid warm/blue drift
+  - highlight-aware crop sampling so training actually sees more of the hard bright-neutral regions
+- **Compare and timeline stability improved**
+  - compare snapshots are recomputed deterministically instead of borrowing stale live playback state
+  - backward seeks are less likely to leave HDR video stuck on an old frame while audio has already moved
 - **Paused precision / pre-dequantize swaps redraw the current frame in place** without needing Resume
-- **Modular GUI refactor remains in place**: `gui.py` composes focused mixins/modules (`gui_ui_builder.py`, `gui_signal_wiring.py`, `gui_playback_runtime.py`, `gui_pipeline_worker_*.py`, etc.)
+- **Modular GUI refactor remains in place**
+  - `gui.py` composes focused mixins/modules (`gui_ui_builder.py`, `gui_signal_wiring.py`, `gui_playback_runtime.py`, `gui_pipeline_worker_*.py`, etc.)
 
 ### Features
 
@@ -91,14 +120,17 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
+| **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
 | **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
 | **Film grain** | Optional film grain restoration (mpv shader) |
 | **Video export** | Separate export dialog with native resolution/FPS defaults, independent model preset selection, and ProRes 422 HQ output |
+| **Export temporal stabilization** | Always-on masked temporal stabilization reduces bright flat-region chroma speckle/boiling in exported HDR output |
 | **Audio support** | Auto-detect, attach external audio, and choose audio track |
 | **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
+| **Timeline recovery** | Backward seeks and relocks reset stale frame-drop state more reliably to avoid frozen HDR video after the audio already moved |
 | **Keyboard shortcuts** | `F11` borderless full-window, `Esc` exit borderless mode, `Space` pause/resume |
 | **Cursor idle hide** | Optional auto-hide cursor during playback |
 | **INT8 pre-dequantization control** | Tools-menu toggle for `Auto` / `On` / `Off` on INT8 runtimes |
@@ -142,10 +174,12 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - Export supports any available model preset (`FP16`, `FP32`, `INT8 PTQ/QAT`, HG on/off) directly from the export dialog
 - Output is intentionally limited to **ProRes 422 HQ (`.mov`) + PCM audio**
   - This is a high-quality mezzanine format that avoids recompressing already-compressed sources back into delivery codecs like H.265 during intermediate work
+- ProRes export is tagged through the HDR path as **BT.2020 / PQ**, with a `1001 nit` target peak expectation in the export conversion path
 - HDR input sources are rejected immediately when selected in the export dialog
 - Export has an **Advanced** tab for:
   - experimental max-autotune compile reuse
   - INT8 pre-dequantize override (`Auto` / `Force On` / `Force Off`)
+- Export now also applies an always-on masked temporal stabilization pass in bright, flat, near-neutral, low-motion regions before ProRes encoding
 - Starting a normal export keeps playback paused/locked for the export run
 - Starting an export with **experimental max-autotune** may trigger the same full **Stop** behavior first so compile/warmup can run cleanly
 - Canceling an export tears down the export model/runtime and releases GPU resources without requiring an app close
@@ -377,6 +411,10 @@ python scripts/quantize/quantize_int8_full.py
 python scripts/quantize/quantize_int8_full_qat.py
 ```
 - Starts from the PTQ full checkpoint and fine-tunes with fake quantization + STE
+- Full QAT is now a **PTQ-anchored** full-W8A8 path:
+  - freezes a curated set of highlight/color-sensitive layers during training
+  - also freezes SFT scale/shift control layers by default
+  - uses stronger teacher/highlight anchoring to reduce highlight tint drift while still exporting a full `W8A8` checkpoint
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
   - **~4.0× compression vs FP16+HG**
@@ -405,6 +443,9 @@ python scripts/quantize/quantize_int8_mixed.py
 python scripts/quantize/quantize_int8_mixed_qat.py
 ```
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
+- Mixed QAT is the **adaptive mixed-precision** path:
+  - keeps leaning on `W8A16` and curated `FP16` exemptions for the most highlight/color-sensitive layers
+  - SFT control protection is enabled by default
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth while preserving the FP16-sensitive exemptions
 - QAT now defaults to deterministic/repeatable training (`--seed`, deterministic mode), highlight-aware monitor selection, and early stopping
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 + teacher + highlight-aware losses)
