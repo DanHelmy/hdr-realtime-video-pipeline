@@ -15,7 +15,7 @@ _FLAT_TEMPORAL_BRIGHTNESS = 0.80
 _FLAT_TEMPORAL_NEUTRAL = 0.12
 _FLAT_TEMPORAL_DETAIL = 0.028
 _FLAT_TEMPORAL_MOTION = 0.030
-_FLAT_TEMPORAL_BLEND = 0.78
+_FLAT_TEMPORAL_LUMA_DELTA = 0.018
 _SCENE_CUT_DOWNSCALE = (48, 27)
 _SCENE_CUT_THRESHOLD = 18.0
 
@@ -77,7 +77,7 @@ class PipelineWorkerFrameProcessingMixin:
         return diff > _SCENE_CUT_THRESHOLD
 
     def _temporally_stabilize_flat_highlights(self, prepared_out, scene_cut: bool):
-        """Reduce boiling in bright flat neutral areas with masked temporal blending."""
+        """Reduce boiling in bright flat neutral areas with masked luma delta clamping."""
         if not _FLAT_TEMPORAL_ENABLED or prepared_out is None:
             return prepared_out
         if not torch.is_tensor(prepared_out) or prepared_out.ndim != 4:
@@ -95,6 +95,7 @@ class PipelineWorkerFrameProcessingMixin:
         detail = (luma - local_mean).abs()
 
         stabilized = prepared_out
+        stabilized_luma = luma
         prev_rgb = getattr(self, "_flat_temporal_prev_rgb", None)
         prev_luma = getattr(self, "_flat_temporal_prev_luma", None)
 
@@ -119,13 +120,24 @@ class PipelineWorkerFrameProcessingMixin:
             stable_weight = (
                 (_FLAT_TEMPORAL_MOTION - motion) / _FLAT_TEMPORAL_MOTION
             ).clamp_(0.0, 1.0)
-            blend = (
-                bright_weight * neutral_weight * flat_weight * stable_weight
-            ) * _FLAT_TEMPORAL_BLEND
-            stabilized = prepared_out * (1.0 - blend) + prev_rgb * blend
+            mask = bright_weight * neutral_weight * flat_weight * stable_weight
+
+            # Clamp brightness changes in problematic regions while preserving
+            # current-frame chroma by scaling RGB from stabilized luma.
+            delta = luma - prev_luma
+            target_luma = prev_luma + delta.clamp(
+                min=-_FLAT_TEMPORAL_LUMA_DELTA,
+                max=_FLAT_TEMPORAL_LUMA_DELTA,
+            )
+            stabilized_luma = luma * (1.0 - mask) + target_luma * mask
+
+            safe_luma = luma.clamp_min(1e-6)
+            scale = stabilized_luma / safe_luma
+            scale = torch.where(luma > 1e-6, scale, torch.ones_like(scale))
+            stabilized = (prepared_out * scale).clamp_min(0.0)
 
         self._flat_temporal_prev_rgb = stabilized.detach()
-        self._flat_temporal_prev_luma = luma.detach()
+        self._flat_temporal_prev_luma = stabilized_luma.detach()
         return stabilized
 
     def _prepare_hdr_output_tensor(self, raw_out, lower_res_processing: bool, scene_cut: bool):

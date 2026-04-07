@@ -54,7 +54,7 @@ _EXPORT_FLAT_TEMPORAL_BRIGHTNESS = 0.80
 _EXPORT_FLAT_TEMPORAL_NEUTRAL = 0.12
 _EXPORT_FLAT_TEMPORAL_DETAIL = 0.028
 _EXPORT_FLAT_TEMPORAL_MOTION = 0.030
-_EXPORT_FLAT_TEMPORAL_BLEND = 0.78
+_EXPORT_FLAT_TEMPORAL_LUMA_DELTA = 0.018
 _EXPORT_SCENE_CUT_DOWNSCALE = (48, 27)
 _EXPORT_SCENE_CUT_THRESHOLD = 18.0
 
@@ -813,6 +813,7 @@ class VideoExportWorker(QObject):
         detail = (luma - local_mean).abs()
 
         stabilized = prepared
+        stabilized_luma = luma
         prev_rgb = self._flat_temporal_prev_rgb
         prev_luma = self._flat_temporal_prev_luma
         if (
@@ -839,13 +840,24 @@ class VideoExportWorker(QObject):
                 (_EXPORT_FLAT_TEMPORAL_MOTION - motion)
                 / _EXPORT_FLAT_TEMPORAL_MOTION
             ).clamp_(0.0, 1.0)
-            blend = (
-                bright_weight * neutral_weight * flat_weight * stable_weight
-            ) * _EXPORT_FLAT_TEMPORAL_BLEND
-            stabilized = prepared * (1.0 - blend) + prev_rgb * blend
+            mask = bright_weight * neutral_weight * flat_weight * stable_weight
+
+            # Clamp brightness changes in problematic regions while preserving
+            # current-frame chroma by scaling RGB from stabilized luma.
+            delta = luma - prev_luma
+            target_luma = prev_luma + delta.clamp(
+                min=-_EXPORT_FLAT_TEMPORAL_LUMA_DELTA,
+                max=_EXPORT_FLAT_TEMPORAL_LUMA_DELTA,
+            )
+            stabilized_luma = luma * (1.0 - mask) + target_luma * mask
+
+            safe_luma = luma.clamp_min(1e-6)
+            scale = stabilized_luma / safe_luma
+            scale = torch.where(luma > 1e-6, scale, torch.ones_like(scale))
+            stabilized = (prepared * scale).clamp_min(0.0)
 
         self._flat_temporal_prev_rgb = stabilized.detach()
-        self._flat_temporal_prev_luma = luma.detach()
+        self._flat_temporal_prev_luma = stabilized_luma.detach()
         return stabilized
 
     def run(self):
