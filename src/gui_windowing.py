@@ -8,6 +8,7 @@ import psutil
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QTimer, Qt
 from PyQt6.QtWidgets import QApplication, QGraphicsOpacityEffect, QVBoxLayout, QWidget
 
+from gui_config import SOURCE_MODE_WINDOW, _normalize_source_mode
 from gui_widgets import DetachedVideoWindow
 
 
@@ -312,7 +313,9 @@ class WindowingMixin:
             self._ui_overlay_btn.hide()
             return
         if self._row3_widget is not None:
-            self._row3_widget.setVisible(True)
+            self._row3_widget.setVisible(
+                getattr(self, "_source_mode", "video") != "window_capture"
+            )
         self._position_ui_overlay()
         self._ui_overlay_btn.show()
         self._ui_overlay_btn.raise_()
@@ -341,7 +344,9 @@ class WindowingMixin:
             self.menuBar().setVisible(True)
             self.statusBar().setVisible(True)
             if self._row3_widget is not None:
-                self._row3_widget.setVisible(True)
+                self._row3_widget.setVisible(
+                    getattr(self, "_source_mode", "video") != "window_capture"
+                )
             if self._ui_overlay_btn is not None:
                 self._ui_overlay_btn.hide()
         if self._btn_toggle_ui is not None:
@@ -520,6 +525,11 @@ class WindowingMixin:
     def _periodic_relock_tick(self):
         if not self._playing:
             return
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        ):
+            return
         if self._worker is None or self._worker.is_paused:
             return
         if self._startup_sync_pending:
@@ -578,6 +588,11 @@ class WindowingMixin:
         if self._periodic_relock_timer is None:
             return
         self._periodic_relock_timer.stop()
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        ):
+            return
         if self._audio_available and self._audio_player is not None:
             return
         period_ms = int(getattr(self, "_periodic_relock_ms", 1200))
@@ -629,7 +644,12 @@ class WindowingMixin:
                 self._disp_hdr_mpv.set_paused(False)
             if self._disp_sdr_mpv is not None:
                 self._disp_sdr_mpv.set_paused(False)
-            if self._audio_available and not self._startup_sync_pending:
+            if (
+                self._audio_available
+                and not self._startup_sync_pending
+                and _normalize_source_mode(getattr(self, "_source_mode", None))
+                != SOURCE_MODE_WINDOW
+            ):
                 # Keep audio paused until FPS stabilizes after the UI change.
                 self._startup_audio_gate_active = True
                 self._ui_resync_gate_strict = True
@@ -644,6 +664,49 @@ class WindowingMixin:
             pass
         self._ui_pause_timer.timeout.connect(_resume)
         self._ui_pause_timer.start(delay)
+
+    def _stabilize_window_capture_surface_after_startup(self):
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            != SOURCE_MODE_WINDOW
+        ):
+            return
+        if not self._playing or not self._active_use_mpv:
+            return
+        tabs = getattr(self, "_video_tabs", None)
+        if tabs is None or tabs.count() < 2:
+            self._pause_for_ui_transition(duration_ms=120, wait_for_stable=True)
+            self._with_layout_freeze(lambda: None, refresh_delay=40)
+            self._relock_timeline(delay_ms=140, drop_frames=3)
+            return
+        original_index = max(0, int(tabs.currentIndex()))
+        candidate_index = None
+        for offset in range(1, tabs.count()):
+            idx = (original_index + offset) % tabs.count()
+            if idx != original_index:
+                candidate_index = idx
+                break
+        if candidate_index is None:
+            return
+
+        # The reliable user-discovered fix is an actual pane change, not just
+        # a repaint. Mirror that once on startup, then restore the user's tab.
+        tabs.setCurrentIndex(candidate_index)
+
+        def _restore_original_tab():
+            if (
+                _normalize_source_mode(getattr(self, "_source_mode", None))
+                != SOURCE_MODE_WINDOW
+            ):
+                return
+            if not self._playing:
+                return
+            try:
+                tabs.setCurrentIndex(original_index)
+            except Exception:
+                pass
+
+        QTimer.singleShot(120, _restore_original_tab)
 
     def _toggle_borderless_full_window(self):
         now_t = time.perf_counter()

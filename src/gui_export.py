@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -50,13 +49,6 @@ from models.hdrtvnet_torch import (
 from video_source import VideoSource
 
 EXPORT_HDR_TARGET_PEAK_NITS = 1001.0
-_EXPORT_FLAT_TEMPORAL_BRIGHTNESS = 0.80
-_EXPORT_FLAT_TEMPORAL_NEUTRAL = 0.12
-_EXPORT_FLAT_TEMPORAL_DETAIL = 0.028
-_EXPORT_FLAT_TEMPORAL_MOTION = 0.030
-_EXPORT_FLAT_TEMPORAL_LUMA_DELTA = 0.018
-_EXPORT_SCENE_CUT_DOWNSCALE = (48, 27)
-_EXPORT_SCENE_CUT_THRESHOLD = 18.0
 
 
 def _ensure_even(value: int) -> int:
@@ -646,9 +638,6 @@ class VideoExportWorker(QObject):
         self._rgb48_host_tensor = None
         self._rgb48_host_np = None
         self._rgb48_host_shape = None
-        self._flat_temporal_prev_rgb = None
-        self._flat_temporal_prev_luma = None
-        self._flat_temporal_prev_scene = None
 
     def cancel(self):
         self._cancel_requested.set()
@@ -679,9 +668,6 @@ class VideoExportWorker(QObject):
             self._rgb48_host_tensor = None
             self._rgb48_host_np = None
             self._rgb48_host_shape = None
-            self._flat_temporal_prev_rgb = None
-            self._flat_temporal_prev_luma = None
-            self._flat_temporal_prev_scene = None
 
         if source is not None:
             try:
@@ -777,88 +763,6 @@ class VideoExportWorker(QObject):
             torch.cuda.current_stream().synchronize()
             return self._rgb48_host_np.tobytes()
         return rgb_u16.cpu().numpy().tobytes()
-
-    def _detect_scene_cut(self, frame_bgr: np.ndarray) -> bool:
-        if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
-            self._flat_temporal_prev_scene = None
-            return True
-
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(
-            gray, _EXPORT_SCENE_CUT_DOWNSCALE, interpolation=cv2.INTER_AREA
-        )
-        prev = self._flat_temporal_prev_scene
-        self._flat_temporal_prev_scene = small
-        if prev is None or prev.shape != small.shape:
-            return True
-        diff = float(
-            np.mean(np.abs(small.astype(np.float32) - prev.astype(np.float32)))
-        )
-        return diff > _EXPORT_SCENE_CUT_THRESHOLD
-
-    def _temporally_stabilize_flat_highlights(self, raw_out, scene_cut: bool):
-        prepared = raw_out[0] if isinstance(raw_out, (tuple, list)) else raw_out
-        if prepared is None or not torch.is_tensor(prepared) or prepared.ndim != 4:
-            return prepared
-
-        peak = prepared.amax(dim=1, keepdim=True)
-        floor = prepared.amin(dim=1, keepdim=True)
-        chroma = peak - floor
-        luma = (
-            0.2126 * prepared[:, 0:1, :, :]
-            + 0.7152 * prepared[:, 1:2, :, :]
-            + 0.0722 * prepared[:, 2:3, :, :]
-        )
-        local_mean = F.avg_pool2d(luma, kernel_size=3, stride=1, padding=1)
-        detail = (luma - local_mean).abs()
-
-        stabilized = prepared
-        stabilized_luma = luma
-        prev_rgb = self._flat_temporal_prev_rgb
-        prev_luma = self._flat_temporal_prev_luma
-        if (
-            not scene_cut
-            and prev_rgb is not None
-            and prev_luma is not None
-            and prev_rgb.shape == prepared.shape
-            and prev_luma.shape == luma.shape
-        ):
-            bright_weight = (
-                (peak - _EXPORT_FLAT_TEMPORAL_BRIGHTNESS)
-                / max(1.0 - _EXPORT_FLAT_TEMPORAL_BRIGHTNESS, 1e-6)
-            ).clamp_(0.0, 1.0)
-            neutral_weight = (
-                (_EXPORT_FLAT_TEMPORAL_NEUTRAL - chroma)
-                / _EXPORT_FLAT_TEMPORAL_NEUTRAL
-            ).clamp_(0.0, 1.0)
-            flat_weight = (
-                (_EXPORT_FLAT_TEMPORAL_DETAIL - detail)
-                / _EXPORT_FLAT_TEMPORAL_DETAIL
-            ).clamp_(0.0, 1.0)
-            motion = (luma - prev_luma).abs()
-            stable_weight = (
-                (_EXPORT_FLAT_TEMPORAL_MOTION - motion)
-                / _EXPORT_FLAT_TEMPORAL_MOTION
-            ).clamp_(0.0, 1.0)
-            mask = bright_weight * neutral_weight * flat_weight * stable_weight
-
-            # Clamp brightness changes in problematic regions while preserving
-            # current-frame chroma by scaling RGB from stabilized luma.
-            delta = luma - prev_luma
-            target_luma = prev_luma + delta.clamp(
-                min=-_EXPORT_FLAT_TEMPORAL_LUMA_DELTA,
-                max=_EXPORT_FLAT_TEMPORAL_LUMA_DELTA,
-            )
-            stabilized_luma = luma * (1.0 - mask) + target_luma * mask
-
-            safe_luma = luma.clamp_min(1e-6)
-            scale = stabilized_luma / safe_luma
-            scale = torch.where(luma > 1e-6, scale, torch.ones_like(scale))
-            stabilized = (prepared * scale).clamp_min(0.0)
-
-        self._flat_temporal_prev_rgb = stabilized.detach()
-        self._flat_temporal_prev_luma = stabilized_luma.detach()
-        return stabilized
 
     def run(self):
         source = None
@@ -1062,14 +966,10 @@ class VideoExportWorker(QObject):
                     int(self._config.width),
                     int(self._config.height),
                 )
-                scene_cut = self._detect_scene_cut(model_inp)
                 with torch.inference_mode():
                     tensor, cond = processor.preprocess(model_inp)
                     raw_out = processor.infer((tensor, cond))
-                stabilized_out = self._temporally_stabilize_flat_highlights(
-                    raw_out, scene_cut
-                )
-                output_rgb48 = self._tensor_to_rgb48_bytes(stabilized_out)
+                output_rgb48 = self._tensor_to_rgb48_bytes(raw_out)
                 if self._canceled():
                     raise InterruptedError("Export canceled by user.")
                 while not self._canceled():

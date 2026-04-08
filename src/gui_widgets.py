@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSplitter,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -47,6 +48,7 @@ class VideoDisplay(QLabel):
         self._title = title
         self.setMinimumSize(320, 180)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setStyleSheet("QLabel { background: #111; color: #555; "
                            "font-size: 14px; }")
         self.setText(title)
@@ -173,11 +175,15 @@ class _CompareVideoPane(QWidget):
 class CompareFrameDialog(QDialog):
     """Three-way paused-frame compare view: SDR vs HDR GT vs HDR Convert."""
 
-    precision_requested = pyqtSignal(str)
+    compare_requested = pyqtSignal(str, int)
 
     def __init__(self, mpv_available: bool, mpv_widget_factory, best_mpv_scale: str, parent=None):
-        super().__init__(parent)
-        self.setWindowFlag(Qt.WindowType.Window, True)
+        # Keep Compare as an independent top-level dialog on Windows. When a
+        # parent-owned top-level window is minimized, Qt/Windows can collapse it
+        # into a tiny corner stub instead of treating it like a normal window.
+        super().__init__(None)
+        self._owner_widget = parent
+        self.setWindowFlag(Qt.WindowType.Dialog, True)
         self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
@@ -199,19 +205,29 @@ class CompareFrameDialog(QDialog):
         self._lbl_compare_prec.setStyleSheet("color: #bbb;")
         self._cmb_compare_prec = QComboBox()
         self._cmb_compare_prec.setMinimumWidth(190)
+        self._lbl_compare_frame = QLabel("Frame:")
+        self._lbl_compare_frame.setStyleSheet("color: #bbb;")
+        self._spn_compare_frame = QSpinBox()
+        self._spn_compare_frame.setMinimumWidth(110)
+        self._spn_compare_frame.setRange(0, 0)
+        self._spn_compare_frame.setAccelerated(True)
+        self._spn_compare_frame.setKeyboardTracking(False)
         self._btn_recompare = QPushButton("Refresh")
         self._btn_recompare.setMinimumWidth(110)
         controls.addWidget(self._lbl_compare_prec)
         controls.addWidget(self._cmb_compare_prec)
+        controls.addWidget(self._lbl_compare_frame)
+        controls.addWidget(self._spn_compare_frame)
         controls.addWidget(self._btn_recompare)
         controls.addStretch(1)
         root.addLayout(controls)
 
         self._precision_sync_guard = False
-        self._btn_recompare.clicked.connect(self._emit_precision_request)
+        self._btn_recompare.clicked.connect(self._emit_compare_request)
         self._cmb_compare_prec.currentTextChanged.connect(
-            lambda _text: self._emit_precision_request()
+            lambda _text: self._emit_compare_request()
         )
+        self._spn_compare_frame.editingFinished.connect(self._emit_compare_request)
 
         self._disp_sdr = _CompareVideoPane(
             "SDR",
@@ -269,6 +285,38 @@ class CompareFrameDialog(QDialog):
         self._lbl_note.setStyleSheet("color: #9ecbff;")
         root.addWidget(self._lbl_note)
 
+    def _restore_parent_video_cursor(self):
+        parent = getattr(self, "_owner_widget", None)
+        targets = [parent]
+        if parent is not None:
+            for name in (
+                "_disp_hdr_mpv",
+                "_disp_sdr_mpv",
+                "_disp_hdr_cpu",
+                "_disp_sdr_cpu",
+                "_disp_hdr_stack",
+                "_disp_sdr_stack",
+            ):
+                widget = getattr(parent, name, None)
+                if widget is not None:
+                    targets.append(widget)
+        for widget in targets:
+            try:
+                widget.setCursor(Qt.CursorShape.ArrowCursor)
+            except Exception:
+                pass
+
+    def hideEvent(self, event):
+        try:
+            self.clearFocus()
+            self._cmb_compare_prec.clearFocus()
+            self._spn_compare_frame.clearFocus()
+            self._btn_recompare.clearFocus()
+        except Exception:
+            pass
+        super().hideEvent(event)
+        QTimer.singleShot(0, self._restore_parent_video_cursor)
+
     def _reset_compare_splitter_sizes(self):
         if not hasattr(self, "_split_compare") or self._split_compare is None:
             return
@@ -286,12 +334,27 @@ class CompareFrameDialog(QDialog):
             self._reset_splitter_on_show = False
             QTimer.singleShot(0, self._reset_compare_splitter_sizes)
 
-    def _emit_precision_request(self):
+    def _emit_compare_request(self):
         if self._precision_sync_guard:
             return
         key = str(self._cmb_compare_prec.currentText() or "").strip()
         if key:
-            self.precision_requested.emit(key)
+            self.compare_requested.emit(key, int(self._spn_compare_frame.value()))
+
+    def set_frame_bounds(
+        self,
+        min_frame: int,
+        max_frame: int,
+        current_frame: int | None = None,
+    ):
+        low = max(0, int(min_frame))
+        high = max(low, int(max_frame))
+        current = self._spn_compare_frame.value() if current_frame is None else int(current_frame)
+        current = max(low, min(high, current))
+        self._precision_sync_guard = True
+        self._spn_compare_frame.setRange(low, high)
+        self._spn_compare_frame.setValue(current)
+        self._precision_sync_guard = False
 
     def set_precision_options(self, options: list[str], selected: str | None = None):
         keys = [str(v).strip() for v in (options or []) if str(v).strip()]
@@ -301,6 +364,7 @@ class CompareFrameDialog(QDialog):
             self._cmb_compare_prec.clear()
             self._precision_sync_guard = False
             self._cmb_compare_prec.setEnabled(False)
+            self._spn_compare_frame.setEnabled(False)
             self._btn_recompare.setEnabled(False)
             return
         if current not in keys:
@@ -312,18 +376,26 @@ class CompareFrameDialog(QDialog):
         self._cmb_compare_prec.setCurrentText(current)
         self._precision_sync_guard = False
         self._cmb_compare_prec.setEnabled(True)
+        self._spn_compare_frame.setEnabled(True)
         self._btn_recompare.setEnabled(True)
 
     def set_recompare_busy(self, busy: bool):
         is_busy = bool(busy)
         self._cmb_compare_prec.setEnabled(not is_busy and self._cmb_compare_prec.count() > 0)
+        self._spn_compare_frame.setEnabled(not is_busy and self._cmb_compare_prec.count() > 0)
         self._btn_recompare.setEnabled(not is_busy and self._cmb_compare_prec.count() > 0)
+
     def set_frames(self, frame_idx: int, sdr: np.ndarray | None,
                    hdr_gt: np.ndarray | None, hdr_algo: np.ndarray | None,
                    note: str = "", metrics: dict | None = None,
                    hdr_algo_label: str | None = None):
         self.setWindowTitle(f"Frame Compare - frame {int(frame_idx)}")
         self._lbl_meta.setText(f"Frame: {int(frame_idx)}")
+        self.set_frame_bounds(
+            self._spn_compare_frame.minimum(),
+            self._spn_compare_frame.maximum(),
+            current_frame=int(frame_idx),
+        )
 
         algo_title = str(hdr_algo_label or "HDR Convert")
         self._disp_algo.set_title(algo_title)

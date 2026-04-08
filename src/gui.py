@@ -97,7 +97,15 @@ class MainWindow(
                  initial_use_hg=None,
                  initial_autoplay=False, initial_start_frame=None,
                  initial_upscale=None, initial_film_grain=None,
-                 initial_hdr_gt=None):
+                 initial_hdr_gt=None,
+                 initial_source_mode=None,
+                 initial_capture_hwnd=None,
+                 initial_capture_session_id=None,
+                 initial_capture_title=None,
+                 initial_capture_browser_name=None,
+                 initial_capture_process_name=None,
+                 initial_capture_url=None,
+                 initial_capture_fps=None):
         super().__init__()
         self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
         self.setMinimumSize(1024, 600)
@@ -122,13 +130,24 @@ class MainWindow(
             initial_upscale,
             initial_film_grain,
             initial_hdr_gt,
+            initial_source_mode,
+            initial_capture_fps,
         )
         self._init_cursor_idle_tracking()
+        QTimer.singleShot(0, self._maybe_prompt_source_mode_choice)
         QTimer.singleShot(0, self._show_startup_runtime_warnings)
 
         # Auto-open video passed via --video (used by restart)
         self._queue_initial_video_open(
             initial_video=initial_video,
+            initial_source_mode=initial_source_mode,
+            initial_capture_hwnd=initial_capture_hwnd,
+            initial_capture_session_id=initial_capture_session_id,
+            initial_capture_title=initial_capture_title,
+            initial_capture_browser_name=initial_capture_browser_name,
+            initial_capture_process_name=initial_capture_process_name,
+            initial_capture_url=initial_capture_url,
+            initial_capture_fps=initial_capture_fps,
             initial_resolution=initial_resolution,
             initial_precision=initial_precision,
             initial_view=initial_view,

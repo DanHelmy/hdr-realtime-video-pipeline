@@ -25,6 +25,11 @@ class LifecycleMixin:
         self._startup_sync_pending = False
         self._auto_muted_low_fps = False
         self._scrub_muted = False
+        self._live_audio_active = False
+        self._pending_live_audio_start_target = None
+        self._pending_live_audio_retry_at = 0.0
+        self._live_audio_compile_ready = False
+        self._live_audio_has_latency_hint = False
         self._ui_hidden = False
         self._hdr_mpv_screen_sig = None
         self._sdr_mpv_screen_sig = None
@@ -70,11 +75,15 @@ class LifecycleMixin:
             self._compile_dlg.close()
             self._compile_dlg.deleteLater()
             self._compile_dlg = None
-        self._btn_play.setEnabled(bool(self._video_path))
+        self._btn_play.setEnabled(self._current_source_available())
         self._btn_pause.setEnabled(False)
         self._btn_stop.setEnabled(False)
         self._btn_compare.setEnabled(False)
         self._btn_file.setEnabled(True)
+        if hasattr(self, "_cmb_source_mode") and self._cmb_source_mode is not None:
+            self._cmb_source_mode.setEnabled(True)
+        if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
+            self._cmb_capture_fps.setEnabled(self._source_mode == "window_capture")
         if self._btn_toggle_ui is not None:
             self._btn_toggle_ui.setEnabled(False)
             self._btn_toggle_ui.setText("Hide UI")
@@ -91,11 +100,13 @@ class LifecycleMixin:
         self._seek_slider.setEnabled(False)
         self._seek_slider.setValue(0)
         self._lbl_time.setText("0:00")
+        self._lbl_duration.setText("0:00")
         self._audio_sync_frame_hint = 0
         self._last_sdr_frame = None
         self._last_hdr_frame = None
         if self._compare_dialog is not None and self._compare_dialog.isVisible():
             self._compare_dialog.close()
+        self._refresh_source_mode_ui()
         # Reset HDR panel
         self._hdr_labels["status"].setText("HDR: waiting\u2026")
         self._hdr_labels["status"].setStyleSheet("")
@@ -136,8 +147,15 @@ class LifecycleMixin:
                 break
 
     def closeEvent(self, event):
+        from browser_tab_bridge import close_browser_tab_bridge
+
         self._ui_closing = True
         self._save_user_settings()
+        if hasattr(self, "_stop_active_browser_tab_session"):
+            try:
+                self._stop_active_browser_tab_session()
+            except Exception:
+                pass
         if self._export_worker is not None:
             try:
                 self._export_worker.cancel()
@@ -164,6 +182,10 @@ class LifecycleMixin:
         if self._export_thread is not None:
             self._export_thread.quit()
             self._export_thread.wait(5000)
+        try:
+            close_browser_tab_bridge()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def keyPressEvent(self, event):

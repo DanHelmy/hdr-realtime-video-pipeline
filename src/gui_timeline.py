@@ -4,9 +4,18 @@ import time
 
 from PyQt6.QtCore import QTimer
 
+from gui_config import SOURCE_MODE_WINDOW, _normalize_source_mode
+
 
 class TimelineSeekMixin:
     """Timeline synchronization + seek/position slot helpers for MainWindow."""
+
+    def _is_live_window_capture_active(self) -> bool:
+        return (
+            self._playing
+            and _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        )
 
     def _sync_anchor_frame(self) -> int:
         """Best-effort current frame anchor for A/V relock."""
@@ -20,6 +29,8 @@ class TimelineSeekMixin:
 
     def _resync_audio_to_current_timeline(self):
         if not self._playing:
+            return
+        if self._is_live_window_capture_active():
             return
         fps = getattr(self, "_vid_fps", 30.0)
         sec = float(self._sync_anchor_frame()) / max(fps, 1e-6)
@@ -45,6 +56,8 @@ class TimelineSeekMixin:
     def _relock_timeline(self, delay_ms: int = 0, drop_frames: int = 2):
         """Force a timeline relock (audio + HDR queue) after UI actions."""
         if not self._playing:
+            return
+        if self._is_live_window_capture_active():
             return
 
         def _do():
@@ -122,14 +135,22 @@ class TimelineSeekMixin:
         """Update seek slider + time labels from worker."""
         self._last_seek_frame = int(current_frame)
         self._audio_sync_frame_hint = int(current_frame)
-        if not self._seek_slider.isSliderDown():
+        if (
+            total_frames > 0
+            and not self._seek_slider.isSliderDown()
+            and int(self._seek_slider.value()) != int(current_frame)
+        ):
             self._seek_slider.setValue(current_frame)
         fps = getattr(self, "_vid_fps", 30.0)
         self._lbl_time.setText(self._fmt_time(current_frame / fps))
 
         # On startup or when returning to the beginning, re-anchor mpv to 0
         # to eliminate initial HDR lag.
-        if self._disp_hdr_mpv is not None and current_frame <= 1:
+        if (
+            (not self._is_live_window_capture_active())
+            and self._disp_hdr_mpv is not None
+            and current_frame <= 1
+        ):
             now_t = time.perf_counter()
             if (now_t - self._mpv_start_resync_t) > 0.8:
                 self._mpv_start_resync_t = now_t
@@ -158,6 +179,7 @@ class TimelineSeekMixin:
             self._playing
             and self._audio_available
             and self._audio_player is not None
+            and (not self._is_live_window_capture_active())
             and not self._seek_slider.isSliderDown()
         ):
             want_ms = int((current_frame / max(fps, 1e-6)) * 1000.0)

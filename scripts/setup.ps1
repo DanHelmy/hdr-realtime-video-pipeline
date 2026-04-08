@@ -75,6 +75,9 @@ function Resolve-Backend([string]$RequestedBackend) {
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $selection = Resolve-Backend -RequestedBackend $Backend
 $target = [string]$selection.Backend
+$venvPython = Join-Path $repoRoot "venv\Scripts\python.exe"
+$guiEntry = Join-Path $repoRoot "src\gui.py"
+$assetBootstrap = Join-Path $repoRoot "src\required_clone_assets.py"
 
 Write-Step "Backend selection: $target ($($selection.Reason))"
 $gpuList = @(@($selection.Gpus) | Where-Object { $_ -and $_.ToString().Trim().Length -gt 0 })
@@ -92,13 +95,27 @@ if (-not (Test-Path $targetScript)) {
 
 $forwardParams = @{}
 if ($RecreateVenv) { $forwardParams["RecreateVenv"] = $true }
-if ($RunGui) { $forwardParams["RunGui"] = $true }
 if ($SkipPipUpgrade) { $forwardParams["SkipPipUpgrade"] = $true }
 
 Write-Step "Running $targetScript ..."
 & $targetScript @forwardParams
 
+if ((Test-Path $venvPython) -and (Test-Path $assetBootstrap)) {
+    Write-Step "Checking required runtime assets (libmpv + HG weights) ..."
+    try {
+        & $venvPython $assetBootstrap --download-missing --root $repoRoot
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Asset auto-download did not fully complete. The GUI will retry on first launch if needed."
+        }
+    } catch {
+        Write-Warning "Asset auto-download failed: $($_.Exception.Message)"
+    }
+}
+
 Write-Step "Done."
 if (-not $RunGui) {
     Write-Host "[setup] Next step: run .\run_gui.bat"
+} elseif (Test-Path $venvPython) {
+    Write-Step "Launching GUI..."
+    & $venvPython $guiEntry
 }

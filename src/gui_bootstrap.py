@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from windows_runtime import (
-    default_cache_root,
+    project_cache_root,
     enable_high_resolution_timer,
     ensure_windows_supported,
 )
@@ -118,7 +118,7 @@ def prepare_runtime_environment(current_file: str) -> tuple[str, str]:
     """Configure cache and DLL lookup paths before torch/PyQt are imported."""
     ensure_windows_supported("HDRTVNet++ GUI")
     enable_high_resolution_timer(1)
-    cache_root = os.environ.get("HDRTVNET_CACHE_DIR", default_cache_root())
+    cache_root = project_cache_root(current_file)
     try:
         os.makedirs(cache_root, exist_ok=True)
     except Exception:

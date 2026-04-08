@@ -51,6 +51,22 @@ def _parse_gui_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--video", default=None,
                         help="Auto-open this video on launch")
+    parser.add_argument("--source-mode", default=None,
+                        help="Initial source mode (video/window_capture for live browser-window capture)")
+    parser.add_argument("--capture-hwnd", default=None,
+                        help="Initial native browser-window handle for live capture mode")
+    parser.add_argument("--capture-session-id", default=None,
+                        help="Optional Chrome Audio Sync session id to pair with a browser window capture target")
+    parser.add_argument("--capture-title", default=None,
+                        help="Title hint for live capture mode")
+    parser.add_argument("--capture-browser-name", default=None,
+                        help="Browser name hint for live capture mode")
+    parser.add_argument("--capture-process-name", default=None,
+                        help="Browser process-name hint for live capture mode")
+    parser.add_argument("--capture-url", default=None,
+                        help="Source URL hint for live capture mode")
+    parser.add_argument("--capture-fps", default=None,
+                        help="Initial capture FPS preset label (e.g. 24 FPS)")
     parser.add_argument("--resolution", default=None,
                         help="Initial resolution preset (1080p/720p/540p/Source)")
     parser.add_argument("--precision", default=None,
@@ -81,6 +97,15 @@ def run_gui(window_cls, root_dir: str, argv: list[str] | None = None):
     args = _parse_gui_args(argv)
     os.chdir(root_dir)
     _install_qt_log_filter()
+    try:
+        from browser_tab_bridge import ensure_browser_tab_bridge_running
+
+        ensure_browser_tab_bridge_running()
+    except Exception as exc:
+        try:
+            print(f"Browser tab bridge startup failed: {exc}")
+        except Exception:
+            pass
     app_argv = sys.argv if argv is None else argv
     app = QApplication(app_argv)
     _apply_dark_theme(app)
@@ -95,6 +120,14 @@ def run_gui(window_cls, root_dir: str, argv: list[str] | None = None):
         initial_upscale=args.upscale,
         initial_film_grain=args.film_grain,
         initial_hdr_gt=args.hdr_gt,
+        initial_source_mode=args.source_mode,
+        initial_capture_hwnd=args.capture_hwnd,
+        initial_capture_session_id=args.capture_session_id,
+        initial_capture_title=args.capture_title,
+        initial_capture_browser_name=args.capture_browser_name,
+        initial_capture_process_name=args.capture_process_name,
+        initial_capture_url=args.capture_url,
+        initial_capture_fps=args.capture_fps,
     )
     win.show()
     return app.exec()

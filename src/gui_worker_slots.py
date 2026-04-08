@@ -4,6 +4,8 @@ import time
 import numpy as np
 from PyQt6.QtCore import QTimer
 
+from gui_config import SOURCE_MODE_WINDOW, _normalize_source_mode
+
 
 class WorkerSlotsMixin:
     """Worker/mpv signal handlers and live metrics UI updates."""
@@ -69,8 +71,15 @@ class WorkerSlotsMixin:
 
     def _on_metrics(self, m):
         self._m["fps"].setText(f"FPS: {m['fps']:.1f}")
-        self._m["latency"].setText(f"Latency: {m['latency_ms']:.1f} ms")
-        self._m["frame"].setText(f"Frame: {m['frame']}")
+        is_window_source = (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        )
+        shown_latency_ms = float(m.get("latency_ms", 0.0) or 0.0)
+        self._m["latency"].setText(f"Latency: {shown_latency_ms:.1f} ms")
+        self._m["frame"].setText(
+            "Frame: Live" if is_window_source else f"Frame: {m['frame']}"
+        )
         self._m["res"].setText(f"Res: {m['proc_res']}")
         self._m["gpu"].setText(f"VRAM: {m['gpu_mb']:.0f} MB")
         self._m["cpu"].setText(f"CPU: {m['cpu_mb']:.0f} MB")
@@ -85,7 +94,16 @@ class WorkerSlotsMixin:
             self._audio_sync_frame_hint = max(0, int(getattr(self, "_last_seek_frame", 0)))
 
         fps_now = float(m.get("fps", 0.0))
-        self._update_auto_mute_from_fps(fps_now)
+        if is_window_source:
+            self._fps_prev_sample = None
+            self._fps_is_stable = False
+            self._fps_stable_count = 0
+            self._fps_unstable_count = 0
+            self._fps_stable_since_t = 0.0
+            if self._auto_muted_low_fps:
+                self._set_low_fps_mute(False)
+        else:
+            self._update_auto_mute_from_fps(fps_now)
         if self._startup_audio_gate_active:
             bypass_gate = not bool(
                 getattr(self, "_enable_low_fps_audio_mute", True)

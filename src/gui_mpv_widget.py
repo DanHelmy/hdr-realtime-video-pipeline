@@ -39,6 +39,7 @@ class MpvHDRWidget(QWidget):
         super().__init__(parent)
         self.setMinimumSize(320, 180)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setStyleSheet("background: #111;")
         self._player = None
         self._pipe_name: str | None = None

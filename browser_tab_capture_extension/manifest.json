@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "HDRTVNet++ Chrome Audio Sync (Experimental)",
+  "version": "0.1.0",
+  "description": "Experimental Chrome-only delayed local audio for HDRTVNet++ Browser Window Capture.",
+  "permissions": [
+    "activeTab",
+    "offscreen",
+    "storage",
+    "tabCapture",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:39091/*",
+    "http://localhost:39091/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "HDRTVNet++ Chrome Audio Sync",
+    "default_popup": "popup.html"
+  }
+}

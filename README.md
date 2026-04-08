@@ -1,7 +1,7 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v2.2-blue)
-![Status](https://img.shields.io/badge/status-stable-brightgreen)
+![Version](https://img.shields.io/badge/version-v3.0-blue)
+![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
 ---
@@ -10,7 +10,16 @@
 
 **Real-Time SDR-to-HDR Video Reconstruction with HDRTVNet++ and PyTorch**
 
-This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using a deep learning model (HDRTVNet++). It runs entirely on the GPU with `torch.compile` optimizations and includes a full-featured desktop GUI.
+This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, compile caching, export, and live browser-window viewing.
+
+`v3.0` is the big browser-window update:
+
+- native `Browser Window Capture (Experimental)` video path
+- modern Windows output capture backend for browser-window video instead of legacy GDI-only readback
+- Chrome Audio Sync extension reduced to delayed local audio only
+- cleaner compile-cache reuse for compatible kernels
+- clearer Chrome-only setup/runtime warnings
+- continued export and playback polish from the `v2.x` line
 
 Windows-only project with **NVIDIA CUDA**, **AMD ROCm-Windows**, and **CPU** backends.
 
@@ -24,12 +33,12 @@ No manual asset download is required before setup.
 2. Run `setup.bat` (double-click or terminal).
 3. Run `run_gui.bat` to start the app.
 
-If required files are missing (`libmpv-2.dll`, `HG_weights.pth`), the app shows a blocking dialog with:
-- an **Open Google Drive** button
-- exact placement paths
-- an **OK** button to re-check files (no restart required)
+What now happens automatically:
+- `setup.bat` tries to download `libmpv-2.dll` and `HG_weights.pth` into the repo.
+- `run_gui.bat` checks for missing Python dependencies and offers to rerun setup if an update added a new library.
+- If `libmpv-2.dll` or `HG_weights.pth` are still missing, the GUI tries to download them on first launch before showing a recovery dialog.
 
-Google Drive assets link:
+Manual fallback assets link:
 
 `https://drive.google.com/drive/folders/1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link`
 
@@ -54,54 +63,84 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## GUI (v2.2)
+## Browser Audio Sync Extension
+
+The browser extension is already included in this repo. You do not download it separately, and it is now audio-only.
+
+Extension folder:
+
+`browser_tab_capture_extension/`
+
+Use this flow for `Browser Window Capture`:
+
+1. Run the app with `run_gui.bat` or `py src\gui.py`
+2. In Chrome, open `Settings > System`
+3. Turn off `Use graphics acceleration when available`
+4. Restart Chrome
+5. Open `chrome://extensions`
+6. Turn on `Developer mode`
+7. Click `Load unpacked`
+8. Select the repo's `browser_tab_capture_extension` folder
+9. In HDRTVNet++, choose `Browser Window Capture (Experimental)`
+10. In Chrome, open the tab you want and click the extension's `Start Chrome Audio Sync`
+11. Back in HDRTVNet++, pick the matching visible Chrome window
+12. Adjust the extension delay slider while playback is running until lip-sync looks right
+
+Important:
+
+- `Browser Window Capture` is experimental.
+- Google Chrome is the only supported browser for synced browser-window playback in this mode.
+- Chrome hardware acceleration must be off for this path.
+- HDRTVNet++ captures video directly from the visible Chrome window.
+- Browser-window video uses a native Windows output-capture backend; performance still depends on window size and monitor configuration.
+- The extension is audio-only and delays tab audio locally inside Chrome.
+- HDRTVNet++ stays silent during browser-window playback.
+- Without Chrome Audio Sync, Chrome keeps playing audio locally and it can lead the video.
+
+---
+
+## GUI (v3.0)
 
 ```bash
 python src/gui.py
 ```
 
-The GUI is the primary way to use the pipeline. It handles everything — kernel compilation, model loading, HDR display — automatically.
+The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, and live browser-window viewing.
 
-### New in v2.2
+### Grand Update v3.0 Highlights
 
-- **Export workflow matured into a production-style path**
+- **Native Browser Window Capture replaces the old browser-video bridge**
+  - HDRTVNet++ now captures browser video directly from the visible Chrome window
+  - the extension is kept only for delayed local Chrome audio
+  - the app no longer depends on browser JPEG frame uploads in this mode
+- **Chrome Audio Sync is simpler and more explicit**
+  - Chrome-only
+  - experimental
+  - manual delay slider in the extension popup
+  - HDRTVNet++ stays silent while Chrome replays delayed tab audio locally
+- **Kernel cache reuse is more robust**
+  - compatible older compile-profile namespaces can be reused instead of acting like the cache disappeared
+  - FP16 and predequantized mixed INT8 cache markers now line up more consistently
+- **Export workflow remains production-oriented**
   - separate `File > Export Video...` flow with independent precision/model/HG selection
   - source-native resolution/FPS defaults
   - aspect-ratio-safe fit/pad resizing
   - ProRes 422 HQ (`.mov`) + PCM audio only
-- **Export dialog polish**
+- **Export and playback polish continues**
   - HDR sources are rejected immediately when chosen
   - keep-aspect ratio editing no longer fights typed values
   - pressing `Enter` in resolution/FPS/path fields no longer starts export accidentally
   - cancel tears down the export runtime and releases GPU resources more cleanly
   - progress/finalization reporting is more truthful during long exports
-- **Export HDR metadata/tagging improved**
+- **HDR metadata/tagging improved**
   - ProRes exports now use a more reliable BT.2020 / PQ tagging path
   - export conversion path now targets a `1001 nit` HDR peak expectation
-- **Export now includes default temporal highlight stabilization**
-  - always-on masked temporal blending in bright, flat, near-neutral, low-motion regions
-  - scene-cut-aware reset to avoid carrying history across hard cuts
+- **Playback and export now use a simpler single-frame path**
+  - temporal stabilization has been removed globally to reduce GPU cost and keep latency/FPS behavior more predictable
+  - browser-window playback, video playback, and export now all follow the same no-temporal-stabilization policy
 - **Experimental max-autotune export reuses the playback compile cache**
   - export uses the same compile/cache keying and compile dialogs as playback
   - max-autotune export uses full Stop behavior first to avoid stale GPU/MIOpen state
-- **Playback compile startup is less wasteful**
-  - exact cache hits now skip the clean precompile subprocess instead of needlessly re-running it
-- **Mixed INT8 upgraded to true 3-way mixed precision**
-  - `W8A8` + `W8A16` + selected full `FP16` sensitive layers
-  - mixed scripts now support both `base.*` and no-HG naming schemes for FP16-sensitive defaults
-- **Full and mixed QAT paths now diverge more intentionally**
-  - `INT8 Mixed (QAT)` is the adaptive path that leans on `W8A16` / `FP16` protection for highlight-sensitive layers
-  - `INT8 Full (QAT)` is now a PTQ-anchored full-W8A8 path that freezes curated sensitive layers and SFT control layers during training
-- **QAT reliability and color behavior improved**
-  - seeded/deterministic defaults for repeatable runs
-  - highlight-aware monitor selection instead of arbitrary first-image validation
-  - early stopping
-  - new highlight-teacher / highlight-balance losses to keep bright neutral highlights closer to GT/PTQ and avoid warm/blue drift
-  - highlight-aware crop sampling so training actually sees more of the hard bright-neutral regions
-- **Compare and timeline stability improved**
-  - compare snapshots are recomputed deterministically instead of borrowing stale live playback state
-  - backward seeks are less likely to leave HDR video stuck on an old frame while audio has already moved
-- **Paused precision / pre-dequantize swaps redraw the current frame in place** without needing Resume
 - **Modular GUI refactor remains in place**
   - `gui.py` composes focused mixins/modules (`gui_ui_builder.py`, `gui_signal_wiring.py`, `gui_playback_runtime.py`, `gui_pipeline_worker_*.py`, etc.)
 
@@ -110,6 +149,7 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | Feature | Description |
 |---|---|
 | **Open any video** | Browse or drag-and-drop — playback starts automatically |
+| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with Chrome Audio Sync handled separately by the bundled extension |
 | **Modular codebase** | GUI and worker logic split into maintainable mixins/modules for easier iteration |
 | **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
 | **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |
@@ -125,9 +165,9 @@ The GUI is the primary way to use the pipeline. It handles everything — kernel
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
 | **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
+| **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
 | **Film grain** | Optional film grain restoration (mpv shader) |
 | **Video export** | Separate export dialog with native resolution/FPS defaults, independent model preset selection, and ProRes 422 HQ output |
-| **Export temporal stabilization** | Always-on masked temporal stabilization reduces bright flat-region chroma speckle/boiling in exported HDR output |
 | **Audio support** | Auto-detect, attach external audio, and choose audio track |
 | **Volume + stability policy** | Volume slider plus automatic mute below low FPS threshold, with fade-in restore on recovery |
 | **Timeline recovery** | Backward seeks and relocks reset stale frame-drop state more reliably to avoid frozen HDR video after the audio already moved |
@@ -154,7 +194,11 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
-  - First HDR-VDP3 run auto-downloads toolbox files to a user cache folder:
+  - If an HDR-VDP3 toolbox is already present from an older run, it is reused and copied into the repo-local folder when possible.
+  - New toolbox downloads only happen when GNU Octave is available.
+  - First HDR-VDP3 run auto-downloads toolbox files into:
+    - `third_party/hdrvdp/`
+  - If the repo location is not writable, it falls back to:
     - `%LOCALAPPDATA%\HDRTVNetCache\hdrvdp\`
   - Requires **GNU Octave** installed and available in `PATH`.
 - You can still override with your own command using env var `HDRTVNET_HDRVDP3_CMD`.
@@ -179,7 +223,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - Export has an **Advanced** tab for:
   - experimental max-autotune compile reuse
   - INT8 pre-dequantize override (`Auto` / `Force On` / `Force Off`)
-- Export now also applies an always-on masked temporal stabilization pass in bright, flat, near-neutral, low-motion regions before ProRes encoding
+- Export follows the same single-frame processing path as playback; temporal stabilization is disabled globally
 - Starting a normal export keeps playback paused/locked for the export run
 - Starting an export with **experimental max-autotune** may trigger the same full **Stop** behavior first so compile/warmup can run cleanly
 - Canceling an export tears down the export model/runtime and releases GPU resources without requiring an app close
@@ -193,7 +237,8 @@ Both SDR and HDR panes are rendered through embedded **mpv** (D3D11):
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
 
 > **Requires** `libmpv-2.dll` in the `src/` folder.
-> Download it from the shared Google Drive assets folder above (same folder as
+> `setup.bat` and first GUI launch now try to download it automatically.
+> Manual fallback: shared Google Drive assets folder above (same folder as
 > `HG_weights.pth`).  
 > Fallback source: [mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)
 > (`mpv-dev-x86_64-*-git-*.7z`).
@@ -374,9 +419,10 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 
 ### HG Weights (Required Download)
 `HG_weights.pth` is not included in this GitHub repo because it is too large for
-normal GitHub tracking. For clone users, startup checks require this file.
+normal GitHub tracking. For clone users, `setup.bat` and the GUI now try to
+download it automatically into the repo when it is missing.
 
-Download it from the shared Google Drive assets folder:
+If you want to place it manually, download it from the shared Google Drive assets folder:
 
 `https://drive.google.com/drive/folders/1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link`
 

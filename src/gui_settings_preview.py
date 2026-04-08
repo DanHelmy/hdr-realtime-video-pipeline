@@ -7,12 +7,24 @@ import cv2
 import numpy as np
 
 from PyQt6.QtCore import QEvent
+from PyQt6.QtWidgets import QInputDialog
 
 from gui_config import (
+    SOURCE_MODE_VIDEO,
+    SOURCE_MODE_WINDOW,
     _available_precision_keys,
     MAX_W,
     MAX_H,
     RESOLUTION_SCALES,
+    SOURCE_MODE_LABELS,
+    _capture_fps_value_from_label,
+    _normalize_capture_fps_label,
+    _normalize_source_mode,
+    _source_mode_label,
+    _max_processing_preset_for_source,
+    _processing_preset_dims,
+    _processing_preset_options_for_source,
+    _source_is_below_processing_preset,
 )
 from gui_scaling import (
     UPSCALER_CHOICES,
@@ -32,7 +44,14 @@ class SettingsPreviewMixin:
         if not hasattr(self, "_cmb_upscale") or self._cmb_upscale is None:
             return
         scale_key = self._cmb_res.currentText()
-        allow = scale_key in {"540p", "720p"}
+        top_key = str(getattr(self, "_source_max_resolution_key", "1080p") or "1080p")
+        top_dims = _processing_preset_dims(top_key)
+        sel_dims = _processing_preset_dims(scale_key)
+        allow = (
+            scale_key in {"540p", "720p"}
+            and sel_dims[0] < top_dims[0]
+            and sel_dims[1] < top_dims[1]
+        )
         self._cmb_upscale.blockSignals(True)
         if allow:
             self._cmb_upscale.setEnabled(True)
@@ -44,11 +63,13 @@ class SettingsPreviewMixin:
         self._cmb_upscale.blockSignals(False)
 
     def _refresh_resolution_options_for_video(self, path: str):
-        """Show only processing presets that do not exceed source resolution."""
+        """Limit processing presets to the nearest source-sized preset bucket."""
         options = list(RESOLUTION_SCALES.keys())
         source_dims = None
         current = self._cmb_res.currentText()
         self._source_proc_dims = None
+        self._source_video_dims = None
+        self._source_max_resolution_key = "1080p"
 
         cap = cv2.VideoCapture(path)
         if cap.isOpened():
@@ -57,21 +78,16 @@ class SettingsPreviewMixin:
             cap.release()
             if vw > 0 and vh > 0:
                 source_dims = (vw, vh)
-                filtered = []
-                for key, dims in RESOLUTION_SCALES.items():
-                    tw, th = (MAX_W, MAX_H) if dims is None else dims
-                    if tw <= vw and th <= vh:
-                        filtered.append(key)
-                if filtered:
-                    options = filtered
-                    self._source_proc_dims = None
-                else:
-                    sw = max(2, vw - (vw % 2))
-                    sh = max(2, vh - (vh % 2))
-                    self._source_proc_dims = (sw, sh)
-                    options = ["Source"]
+                self._source_video_dims = source_dims
+                self._source_max_resolution_key = _max_processing_preset_for_source(
+                    vw, vh
+                )
+                options = _processing_preset_options_for_source(vw, vh)
         else:
             cap.release()
+
+        if current == "Source":
+            current = self._source_max_resolution_key
 
         self._cmb_res.blockSignals(True)
         self._cmb_res.clear()
@@ -84,9 +100,16 @@ class SettingsPreviewMixin:
         self._sync_upscale_controls()
 
         if source_dims is not None and source_dims[1] < MAX_H:
-            self.statusBar().showMessage(
-                f"Source is {source_dims[0]}x{source_dims[1]}: hiding higher processing presets."
+            top_key = self._source_max_resolution_key
+            msg = (
+                f"Source is {source_dims[0]}x{source_dims[1]}: "
+                f"max processing/output preset is {top_key}."
             )
+            if _source_is_below_processing_preset(
+                source_dims[0], source_dims[1], top_key
+            ):
+                msg += f" No upscale is applied when {top_key} is selected."
+            self.statusBar().showMessage(msg)
 
     def _load_user_settings(
         self,
@@ -97,6 +120,8 @@ class SettingsPreviewMixin:
         initial_upscale,
         initial_film_grain,
         initial_hdr_gt,
+        initial_source_mode=None,
+        initial_capture_fps=None,
     ):
         """Load persisted GUI preferences unless explicitly overridden by CLI."""
         data = {}
@@ -111,6 +136,22 @@ class SettingsPreviewMixin:
             p = data.get("precision")
             if p in _available_precision_keys():
                 self._cmb_prec.setCurrentText(p)
+        self._source_mode_prompt_pending = "source_mode" not in data and initial_source_mode is None
+        source_mode = _normalize_source_mode(
+            initial_source_mode
+            if initial_source_mode is not None
+            else data.get("source_mode", SOURCE_MODE_VIDEO)
+        )
+        self._source_mode = source_mode
+        self._cmb_source_mode.setCurrentText(_source_mode_label(source_mode))
+        capture_fps_label = _normalize_capture_fps_label(
+            initial_capture_fps
+            if initial_capture_fps is not None
+            else data.get("capture_fps", self._capture_fps_label)
+        )
+        self._capture_fps_label = capture_fps_label
+        self._capture_fps_value = _capture_fps_value_from_label(capture_fps_label)
+        self._cmb_capture_fps.setCurrentText(capture_fps_label)
         if initial_resolution is None:
             r = data.get("resolution")
             if r in RESOLUTION_SCALES or r == "Source":
@@ -133,17 +174,12 @@ class SettingsPreviewMixin:
             v = data.get("view")
             if v == "Tabbed":
                 self._cmb_view.setCurrentText("Tabbed")
-        # Restore last active tab (defaults to HDR if missing).
+        # Restore last active tab when available; otherwise keep the current tab.
         if self._video_tabs is not None:
-            saved_tab = data.get("active_tab", "HDR")
-            for i in range(self._video_tabs.count()):
-                if self._video_tabs.tabText(i) == saved_tab:
-                    self._video_tabs.setCurrentIndex(i)
-                    break
-            else:
-                # If saved tab not found, default to HDR.
+            saved_tab = str(data.get("active_tab", "") or "").strip()
+            if saved_tab:
                 for i in range(self._video_tabs.count()):
-                    if self._video_tabs.tabText(i) == "HDR":
+                    if self._video_tabs.tabText(i) == saved_tab:
                         self._video_tabs.setCurrentIndex(i)
                         break
         self._chk_hg.setChecked(bool(data.get("use_hg", True)))
@@ -209,9 +245,16 @@ class SettingsPreviewMixin:
         self._update_hdr_ground_truth_label()
 
         self._sync_upscale_controls()
+        self._refresh_source_mode_ui()
 
     def _save_user_settings(self):
         data = {
+            "source_mode": str(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)),
+            "capture_fps": str(
+                self._cmb_capture_fps.currentText()
+                if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
+                else getattr(self, "_capture_fps_label", _normalize_capture_fps_label(None))
+            ),
             "precision": self._cmb_prec.currentText(),
             "resolution": self._cmb_res.currentText(),
             "upscale_mode": self._cmb_upscale.currentText()
@@ -293,6 +336,174 @@ class SettingsPreviewMixin:
     def _update_apply_button_state(self):
         self._btn_apply_settings.setEnabled(self._has_pending_setting_changes())
 
+    def _current_source_available(self) -> bool:
+        if str(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)) == SOURCE_MODE_WINDOW:
+            return getattr(self, "_capture_target", None) is not None
+        return bool(getattr(self, "_video_path", None))
+
+    def _refresh_source_mode_ui(self):
+        mode = _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+        self._source_mode = mode
+        is_window = mode == SOURCE_MODE_WINDOW
+        if hasattr(self, "_cmb_source_mode") and self._cmb_source_mode is not None:
+            self._cmb_source_mode.blockSignals(True)
+            self._cmb_source_mode.setCurrentText(_source_mode_label(mode))
+            self._cmb_source_mode.setEnabled(not self._playing)
+            self._cmb_source_mode.blockSignals(False)
+        if hasattr(self, "_capture_fps_container") and self._capture_fps_container is not None:
+            self._capture_fps_container.setVisible(is_window)
+        if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
+            self._cmb_capture_fps.blockSignals(True)
+            self._cmb_capture_fps.setCurrentText(
+                _normalize_capture_fps_label(getattr(self, "_capture_fps_label", None))
+            )
+            self._cmb_capture_fps.setEnabled(is_window and not self._playing)
+            self._cmb_capture_fps.blockSignals(False)
+        if hasattr(self, "_btn_file") and self._btn_file is not None:
+            self._btn_file.setText("Choose Browser Window ..." if is_window else "Open Video ...")
+        if hasattr(self, "_act_open_source") and self._act_open_source is not None:
+            self._act_open_source.setText("&Choose Browser Window ..." if is_window else "&Open Video ...")
+        if hasattr(self, "_act_export_video") and self._act_export_video is not None:
+            self._act_export_video.setEnabled(not is_window)
+        if hasattr(self, "_btn_pause") and self._btn_pause is not None:
+            self._btn_pause.setVisible(not is_window)
+            if is_window:
+                self._btn_pause.setEnabled(False)
+        if hasattr(self, "_btn_compare") and self._btn_compare is not None:
+            self._btn_compare.setVisible(not is_window)
+            if is_window:
+                self._btn_compare.setEnabled(False)
+        if hasattr(self, "_btn_hdr_gt") and self._btn_hdr_gt is not None:
+            self._btn_hdr_gt.setVisible(not is_window)
+            self._btn_hdr_gt.setEnabled(not is_window)
+            if is_window:
+                self._btn_hdr_gt.setToolTip(
+                    "HDR ground-truth compare is only available for file-based video playback."
+                )
+            else:
+                self._btn_hdr_gt.setToolTip(
+                    "Choose an HDR ground-truth video for compare / objective metrics."
+                )
+        if hasattr(self, "_lbl_hdr_gt") and self._lbl_hdr_gt is not None:
+            self._lbl_hdr_gt.setVisible(not is_window)
+        if hasattr(self, "_row3_widget") and self._row3_widget is not None:
+            self._row3_widget.setVisible(not is_window)
+        if hasattr(self, "_cmb_audio_track") and self._cmb_audio_track is not None and is_window:
+            self._cmb_audio_track.blockSignals(True)
+            self._cmb_audio_track.clear()
+            target = getattr(self, "_capture_target", None)
+            has_tab_audio_sync = bool(str(getattr(target, "session_id", "") or "").strip())
+            if has_tab_audio_sync:
+                self._cmb_audio_track.addItem("Chrome extension delayed audio")
+                tooltip = (
+                    "Browser Window Capture is experimental and only supported with Google Chrome. "
+                    "Chrome's 'Use graphics acceleration when available' must be turned off. "
+                    "HDRTVNet++ stays silent while the Chrome extension delays and plays the tab audio locally. "
+                    "Adjust the delay in the extension popup while playback is running. "
+                    "Exact sync depends on your PC, browser, and processing load."
+                )
+            else:
+                self._cmb_audio_track.addItem("Chrome Audio Sync not active")
+                tooltip = (
+                    "Browser Window Capture is experimental and only supported with Google Chrome. "
+                    "Chrome's 'Use graphics acceleration when available' must be turned off. "
+                    "Start Chrome Audio Sync in the Chrome extension if you want delayed local browser audio. "
+                    "Without it, HDRTVNet++ stays silent and Chrome keeps playing its own audio locally, which can lead the video."
+                )
+            self._cmb_audio_track.setEnabled(False)
+            self._cmb_audio_track.setToolTip(tooltip)
+            self._cmb_audio_track.blockSignals(False)
+        elif hasattr(self, "_cmb_audio_track") and self._cmb_audio_track is not None:
+            path = getattr(self, "_video_path", None)
+            if path and os.path.isfile(path):
+                try:
+                    self._refresh_audio_tracks_for_video(path)
+                except Exception:
+                    pass
+            else:
+                self._cmb_audio_track.blockSignals(True)
+                self._cmb_audio_track.clear()
+                self._cmb_audio_track.addItem("Select a video first")
+                self._cmb_audio_track.setEnabled(False)
+                self._cmb_audio_track.setToolTip(
+                    "Choose a source video to inspect audio tracks."
+                )
+                self._cmb_audio_track.blockSignals(False)
+        if hasattr(self, "_lbl_file") and self._lbl_file is not None:
+            if is_window:
+                target = getattr(self, "_capture_target", None)
+                self._lbl_file.setText(target.label if target is not None else "No browser window selected")
+            else:
+                path = getattr(self, "_video_path", None)
+                self._lbl_file.setText(os.path.basename(path) if path else "No video selected")
+        if hasattr(self, "_m") and isinstance(self._m, dict) and "frame" in self._m:
+            self._m["frame"].setText("Frame: Live" if is_window else "Frame: -")
+        if not self._playing and hasattr(self, "_btn_play") and self._btn_play is not None:
+            self._btn_play.setEnabled(self._current_source_available())
+
+    def _maybe_prompt_source_mode_choice(self):
+        if not bool(getattr(self, "_source_mode_prompt_pending", False)):
+            return
+        self._source_mode_prompt_pending = False
+        options = [
+            SOURCE_MODE_LABELS[SOURCE_MODE_VIDEO],
+            SOURCE_MODE_LABELS[SOURCE_MODE_WINDOW],
+        ]
+        current_idx = 0 if self._source_mode == SOURCE_MODE_VIDEO else 1
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Choose Source Mode",
+            "How do you want to use HDRTVNet++ first?",
+            options,
+            current_idx,
+            False,
+        )
+        if ok and str(choice or "").strip():
+            self._source_mode = _normalize_source_mode(str(choice))
+        else:
+            self._source_mode = SOURCE_MODE_VIDEO
+        self._refresh_source_mode_ui()
+        self._save_user_settings()
+
+    def _show_idle_preview_frame(self, preview: np.ndarray | None):
+        if preview is not None:
+            if self._disp_sdr_cpu is not None:
+                self._disp_sdr_cpu.update_frame(preview)
+            if self._disp_hdr_cpu is not None:
+                self._disp_hdr_cpu.update_frame(preview)
+            if self._disp_sdr_mpv is not None:
+                self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
+            if self._disp_hdr_mpv is not None:
+                self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
+        else:
+            if self._disp_sdr_cpu is not None:
+                self._disp_sdr_cpu.clear_display()
+            if self._disp_hdr_cpu is not None:
+                self._disp_hdr_cpu.clear_display()
+
+    def _set_source_resolution_options_for_dims(self, src_w: int, src_h: int):
+        options = list(RESOLUTION_SCALES.keys())
+        current = self._cmb_res.currentText()
+        self._source_proc_dims = None
+        self._source_video_dims = (int(src_w), int(src_h))
+        self._source_max_resolution_key = "1080p"
+        if current == "Source":
+            current = self._source_max_resolution_key
+        self._cmb_res.blockSignals(True)
+        self._cmb_res.clear()
+        self._cmb_res.addItems(options)
+        if current in options:
+            self._cmb_res.setCurrentText(current)
+        else:
+            self._cmb_res.setCurrentIndex(0)
+        self._cmb_res.blockSignals(False)
+        self._sync_upscale_controls()
+        msg = (
+            f"Browser window source is {int(src_w)}x{int(src_h)}: "
+            "browser-window capture processing/output remains capped at 1080p."
+        )
+        self.statusBar().showMessage(msg)
+
     def _choose_preview_frame(self, path: str) -> np.ndarray | None:
         """Pick a representative frame (non-black, high-detail) for idle preview."""
         cap = cv2.VideoCapture(path)
@@ -335,21 +546,7 @@ class SettingsPreviewMixin:
 
     def _show_idle_preview(self, path: str):
         """Render selected-video preview without starting playback."""
-        preview = self._choose_preview_frame(path)
-        if preview is not None:
-            if self._disp_sdr_cpu is not None:
-                self._disp_sdr_cpu.update_frame(preview)
-            if self._disp_hdr_cpu is not None:
-                self._disp_hdr_cpu.update_frame(preview)
-            if self._disp_sdr_mpv is not None:
-                self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
-            if self._disp_hdr_mpv is not None:
-                self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
-        else:
-            if self._disp_sdr_cpu is not None:
-                self._disp_sdr_cpu.clear_display()
-            if self._disp_hdr_cpu is not None:
-                self._disp_hdr_cpu.clear_display()
+        self._show_idle_preview_frame(self._choose_preview_frame(path))
 
     def _prepare_idle_timeline(self, path: str):
         """Populate duration labels/slider in idle state."""
@@ -373,3 +570,33 @@ class SettingsPreviewMixin:
         self._lbl_time.setText("0:00")
         dur_secs = total_frames / self._vid_fps if self._vid_fps > 0 else 0.0
         self._lbl_duration.setText(self._fmt_time(dur_secs))
+
+    def _prepare_live_timeline(self, fps: float):
+        self._vid_fps = float(fps) if fps and fps > 0 else 24.0
+        self._seek_slider.setRange(0, 0)
+        self._seek_slider.setValue(0)
+        self._seek_slider.setEnabled(False)
+        self._lbl_time.setText("0:00")
+        self._lbl_duration.setText("LIVE")
+
+    def _on_source_mode_changed(self, label: str):
+        new_mode = _normalize_source_mode(label)
+        if new_mode == getattr(self, "_source_mode", SOURCE_MODE_VIDEO):
+            self._refresh_source_mode_ui()
+            return
+        if self._playing:
+            self._cmb_source_mode.blockSignals(True)
+            self._cmb_source_mode.setCurrentText(_source_mode_label(self._source_mode))
+            self._cmb_source_mode.blockSignals(False)
+            self.statusBar().showMessage(
+                "Stop playback before switching between Video Player and Browser Window Capture."
+            )
+            return
+        self._source_mode = new_mode
+        self._capture_fps_label = _normalize_capture_fps_label(
+            getattr(self, "_cmb_capture_fps", None).currentText()
+            if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
+            else getattr(self, "_capture_fps_label", None)
+        )
+        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
+        self._refresh_source_mode_ui()

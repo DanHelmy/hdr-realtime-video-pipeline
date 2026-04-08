@@ -32,12 +32,12 @@ import os
 import sys
 import time
 
-from windows_runtime import default_cache_root, ensure_windows_supported
+from windows_runtime import ensure_windows_supported, project_cache_root
 
 # Pin caches to a stable user path (avoid Temp churn/permissions).
 ensure_windows_supported("HDRTVNet++ kernel compiler")
 
-_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", default_cache_root())
+_cache_root = project_cache_root(__file__)
 try:
     os.makedirs(_cache_root, exist_ok=True)
 except Exception:
@@ -96,6 +96,28 @@ def _mark_compiled(
     )
 
 
+def _effective_marker_predequantize_mode(
+    precision: str,
+    args_predequantize: str,
+    processor,
+) -> str:
+    if not str(precision or "").strip().lower().startswith("int8"):
+        return "auto"
+    mode = str(args_predequantize or "auto").strip().lower()
+    if mode not in {"auto", "on", "off"}:
+        mode = "auto"
+    if mode != "auto":
+        return mode
+    # Match the actual runtime graph that got compiled. Older versions wrote
+    # "auto" literally, which made GUI playback miss AMD/NVIDIA auto-resolved
+    # INT8 cache entries and show false first-time warnings.
+    try:
+        is_w8_model = bool(getattr(processor, "_is_w8_model"))
+    except Exception:
+        return "auto"
+    return "off" if is_w8_model else "on"
+
+
 def _clear_caches():
     """Delete Triton and TorchInductor kernel caches."""
     import shutil
@@ -106,7 +128,7 @@ def _clear_caches():
     cleared = []
 
     triton_root = pathlib.Path(
-        os.environ.get("TRITON_CACHE_DIR", os.path.join(default_cache_root(), "triton"))
+        os.environ.get("TRITON_CACHE_DIR", os.path.join(project_cache_root(__file__), "triton"))
     )
     triton_dir = triton_root / "cache"
     if triton_dir.exists():
@@ -253,7 +275,11 @@ def main():
             args.precision,
             model_path=model_path,
             use_hg=str(args.use_hg).strip() != "0",
-            predequantize_mode=args.predequantize,
+            predequantize_mode=_effective_marker_predequantize_mode(
+                args.precision,
+                args.predequantize,
+                processor,
+            ),
         )
 
     print("[compile] All resolutions compiled successfully.")

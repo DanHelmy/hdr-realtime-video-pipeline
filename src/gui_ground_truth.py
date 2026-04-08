@@ -114,6 +114,13 @@ class GroundTruthMixin:
         )
 
     def _pick_hdr_ground_truth_file(self):
+        if getattr(self, "_source_mode", "video") != "video":
+            QMessageBox.information(
+                self,
+                "HDR Ground Truth",
+                "HDR ground-truth compare is only available for file-based video playback.",
+            )
+            return
         if not self._video_path or not os.path.isfile(self._video_path):
             QMessageBox.information(
                 self,

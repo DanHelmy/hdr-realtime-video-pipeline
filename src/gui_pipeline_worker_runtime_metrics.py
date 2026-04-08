@@ -29,6 +29,8 @@ class PipelineWorkerRuntimeMetricsMixin:
         deitp_avg,
         hdr_vdp3_avg,
         hg_weights_path: str,
+        live_video_latency_ms: float = 0.0,
+        is_live_capture: bool = False,
     ) -> None:
         if (
             not force
@@ -72,6 +74,8 @@ class PipelineWorkerRuntimeMetricsMixin:
         self.metrics_updated.emit({
             "fps": fps,
             "latency_ms": avg,
+            "live_video_latency_ms": float(live_video_latency_ms),
+            "is_live_capture": bool(is_live_capture),
             "frame": frame_idx,
             "cpu_mb": cpu_mb,
             "gpu_mb": gpu_mb,

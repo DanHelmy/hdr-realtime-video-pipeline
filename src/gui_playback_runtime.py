@@ -21,11 +21,18 @@ from PyQt6.QtWidgets import (
 
 from gui_config import (
     PRECISIONS,
+    SOURCE_MODE_VIDEO,
+    SOURCE_MODE_WINDOW,
     _select_model_path,
     _available_precision_keys,
+    _capture_fps_value_from_label,
+    _normalize_capture_fps_label,
+    _normalize_source_mode,
     MAX_W,
     MAX_H,
     RESOLUTION_SCALES,
+    _processing_preset_dims,
+    _source_is_below_processing_preset,
 )
 from gui_compile_cache import (
     _compiled_marker_path,
@@ -42,6 +49,11 @@ from gui_media_probe import (
     _probe_hdr_input,
     _norm_path,
 )
+from required_clone_assets import (
+    ensure_required_clone_assets,
+    manual_assets_drive_url,
+    missing_required_clone_assets,
+)
 from gui_scaling import (
     BEST_UPSCALE_MODE,
     UPSCALER_CHOICES,
@@ -55,7 +67,14 @@ from gui_scaling import (
     _ensure_filmgrain_shader,
 )
 from gui_widgets import _KernelCacheClearWorker
-from windows_runtime import default_cache_root
+from gui_capture_dialogs import WindowCaptureDialog
+from windows_runtime import project_cache_root
+from window_capture_source import (
+    WindowCaptureTarget,
+    capture_target_to_cli_args,
+    probe_window_capture_target,
+    resolve_window_capture_target,
+)
 
 try:
     from models.hdrtvnet_torch import _HAS_COMPILE, _HAS_HIP_SDK, _HAS_TRITON, _IS_ROCM
@@ -71,10 +90,6 @@ _HG_WEIGHTS_PATH = os.path.join(
     _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
 _LIBMPV_DLL_PATH = os.path.join(_ROOT, "src", "libmpv-2.dll")
-_ASSETS_DRIVE_URL = (
-    "https://drive.google.com/drive/folders/"
-    "1jh8gXBVzqRse-7w_2Dztca1_KVh5eRu1?usp=drive_link"
-)
 _HIP_SDK_URL = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
 
 
@@ -92,6 +107,20 @@ def _normalize_predequantize_mode(mode: str) -> str:
 class PlaybackRuntimeMixin:
     """Playback, restart/apply settings, and compile/file tool flows for MainWindow."""
 
+    def _stop_active_browser_tab_session(self) -> None:
+        if _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)) != SOURCE_MODE_WINDOW:
+            return
+        target = getattr(self, "_capture_target", None)
+        session_id = str(getattr(target, "session_id", "") or "").strip()
+        if not session_id:
+            return
+        try:
+            from browser_tab_bridge import close_browser_tab_session
+
+            close_browser_tab_session(session_id)
+        except Exception:
+            pass
+
     _EXPORT_LOCK_WIDGET_NAMES = (
         "_btn_file",
         "_btn_play",
@@ -100,6 +129,8 @@ class PlaybackRuntimeMixin:
         "_btn_compare",
         "_btn_apply_settings",
         "_seek_slider",
+        "_cmb_source_mode",
+        "_cmb_capture_fps",
         "_cmb_prec",
         "_chk_hg",
         "_cmb_res",
@@ -210,6 +241,11 @@ class PlaybackRuntimeMixin:
         use_hg: bool,
         selected_predequantize_mode: str | None = None,
     ) -> bool:
+        selected_pdq_mode = _normalize_predequantize_mode(
+            selected_predequantize_mode
+            if selected_predequantize_mode is not None
+            else getattr(self, "_predequantize_mode", "auto")
+        )
         effective_pdq_mode = self._effective_predequantize_mode_for_precision(
             precision,
             selected_mode=selected_predequantize_mode,
@@ -223,6 +259,22 @@ class PlaybackRuntimeMixin:
             predequantize_mode=effective_pdq_mode,
         ):
             return True
+        if (
+            str(precision).startswith("int8")
+            and selected_pdq_mode == "auto"
+            and effective_pdq_mode != "auto"
+        ):
+            # Backward compatibility: older compile subprocesses wrote the
+            # raw "auto" marker even when runtime auto-resolved to on/off.
+            if _is_compiled(
+                w,
+                h,
+                precision,
+                model_path=model_path,
+                use_hg=bool(use_hg),
+                predequantize_mode="auto",
+            ):
+                return True
         # INT8 with effective pre-dequantize ON reuses FP16 runtime graph
         # shape; treat matching FP16 compile as ready.
         if str(precision).startswith("int8") and effective_pdq_mode == "on":
@@ -237,6 +289,16 @@ class PlaybackRuntimeMixin:
             ):
                 return True
         return False
+
+    def _effective_precompile_predequantize_mode(
+        self,
+        precision: str,
+        selected_mode: str | None = None,
+    ) -> str:
+        return self._effective_predequantize_mode_for_precision(
+            precision,
+            selected_mode=selected_mode,
+        )
 
     def _compile_cache_missing_for_any(
         self,
@@ -269,13 +331,66 @@ class PlaybackRuntimeMixin:
             return
         self._warn_if_hip_sdk_missing_on_rocm_windows()
 
-    def _missing_required_clone_assets(self) -> list[tuple[str, str]]:
-        missing: list[tuple[str, str]] = []
-        if not os.path.isfile(_LIBMPV_DLL_PATH):
-            missing.append(("libmpv-2.dll", _LIBMPV_DLL_PATH))
-        if not os.path.isfile(_HG_WEIGHTS_PATH):
-            missing.append(("HG_weights.pth", _HG_WEIGHTS_PATH))
+    def _missing_required_clone_assets(self) -> list[tuple[str, str, str]]:
+        missing: list[tuple[str, str, str]] = []
+        for asset in missing_required_clone_assets(_ROOT):
+            missing.append(
+                (
+                    asset.name,
+                    str(asset.target_path(_ROOT)),
+                    asset.drive_url,
+                )
+            )
         return missing
+
+    def _try_auto_download_required_clone_assets(self) -> tuple[bool, list[str]]:
+        if not _env_enabled("HDRTVNET_AUTO_DOWNLOAD_CLONE_ASSETS", "1"):
+            return False, ["Automatic asset download is disabled by environment."]
+
+        dlg = QProgressDialog("Downloading required files ...", None, 0, 0, self)
+        dlg.setWindowTitle("Downloading Required Files")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.show()
+        QApplication.processEvents()
+
+        def _progress(message: str):
+            dlg.setLabelText(message)
+            QApplication.processEvents()
+
+        try:
+            results = ensure_required_clone_assets(_ROOT, progress=_progress)
+        finally:
+            dlg.close()
+            QApplication.processEvents()
+
+        errors = [
+            f"- {result.asset.name}: {result.detail}"
+            for result in results
+            if result.status == "failed"
+        ]
+        return len(self._missing_required_clone_assets()) == 0, errors
+
+    def _launch_setup_and_exit(self) -> bool:
+        setup_bat = os.path.join(_ROOT, "setup.bat")
+        try:
+            os.startfile(setup_bat)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Setup Launch Failed",
+                f"Could not open setup.bat automatically.\n\n{exc}",
+            )
+            return False
+        QMessageBox.information(
+            self,
+            "Setup Started",
+            "Setup has been opened in a new window.\n\n"
+            "Finish setup, then launch the GUI again.",
+        )
+        self.close()
+        return False
 
     def _enforce_required_clone_assets(self) -> bool:
         """Block startup until required external clone assets are present."""
@@ -286,9 +401,14 @@ class PlaybackRuntimeMixin:
         if not missing:
             return True
 
+        auto_ok, auto_errors = self._try_auto_download_required_clone_assets()
+        if auto_ok:
+            return True
+        missing = self._missing_required_clone_assets()
+
         while missing:
             missing_lines = "\n".join(
-                [f"- {name}: {path}" for name, path in missing]
+                [f"- {name}: {path}" for name, path, _url in missing]
             )
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Critical)
@@ -296,42 +416,67 @@ class PlaybackRuntimeMixin:
             box.setText(
                 "This Git-clone setup is missing required files, so the app cannot run yet."
             )
+            auto_error_text = ""
+            if auto_errors:
+                auto_error_text = (
+                    "\nAutomatic download did not complete:\n"
+                    + "\n".join(auto_errors)
+                    + "\n"
+                )
             box.setInformativeText(
-                "Download from Google Drive, place files exactly at:\n\n"
+                "The app already tried to download the missing files automatically.\n\n"
+                "Required locations:\n\n"
                 "1) libmpv-2.dll -> src/libmpv-2.dll\n"
                 "2) HG_weights.pth -> src/models/weights/HG_weights.pth\n\n"
-                "Then click OK to re-check.\n"
-                "If files are still missing, this warning will appear again.\n\n"
+                "Use Retry to try the auto-download again, Run Setup to refresh the environment, "
+                "or open the Google Drive links and place the files manually."
+                f"{auto_error_text}\n"
                 f"Missing right now:\n{missing_lines}"
+            )
+            retry_btn = box.addButton(
+                "Retry Download / Re-check",
+                QMessageBox.ButtonRole.AcceptRole,
             )
             open_btn = box.addButton(
                 "Open Google Drive",
                 QMessageBox.ButtonRole.ActionRole,
             )
-            ok_btn = box.addButton(
-                "OK",
+            setup_btn = box.addButton(
+                "Run Setup",
                 QMessageBox.ButtonRole.AcceptRole,
             )
             exit_btn = box.addButton(
                 "Exit",
                 QMessageBox.ButtonRole.RejectRole,
             )
-            box.setDefaultButton(ok_btn)
+            box.setDefaultButton(retry_btn)
             box.setEscapeButton(exit_btn)
             box.exec()
 
             clicked = box.clickedButton()
             if clicked is open_btn:
                 try:
-                    webbrowser.open(_ASSETS_DRIVE_URL, new=2)
+                    opened_any = False
+                    for _name, _path, url in missing:
+                        if url:
+                            webbrowser.open(url, new=2)
+                            opened_any = True
+                    if not opened_any:
+                        webbrowser.open(manual_assets_drive_url(), new=2)
                 except Exception:
                     pass
                 missing = self._missing_required_clone_assets()
                 continue
 
-            if clicked is ok_btn:
+            if clicked is retry_btn:
+                auto_ok, auto_errors = self._try_auto_download_required_clone_assets()
+                if auto_ok:
+                    return True
                 missing = self._missing_required_clone_assets()
                 continue
+
+            if clicked is setup_btn:
+                return self._launch_setup_and_exit()
 
             self.close()
             return False
@@ -405,6 +550,8 @@ class PlaybackRuntimeMixin:
             "Kernel max-autotune is about to run.\n\n"
             "For best kernel selection, close GPU-heavy apps first "
             "(games, video editors, and browser GPU tabs).\n\n"
+            "If max-autotune still gives poor kernel picks, a fresh PC restart "
+            "can help clear leftover GPU/driver state before compiling again.\n\n"
             "Continue compiling now?",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Ok,
@@ -489,8 +636,7 @@ class PlaybackRuntimeMixin:
                         f"{cur_pw}x{cur_ph}; restarting for clean compile."
                     )
                     self._save_user_settings()
-                    self._restart_with_video(
-                        self._video_path,
+                    self._restart_with_active_source(
                         resolution=self._cmb_res.currentText(),
                         precision=active_gui_prec,
                         view=self._cmb_view.currentText(),
@@ -665,11 +811,20 @@ class PlaybackRuntimeMixin:
             self._worker.set_sdr_mpv_widget(self._disp_sdr_mpv)
             self._sdr_mpv_feed_from_worker = True
             self._pending_sdr_mpv_start = None
+        self._note_live_audio_compile_ready()
         self._sync_screen_change_hooks()
 
     def _precompile_kernels(self):
         """Open the pre-compile dialog - runs compile_kernels.py as a
         completely separate process with zero GPU interference."""
+        if self._playing or (self._worker is not None and self._worker.isRunning()):
+            QMessageBox.information(
+                self,
+                "Pre-compile Kernels",
+                "Stop playback before pre-compiling kernels.\n\n"
+                "This avoids GPU interference and ensures clean autotune results.",
+            )
+            return
 
         opts = _PrecompileOptionsDialog(
             initial_precision=self._cmb_prec.currentText(),
@@ -700,8 +855,9 @@ class PlaybackRuntimeMixin:
             use_hg=self._chk_hg.isChecked(),
             hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
             clear_cache=False,
-            predequantize_mode=_normalize_predequantize_mode(
-                getattr(self, "_predequantize_mode", "auto")
+            predequantize_mode=self._effective_precompile_predequantize_mode(
+                prec_arg,
+                getattr(self, "_predequantize_mode", "auto"),
             ),
             parent=self,
         )
@@ -715,9 +871,20 @@ class PlaybackRuntimeMixin:
         import pathlib
         import re
         import tempfile
+        if self._playing or (self._worker is not None and self._worker.isRunning()):
+            QMessageBox.information(
+                self,
+                "Clear Kernel Cache",
+                "Stop playback before clearing the kernel cache.\n\n"
+                "This prevents mid-playback stalls and avoids GPU contention.",
+            )
+            return
 
         triton_root = pathlib.Path(
-            os.environ.get("TRITON_CACHE_DIR", os.path.join(default_cache_root(), "triton"))
+            os.environ.get(
+                "TRITON_CACHE_DIR",
+                os.path.join(project_cache_root(__file__), "triton"),
+            )
         )
         triton_dir = triton_root / "cache"
 
@@ -765,7 +932,7 @@ class PlaybackRuntimeMixin:
 
         marker_lines = _read_marker_lines()
         key_re = re.compile(
-            r"^(?P<w>\d+)x(?P<h>\d+)_(?P<precision>[^_]+)_hg[01]_[^_]+_"
+            r"^(?:(?P<ns>[^:]+):)?(?P<w>\d+)x(?P<h>\d+)_(?P<precision>[^_]+)_hg[01]_[^_]+_"
             r"(?:(?:auto|on|off)_)?(?:[A-Za-z0-9-]+)$"
         )
         marker_groups: dict[tuple[str, int, int], set[str]] = {}
@@ -968,7 +1135,11 @@ class PlaybackRuntimeMixin:
             )
 
     def _open_file(self):
-        if self._show_export_lock_message("Open video"):
+        action_name = "Choose browser window" if self._source_mode == SOURCE_MODE_WINDOW else "Open video"
+        if self._show_export_lock_message(action_name):
+            return
+        if self._source_mode == SOURCE_MODE_WINDOW:
+            self._open_window_capture_dialog()
             return
         start_dir = self._last_open_dir if os.path.isdir(self._last_open_dir) else _ROOT
         path, _ = QFileDialog.getOpenFileName(
@@ -987,7 +1158,47 @@ class PlaybackRuntimeMixin:
                 pass
             self._set_video(path)
 
+    def _open_window_capture_dialog(self):
+        current_session_id = None
+        target = getattr(self, "_capture_target", None)
+        if target is not None:
+            try:
+                current_session_id = str(getattr(target, "session_id", "") or "").strip() or None
+            except Exception:
+                current_session_id = None
+        dlg = WindowCaptureDialog(
+            initial_fps_label=_normalize_capture_fps_label(
+                getattr(self, "_capture_fps_label", None)
+            ),
+            initial_session_id=current_session_id,
+            initial_target=target if isinstance(target, WindowCaptureTarget) else None,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = dlg.selected_target()
+        if target is None:
+            QMessageBox.information(
+                self,
+                "Browser Window Capture",
+                "Choose a visible browser window first.",
+            )
+            return
+        self._capture_fps_label = dlg.selected_fps_label()
+        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
+        if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
+            self._cmb_capture_fps.setCurrentText(self._capture_fps_label)
+        self._set_window_capture_source(target)
+
     def _open_export_dialog(self):
+        if self._source_mode == SOURCE_MODE_WINDOW:
+            QMessageBox.information(
+                self,
+                "Export Unavailable",
+                "Export is only available in Video Player mode.\n\n"
+                "Browser Window Capture is a live viewer and does not export the source window.",
+            )
+            return
         if self._export_thread is not None:
             QMessageBox.information(
                 self,
@@ -1082,7 +1293,10 @@ class PlaybackRuntimeMixin:
             model_path=model_path,
             use_hg=bool(config.use_hg),
             hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
-            predequantize_mode=selected_pdq_mode,
+            predequantize_mode=self._effective_precompile_predequantize_mode(
+                prec_arg,
+                selected_pdq_mode,
+            ),
             parent=self,
         )
         dlg.exec()
@@ -1315,6 +1529,8 @@ class PlaybackRuntimeMixin:
             return
 
         self._video_path = path
+        self._capture_target = None
+        self._source_mode = SOURCE_MODE_VIDEO
         try:
             vdir = os.path.dirname(path)
             if vdir and os.path.isdir(vdir):
@@ -1332,9 +1548,92 @@ class PlaybackRuntimeMixin:
         self._btn_apply_settings.setEnabled(False)
         self._prepare_idle_timeline(path)
         self._show_idle_preview(path)
+        self._refresh_source_mode_ui()
         self.setWindowTitle(f"HDRTVNet++ - {os.path.basename(path)}")
         self.statusBar().showMessage(
             f"Selected: {path} - preview loaded. Press Play to start."
+        )
+        if auto_play:
+            QTimer.singleShot(100, self._play)
+
+    def _set_window_capture_source(self, target: WindowCaptureTarget, auto_play: bool = False):
+        if self._show_export_lock_message("Choosing a browser window"):
+            return
+        if target is None:
+            return
+
+        preview, src_w, src_h = probe_window_capture_target(target)
+        if preview is None or src_w <= 0 or src_h <= 0:
+            QMessageBox.warning(
+                self,
+                "Browser Window Capture",
+                "Could not capture frames from the selected browser window.\n\n"
+                "Make sure the window is visible on screen, then try again.",
+            )
+            return
+
+        if self._playing:
+            self._stop()
+
+        self._source_mode = SOURCE_MODE_WINDOW
+        self._video_path = None
+        self._capture_target = WindowCaptureTarget(
+            title=str(target.title or "").strip(),
+            process_name=str(target.process_name or "").strip(),
+            pid=int(getattr(target, "pid", 0) or 0),
+            width=int(src_w),
+            height=int(src_h),
+            hwnd=int(getattr(target, "hwnd", 0) or 0),
+            session_id=str(getattr(target, "session_id", "") or "").strip(),
+            browser_name=str(getattr(target, "browser_name", "") or "").strip(),
+            source_url=str(getattr(target, "source_url", "") or "").strip(),
+        )
+        self._capture_fps_label = _normalize_capture_fps_label(
+            getattr(self, "_cmb_capture_fps", None).currentText()
+            if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
+            else getattr(self, "_capture_fps_label", None)
+        )
+        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
+        self._reset_hdr_ground_truth()
+
+        if self._last_res is not None:
+            self._restart_with_capture_source(
+                self._capture_target,
+                resolution=self._cmb_res.currentText(),
+                precision=self._cmb_prec.currentText(),
+                view=self._cmb_view.currentText(),
+                use_hg=self._chk_hg.isChecked(),
+                upscale=self._cmb_upscale.currentText()
+                if hasattr(self, "_cmb_upscale")
+                else None,
+                film_grain=self._chk_film_grain.isChecked()
+                if hasattr(self, "_chk_film_grain")
+                else None,
+                autoplay=auto_play,
+            )
+            return
+
+        self._save_user_settings()
+        self._set_source_resolution_options_for_dims(src_w, src_h)
+        self._prepare_live_timeline(self._capture_fps_value)
+        self._show_idle_preview_frame(preview)
+        self._refresh_source_mode_ui()
+        self._btn_pause.setEnabled(False)
+        self._btn_stop.setEnabled(False)
+        self._btn_compare.setEnabled(False)
+        self._btn_apply_settings.setEnabled(False)
+        self.setWindowTitle(f"HDRTVNet++ - {self._capture_target.label}")
+        has_tab_audio_sync = bool(str(getattr(self._capture_target, "session_id", "") or "").strip())
+        self.statusBar().showMessage(
+            (
+                f"Selected live browser window: {self._capture_target.label}. "
+                "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Press Play to start video. If Chrome Audio Sync is active, the extension will delay and play the tab audio locally while HDRTVNet++ stays silent."
+            )
+            if has_tab_audio_sync
+            else (
+                f"Selected live browser window: {self._capture_target.label}. "
+                "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Start Chrome Audio Sync in the extension before Play if you want delayed local browser audio. Without it, Chrome keeps playing audio locally and it can lead the video."
+            )
         )
         if auto_play:
             QTimer.singleShot(100, self._play)
@@ -1371,6 +1670,12 @@ class PlaybackRuntimeMixin:
         # Hide the parent window so the user doesn't see two GUIs
         self.hide()
         QApplication.instance().processEvents()
+        try:
+            from browser_tab_bridge import close_browser_tab_bridge
+
+            close_browser_tab_bridge()
+        except Exception:
+            pass
 
         # Re-exec with --video
         # The parent must wait for the child so the shell stays blocked
@@ -1403,63 +1708,248 @@ class PlaybackRuntimeMixin:
         rc = _sp.call(args)
         sys.exit(rc)
 
+    def _restart_with_capture_source(
+        self,
+        target: WindowCaptureTarget,
+        resolution=None,
+        precision=None,
+        view=None,
+        use_hg=None,
+        upscale=None,
+        film_grain=None,
+        autoplay=False,
+        start_frame=None,
+    ):
+        if target is None:
+            return
+        self.statusBar().showMessage("Restarting for new capture settings ...")
+        self._suppress_eof_restart_once = True
+        if self._playing:
+            self._worker.stop()
+            self._worker.wait(5000)
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.stop_playback()
+        if self._disp_sdr_mpv is not None:
+            self._disp_sdr_mpv.stop_playback()
+        self.hide()
+        QApplication.instance().processEvents()
+        try:
+            from browser_tab_bridge import close_browser_tab_bridge
+
+            close_browser_tab_bridge()
+        except Exception:
+            pass
+
+        import subprocess as _sp
+
+        args = [sys.executable, sys.argv[0], "--source-mode", SOURCE_MODE_WINDOW]
+        args += capture_target_to_cli_args(target)
+        args += ["--capture-fps", _normalize_capture_fps_label(self._capture_fps_label)]
+        if resolution in RESOLUTION_SCALES:
+            args += ["--resolution", resolution]
+        elif resolution == "Source":
+            args += ["--resolution", "Source"]
+        if precision in PRECISIONS:
+            args += ["--precision", precision]
+        if view == "Tabbed":
+            args += ["--view", view]
+        if use_hg is not None:
+            args += ["--use-hg", "1" if use_hg else "0"]
+        if isinstance(upscale, str) and upscale in UPSCALER_CHOICES:
+            args += ["--upscale", upscale]
+        if film_grain is not None:
+            args += ["--film-grain", "1" if film_grain else "0"]
+        if autoplay:
+            args += ["--autoplay", "1"]
+        if start_frame is not None:
+            args += ["--start-frame", str(max(0, int(start_frame)))]
+        rc = _sp.call(args)
+        sys.exit(rc)
+
+    def _restart_with_active_source(
+        self,
+        *,
+        resolution=None,
+        precision=None,
+        view=None,
+        use_hg=None,
+        upscale=None,
+        film_grain=None,
+        hdr_gt=None,
+        autoplay=False,
+        start_frame=None,
+    ):
+        if self._source_mode == SOURCE_MODE_WINDOW:
+            if self._capture_target is None:
+                return
+            self._restart_with_capture_source(
+                self._capture_target,
+                resolution=resolution,
+                precision=precision,
+                view=view,
+                use_hg=use_hg,
+                upscale=upscale,
+                film_grain=film_grain,
+                autoplay=autoplay,
+                start_frame=start_frame,
+            )
+            return
+        if self._video_path:
+            self._restart_with_video(
+                self._video_path,
+                resolution=resolution,
+                precision=precision,
+                view=view,
+                use_hg=use_hg,
+                upscale=upscale,
+                film_grain=film_grain,
+                hdr_gt=hdr_gt,
+                autoplay=autoplay,
+                start_frame=start_frame,
+            )
+
     # - Slots: playback ---------------------------------------
 
     def _play(self):
         if self._show_export_lock_message("Playback"):
             return
-        if self._playing or not self._video_path:
+        source_mode = _normalize_source_mode(
+            getattr(self, "_source_mode", SOURCE_MODE_VIDEO)
+        )
+        is_window_source = source_mode == SOURCE_MODE_WINDOW
+        if self._playing:
             return
 
-        src_probe = _probe_hdr_input(self._video_path)
-        if bool(src_probe.get("is_hdr", False)):
-            reason = str(src_probe.get("reason", "HDR metadata detected")).strip()
-            QMessageBox.warning(
-                self,
-                "Unsupported Input",
-                "HDR input videos are not supported for conversion.\n\n"
-                f"This file appears HDR ({reason}).\n"
-                "Please select an SDR source video.",
+        if is_window_source:
+            target = getattr(self, "_capture_target", None)
+            if target is None:
+                self.statusBar().showMessage(
+                    "Choose a browser window source first, then press Play."
+                )
+                return
+            resolved_target = resolve_window_capture_target(target)
+            if resolved_target is not None:
+                target = resolved_target
+                self._capture_target = resolved_target
+            preview, vw, vh = probe_window_capture_target(target)
+            if preview is None or vw <= 0 or vh <= 0:
+                QMessageBox.warning(
+                    self,
+                    "Browser Window Capture",
+                    "Could not capture frames from the selected browser window.\n\n"
+                    "Make sure the window is still visible on screen, then try again.",
+                )
+                self.statusBar().showMessage(
+                    "Browser window capture unavailable: no visible window frames were received."
+                )
+                return
+            self._capture_target = WindowCaptureTarget(
+                title=str(target.title or "").strip(),
+                process_name=str(target.process_name or "").strip(),
+                pid=int(getattr(target, "pid", 0) or 0),
+                width=int(vw),
+                height=int(vh),
+                hwnd=int(getattr(target, "hwnd", 0) or 0),
+                session_id=str(getattr(target, "session_id", "") or "").strip(),
+                browser_name=str(getattr(target, "browser_name", "") or "").strip(),
+                source_url=str(getattr(target, "source_url", "") or "").strip(),
             )
-            self.statusBar().showMessage("Cannot start conversion: input video is HDR.")
-            return
-
-        if self._hdr_ground_truth_path:
-            ok, note = self._validate_hdr_ground_truth(
-                self._hdr_ground_truth_path,
-                source_path=self._video_path,
+            self._capture_fps_label = _normalize_capture_fps_label(
+                getattr(self, "_cmb_capture_fps", None).currentText()
+                if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
+                else getattr(self, "_capture_fps_label", None)
             )
-            if not ok:
-                bad_name = os.path.basename(self._hdr_ground_truth_path)
-                self._reset_hdr_ground_truth(f"HDR GT cleared ({bad_name}): {note}")
-            self._objective_metrics_enabled = False
+            self._capture_fps_value = _capture_fps_value_from_label(
+                self._capture_fps_label
+            )
+            self._set_source_resolution_options_for_dims(vw, vh)
+            self._prepare_live_timeline(self._capture_fps_value)
+            self._source_hdr_info = {"is_hdr": False, "reason": "browser_window_capture"}
+            total_frames = 0
+            self._vid_fps = float(self._capture_fps_value or 24.0)
+            if not str(getattr(self._capture_target, "session_id", "") or "").strip():
+                self.statusBar().showMessage(
+                    "No matching Chrome Audio Sync session was found. "
+                    "Chrome's 'Use graphics acceleration when available' must be off. "
+                    "Chrome requires you to start Chrome Audio Sync from the extension before Play. "
+                    "Until then, HDRTVNet++ stays silent and the browser keeps playing audio locally."
+                )
         else:
-            self._objective_metrics_enabled = False
-            self._update_hdr_ground_truth_label()
+            if not self._video_path:
+                return
 
-        self._source_hdr_info = _probe_hdr_input(self._video_path)
+            src_probe = _probe_hdr_input(self._video_path)
+            if bool(src_probe.get("is_hdr", False)):
+                reason = str(src_probe.get("reason", "HDR metadata detected")).strip()
+                QMessageBox.warning(
+                    self,
+                    "Unsupported Input",
+                    "HDR input videos are not supported for conversion.\n\n"
+                    f"This file appears HDR ({reason}).\n"
+                    "Please select an SDR source video.",
+                )
+                self.statusBar().showMessage(
+                    "Cannot start conversion: input video is HDR."
+                )
+                return
 
-        # Determine processing resolution
-        cap = cv2.VideoCapture(self._video_path)
-        vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        vfps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
+            if self._hdr_ground_truth_path:
+                ok, note = self._validate_hdr_ground_truth(
+                    self._hdr_ground_truth_path,
+                    source_path=self._video_path,
+                )
+                if not ok:
+                    bad_name = os.path.basename(self._hdr_ground_truth_path)
+                    self._reset_hdr_ground_truth(f"HDR GT cleared ({bad_name}): {note}")
+                self._objective_metrics_enabled = False
+            else:
+                self._objective_metrics_enabled = False
+                self._update_hdr_ground_truth_label()
 
-        # Output (display) resolution: always 1080p (letterbox handles aspect).
-        ow, oh = MAX_W, MAX_H
+            self._source_hdr_info = _probe_hdr_input(self._video_path)
+
+            # Determine processing resolution
+            cap = cv2.VideoCapture(self._video_path)
+            vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            vfps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            self._vid_fps = vfps if vfps > 0 else 30.0
+
+        self._objective_metrics_enabled = False
+
+        if vw <= 0 or vh <= 0:
+            self.statusBar().showMessage("Could not determine source dimensions.")
+            return
+
+        # Output/display resolution follows the source-limited top preset so
+        # SDR and HDR panes share the same effective sharpness ceiling.
+        output_key = str(getattr(self, "_source_max_resolution_key", "1080p") or "1080p")
+        ow, oh = _processing_preset_dims(output_key)
         self._cur_output_w, self._cur_output_h = ow, oh
 
         # Processing resolution from scale selector (fixed preset; letterbox handles aspect).
         scale_key = self._cmb_res.currentText()
+        if scale_key == "Source":
+            scale_key = getattr(self, "_source_max_resolution_key", "1080p")
         scale_dims = RESOLUTION_SCALES.get(scale_key)
-        if scale_key == "Source" and self._source_proc_dims is not None:
-            scale_dims = self._source_proc_dims
         if scale_dims is not None and (scale_dims[0] < ow or scale_dims[1] < oh):
             pw, ph = scale_dims
         else:
             pw, ph = ow, oh
+
+        source_max_key = getattr(self, "_source_max_resolution_key", "1080p")
+        source_dims = getattr(self, "_source_video_dims", None)
+        disable_top_preset_sharpen = False
+        if (
+            isinstance(source_dims, tuple)
+            and len(source_dims) == 2
+            and scale_key == source_max_key
+        ):
+            disable_top_preset_sharpen = _source_is_below_processing_preset(
+                source_dims[0], source_dims[1], scale_key
+            )
 
         # Select upscale kernel choice (only allowed for 540p/720p presets)
         upscale_choice = DEFAULT_UPSCALER
@@ -1476,15 +1966,26 @@ class PlaybackRuntimeMixin:
             upscale_choice = "EWA LanczosSharp"
 
         # Set up seek slider
-        self._vid_fps = vfps if vfps > 0 else 30.0
-        display_fps = _limited_playback_fps(self._vid_fps)
-        self._seek_slider.setRange(0, max(0, total_frames - 1))
-        self._seek_slider.setValue(0)
-        self._seek_slider.setEnabled(True)
-        self._seek_slider.setToolTip("Seek while paused is queued and applied on Resume.")
-        self._lbl_time.setText("0:00")
-        dur_secs = total_frames / self._vid_fps if self._vid_fps > 0 else 0
-        self._lbl_duration.setText(self._fmt_time(dur_secs))
+        display_fps = (
+            float(self._vid_fps)
+            if is_window_source
+            else _limited_playback_fps(self._vid_fps)
+        )
+        if is_window_source:
+            self._seek_slider.setRange(0, 0)
+            self._seek_slider.setValue(0)
+            self._seek_slider.setEnabled(False)
+            self._seek_slider.setToolTip("Live capture has no seekable timeline.")
+            self._lbl_time.setText("0:00")
+            self._lbl_duration.setText("LIVE")
+        else:
+            self._seek_slider.setRange(0, max(0, total_frames - 1))
+            self._seek_slider.setValue(0)
+            self._seek_slider.setEnabled(True)
+            self._seek_slider.setToolTip("Seek while paused is queued and applied on Resume.")
+            self._lbl_time.setText("0:00")
+            dur_secs = total_frames / self._vid_fps if self._vid_fps > 0 else 0
+            self._lbl_duration.setText(self._fmt_time(dur_secs))
 
         # Map GUI precision to compile arg
         gui_prec = self._cmb_prec.currentText()
@@ -1520,8 +2021,9 @@ class PlaybackRuntimeMixin:
                 model_path=model_path,
                 use_hg=self._chk_hg.isChecked(),
                 hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
-                predequantize_mode=_normalize_predequantize_mode(
-                    getattr(self, "_predequantize_mode", "auto")
+                predequantize_mode=self._effective_precompile_predequantize_mode(
+                    prec_arg,
+                    getattr(self, "_predequantize_mode", "auto"),
                 ),
                 parent=self,
             )
@@ -1540,7 +2042,7 @@ class PlaybackRuntimeMixin:
         # Keep mpv initialized whenever available so view switches are UI-only.
         use_mpv_pipeline = self._disp_hdr_mpv is not None
         self._active_use_mpv = use_mpv_pipeline
-        self._startup_sync_pending = bool(use_mpv_pipeline)
+        self._startup_sync_pending = bool(use_mpv_pipeline and (not is_window_source))
         self._mpv_start_resync_t = 0.0
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_stack.setCurrentWidget(
@@ -1552,14 +2054,15 @@ class PlaybackRuntimeMixin:
             )
         self._update_apply_button_state()
         self._btn_play.setEnabled(False)
-        self._btn_pause.setEnabled(True)
+        self._btn_pause.setEnabled(not is_window_source)
         self._btn_stop.setEnabled(True)
-        self._btn_compare.setEnabled(True)
+        self._btn_compare.setEnabled(not is_window_source)
         self._btn_file.setEnabled(False)
         if self._btn_toggle_ui is not None:
             self._btn_toggle_ui.setEnabled(True)
         self._cmb_prec.setEnabled(True)
         self._set_pause_button_labels(False)
+        self._refresh_source_mode_ui()
 
         # Start mpv HDR display AFTER compile finishes (via signal)
         # so that mpv's D3D11 GPU usage doesn't pollute Triton autotuning.
@@ -1567,7 +2070,9 @@ class PlaybackRuntimeMixin:
         self._pending_mpv_start = None
         self._pending_sdr_mpv_start = None
         if use_mpv_pipeline and self._disp_hdr_mpv is not None:
-            mpv_audio_path = None if self._audio_available else self._video_path
+            mpv_audio_path = None
+            if (not is_window_source) and (not self._audio_available):
+                mpv_audio_path = self._video_path
             self._active_mpv_scale_kernel = _select_hdr_scale_kernel(
                 pw, ph, ow, oh, upscale_choice
             )
@@ -1578,6 +2083,8 @@ class PlaybackRuntimeMixin:
             self._active_mpv_cas = _select_mpv_cas_strength(
                 pw, ph, ow, oh, using_fsr, self._active_mpv_scale_kernel
             )
+            if disable_top_preset_sharpen:
+                self._active_mpv_cas = 0.0
             self._active_film_grain = bool(
                 hasattr(self, "_chk_film_grain") and self._chk_film_grain.isChecked()
             )
@@ -1612,7 +2119,7 @@ class PlaybackRuntimeMixin:
             self._sdr_mpv_feed_from_worker = False
 
         self._worker.configure(
-            self._video_path,
+            self._video_path if not is_window_source else None,
             self._cmb_prec.currentText(),
             proc_w=pw,
             proc_h=ph,
@@ -1625,6 +2132,22 @@ class PlaybackRuntimeMixin:
             ),
             objective_metrics_enabled=self._objective_metrics_enabled,
             hdr_ground_truth_path=self._hdr_ground_truth_path,
+            capture_target=(
+                {
+                    "hwnd": int(getattr(self._capture_target, "hwnd", 0) or 0),
+                    "session_id": str(getattr(self._capture_target, "session_id", "") or ""),
+                    "title": str(self._capture_target.title or ""),
+                    "browser_name": str(getattr(self._capture_target, "browser_name", "") or ""),
+                    "source_url": str(getattr(self._capture_target, "source_url", "") or ""),
+                    "process_name": str(getattr(self._capture_target, "process_name", "") or ""),
+                    "pid": int(getattr(self._capture_target, "pid", 0) or 0),
+                    "fps": float(self._capture_fps_value or 24.0),
+                    "capture_w": int(pw),
+                    "capture_h": int(ph),
+                }
+                if is_window_source and self._capture_target is not None
+                else None
+            ),
         )
 
         # Show loading dialog (in-process model load + cache warmup is fast
@@ -1640,25 +2163,41 @@ class PlaybackRuntimeMixin:
                 f"Upscale active: {pw}x{ph} -> {ow}x{oh} via {BEST_UPSCALE_MODE} ({upscale_backend})"
             )
         else:
-            self.statusBar().showMessage(f"No upscale stage: processing at {ow}x{oh}.")
+            self.statusBar().showMessage(
+                f"No upscale stage: processing at {ow}x{oh}."
+            )
         self._post_seek_resync_frames = 0
         self._pending_seek_on_resume = None
         if self._startup_sync_pending:
             self._worker.pause()
-        # Startup audio gate: release audio only after FPS stabilizes.
-        self._startup_audio_gate_active = True
-        self._scrub_muted = True
-        self._arm_mute_until_fps_recovery()
-        if self._audio_available:
+        if is_window_source:
+            self._stop_live_audio_capture()
+            self._startup_audio_gate_active = False
+            self._scrub_muted = False
+            self._refresh_source_mode_ui()
+            self.statusBar().showMessage(
+                f"Live browser window capture started at {self._capture_fps_label}. "
+                "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. HDRTVNet++ stays silent. If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
+            )
+        elif self._audio_available:
+            self._stop_live_audio_capture()
+            # Startup audio gate: release audio only after FPS stabilizes.
+            self._startup_audio_gate_active = True
+            self._scrub_muted = True
+            self._arm_mute_until_fps_recovery()
             self._start_audio_playback(self._video_path)
             self._set_audio_paused(True)
         else:
+            self._stop_live_audio_capture()
+            self._startup_audio_gate_active = True
+            self._scrub_muted = True
+            self._arm_mute_until_fps_recovery()
             self.statusBar().showMessage(
                 "Qt audio backend unavailable; using mpv audio fallback (seek sync may be limited)."
             )
 
         # Restore timeline position after process restart (resolution change).
-        if self._startup_seek_frame is not None:
+        if self._startup_seek_frame is not None and not is_window_source:
             target = max(
                 0, min(int(self._startup_seek_frame), self._seek_slider.maximum())
             )
@@ -1674,6 +2213,11 @@ class PlaybackRuntimeMixin:
 
     def _toggle_pause(self):
         if self._show_export_lock_message("Playback"):
+            return
+        if _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)) == SOURCE_MODE_WINDOW:
+            self.statusBar().showMessage(
+                "Browser Window Capture is a live viewer. Pause is unavailable in this mode."
+            )
             return
         if not self._playing:
             return
@@ -1772,6 +2316,7 @@ class PlaybackRuntimeMixin:
 
     def _stop(self):
         self._suppress_eof_restart_once = True
+        self._stop_active_browser_tab_session()
         self._worker.stop()
         self._worker.wait(10000)
         if self._disp_hdr_mpv is not None:
@@ -1780,13 +2325,38 @@ class PlaybackRuntimeMixin:
             self._disp_sdr_mpv.stop_playback()
         self._stop_audio_playback()
         self._set_process_priority(False)
-        # Clear the current video so user must choose a file again.
+        preserve_capture_target = (
+            _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+            == SOURCE_MODE_WINDOW
+        )
+        remembered_capture_target = None
+        if preserve_capture_target and self._capture_target is not None:
+            remembered_capture_target = WindowCaptureTarget(
+                title=str(self._capture_target.title or "").strip(),
+                process_name=str(getattr(self._capture_target, "process_name", "") or "").strip(),
+                pid=int(getattr(self._capture_target, "pid", 0) or 0),
+                width=int(getattr(self._capture_target, "width", 0) or 0),
+                height=int(getattr(self._capture_target, "height", 0) or 0),
+                hwnd=int(getattr(self._capture_target, "hwnd", 0) or 0),
+                session_id=str(getattr(self._capture_target, "session_id", "") or "").strip(),
+                browser_name=str(getattr(self._capture_target, "browser_name", "") or "").strip(),
+                source_url=str(getattr(self._capture_target, "source_url", "") or "").strip(),
+            )
         self._video_path = None
+        self._capture_target = remembered_capture_target if preserve_capture_target else None
         self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
         # No active input video => clear GT binding too.
         self._reset_hdr_ground_truth()
         if self._lbl_file is not None:
-            self._lbl_file.setText("No video selected")
+            self._lbl_file.setText(
+                (
+                    self._capture_target.label
+                    if preserve_capture_target and self._capture_target is not None
+                    else "No browser window selected"
+                )
+                if self._source_mode == SOURCE_MODE_WINDOW
+                else "No video selected"
+            )
         if self._lbl_duration is not None:
             self._lbl_duration.setText("0:00")
         self._reset_controls()
@@ -1808,6 +2378,12 @@ class PlaybackRuntimeMixin:
         # Hide the parent window so the user doesn't see two GUIs
         self.hide()
         QApplication.instance().processEvents()
+        try:
+            from browser_tab_bridge import close_browser_tab_bridge
+
+            close_browser_tab_bridge()
+        except Exception:
+            pass
 
         import subprocess as _sp
 
@@ -1848,7 +2424,7 @@ class PlaybackRuntimeMixin:
     def _apply_runtime_settings(self):
         if self._show_export_lock_message("Runtime setting changes"):
             return
-        if not self._playing or not self._video_path:
+        if not self._playing or not self._current_source_available():
             return
         if not self._has_pending_setting_changes():
             self.statusBar().showMessage("No pending setting changes.")
@@ -1887,8 +2463,7 @@ class PlaybackRuntimeMixin:
 
         if needs_restart:
             self._save_user_settings()
-            self._restart_with_video(
-                self._video_path,
+            self._restart_with_active_source(
                 resolution=new_res,
                 precision=new_prec,
                 view=self._cmb_view.currentText(),
@@ -1974,6 +2549,19 @@ class PlaybackRuntimeMixin:
                     return False
                 self._active_mpv_scale_kernel = kernel
                 self._active_mpv_scale_antiring = antiring
+                active_scale_key = str(self._active_resolution or self._cmb_res.currentText() or "").strip()
+                if active_scale_key == "Source":
+                    active_scale_key = getattr(self, "_source_max_resolution_key", "1080p")
+                source_dims = getattr(self, "_source_video_dims", None)
+                disable_top_preset_sharpen = False
+                if (
+                    isinstance(source_dims, tuple)
+                    and len(source_dims) == 2
+                    and active_scale_key == getattr(self, "_source_max_resolution_key", "1080p")
+                ):
+                    disable_top_preset_sharpen = _source_is_below_processing_preset(
+                        source_dims[0], source_dims[1], active_scale_key
+                    )
                 self._active_mpv_cas = _select_mpv_cas_strength(
                     cur_pw,
                     cur_ph,
@@ -1982,6 +2570,8 @@ class PlaybackRuntimeMixin:
                     using_fsr=(kernel == "fsr"),
                     scale_kernel=kernel,
                 )
+                if disable_top_preset_sharpen:
+                    self._active_mpv_cas = 0.0
                 self._disp_hdr_mpv.set_cas_strength(self._active_mpv_cas)
                 self._active_upscale_mode = new_upscale
 
@@ -2024,8 +2614,7 @@ class PlaybackRuntimeMixin:
                     f"Precision {new_prec} not precompiled at {cur_pw}x{cur_ph}; restarting for clean compile."
                 )
                 self._save_user_settings()
-                self._restart_with_video(
-                    self._video_path,
+                self._restart_with_active_source(
                     resolution=new_res,
                     precision=new_prec,
                     view=self._cmb_view.currentText(),

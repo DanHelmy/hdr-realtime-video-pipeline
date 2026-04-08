@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>HDRTVNet++ Chrome Audio Sync</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        width: 320px;
+        background: #15181d;
+        color: #e8edf2;
+      }
+      main {
+        padding: 14px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+      p {
+        margin: 0 0 10px;
+        color: #b7c2cc;
+        line-height: 1.35;
+        font-size: 12px;
+      }
+      button {
+        width: 100%;
+        margin: 0 0 8px;
+        border: 0;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #start-audio {
+        background: #69d36f;
+        color: #0d160f;
+      }
+      #stop {
+        background: #29303a;
+        color: #edf2f7;
+      }
+      .delay-card {
+        margin: 10px 0 12px;
+        border-radius: 8px;
+        background: #1c232c;
+        padding: 10px;
+      }
+      .delay-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+      .delay-head strong {
+        font-size: 12px;
+      }
+      .delay-value {
+        color: #7ddf91;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      #delay-slider {
+        width: 100%;
+        margin: 0;
+      }
+      .delay-note {
+        margin: 8px 0 0;
+        color: #8ea0af;
+        font-size: 11px;
+        line-height: 1.35;
+      }
+      #status {
+        margin-top: 8px;
+        min-height: 34px;
+        border-radius: 8px;
+        background: #1c232c;
+        padding: 8px 10px;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      .muted {
+        color: #8ea0af;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>HDRTVNet++ Chrome Audio Sync</h1>
+      <p>Experimental, Chrome-only delayed local audio for Browser Window Capture. Turn off Chrome's "Use graphics acceleration when available" setting in Settings &gt; System, then restart Chrome. Chrome requires you to start Chrome Audio Sync from this extension; HDRTVNet++ can stop it automatically when playback stops or the app closes.</p>
+      <div class="delay-card">
+        <div class="delay-head">
+          <strong>Manual Audio Delay</strong>
+          <span id="delay-value" class="delay-value">95 ms</span>
+        </div>
+        <input id="delay-slider" type="range" min="0" max="500" step="1" value="95">
+        <p class="delay-note">Exact sync depends on your PC, browser, and processing load. Adjust this while playback is running until lip-sync looks right.</p>
+      </div>
+      <button id="start-audio">Start Chrome Audio Sync</button>
+      <button id="stop">Stop Chrome Audio Sync</button>
+      <div id="status" class="muted">Checking local bridge ...</div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+  </html>

@@ -4,7 +4,15 @@ import os
 
 from PyQt6.QtCore import QTimer, Qt
 
-from gui_config import PRECISIONS, RESOLUTION_SCALES
+from gui_config import (
+    PRECISIONS,
+    RESOLUTION_SCALES,
+    SOURCE_MODE_VIDEO,
+    _capture_fps_value_from_label,
+    _normalize_capture_fps_label,
+    _normalize_source_mode,
+)
+from window_capture_source import target_from_hwnd
 from gui_scaling import UPSCALER_CHOICES
 
 
@@ -13,6 +21,11 @@ class StateInitMixin:
 
     def _init_runtime_state(self, initial_start_frame, root_dir: str, has_qt_audio: bool):
         self._video_path = None
+        self._source_mode = SOURCE_MODE_VIDEO
+        self._source_mode_prompt_pending = False
+        self._capture_target = None
+        self._capture_fps_label = _normalize_capture_fps_label(None)
+        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
         self._playing = False
         self._compile_dlg = None
         self._pending_mpv_start = None
@@ -92,6 +105,30 @@ class StateInitMixin:
         self._audio_player = None
         self._audio_output = None
         self._audio_available = bool(has_qt_audio)
+        self._live_audio_controller = None
+        self._live_audio_active = False
+        self._pending_live_audio_start_target = None
+        self._pending_live_audio_retry_at = 0.0
+        self._live_audio_compile_ready = False
+        self._live_audio_has_latency_hint = False
+        self._live_audio_default_delay_ms = max(
+            50.0, float(os.environ.get("HDRTVNET_LIVE_AUDIO_DEFAULT_DELAY_MS", "95"))
+        )
+        self._live_audio_delay_margin_ms = max(
+            0.0, float(os.environ.get("HDRTVNET_LIVE_AUDIO_DELAY_MARGIN_MS", "10"))
+        )
+        self._live_audio_min_delay_ms = max(
+            40.0, float(os.environ.get("HDRTVNET_LIVE_AUDIO_MIN_DELAY_MS", "70"))
+        )
+        self._live_audio_max_delay_ms = max(
+            self._live_audio_min_delay_ms,
+            float(os.environ.get("HDRTVNET_LIVE_AUDIO_MAX_DELAY_MS", "650")),
+        )
+        self._live_tab_audio_floor_delay_ms = max(
+            self._live_audio_min_delay_ms,
+            float(os.environ.get("HDRTVNET_LIVE_TAB_AUDIO_FLOOR_DELAY_MS", "80")),
+        )
+        self._live_audio_target_delay_ms = self._live_audio_default_delay_ms
         self._audio_tracks = []
         self._selected_audio_track = 0
         self._audio_apply_token = 0
@@ -130,7 +167,10 @@ class StateInitMixin:
         self._last_hdr_frame = None
         self._compare_dialog = None
         self._compare_snapshot_pending = False
+        self._compare_anchor_frame = None
         self._source_proc_dims = None
+        self._source_video_dims = None
+        self._source_max_resolution_key = "1080p"
         self._last_open_dir = root_dir
         self._last_export_dir = root_dir
         self._predequantize_mode = "auto"
@@ -212,16 +252,24 @@ class StateInitMixin:
     def _queue_initial_video_open(
         self,
         initial_video,
+        initial_source_mode,
+        initial_capture_hwnd,
+        initial_capture_session_id,
+        initial_capture_title,
+        initial_capture_browser_name,
+        initial_capture_process_name,
+        initial_capture_url,
+        initial_capture_fps,
         initial_resolution,
         initial_precision,
         initial_view,
         initial_autoplay,
         initial_upscale,
     ):
-        if not (initial_video and os.path.isfile(initial_video)):
-            return
-
         def _boot_open():
+            source_mode = _normalize_source_mode(initial_source_mode or self._source_mode)
+            self._source_mode = source_mode
+            self._refresh_source_mode_ui()
             if initial_precision in PRECISIONS:
                 self._cmb_prec.setCurrentText(initial_precision)
             legacy_resolution_map = {
@@ -235,6 +283,24 @@ class StateInitMixin:
                     self._cmb_upscale.setCurrentText(initial_upscale)
             if initial_view == "Tabbed":
                 self._cmb_view.setCurrentText("Tabbed")
-            self._set_video(initial_video, auto_play=bool(initial_autoplay))
+            if source_mode != SOURCE_MODE_VIDEO and initial_capture_fps:
+                self._capture_fps_label = _normalize_capture_fps_label(initial_capture_fps)
+                self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
+                if hasattr(self, "_cmb_capture_fps"):
+                    self._cmb_capture_fps.setCurrentText(self._capture_fps_label)
+            if source_mode != SOURCE_MODE_VIDEO and initial_capture_hwnd:
+                target = target_from_hwnd(
+                    initial_capture_hwnd,
+                    title=initial_capture_title or "",
+                    browser_name=initial_capture_browser_name or "",
+                    process_name=initial_capture_process_name or "",
+                    source_url=initial_capture_url or "",
+                    session_id=initial_capture_session_id or "",
+                )
+                if target is not None:
+                    self._set_window_capture_source(target, auto_play=bool(initial_autoplay))
+                    return
+            if initial_video and os.path.isfile(initial_video):
+                self._set_video(initial_video, auto_play=bool(initial_autoplay))
 
         QTimer.singleShot(200, _boot_open)

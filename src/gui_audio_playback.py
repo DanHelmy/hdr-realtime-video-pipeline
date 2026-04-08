@@ -12,8 +12,6 @@ except ImportError:
     _HAS_QT_AUDIO = False
 
 from gui_media_probe import _probe_audio_streams
-
-
 class AudioPlaybackMixin:
     """Audio backend, track selection, and volume control helpers for MainWindow."""
 
@@ -21,17 +19,18 @@ class AudioPlaybackMixin:
         """Initialize Qt audio backend (used for seekable timeline audio)."""
         if not _HAS_QT_AUDIO:
             self._audio_available = False
-            return
-        try:
-            self._audio_player = QMediaPlayer(self)
-            self._audio_output = QAudioOutput(self)
-            self._audio_output.setVolume(self._volume_percent / 100.0)
-            self._audio_player.setAudioOutput(self._audio_output)
-            self._audio_available = True
-        except Exception:
-            self._audio_player = None
-            self._audio_output = None
-            self._audio_available = False
+        else:
+            try:
+                self._audio_player = QMediaPlayer(self)
+                self._audio_output = QAudioOutput(self)
+                self._audio_output.setVolume(self._volume_percent / 100.0)
+                self._audio_player.setAudioOutput(self._audio_output)
+                self._audio_available = True
+            except Exception:
+                self._audio_player = None
+                self._audio_output = None
+                self._audio_available = False
+        self._live_audio_controller = None
 
     @staticmethod
     def _format_audio_track_label(track: dict, fallback_idx: int) -> str:
@@ -164,6 +163,12 @@ class AudioPlaybackMixin:
             self._disp_hdr_mpv.set_muted(muted)
             if not muted:
                 self._disp_hdr_mpv.set_volume_percent(self._volume_percent)
+        for controller_name in ("_live_audio_controller",):
+            controller = getattr(self, controller_name, None)
+            if controller is None:
+                continue
+            controller.set_muted(muted)
+            controller.set_volume_percent(self._volume_percent)
 
     def _start_audio_restore_fade(self, duration_ms: int | None = None):
         """Smoothly restore audio level after auto-mute release."""
@@ -180,6 +185,12 @@ class AudioPlaybackMixin:
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.set_muted(False)
             self._disp_hdr_mpv.set_volume_percent(0)
+        for controller_name in ("_live_audio_controller",):
+            controller = getattr(self, controller_name, None)
+            if controller is None:
+                continue
+            controller.set_muted(False)
+            controller.set_volume_percent(0)
         step_ms = max(10, int(duration_ms / max(1, self._audio_fade_steps)))
         self._audio_fade_timer.start(step_ms)
 
@@ -195,6 +206,11 @@ class AudioPlaybackMixin:
             self._audio_output.setVolume(target * ratio)
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.set_volume_percent(int(round(self._volume_percent * ratio)))
+        for controller_name in ("_live_audio_controller",):
+            controller = getattr(self, controller_name, None)
+            if controller is None:
+                continue
+            controller.set_volume_percent(int(round(self._volume_percent * ratio)))
         if ratio >= 1.0 and self._audio_fade_timer is not None:
             self._audio_fade_timer.stop()
             self._apply_volume_to_backends()
@@ -242,6 +258,7 @@ class AudioPlaybackMixin:
                 self._audio_player.stop()
             except Exception:
                 pass
+        self._stop_live_audio_capture()
 
     def _set_audio_paused(self, paused: bool):
         if not self._audio_available or self._audio_player is None:
@@ -262,6 +279,45 @@ class AudioPlaybackMixin:
             self._audio_player.setPosition(int(max(0.0, sec) * 1000.0))
         except Exception:
             pass
+
+    def _queue_live_audio_capture_start(self, target) -> None:
+        del target
+        self._stop_live_audio_capture()
+
+    def _note_live_audio_compile_ready(self) -> None:
+        return
+
+    def _note_live_audio_latency_hint(self) -> None:
+        return
+
+    def _maybe_start_queued_live_audio_capture(self) -> bool:
+        return False
+
+    def _start_live_audio_capture(self, target, initial_delay_ms: float | None = None) -> bool:
+        del target, initial_delay_ms
+        self._stop_live_audio_capture()
+        self._live_audio_controller = None
+        self._live_audio_active = False
+        return False
+
+    def _stop_live_audio_capture(self) -> None:
+        self._pending_live_audio_start_target = None
+        self._pending_live_audio_retry_at = 0.0
+        self._live_audio_compile_ready = False
+        self._live_audio_has_latency_hint = False
+        self._live_audio_controller = None
+        self._live_audio_active = False
+
+    def _set_live_audio_delay_target_ms(self, delay_ms: float, *, immediate: bool = False) -> None:
+        del immediate
+        delay = max(
+            float(getattr(self, "_live_audio_min_delay_ms", 70.0)),
+            min(
+                float(getattr(self, "_live_audio_max_delay_ms", 650.0)),
+                float(delay_ms or 0.0),
+            ),
+        )
+        self._live_audio_target_delay_ms = delay
 
     def _release_startup_sync(self):
         """Unpause worker/mpv/audio together after startup warm sync."""
@@ -287,3 +343,7 @@ class AudioPlaybackMixin:
         self._relock_timeline(delay_ms=160, drop_frames=3)
         # Follow-up relock after startup UI interactions to keep HDR aligned.
         QTimer.singleShot(520, lambda: self._relock_timeline(drop_frames=2))
+        # Window capture benefits from the same mpv surface refresh path that
+        # tab switches trigger; without it startup can remain in a sluggish
+        # compositor state until the user changes panes manually.
+        QTimer.singleShot(140, self._stabilize_window_capture_surface_after_startup)

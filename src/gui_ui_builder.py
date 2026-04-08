@@ -18,7 +18,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gui_config import _available_precision_keys, RESOLUTION_SCALES
+from gui_config import (
+    _available_precision_keys,
+    RESOLUTION_SCALES,
+    SOURCE_MODE_LABELS,
+    _capture_fps_label_options,
+)
 from gui_compare import _HAS_MPV
 from gui_scaling import UPSCALER_CHOICES, DEFAULT_UPSCALER
 from gui_widgets import VideoDisplay
@@ -36,6 +41,7 @@ class UiBuilderMixin:
         root.setSpacing(6)
 
         self._build_menu_bar()
+        self._build_source_mode_row(root)
         self._build_top_controls_row(root)
         self._build_playback_controls_row(root)
         self._build_timeline_row(root)
@@ -47,8 +53,8 @@ class UiBuilderMixin:
     def _build_menu_bar(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
-        file_menu.addAction("&Open Video ...", self._open_file)
-        file_menu.addAction("&Export Video ...", self._open_export_dialog)
+        self._act_open_source = file_menu.addAction("&Open Video ...", self._open_file)
+        self._act_export_video = file_menu.addAction("&Export Video ...", self._open_export_dialog)
         file_menu.addSeparator()
         file_menu.addAction("E&xit", self.close)
 
@@ -64,6 +70,41 @@ class UiBuilderMixin:
             self._toggle_borderless_full_window,
         )
         self._act_borderless_full_window.setCheckable(True)
+
+    def _build_source_mode_row(self, root: QVBoxLayout):
+        self._row0_widget = QWidget()
+        row0 = QHBoxLayout(self._row0_widget)
+        row0.setContentsMargins(0, 0, 0, 0)
+        row0.setSpacing(8)
+
+        self._lbl_source_mode = QLabel("Mode:")
+        row0.addWidget(self._lbl_source_mode)
+
+        self._cmb_source_mode = QComboBox()
+        self._cmb_source_mode.addItems(list(SOURCE_MODE_LABELS.values()))
+        self._cmb_source_mode.setFixedWidth(255)
+        self._cmb_source_mode.setToolTip(
+            "Choose whether HDRTVNet++ opens video files or uses the experimental Google Chrome browser-window path. Chrome's 'Use graphics acceleration when available' must be off for Browser Window Capture."
+        )
+        row0.addWidget(self._cmb_source_mode)
+
+        self._capture_fps_container = QWidget()
+        capture_row = QHBoxLayout(self._capture_fps_container)
+        capture_row.setContentsMargins(0, 0, 0, 0)
+        capture_row.setSpacing(6)
+        self._lbl_capture_fps = QLabel("Capture FPS:")
+        capture_row.addWidget(self._lbl_capture_fps)
+        self._cmb_capture_fps = QComboBox()
+        self._cmb_capture_fps.addItems(_capture_fps_label_options())
+        self._cmb_capture_fps.setFixedWidth(90)
+        self._cmb_capture_fps.setToolTip(
+            "Applies only to Browser Window Capture mode."
+        )
+        capture_row.addWidget(self._cmb_capture_fps)
+        row0.addWidget(self._capture_fps_container)
+
+        row0.addStretch(1)
+        root.addWidget(self._row0_widget)
 
     def _build_top_controls_row(self, root: QVBoxLayout):
         self._row1_widget = QWidget()
@@ -278,7 +319,6 @@ class UiBuilderMixin:
         self._video_tabs.addTab(self._sdr_tab_host, "SDR")
         self._video_tabs.addTab(self._hdr_tab_host, "HDR")
         self._video_tabs.addTab(self._side_tab_host, "Side by Side")
-        self._video_tabs.setCurrentIndex(1)
         if _HAS_MPV and self._disp_sdr_mpv is not None:
             self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_mpv)
         if _HAS_MPV and self._disp_hdr_mpv is not None:

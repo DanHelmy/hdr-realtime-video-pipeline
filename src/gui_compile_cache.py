@@ -6,14 +6,15 @@ import hashlib as _hashlib
 import os
 import pathlib as _pathlib
 
-from windows_runtime import default_cache_root
+from windows_runtime import compile_cache_namespace, project_cache_root
 
 _TRITON_CACHE = (
     _pathlib.Path(
-        os.environ.get("TRITON_CACHE_DIR", os.path.join(default_cache_root(), "triton"))
+        os.environ.get("TRITON_CACHE_DIR", os.path.join(project_cache_root(__file__), "triton"))
     )
     / "cache"
 )
+_CACHE_NAMESPACE = compile_cache_namespace(__file__)
 
 
 def _compiled_marker_path() -> _pathlib.Path:
@@ -63,7 +64,7 @@ def _compiled_key(
     if pdq not in {"auto", "on", "off"}:
         pdq = "auto"
     mh = _model_compile_id(precision, model_path)
-    return f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_{mh}"
+    return f"{_CACHE_NAMESPACE}:{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_{mh}"
 
 
 def _legacy_compiled_keys(
@@ -92,6 +93,12 @@ def _is_compiled(
     """Check if clean-compiled kernels exist for this config."""
     mp = _compiled_marker_path()
     if mp.is_file():
+        def _marker_payload(line: str) -> str:
+            text = str(line or "").strip()
+            if ":" in text:
+                return text.split(":", 1)[1]
+            return text
+
         pdq = str(predequantize_mode or "auto").strip().lower()
         if pdq not in {"auto", "on", "off"}:
             pdq = "auto"
@@ -105,34 +112,31 @@ def _is_compiled(
             predequantize_mode=pdq,
             compile_mode=compile_mode,
         )
+        key_payload = _marker_payload(key)
         if key in lines:
             return True
-        if str(precision).startswith("int8"):
-            # Compatibility: older markers used model-hash suffixes, so PTQ/QAT
-            # variants can differ only in the final token.
-            prefix = f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_"
+        for line in lines:
+            if _marker_payload(line) == key_payload:
+                return True
+        if not str(precision).startswith("int8"):
+            # FP16/FP32 do not have distinct runtime graphs for pre-dequantize
+            # modes. Accept older markers that were mistakenly written with
+            # "_on" / "_off" suffixes.
+            prefix_payload = (
+                f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_"
+            )
             for line in lines:
-                if line.startswith(prefix):
+                if _marker_payload(line).startswith(prefix_payload):
                     return True
-        # Legacy fallback is only safe in auto mode. For explicit on/off we
-        # must avoid false positives across predequantization modes.
-        if pdq == "auto":
-            for old_key in _legacy_compiled_keys(
-                w, h, precision, model_path, use_hg, compile_mode=compile_mode
-            ):
-                if old_key in lines:
-                    return True
-            if str(precision).startswith("int8"):
-                legacy_prefix = f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_"
-                for line in lines:
-                    if not line.startswith(legacy_prefix):
-                        continue
-                    suffix = line[len(legacy_prefix):]
-                    if not suffix:
-                        continue
-                    # Exclude keyed entries that already include pdq mode.
-                    if suffix.startswith(("auto_", "on_", "off_")):
-                        continue
+        if str(precision).startswith("int8"):
+            # Compatibility inside the current repo namespace: older markers
+            # used model-hash suffixes, so PTQ/QAT variants could differ only
+            # in the final token.
+            prefix_payload = (
+                f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_"
+            )
+            for line in lines:
+                if _marker_payload(line).startswith(prefix_payload):
                     return True
     return False
 

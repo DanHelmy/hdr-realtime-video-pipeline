@@ -61,6 +61,22 @@ def _octave_executable() -> str | None:
 class CompareViewMixin:
     """Compare-view related helpers for MainWindow."""
 
+    def _default_compare_frame_anchor(self) -> int | None:
+        worker = getattr(self, "_worker", None)
+        if worker is None:
+            return None
+        if worker.is_paused:
+            queued = getattr(self, "_pending_seek_on_resume", None)
+            if queued is not None:
+                return max(0, int(queued))
+            if hasattr(self, "_sync_anchor_frame"):
+                try:
+                    return max(0, int(self._sync_anchor_frame()))
+                except Exception:
+                    pass
+            return max(0, int(getattr(self, "_last_seek_frame", 0)))
+        return None
+
     def _compare_precision_options(self) -> list[str]:
         if not hasattr(self, "_cmb_prec") or self._cmb_prec is None:
             return []
@@ -93,15 +109,66 @@ class CompareViewMixin:
                 parent=self,
             )
             self._compare_dialog.setModal(False)
-            self._compare_dialog.precision_requested.connect(
-                self._on_compare_precision_requested
+            self._compare_dialog.compare_requested.connect(
+                self._on_compare_requested
             )
         current_prec = str(self._active_precision or self._cmb_prec.currentText() or "").strip()
         self._compare_dialog.set_precision_options(
             self._compare_precision_options(),
             selected=current_prec or None,
         )
+        min_frame, max_frame = self._compare_frame_bounds()
+        current_frame = int(
+            getattr(
+                self,
+                "_compare_anchor_frame",
+                getattr(self, "_last_seek_frame", min_frame),
+            )
+            or min_frame
+        )
+        self._compare_dialog.set_frame_bounds(
+            min_frame=min_frame,
+            max_frame=max_frame,
+            current_frame=current_frame,
+        )
         return self._compare_dialog
+
+    def _compare_frame_bounds(self) -> tuple[int, int]:
+        if getattr(self, "_source_mode", "video") != "video":
+            current = max(
+                0,
+                int(
+                    getattr(
+                        self,
+                        "_compare_anchor_frame",
+                        getattr(self, "_last_seek_frame", 0),
+                    )
+                    or 0
+                ),
+            )
+            return current, current
+        max_frame = 0
+        if hasattr(self, "_seek_slider") and self._seek_slider is not None:
+            try:
+                max_frame = max(0, int(self._seek_slider.maximum()) + 1)
+            except Exception:
+                max_frame = 0
+        if max_frame <= 0:
+            try:
+                max_frame = max(
+                    0,
+                    int(
+                        getattr(
+                            self,
+                            "_compare_anchor_frame",
+                            getattr(self, "_last_seek_frame", 0),
+                        )
+                    ),
+                )
+            except Exception:
+                max_frame = 0
+        min_frame = 1 if max_frame > 0 else 0
+        return min_frame, max_frame
 
     def _request_compare_snapshot(
         self,
@@ -126,13 +193,18 @@ class CompareViewMixin:
         if not self._worker.is_paused:
             self._toggle_pause()
 
-        target_frame = (
-            int(self._seek_slider.value())
-            if frame_number is None
-            else max(0, int(frame_number))
-        )
-        # Compare seek is immediate; avoid re-applying an old queued seek on resume.
-        self._pending_seek_on_resume = None
+        anchor_frame = frame_number
+        preserve_resume_seek = False
+        if anchor_frame is None:
+            anchor_frame = self._default_compare_frame_anchor()
+            preserve_resume_seek = (
+                self._worker.is_paused
+                and getattr(self, "_pending_seek_on_resume", None) is not None
+            )
+
+        # Compare can inspect the queued paused playhead without consuming it.
+        if not preserve_resume_seek:
+            self._pending_seek_on_resume = None
         self._compare_snapshot_pending = True
 
         req_precision = str(precision_key or "").strip()
@@ -147,20 +219,35 @@ class CompareViewMixin:
         self.statusBar().showMessage(
             "Preparing compare snapshot (SDR, HDR GT, HDR Convert) ..."
         )
-        self._worker.request_compare_snapshot(
-            target_frame,
-            hdr_ground_truth_path=self._hdr_ground_truth_path,
-            precision_key=req_precision or None,
-        )
+        if anchor_frame is None:
+            # Let the worker snapshot its actual current decoded frame. The
+            # UI slider/labels are not always updated every frame while
+            # playing, so using them here can drift by several frames.
+            self._worker.request_compare_snapshot(
+                hdr_ground_truth_path=self._hdr_ground_truth_path,
+                precision_key=req_precision or None,
+            )
+        else:
+            self._worker.request_compare_snapshot(
+                max(0, int(anchor_frame)),
+                hdr_ground_truth_path=self._hdr_ground_truth_path,
+                precision_key=req_precision or None,
+                force_immediate=True,
+            )
 
     def _compare_current_frame(self):
+        if getattr(self, "_source_mode", "video") != "video":
+            self.statusBar().showMessage(
+                "Compare is only available in Video Player mode."
+            )
+            return
         self._request_compare_snapshot()
 
-    def _on_compare_precision_requested(self, precision_key: str):
+    def _on_compare_requested(self, precision_key: str, frame_number: int):
         key = str(precision_key or "").strip()
         if not key:
             return
-        anchor = getattr(self, "_compare_anchor_frame", None)
+        anchor = max(0, int(frame_number))
         self._request_compare_snapshot(precision_key=key, frame_number=anchor)
 
     def _on_compare_snapshot_ready(self, payload: dict):
@@ -193,6 +280,12 @@ class CompareViewMixin:
                 self._compare_precision_options(),
                 selected=algo_precision,
             )
+        min_frame, max_frame = self._compare_frame_bounds()
+        dlg.set_frame_bounds(
+            min_frame=min_frame,
+            max_frame=max_frame,
+            current_frame=frame_idx,
+        )
         dlg.set_frames(
             frame_idx,
             sdr,

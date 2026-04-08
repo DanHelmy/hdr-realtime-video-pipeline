@@ -174,7 +174,9 @@ class _PrecompileDialog(QDialog):
         detail = QLabel(
             f"Resolutions: {', '.join(resolutions)}  |  Precision: {precision}\n"
             "This runs in a clean process for best kernel quality.\n"
-            "First compilation may take 2\u20135 minutes per resolution."
+            "First compilation may take 2\u20135 minutes per resolution.\n"
+            "If autotune quality looks unusually bad, restarting the PC before "
+            "recompiling can help."
         )
         detail.setStyleSheet("color: #aaa;")
         layout.addWidget(detail)

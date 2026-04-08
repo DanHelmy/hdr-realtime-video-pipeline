@@ -1,14 +1,14 @@
-import cv2
-import argparse
 import os
+import argparse
 import time
+import cv2
 
-from windows_runtime import default_cache_root, ensure_windows_supported
+from windows_runtime import ensure_windows_supported, project_cache_root
 
 # Pin caches to a stable user path (avoid Temp churn/permissions).
 ensure_windows_supported("HDRTVNet++ CLI")
 
-_cache_root = os.environ.get("HDRTVNET_CACHE_DIR", default_cache_root())
+_cache_root = project_cache_root(__file__)
 try:
     os.makedirs(_cache_root, exist_ok=True)
 except Exception:

@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from video_source import VideoSource
+from window_capture_source import WindowCaptureSource
 from gui_config import (
     PRECISIONS,
     MAX_W,
@@ -38,6 +39,7 @@ _REALTIME_CATCHUP_ENABLED = True
 _REALTIME_SKIP_LAG_FRAMES = 1.1
 _REALTIME_MAX_CATCHUP_SKIP = 6
 _PLAYBACK_SOURCE_PREFETCH = 4
+_PLAYHEAD_UPDATE_STRIDE_PLAYING = 10
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
 
@@ -78,6 +80,7 @@ class PipelineWorker(
     def __init__(self, parent=None):
         super().__init__(parent)
         self._video_path = None
+        self._capture_target: dict | None = None
         self._precision_key = "FP16"
         self._use_hg = True
         self._processor = None
@@ -126,6 +129,8 @@ class PipelineWorker(
         self._hdr_ground_truth_path: str | None = None
         self._pending_metrics_cfg: tuple[bool, str | None] | None = None
         self._pending_compare_snapshot: dict | None = None
+        self._compare_cached_state: dict | None = None
+        self._live_latency_smoothed_ms: float = 0.0
 
     # ── public API (called from main thread) ──
 
@@ -134,8 +139,10 @@ class PipelineWorker(
                   use_hg=True,
                   predequantize_mode: str = "auto",
                   objective_metrics_enabled=False,
-                  hdr_ground_truth_path: str | None = None):
+                  hdr_ground_truth_path: str | None = None,
+                  capture_target: dict | None = None):
         self._video_path = video_path
+        self._capture_target = dict(capture_target) if isinstance(capture_target, dict) else None
         self._precision_key = precision_key
         self._proc_w = proc_w
         self._proc_h = proc_h
@@ -157,11 +164,20 @@ class PipelineWorker(
             self._hdr_ground_truth_path = None
         self._pending_metrics_cfg = None
         self._pending_compare_snapshot = None
+        self._compare_cached_state = None
+        self._live_latency_smoothed_ms = 0.0
         self._realtime_drop_frames = 0
-        # Drop a couple of frames on startup to avoid mpv buffer lag.
-        self._hdr_drop_until_frame = 2
-        self._sdr_drop_until_frame = 2
-        self._hold_until_t = time.perf_counter() + 0.5
+        is_live_capture = bool(self._capture_target)
+        # File playback benefits from a short startup settle window.
+        # Live browser-window capture should render immediately.
+        if is_live_capture:
+            self._hdr_drop_until_frame = 0
+            self._sdr_drop_until_frame = 0
+            self._hold_until_t = 0.0
+        else:
+            self._hdr_drop_until_frame = 2
+            self._sdr_drop_until_frame = 2
+            self._hold_until_t = time.perf_counter() + 0.5
 
     def request_objective_metrics_config(self, enabled: bool, hdr_ground_truth_path: str | None):
         path = str(hdr_ground_truth_path).strip() if hdr_ground_truth_path else None
@@ -174,22 +190,47 @@ class PipelineWorker(
         frame_number: int | None = None,
         hdr_ground_truth_path: str | None = None,
         precision_key: str | None = None,
+        force_immediate: bool = False,
     ):
         if frame_number is None:
-            frame_number = self._frame_idx
+            cached = self._compare_cached_state
+            if isinstance(cached, dict):
+                try:
+                    frame_number = int(cached.get("frame_idx", self._frame_idx))
+                except Exception:
+                    frame_number = self._frame_idx
+            else:
+                frame_number = self._frame_idx
         gt_path = str(hdr_ground_truth_path).strip() if hdr_ground_truth_path else None
         if gt_path and not os.path.isfile(gt_path):
             gt_path = None
         req_precision = str(precision_key).strip() if precision_key else None
         if req_precision and req_precision not in PRECISIONS:
             req_precision = None
+        target_frame = max(0, int(frame_number))
         self._pending_compare_snapshot = {
-            "frame": max(0, int(frame_number)),
+            "frame": target_frame,
             "hdr_gt_path": gt_path,
             "precision_key": req_precision,
+            "force_immediate": bool(force_immediate),
         }
-        self._seek_frame = max(0, int(frame_number))
-        # Unblock paused loop so we can render exactly one compare frame.
+        cached = self._compare_cached_state
+        use_cached_frame = (
+            self._user_paused
+            and self._seek_frame is None
+            and isinstance(cached, dict)
+            and int(cached.get("frame_idx", -1)) == target_frame
+        )
+        if use_cached_frame:
+            self._paused_control_wake = True
+            self._paused_control_refresh_frame = None
+        elif self._user_paused and bool(force_immediate):
+            self._paused_control_wake = True
+            self._paused_control_refresh_frame = None
+        else:
+            self._seek_frame = target_frame
+        # Unblock the worker so compare can be emitted immediately when paused,
+        # or after a single explicit seek when an anchored frame is requested.
         self._pause_event.set()
 
     def request_precision_change(self, key):
@@ -230,6 +271,8 @@ class PipelineWorker(
                     self._sdr_queue.get_nowait()
             except _queue.Empty:
                 pass
+        if self._capture_target:
+            return
         self._hdr_drop_until_frame = max(self._hdr_drop_until_frame,
                                          self._frame_idx + max(0, int(drop_frames)))
         self._sdr_drop_until_frame = max(self._sdr_drop_until_frame,
@@ -290,18 +333,7 @@ class PipelineWorker(
         max_c = F.max_pool2d(linear, kernel_size=3, stride=1, padding=1)
 
         detail = gray_pre - self._box_blur(gray_pre, 3)
-        luma = gray_pre
-        if self._enh_prev_luma is None or self._enh_prev_luma.shape != luma.shape:
-            accum = detail
-        else:
-            motion = (luma - self._enh_prev_luma).abs()
-            motion_w = torch.clamp(1.0 - motion * 6.0, 0.0, 1.0)
-            if self._enh_temporal_detail is None or self._enh_temporal_detail.shape != detail.shape:
-                accum = detail
-            else:
-                accum = self._enh_temporal_detail * motion_w + detail * (1.0 - motion_w)
-        self._enh_prev_luma = luma.detach()
-        self._enh_temporal_detail = accum.detach()
+        accum = detail
 
         base = self._box_blur(gray_pre, 3)
         grain = gray_pre - base
@@ -413,7 +445,7 @@ class PipelineWorker(
         # Signal main thread that compile is done — safe to start mpv now
         self.compile_ready.emit()
 
-        if not self._video_path:
+        if not self._video_path and not self._capture_target:
             self.status_message.emit("No video selected.")
             self.playback_finished.emit()
             return
@@ -435,19 +467,36 @@ class PipelineWorker(
 
         # A small decode-ahead buffer smooths content-dependent decode spikes
         # without making seeks feel sluggish.
-        source = VideoSource(self._video_path, prefetch=_PLAYBACK_SOURCE_PREFETCH)
+        if self._capture_target:
+            source = WindowCaptureSource(
+                float(self._capture_target.get("fps", 24.0) or 24.0),
+                title=str(self._capture_target.get("title", "") or ""),
+                hwnd=int(self._capture_target.get("hwnd", 0) or 0),
+                pid=int(self._capture_target.get("pid", 0) or 0),
+                prefetch=1,
+                capture_max_w=int(
+                    self._capture_target.get("capture_w", self._proc_w) or self._proc_w
+                ),
+                capture_max_h=int(
+                    self._capture_target.get("capture_h", self._proc_h) or self._proc_h
+                ),
+            )
+        else:
+            source = VideoSource(self._video_path, prefetch=_PLAYBACK_SOURCE_PREFETCH)
         self._source = source
+        is_live_capture = bool(self._capture_target)
         gt_source: VideoSource | None = None
         total_frames = source.frame_count
         src_fps = source.fps if source.fps and source.fps > 0 else 30.0
-        out_fps = _limited_playback_fps(src_fps)
-        frame_stride = max(1, int(round(src_fps / out_fps)))
+        out_fps = src_fps if is_live_capture else _limited_playback_fps(src_fps)
+        frame_stride = 1 if is_live_capture else max(1, int(round(src_fps / out_fps)))
         frame_interval_s = 1.0 / src_fps
         next_frame_t = time.perf_counter()
         frame_times = deque(maxlen=30)
         presented_times = deque(maxlen=30)
         metrics_warmup_frames = 0
         frame_idx = 0
+        live_video_latency_ms = 0.0
         force_position_emit = False
         seek_frame_ready_pending = False
         process = psutil.Process(os.getpid())
@@ -539,6 +588,18 @@ class PipelineWorker(
 
                 self._reset_enhance_history()
 
+            if (
+                self._user_paused
+                and self._paused_control_wake
+                and self._seek_frame is None
+                and self._pending_compare_snapshot is not None
+            ):
+                if self._try_emit_compare_snapshot_from_cache():
+                    self._paused_control_wake = False
+                    self._paused_control_refresh_frame = None
+                    next_frame_t = time.perf_counter()
+                    continue
+
             if self._user_paused and self._paused_control_wake and self._seek_frame is None:
                 refresh_frame = self._paused_control_refresh_frame
                 if refresh_frame is not None:
@@ -578,7 +639,7 @@ class PipelineWorker(
                 # early" and gets dropped.
                 self._hdr_drop_until_frame = 0
                 self._sdr_drop_until_frame = 0
-                if seek_to <= 1:
+                if (not self._capture_target) and seek_to <= 1:
                     self._hdr_drop_until_frame = 2
                     self._sdr_drop_until_frame = 2
                     self._hold_until_t = time.perf_counter() + 0.5
@@ -609,20 +670,22 @@ class PipelineWorker(
                 # before we decode another frame.
                 continue
 
-            # Playback pacing: cap processing to the video FPS.
+            # File playback uses a scheduled presentation clock. Live window
+            # capture should process as soon as a fresh frame is available.
             now = time.perf_counter()
             lag_s = 0.0
-            if now < next_frame_t:
-                sleep_until(next_frame_t)
-                now = time.perf_counter()
-            else:
-                lag_s = now - next_frame_t
-            if self._hold_until_t and now < self._hold_until_t:
-                hold_deadline = min(
-                    self._hold_until_t,
-                    time.perf_counter() + frame_interval_s,
-                )
-                sleep_until(hold_deadline)
+            if not is_live_capture:
+                if now < next_frame_t:
+                    sleep_until(next_frame_t)
+                    now = time.perf_counter()
+                else:
+                    lag_s = now - next_frame_t
+                if self._hold_until_t and now < self._hold_until_t:
+                    hold_deadline = min(
+                        self._hold_until_t,
+                        time.perf_counter() + frame_interval_s,
+                    )
+                    sleep_until(hold_deadline)
 
             (
                 ret,
@@ -642,11 +705,17 @@ class PipelineWorker(
 
             frame_idx += 1
             self._frame_idx = frame_idx
+            capture_perf_counter = (
+                float(getattr(source, "last_capture_perf_counter", 0.0) or 0.0)
+                if is_live_capture
+                else 0.0
+            )
 
             # Real-time catch-up: if inference is behind wall clock, drop a few
             # decode frames and process the newest one to preserve cadence.
             if (
-                _REALTIME_CATCHUP_ENABLED
+                (not is_live_capture)
+                and _REALTIME_CATCHUP_ENABLED
                 and (not seek_frame_ready_pending)
                 and lag_s > (frame_interval_s * _REALTIME_SKIP_LAG_FRAMES)
             ):
@@ -686,7 +755,7 @@ class PipelineWorker(
                 next_frame_t += frame_interval_s
                 continue
 
-            present_t = max(next_frame_t, time.perf_counter())
+            present_t = None if is_live_capture else max(next_frame_t, time.perf_counter())
 
             t0 = time.perf_counter()
 
@@ -703,21 +772,44 @@ class PipelineWorker(
                 use_cuda=use_cuda,
             )
 
-            # On-demand compare snapshot (SDR, HDR GT, HDR Convert).
-            self._maybe_emit_compare_snapshot(
-                frame_idx=frame_idx,
-                frame=frame,
-                gt_frame=gt_frame,
-                display_frame=display_frame,
-                output=output,
-                prepared_out=prepared_out,
-                need_hdr_cpu=need_hdr_cpu,
-                out_w=out_w,
-                out_h=out_h,
-                lower_res_processing=lower_res_processing,
-                proc_w=proc_w,
-                proc_h=proc_h,
+            should_cache_compare_state = bool(
+                self._user_paused or self._pending_compare_snapshot is not None
             )
+            if should_cache_compare_state:
+                self._cache_compare_state(
+                    frame_idx=frame_idx,
+                    frame=frame,
+                    gt_frame=gt_frame,
+                    display_frame=display_frame,
+                    output=output,
+                    prepared_out=prepared_out,
+                    need_hdr_cpu=need_hdr_cpu,
+                    out_w=out_w,
+                    out_h=out_h,
+                    lower_res_processing=lower_res_processing,
+                    proc_w=proc_w,
+                    proc_h=proc_h,
+                )
+            elif self._compare_cached_state is not None:
+                self._compare_cached_state = None
+
+            # Keep compare work off the normal playback hot path entirely
+            # unless the user has actually requested a compare snapshot.
+            if self._pending_compare_snapshot is not None:
+                self._maybe_emit_compare_snapshot(
+                    frame_idx=frame_idx,
+                    frame=frame,
+                    gt_frame=gt_frame,
+                    display_frame=display_frame,
+                    output=output,
+                    prepared_out=prepared_out,
+                    need_hdr_cpu=need_hdr_cpu,
+                    out_w=out_w,
+                    out_h=out_h,
+                    lower_res_processing=lower_res_processing,
+                    proc_w=proc_w,
+                    proc_h=proc_h,
+                )
 
             objective_note, hdr_vdp3_note = self._update_objective_metrics(
                 frame_idx=frame_idx,
@@ -737,19 +829,51 @@ class PipelineWorker(
             )
 
             t1 = time.perf_counter()
-            next_frame_t += frame_interval_s
+            if is_live_capture:
+                next_frame_t = time.perf_counter()
+            else:
+                next_frame_t += frame_interval_s
             frame_ms = (t1 - t0) * 1000.0
             frame_times.append(frame_ms)
-            presentation_stamp = max(t1, present_t) if mpv_w is not None else t1
+            presentation_stamp = (
+                max(t1, present_t)
+                if (mpv_w is not None and present_t is not None)
+                else t1
+            )
+            if capture_perf_counter > 0.0:
+                raw_live_latency_ms = max(
+                    0.0, (presentation_stamp - capture_perf_counter) * 1000.0
+                )
+                prev_live_latency_ms = float(
+                    getattr(self, "_live_latency_smoothed_ms", 0.0) or 0.0
+                )
+                if prev_live_latency_ms <= 0.0:
+                    live_video_latency_ms = raw_live_latency_ms
+                else:
+                    live_video_latency_ms = (
+                        (prev_live_latency_ms * 0.82)
+                        + (raw_live_latency_ms * 0.18)
+                    )
+                self._live_latency_smoothed_ms = float(live_video_latency_ms)
             presented_times.append(presentation_stamp)
             if metrics_warmup_frames > 0:
                 metrics_warmup_frames -= 1
 
-            # Position update (every 10 frames, plus immediately after seeks,
-            # and every frame while paused for accurate paused-frame actions).
-            if self._user_paused or force_position_emit or (frame_idx % 10 == 0):
+            # Keep seek/pause/compare updates immediate, but throttle routine
+            # playhead updates so the UI thread is not nudged every frame.
+            should_emit_position = (
+                force_position_emit
+                or seek_frame_ready_pending
+                or self._user_paused
+                or (frame_idx <= 1)
+                or (
+                    _PLAYHEAD_UPDATE_STRIDE_PLAYING > 0
+                    and (frame_idx % _PLAYHEAD_UPDATE_STRIDE_PLAYING) == 0
+                )
+            )
+            if should_emit_position:
                 self.position_updated.emit(frame_idx, total_frames)
-                force_position_emit = False
+            force_position_emit = False
             if seek_frame_ready_pending:
                 self.seek_frame_ready.emit(frame_idx)
                 seek_frame_ready_pending = False
@@ -796,6 +920,8 @@ class PipelineWorker(
                 deitp_avg=deitp_avg,
                 hdr_vdp3_avg=hdr_vdp3_avg,
                 hg_weights_path=_HG_WEIGHTS_PATH,
+                live_video_latency_ms=live_video_latency_ms,
+                is_live_capture=is_live_capture,
             )
             if paused_control_refresh_done:
                 self._paused_control_wake = False

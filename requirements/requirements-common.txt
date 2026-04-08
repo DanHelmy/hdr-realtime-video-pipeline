@@ -3,3 +3,4 @@ numpy
 psutil
 PyQt6
 python-mpv
+dxcam[winrt]
