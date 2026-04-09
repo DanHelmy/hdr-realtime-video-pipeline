@@ -40,6 +40,12 @@ _REALTIME_SKIP_LAG_FRAMES = 1.1
 _REALTIME_MAX_CATCHUP_SKIP = 6
 _PLAYBACK_SOURCE_PREFETCH = 4
 _PLAYHEAD_UPDATE_STRIDE_PLAYING = 10
+_METRICS_EMIT_INTERVAL_S = 0.20
+_LIVE_PRESENT_INTERVAL_MIN_S = 1.0 / 120.0
+_LIVE_PRESENT_INTERVAL_MAX_S = 1.0 / 18.0
+_LIVE_PRESENT_INTERVAL_SMOOTHING = 0.20
+_LIVE_PRESENT_BUFFER_FRAMES = 1.25
+_LIVE_PRESENT_MIN_BUFFER_S = 0.012
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
 
@@ -89,6 +95,7 @@ class PipelineWorker(
         self._pause_event.set()  # not paused
         self._pending_precision = None
         self._pending_predequantize_mode: str | None = None
+        self._pending_capture_fps: float | None = None
         self._paused_control_wake = False
         self._paused_control_refresh_frame: int | None = None
         self._mpv_widget: MpvHDRWidget | None = None
@@ -131,6 +138,8 @@ class PipelineWorker(
         self._pending_compare_snapshot: dict | None = None
         self._compare_cached_state: dict | None = None
         self._live_latency_smoothed_ms: float = 0.0
+        self._metrics_emit_interval_s: float = _METRICS_EMIT_INTERVAL_S
+        self._last_metrics_emit_t: float = 0.0
 
     # ── public API (called from main thread) ──
 
@@ -156,6 +165,7 @@ class PipelineWorker(
             mode = "auto"
         self._predequantize_mode = mode
         self._pending_predequantize_mode = None
+        self._pending_capture_fps = None
         self._objective_metrics_enabled = bool(objective_metrics_enabled)
         self._hdr_ground_truth_path = (
             str(hdr_ground_truth_path).strip() if hdr_ground_truth_path else None
@@ -167,6 +177,7 @@ class PipelineWorker(
         self._compare_cached_state = None
         self._live_latency_smoothed_ms = 0.0
         self._realtime_drop_frames = 0
+        self._last_metrics_emit_t = 0.0
         is_live_capture = bool(self._capture_target)
         # File playback benefits from a short startup settle window.
         # Live browser-window capture should render immediately.
@@ -248,6 +259,19 @@ class PipelineWorker(
         """Request a processing-resolution change (thread-safe)."""
         self._pending_resolution = (proc_w, proc_h)
         self._wake_for_paused_control_change()
+
+    def request_capture_fps_change(self, fps: float):
+        """Request a live browser-window capture FPS cap change."""
+        next_fps = max(1.0, float(fps))
+        self._pending_capture_fps = next_fps
+        if isinstance(self._capture_target, dict):
+            self._capture_target["fps"] = next_fps
+        source = getattr(self, "_source", None)
+        if isinstance(source, WindowCaptureSource):
+            try:
+                source.set_fps(next_fps)
+            except Exception:
+                pass
 
     def _wake_for_paused_control_change(self):
         """Let paused playback process hot-swap work without fully resuming."""
@@ -493,6 +517,7 @@ class PipelineWorker(
         frame_interval_s = 1.0 / src_fps
         next_frame_t = time.perf_counter()
         frame_times = deque(maxlen=30)
+        model_times = deque(maxlen=30)
         presented_times = deque(maxlen=30)
         metrics_warmup_frames = 0
         frame_idx = 0
@@ -503,6 +528,9 @@ class PipelineWorker(
         use_cuda = torch.cuda.is_available()
         objective_note = "Off"
         objective_warned_gt_eof = False
+        live_present_t = 0.0
+        live_capture_prev_perf = 0.0
+        live_present_interval_s = 1.0 / 48.0
         (
             psnr_avg,
             sssim_avg,
@@ -542,6 +570,17 @@ class PipelineWorker(
                     gt_source=gt_source,
                     cur_frame_idx=frame_idx,
                 )
+
+            pending_capture_fps = self._pending_capture_fps
+            if is_live_capture and pending_capture_fps is not None:
+                self._pending_capture_fps = None
+                try:
+                    source.set_fps(pending_capture_fps)
+                    self.status_message.emit(
+                        f"Live browser capture FPS -> {int(round(float(pending_capture_fps)))}"
+                    )
+                except Exception:
+                    pass
 
             pending_predeq = self._pending_predequantize_mode
             if pending_predeq is not None and pending_predeq == self._predequantize_mode:
@@ -647,6 +686,8 @@ class PipelineWorker(
                 frame_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
+                live_present_t = 0.0
+                live_capture_prev_perf = 0.0
 
             # Pause gate
             paused_before_wait = not self._pause_event.is_set()
@@ -659,6 +700,8 @@ class PipelineWorker(
                 frame_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
+                live_present_t = 0.0
+                live_capture_prev_perf = 0.0
             if (
                 self._user_paused
                 and self._paused_control_wake
@@ -755,11 +798,45 @@ class PipelineWorker(
                 next_frame_t += frame_interval_s
                 continue
 
-            present_t = None if is_live_capture else max(next_frame_t, time.perf_counter())
+            if is_live_capture:
+                present_t = None
+                if capture_perf_counter > 0.0:
+                    raw_interval_s = 0.0
+                    if live_capture_prev_perf > 0.0:
+                        raw_interval_s = max(
+                            0.0,
+                            float(capture_perf_counter) - float(live_capture_prev_perf),
+                        )
+                    live_capture_prev_perf = float(capture_perf_counter)
+                    if raw_interval_s > 0.0:
+                        clamped_interval_s = min(
+                            _LIVE_PRESENT_INTERVAL_MAX_S,
+                            max(_LIVE_PRESENT_INTERVAL_MIN_S, raw_interval_s),
+                        )
+                        live_present_interval_s = (
+                            (1.0 - _LIVE_PRESENT_INTERVAL_SMOOTHING)
+                            * live_present_interval_s
+                            + (_LIVE_PRESENT_INTERVAL_SMOOTHING * clamped_interval_s)
+                        )
+                    buffer_s = max(
+                        _LIVE_PRESENT_MIN_BUFFER_S,
+                        live_present_interval_s * _LIVE_PRESENT_BUFFER_FRAMES,
+                    )
+                    now_t = time.perf_counter()
+                    if live_present_t <= 0.0:
+                        live_present_t = now_t + buffer_s
+                    else:
+                        live_present_t += live_present_interval_s
+                        min_present_t = now_t + _LIVE_PRESENT_MIN_BUFFER_S
+                        if live_present_t < min_present_t:
+                            live_present_t = min_present_t
+                    present_t = live_present_t
+            else:
+                present_t = max(next_frame_t, time.perf_counter())
 
             t0 = time.perf_counter()
 
-            display_frame, output, prepared_out, need_hdr_cpu = self._process_frame(
+            display_frame, output, prepared_out, need_hdr_cpu, model_latency_ms = self._process_frame(
                 frame=frame,
                 frame_idx=frame_idx,
                 present_t=present_t,
@@ -835,6 +912,8 @@ class PipelineWorker(
                 next_frame_t += frame_interval_s
             frame_ms = (t1 - t0) * 1000.0
             frame_times.append(frame_ms)
+            if model_latency_ms > 0.0:
+                model_times.append(float(model_latency_ms))
             presentation_stamp = (
                 max(t1, present_t)
                 if (mpv_w is not None and present_t is not None)
@@ -906,6 +985,7 @@ class PipelineWorker(
             self._emit_runtime_metrics_if_ready(
                 frame_idx=frame_idx,
                 frame_times=frame_times,
+                model_times=model_times,
                 presented_times=presented_times,
                 metrics_warmup_frames=metrics_warmup_frames,
                 force=paused_control_refresh_done,

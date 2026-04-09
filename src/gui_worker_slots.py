@@ -75,7 +75,9 @@ class WorkerSlotsMixin:
             _normalize_source_mode(getattr(self, "_source_mode", None))
             == SOURCE_MODE_WINDOW
         )
-        shown_latency_ms = float(m.get("latency_ms", 0.0) or 0.0)
+        shown_latency_ms = float(
+            m.get("model_latency_ms", m.get("latency_ms", 0.0)) or 0.0
+        )
         self._m["latency"].setText(f"Latency: {shown_latency_ms:.1f} ms")
         self._m["frame"].setText(
             "Frame: Live" if is_window_source else f"Frame: {m['frame']}"

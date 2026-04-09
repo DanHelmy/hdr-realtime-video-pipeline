@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-
+import time
 import torch
 
 from gui_config import _select_model_path
@@ -15,6 +15,7 @@ class PipelineWorkerRuntimeMetricsMixin:
         *,
         frame_idx: int,
         frame_times,
+        model_times,
         presented_times,
         metrics_warmup_frames: int,
         force: bool = False,
@@ -32,15 +33,26 @@ class PipelineWorkerRuntimeMetricsMixin:
         live_video_latency_ms: float = 0.0,
         is_live_capture: bool = False,
     ) -> None:
-        if (
-            not force
-            and (frame_idx % 2 != 0 or not frame_times or metrics_warmup_frames != 0)
-        ):
+        if not force and (not frame_times or metrics_warmup_frames != 0):
             return
         if not frame_times:
             return
+        now_t = time.perf_counter()
+        if not force:
+            emit_interval_s = max(
+                0.05,
+                float(getattr(self, "_metrics_emit_interval_s", 0.20) or 0.20),
+            )
+            last_emit_t = float(getattr(self, "_last_metrics_emit_t", 0.0) or 0.0)
+            if last_emit_t > 0.0 and (now_t - last_emit_t) < emit_interval_s:
+                return
 
         avg = sum(frame_times) / len(frame_times)
+        model_avg = (
+            (sum(model_times) / len(model_times))
+            if model_times
+            else 0.0
+        )
         if len(presented_times) >= 2:
             dt = presented_times[-1] - presented_times[0]
             fps = ((len(presented_times) - 1) / dt) if dt > 0 else 0.0
@@ -74,6 +86,7 @@ class PipelineWorkerRuntimeMetricsMixin:
         self.metrics_updated.emit({
             "fps": fps,
             "latency_ms": avg,
+            "model_latency_ms": float(model_avg),
             "live_video_latency_ms": float(live_video_latency_ms),
             "is_live_capture": bool(is_live_capture),
             "frame": frame_idx,
@@ -90,3 +103,4 @@ class PipelineWorkerRuntimeMetricsMixin:
             "objective_note": objective_note,
             "hdr_vdp3_note": hdr_vdp3_note,
         })
+        self._last_metrics_emit_t = now_t

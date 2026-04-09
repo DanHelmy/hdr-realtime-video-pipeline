@@ -34,10 +34,16 @@ def _install_qt_log_filter():
     noisy_prefix = (
         "QObject::disconnect: wildcard call disconnects from destroyed signal of QFFmpeg::"
     )
+    dpi_prefixes = (
+        "SetProcessDpiAwarenessContext() failed:",
+        "Qt's default DPI awareness context is DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.",
+    )
 
     def _handler(_msg_type, _context, message):
         text = str(message or "")
         if text.startswith(noisy_prefix):
+            return
+        if any(text.startswith(prefix) for prefix in dpi_prefixes):
             return
         try:
             print(text)

@@ -4,7 +4,8 @@ const BRIDGE_BASE_CANDIDATES = [
 ];
 const DEFAULT_AUDIO_DELAY_MS = 95;
 const MAX_AUDIO_DELAY_S = 2.0;
-const SESSION_KEEPALIVE_INTERVAL_MS = 500;
+const SESSION_KEEPALIVE_INTERVAL_MS = 1000;
+const SESSION_KEEPALIVE_BACKOFF_MAX_MS = 5000;
 
 const state = {
   stream: null,
@@ -133,13 +134,11 @@ async function handleBridgeFailure(scope, error) {
   const detail = error?.message || String(error || "unknown bridge error");
   const bridgeStatus = Number(error?.bridgeStatus || 0);
   if (bridgeStatus === 410) {
-    console.info(`[HDRTVNet++] ${scope} stopped because HDRTVNet++ closed the capture session.`);
-    await stopCapture({ notifyBridge: false });
+    console.warn(`[HDRTVNet++] ${scope} could not refresh the old HDRTVNet++ session. Chrome Audio Sync will keep running until you stop it manually.`);
     return;
   }
   if (bridgeStatus >= 400 && bridgeStatus < 500) {
-    console.error(`[HDRTVNet++] ${scope} hit a non-recoverable bridge error: ${detail}`);
-    await stopCapture({ notifyBridge: false });
+    console.error(`[HDRTVNet++] ${scope} hit a bridge error, but Chrome Audio Sync will keep running: ${detail}`);
     return;
   }
   const now = performance.now();
@@ -156,10 +155,6 @@ async function handleBridgeFailure(scope, error) {
       `[HDRTVNet++] ${scope} stalled for ${Math.round(now - state.bridgeFailureSincePerf)} ms`,
       error
     );
-  }
-  if ((now - state.bridgeFailureSincePerf) >= 45000) {
-    console.error(`[HDRTVNet++] stopping capture after prolonged bridge outage: ${detail}`);
-    await stopCapture({ notifyBridge: false });
   }
 }
 
@@ -278,6 +273,10 @@ function scheduleSessionKeepalive() {
   if (!state.running || !state.sessionId) {
     return;
   }
+  const retryDelayMs = Math.min(
+    SESSION_KEEPALIVE_BACKOFF_MAX_MS,
+    SESSION_KEEPALIVE_INTERVAL_MS * Math.max(1, state.bridgeFailureCount || 1),
+  );
   state.keepaliveTimerId = setTimeout(async () => {
     state.keepaliveTimerId = 0;
     if (!state.running || !state.sessionId) {
@@ -293,7 +292,7 @@ function scheduleSessionKeepalive() {
         scheduleSessionKeepalive();
       }
     }
-  }, SESSION_KEEPALIVE_INTERVAL_MS);
+  }, retryDelayMs);
 }
 
 async function setupAudioCapture(stream) {

@@ -90,10 +90,11 @@ class PipelineWorkerFrameProcessingMixin:
         lower_res_processing: bool,
         mpv_w,
         use_cuda: bool,
-    ) -> tuple[np.ndarray | None, np.ndarray, object, bool]:
+    ) -> tuple[np.ndarray | None, np.ndarray, object, bool, float]:
         is_live_capture = bool(getattr(self, "_capture_target", None))
         need_display_frame = self._input_is_hdr or self._sdr_visible or mpv_w is None
         display_frame = _letterbox_bgr(frame, out_w, out_h) if need_display_frame else None
+        model_latency_ms = 0.0
 
         if lower_res_processing:
             # Resize from the decoded source directly so we do not scale
@@ -133,11 +134,39 @@ class PipelineWorkerFrameProcessingMixin:
                     self._queue_latest(self._sdr_queue, (present_t, display_frame))
             if self._sdr_visible:
                 need_hdr_cpu = True
-            return display_frame, output, prepared_out, need_hdr_cpu
+            return display_frame, output, prepared_out, need_hdr_cpu, model_latency_ms
 
+        infer_t0 = 0.0
+        cuda_timing = False
+        infer_start_event = None
+        infer_end_event = None
+        if use_cuda:
+            try:
+                infer_start_event = torch.cuda.Event(enable_timing=True)
+                infer_end_event = torch.cuda.Event(enable_timing=True)
+                infer_start_event.record(torch.cuda.current_stream())
+                cuda_timing = True
+            except Exception:
+                infer_start_event = None
+                infer_end_event = None
+                cuda_timing = False
+        if not cuda_timing:
+            infer_t0 = time.perf_counter()
         with torch.inference_mode():
             tensor, cond = self._processor.preprocess(model_inp)
             raw_out = self._processor.infer((tensor, cond))
+        if cuda_timing and infer_end_event is not None:
+            try:
+                infer_end_event.record(torch.cuda.current_stream())
+                infer_end_event.synchronize()
+                model_latency_ms = max(
+                    0.0,
+                    float(infer_start_event.elapsed_time(infer_end_event)),
+                )
+            except Exception:
+                model_latency_ms = 0.0
+        else:
+            model_latency_ms = max(0.0, (time.perf_counter() - infer_t0) * 1000.0)
 
         prepared_out = self._prepare_hdr_output_tensor(
             raw_out,
@@ -159,14 +188,6 @@ class PipelineWorkerFrameProcessingMixin:
                     self._hdr_queue,
                     (present_t, queued_tensor, ready_event),
                 )
-            if use_cuda:
-                try:
-                    if ready_event is not None:
-                        ready_event.synchronize()
-                    else:
-                        torch.cuda.current_stream().synchronize()
-                except Exception:
-                    torch.cuda.synchronize()
 
         if (
             display_frame is not None
@@ -187,4 +208,4 @@ class PipelineWorkerFrameProcessingMixin:
         else:
             output = display_frame if display_frame is not None else frame
 
-        return display_frame, output, prepared_out, need_hdr_cpu
+        return display_frame, output, prepared_out, need_hdr_cpu, model_latency_ms

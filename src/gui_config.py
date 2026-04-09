@@ -82,9 +82,13 @@ CAPTURE_FPS_PRESETS = {
     "24 FPS": 24.0,
     "25 FPS": 25.0,
     "30 FPS": 30.0,
+    "48 FPS": 48.0,
+    "50 FPS": 50.0,
+    "60 FPS": 60.0,
 }
 
 DEFAULT_CAPTURE_FPS_LABEL = "24 FPS"
+LIVE_CAPTURE_DISPLAY_FPS = 120.0
 
 
 def _normalize_source_mode(mode: str | None) -> str:

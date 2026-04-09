@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v3.0-blue)
+![Version](https://img.shields.io/badge/version-v3.1-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,14 +12,15 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, compile caching, export, and live browser-window viewing.
 
-`v3.0` is the big browser-window update:
+`v3.1` builds on the browser-window update with more practical live-viewer polish:
 
 - native `Browser Window Capture (Experimental)` video path
-- modern Windows output capture backend for browser-window video instead of legacy GDI-only readback
-- Chrome Audio Sync extension reduced to delayed local audio only
+- modern Windows direct window capture backend for browser-window video
+- Chrome Audio Sync extension kept audio-only, with manual start/stop in Chrome
+- Browser Window Capture now follows fresh Chrome window frames dynamically instead of using a manual capture-FPS cap
+- cleaner startup logging by filtering harmless Qt DPI-awareness warning spam
 - cleaner compile-cache reuse for compatible kernels
-- clearer Chrome-only setup/runtime warnings
-- continued export and playback polish from the `v2.x` line
+- continued playback/export cleanup from the `v2.x` and `v3.0` work
 
 Windows-only project with **NVIDIA CUDA**, **AMD ROCm-Windows**, and **CPU** backends.
 
@@ -85,6 +86,7 @@ Use this flow for `Browser Window Capture`:
 10. In Chrome, open the tab you want and click the extension's `Start Chrome Audio Sync`
 11. Back in HDRTVNet++, pick the matching visible Chrome window
 12. Adjust the extension delay slider while playback is running until lip-sync looks right
+13. Stop Chrome Audio Sync later from the extension popup when you are done
 
 Important:
 
@@ -94,12 +96,14 @@ Important:
 - HDRTVNet++ captures video directly from the visible Chrome window.
 - Browser-window video uses a native Windows output-capture backend; performance still depends on window size and monitor configuration.
 - The extension is audio-only and delays tab audio locally inside Chrome.
+- Chrome Audio Sync now stays active until you stop it manually in the extension.
 - HDRTVNet++ stays silent during browser-window playback.
+- Browser-window capture now follows fresh Chrome window frames dynamically; there is no manual Browser Window capture-FPS cap anymore.
 - Without Chrome Audio Sync, Chrome keeps playing audio locally and it can lead the video.
 
 ---
 
-## GUI (v3.0)
+## GUI (v3.1)
 
 ```bash
 python src/gui.py
@@ -107,7 +111,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, and live browser-window viewing.
 
-### Grand Update v3.0 Highlights
+### Grand Update v3.1 Highlights
 
 - **Native Browser Window Capture replaces the old browser-video bridge**
   - HDRTVNet++ now captures browser video directly from the visible Chrome window
@@ -117,7 +121,13 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
   - Chrome-only
   - experimental
   - manual delay slider in the extension popup
+  - manual stop behavior stays in the extension popup
   - HDRTVNet++ stays silent while Chrome replays delayed tab audio locally
+- **Browser Window Capture is more usable as a live viewer**
+  - Browser Window Capture now follows fresh Chrome window frames dynamically instead of exposing a manual live capture-FPS cap
+  - the direct-window capture path remains the only active browser-video path
+- **Startup logging is cleaner**
+  - harmless Qt DPI-awareness warnings are filtered so launch logs stay focused on real problems
 - **Kernel cache reuse is more robust**
   - compatible older compile-profile namespaces can be reused instead of acting like the cache disappeared
   - FP16 and predequantized mixed INT8 cache markers now line up more consistently
@@ -138,6 +148,9 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 - **Playback and export now use a simpler single-frame path**
   - temporal stabilization has been removed globally to reduce GPU cost and keep latency/FPS behavior more predictable
   - browser-window playback, video playback, and export now all follow the same no-temporal-stabilization policy
+- **Live metrics are more thesis-friendly**
+  - the `Latency` field now reflects model-stage latency instead of mixing in more source-path timing differences
+  - app `VRAM` / `CPU` memory remain whole-app runtime metrics, which is more honest than pretending they are model-only allocations
 - **Experimental max-autotune export reuses the playback compile cache**
   - export uses the same compile/cache keying and compile dialogs as playback
   - max-autotune export uses full Stop behavior first to avoid stale GPU/MIOpen state
@@ -149,7 +162,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | Feature | Description |
 |---|---|
 | **Open any video** | Browse or drag-and-drop — playback starts automatically |
-| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with Chrome Audio Sync handled separately by the bundled extension |
+| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with bundled Chrome Audio Sync; capture follows fresh Chrome window frames dynamically |
 | **Modular codebase** | GUI and worker logic split into maintainable mixins/modules for easier iteration |
 | **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
 | **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |
@@ -158,7 +171,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
-| **Performance metrics panel** | FPS, latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
+| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |

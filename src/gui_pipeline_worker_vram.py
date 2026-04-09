@@ -8,6 +8,8 @@ import threading
 class PipelineWorkerVramMixin:
     """Windows app-VRAM polling helpers for PipelineWorker."""
 
+    _APP_VRAM_POLL_INTERVAL_S = 2.0
+
     @staticmethod
     def _query_app_vram_mb_windows(pid: int) -> float | None:
         """Return dedicated GPU process memory (MB) for this process on Windows."""
@@ -57,7 +59,7 @@ class PipelineWorkerVramMixin:
                 q = self._query_app_vram_mb_windows(pid)
                 if q is not None:
                     self._app_vram_mb = q
-                self._app_vram_poll_stop.wait(0.5)
+                self._app_vram_poll_stop.wait(self._APP_VRAM_POLL_INTERVAL_S)
 
         self._app_vram_poll_thread = threading.Thread(target=_poll, daemon=True)
         self._app_vram_poll_thread.start()

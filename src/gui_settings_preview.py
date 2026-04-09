@@ -351,13 +351,13 @@ class SettingsPreviewMixin:
             self._cmb_source_mode.setEnabled(not self._playing)
             self._cmb_source_mode.blockSignals(False)
         if hasattr(self, "_capture_fps_container") and self._capture_fps_container is not None:
-            self._capture_fps_container.setVisible(is_window)
+            self._capture_fps_container.setVisible(False)
         if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
             self._cmb_capture_fps.blockSignals(True)
             self._cmb_capture_fps.setCurrentText(
                 _normalize_capture_fps_label(getattr(self, "_capture_fps_label", None))
             )
-            self._cmb_capture_fps.setEnabled(is_window and not self._playing)
+            self._cmb_capture_fps.setEnabled(False)
             self._cmb_capture_fps.blockSignals(False)
         if hasattr(self, "_btn_file") and self._btn_file is not None:
             self._btn_file.setText("Choose Browser Window ..." if is_window else "Open Video ...")

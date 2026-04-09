@@ -112,7 +112,7 @@ startAudioBtn.addEventListener("click", async () => {
         response.hasAudio === false
           ? "No tab-audio track was detected."
           : `Chrome is now replaying delayed tab audio locally at ${response.audioDelayMs || audioDelayMs} ms.`
-      }\nReturn to HDRTVNet++ and press Play. HDRTVNet++ will stop this session automatically when playback stops or the app closes.`
+      }\nReturn to HDRTVNet++ and press Play. Chrome Audio Sync will stay active until you stop it here.`
     );
   } catch (error) {
     setStatus(`Could not start Chrome Audio Sync:\n${error.message || error}`, true);

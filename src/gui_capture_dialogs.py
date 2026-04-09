@@ -13,10 +13,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from gui_config import (
-    _capture_fps_label_options,
-    _normalize_capture_fps_label,
-)
 from window_capture_source import (
     WindowCaptureTarget,
     attach_best_browser_tab_session,
@@ -31,7 +27,7 @@ _SUPPORTED_CHROME_PROCESS = "chrome.exe"
 
 
 class WindowCaptureDialog(QDialog):
-    """Choose a visible browser window and capture FPS preset."""
+    """Choose a visible Chrome window for native live capture."""
 
     def __init__(
         self,
@@ -61,7 +57,7 @@ class WindowCaptureDialog(QDialog):
             "5. Adjust the extension delay slider while playback is running until lip-sync looks right.\n"
             "6. HDRTVNet++ captures video from a visible Chrome window and stays silent.\n"
             "7. The extension delays and plays Chrome tab audio locally.\n"
-            "8. HDRTVNet++ stops the extension session automatically when playback stops or the app closes."
+            "8. Chrome Audio Sync stays active until you stop it in the extension."
         )
         self._lbl_intro.setWordWrap(True)
         root.addWidget(self._lbl_intro)
@@ -81,17 +77,15 @@ class WindowCaptureDialog(QDialog):
         row_window.addWidget(self._btn_refresh)
         root.addLayout(row_window)
 
-        row_fps = QHBoxLayout()
-        row_fps.addWidget(QLabel("Capture FPS:"))
-        self._cmb_fps = QComboBox()
-        self._cmb_fps.addItems(_capture_fps_label_options())
-        self._cmb_fps.setCurrentText(_normalize_capture_fps_label(initial_fps_label))
-        row_fps.addWidget(self._cmb_fps)
-        row_fps.addStretch(1)
-        root.addLayout(row_fps)
+        self._lbl_capture_mode = QLabel(
+            "Capture rate adapts automatically to whatever Chrome is actually presenting."
+        )
+        self._lbl_capture_mode.setWordWrap(True)
+        root.addWidget(self._lbl_capture_mode)
 
         self._lbl_status = QLabel("")
         self._lbl_status.setStyleSheet("color: #9ecbff;")
+        self._lbl_status.setWordWrap(True)
         root.addWidget(self._lbl_status)
 
         buttons = QDialogButtonBox(
@@ -181,28 +175,35 @@ class WindowCaptureDialog(QDialog):
                 "No visible Google Chrome windows were found. Open the Chrome window you want to capture, keep it visible, then refresh."
             )
             return
-        dims = ""
+        title = str(getattr(target, "title", "") or "").strip() or target.label
+        details: list[str] = []
         if int(target.width) > 0 and int(target.height) > 0:
-            dims = f" - {int(target.width)}x{int(target.height)}"
-        source_url = str(getattr(target, "source_url", "") or "").strip()
-        if source_url:
-            dims += f" - {source_url}"
-        elif str(getattr(target, "process_name", "") or "").strip():
-            dims += f" - {str(getattr(target, 'process_name', '') or '').strip()}"
+            details.append(f"{int(target.width)}x{int(target.height)}")
+        browser_name = str(getattr(target, "browser_name", "") or "").strip()
+        process_name = str(getattr(target, "process_name", "") or "").strip()
+        if browser_name:
+            details.append(browser_name)
+        elif process_name:
+            details.append(process_name)
         session_id = str(getattr(target, "session_id", "") or "").strip()
         if session_id:
-            dims += " - Chrome Audio Sync ready; keep Chrome graphics acceleration off and adjust delay in extension popup"
+            sync_text = (
+                "Chrome Audio Sync ready. Keep Chrome graphics acceleration off and adjust delay in the extension popup."
+            )
         else:
-            dims += " - Keep Chrome graphics acceleration off; start Chrome Audio Sync before Play if you want delayed audio"
-        self._lbl_status.setText(
-            f"Selected: {target.label}{dims}"
-        )
+            sync_text = (
+                "Chrome Audio Sync not started. Keep Chrome graphics acceleration off, then start Chrome Audio Sync before Play if you want delayed audio."
+            )
+        detail_text = " - ".join(details)
+        if detail_text:
+            self._lbl_status.setText(
+                f"Selected: {title}\nWindow: {detail_text}\n{sync_text}"
+            )
+        else:
+            self._lbl_status.setText(f"Selected: {title}\n{sync_text}")
 
     def selected_target(self) -> WindowCaptureTarget | None:
         idx = int(self._cmb_window.currentIndex())
         if idx < 0 or idx >= len(self._targets):
             return None
         return self._targets[idx]
-
-    def selected_fps_label(self) -> str:
-        return _normalize_capture_fps_label(self._cmb_fps.currentText())

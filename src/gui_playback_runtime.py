@@ -20,12 +20,12 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
+    LIVE_CAPTURE_DISPLAY_FPS,
     PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
     _select_model_path,
     _available_precision_keys,
-    _capture_fps_value_from_label,
     _normalize_capture_fps_label,
     _normalize_source_mode,
     MAX_W,
@@ -108,18 +108,7 @@ class PlaybackRuntimeMixin:
     """Playback, restart/apply settings, and compile/file tool flows for MainWindow."""
 
     def _stop_active_browser_tab_session(self) -> None:
-        if _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)) != SOURCE_MODE_WINDOW:
-            return
-        target = getattr(self, "_capture_target", None)
-        session_id = str(getattr(target, "session_id", "") or "").strip()
-        if not session_id:
-            return
-        try:
-            from browser_tab_bridge import close_browser_tab_session
-
-            close_browser_tab_session(session_id)
-        except Exception:
-            pass
+        return
 
     _EXPORT_LOCK_WIDGET_NAMES = (
         "_btn_file",
@@ -1167,9 +1156,6 @@ class PlaybackRuntimeMixin:
             except Exception:
                 current_session_id = None
         dlg = WindowCaptureDialog(
-            initial_fps_label=_normalize_capture_fps_label(
-                getattr(self, "_capture_fps_label", None)
-            ),
             initial_session_id=current_session_id,
             initial_target=target if isinstance(target, WindowCaptureTarget) else None,
             parent=self,
@@ -1184,10 +1170,6 @@ class PlaybackRuntimeMixin:
                 "Choose a visible browser window first.",
             )
             return
-        self._capture_fps_label = dlg.selected_fps_label()
-        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
-        if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
-            self._cmb_capture_fps.setCurrentText(self._capture_fps_label)
         self._set_window_capture_source(target)
 
     def _open_export_dialog(self):
@@ -1588,12 +1570,7 @@ class PlaybackRuntimeMixin:
             browser_name=str(getattr(target, "browser_name", "") or "").strip(),
             source_url=str(getattr(target, "source_url", "") or "").strip(),
         )
-        self._capture_fps_label = _normalize_capture_fps_label(
-            getattr(self, "_cmb_capture_fps", None).currentText()
-            if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
-            else getattr(self, "_capture_fps_label", None)
-        )
-        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
+        self._capture_fps_value = float(LIVE_CAPTURE_DISPLAY_FPS)
         self._reset_hdr_ground_truth()
 
         if self._last_res is not None:
@@ -1615,7 +1592,7 @@ class PlaybackRuntimeMixin:
 
         self._save_user_settings()
         self._set_source_resolution_options_for_dims(src_w, src_h)
-        self._prepare_live_timeline(self._capture_fps_value)
+        self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
         self._show_idle_preview_frame(preview)
         self._refresh_source_mode_ui()
         self._btn_pause.setEnabled(False)
@@ -1744,7 +1721,6 @@ class PlaybackRuntimeMixin:
 
         args = [sys.executable, sys.argv[0], "--source-mode", SOURCE_MODE_WINDOW]
         args += capture_target_to_cli_args(target)
-        args += ["--capture-fps", _normalize_capture_fps_label(self._capture_fps_label)]
         if resolution in RESOLUTION_SCALES:
             args += ["--resolution", resolution]
         elif resolution == "Source":
@@ -1854,19 +1830,12 @@ class PlaybackRuntimeMixin:
                 browser_name=str(getattr(target, "browser_name", "") or "").strip(),
                 source_url=str(getattr(target, "source_url", "") or "").strip(),
             )
-            self._capture_fps_label = _normalize_capture_fps_label(
-                getattr(self, "_cmb_capture_fps", None).currentText()
-                if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
-                else getattr(self, "_capture_fps_label", None)
-            )
-            self._capture_fps_value = _capture_fps_value_from_label(
-                self._capture_fps_label
-            )
+            self._capture_fps_value = float(LIVE_CAPTURE_DISPLAY_FPS)
             self._set_source_resolution_options_for_dims(vw, vh)
-            self._prepare_live_timeline(self._capture_fps_value)
+            self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
             self._source_hdr_info = {"is_hdr": False, "reason": "browser_window_capture"}
             total_frames = 0
-            self._vid_fps = float(self._capture_fps_value or 24.0)
+            self._vid_fps = float(LIVE_CAPTURE_DISPLAY_FPS)
             if not str(getattr(self._capture_target, "session_id", "") or "").strip():
                 self.statusBar().showMessage(
                     "No matching Chrome Audio Sync session was found. "
@@ -2141,7 +2110,7 @@ class PlaybackRuntimeMixin:
                     "source_url": str(getattr(self._capture_target, "source_url", "") or ""),
                     "process_name": str(getattr(self._capture_target, "process_name", "") or ""),
                     "pid": int(getattr(self._capture_target, "pid", 0) or 0),
-                    "fps": float(self._capture_fps_value or 24.0),
+                    "fps": float(LIVE_CAPTURE_DISPLAY_FPS),
                     "capture_w": int(pw),
                     "capture_h": int(ph),
                 }
@@ -2176,8 +2145,10 @@ class PlaybackRuntimeMixin:
             self._scrub_muted = False
             self._refresh_source_mode_ui()
             self.statusBar().showMessage(
-                f"Live browser window capture started at {self._capture_fps_label}. "
-                "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. HDRTVNet++ stays silent. If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
+                "Live browser window capture started. "
+                "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. "
+                "Capture runs dynamically from fresh Chrome window frames. HDRTVNet++ stays silent. "
+                "If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
             )
         elif self._audio_available:
             self._stop_live_audio_capture()
@@ -2316,7 +2287,6 @@ class PlaybackRuntimeMixin:
 
     def _stop(self):
         self._suppress_eof_restart_once = True
-        self._stop_active_browser_tab_session()
         self._worker.stop()
         self._worker.wait(10000)
         if self._disp_hdr_mpv is not None:
@@ -2406,6 +2376,19 @@ class PlaybackRuntimeMixin:
         self._sync_upscale_controls()
         if self._playing:
             self._update_apply_button_state()
+
+    def _refresh_live_capture_playback_fps(self, fps: float):
+        del fps
+        return
+
+    def _on_capture_fps_changed(self, label: str):
+        self._capture_fps_label = _normalize_capture_fps_label(label)
+        self._capture_fps_value = float(LIVE_CAPTURE_DISPLAY_FPS)
+        if _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)) != SOURCE_MODE_WINDOW:
+            self._refresh_source_mode_ui()
+            return
+        self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
+        self._refresh_source_mode_ui()
 
     def _on_upscale_changed(self, _mode: str):
         self._sync_upscale_controls()

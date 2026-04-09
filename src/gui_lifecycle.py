@@ -83,7 +83,7 @@ class LifecycleMixin:
         if hasattr(self, "_cmb_source_mode") and self._cmb_source_mode is not None:
             self._cmb_source_mode.setEnabled(True)
         if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
-            self._cmb_capture_fps.setEnabled(self._source_mode == "window_capture")
+            self._cmb_capture_fps.setEnabled(False)
         if self._btn_toggle_ui is not None:
             self._btn_toggle_ui.setEnabled(False)
             self._btn_toggle_ui.setText("Hide UI")
@@ -151,11 +151,6 @@ class LifecycleMixin:
 
         self._ui_closing = True
         self._save_user_settings()
-        if hasattr(self, "_stop_active_browser_tab_session"):
-            try:
-                self._stop_active_browser_tab_session()
-            except Exception:
-                pass
         if self._export_worker is not None:
             try:
                 self._export_worker.cancel()

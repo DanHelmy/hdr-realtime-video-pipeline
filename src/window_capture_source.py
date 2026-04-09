@@ -4,12 +4,12 @@ import atexit
 import ctypes
 import importlib
 import os
-import queue
 import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 import psutil
 
@@ -55,6 +55,8 @@ if _DXCAM_FACTORY is None and dxcam is not None:
     _DXCAM_FACTORY = dxcam.DXFactory()
 _WINRT_WINDOW_CAPTURE_CACHE: dict[int, "_WinRTWindowCaptureSession"] = {}
 _WINRT_WINDOW_BINDINGS = None
+_WINDOW_CAPTURE_DUPLICATE_WAIT_S = 0.25
+_WINRT_CAPTURE_POLL_MAX_SLEEP_S = 0.002
 
 
 @dataclass
@@ -421,9 +423,12 @@ class _WinRTWindowCaptureSession:
             if wait_timeout_s <= 0.0 or time.perf_counter() >= deadline:
                 return None
             if not saw_frame:
-                time.sleep(0.01)
+                remaining_s = max(0.0, deadline - time.perf_counter())
+                if remaining_s <= 0.0:
+                    return None
+                time.sleep(min(_WINRT_CAPTURE_POLL_MAX_SLEEP_S, remaining_s))
 
-    def grab(self) -> np.ndarray | None:
+    def grab(self, *, wait_timeout_s: float | None = None) -> np.ndarray | None:
         if not _window_exists(self.hwnd):
             return None
         current_monitor = _window_monitor(self.hwnd)
@@ -431,7 +436,8 @@ class _WinRTWindowCaptureSession:
             return None
         if current_monitor != self._monitor or self._session is None:
             self._open()
-        wait_timeout_s = 0.15 if not self._seen_frame else 0.0
+        if wait_timeout_s is None:
+            wait_timeout_s = 0.15 if not self._seen_frame else 0.0
         frame = self._drain_to_latest_frame(wait_timeout_s=wait_timeout_s)
         if frame is None:
             return None
@@ -504,7 +510,11 @@ def _cleanup_winrt_window_captures() -> None:
         _release_cached_winrt_window_capture(hwnd)
 
 
-def _capture_window_via_winrt(hwnd: int) -> tuple[bool, np.ndarray | None]:
+def _capture_window_via_winrt(
+    hwnd: int,
+    *,
+    wait_timeout_s: float | None = None,
+) -> tuple[bool, np.ndarray | None]:
     hwnd_i = max(0, int(hwnd or 0))
     if hwnd_i <= 0:
         return False, None
@@ -516,7 +526,7 @@ def _capture_window_via_winrt(hwnd: int) -> tuple[bool, np.ndarray | None]:
             return False, None
         _WINRT_WINDOW_CAPTURE_CACHE[hwnd_i] = session
     try:
-        frame = session.grab()
+        frame = session.grab(wait_timeout_s=wait_timeout_s)
     except Exception:
         _release_cached_winrt_window_capture(hwnd_i)
         return False, None
@@ -576,14 +586,18 @@ def _native_target_from_hwnd(
     )
 
 
-def _capture_native_window_frame(hwnd: int) -> tuple[np.ndarray | None, int, int]:
+def _capture_native_window_frame(
+    hwnd: int,
+    *,
+    wait_timeout_s: float | None = None,
+) -> tuple[np.ndarray | None, int, int]:
     if not _window_exists(hwnd):
         _release_cached_winrt_window_capture(hwnd)
         return None, 0, 0
     _left, _top, width, height = _window_rect(hwnd)
     if width <= 0 or height <= 0:
         return None, max(0, int(width)), max(0, int(height))
-    handled, frame = _capture_window_via_winrt(hwnd)
+    handled, frame = _capture_window_via_winrt(hwnd, wait_timeout_s=wait_timeout_s)
     if not handled:
         return None, int(width), int(height)
     if frame is None:
@@ -943,18 +957,14 @@ class WindowCaptureSource:
         self.last_capture_perf_counter = 0.0
         self._stopped = False
         self._last_frame_index = -1
-        self._queue = None
         self._thread = None
-        self._sentinel = object()
-        self._last_native_frame: np.ndarray | None = None
+        self._payload_cond = threading.Condition()
+        self._latest_payload: tuple[int, float, float, np.ndarray] | None = None
+        self._delivered_seq = -1
         self._capture_started_perf = time.perf_counter()
-        self._next_native_capture_perf = self._capture_started_perf
-        self._frame_interval_s = 1.0 / self.fps
 
-        if self.prefetch > 0:
-            self._queue = queue.Queue(maxsize=max(1, self.prefetch))
-            self._thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self._thread.start()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
 
     def read(self):
         ok, frame, _idx, _pts = self.read_with_meta()
@@ -976,84 +986,60 @@ class WindowCaptureSource:
         )
         if dst_w == src_w and dst_h == src_h:
             return frame
-        import cv2
-
         resized = cv2.resize(frame, (int(dst_w), int(dst_h)), interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(resized)
 
-    def _sleep_until_next_native_capture(self) -> bool:
-        while not self._stopped:
-            now = time.perf_counter()
-            if now >= self._next_native_capture_perf:
-                return True
-            time.sleep(min(self._next_native_capture_perf - now, 0.01))
-        return False
+    def _capture_wait_timeout_s(self) -> float:
+        return min(_WINDOW_CAPTURE_DUPLICATE_WAIT_S, 1.0 / 120.0)
 
-    def _native_capture_payload(self) -> tuple[int, float, float, np.ndarray] | None:
-        if not self._sleep_until_next_native_capture():
-            return None
-
-        frame, width, height = _capture_native_window_frame(self.hwnd)
-        captured_t = time.perf_counter()
-        self._next_native_capture_perf = max(
-            self._next_native_capture_perf + self._frame_interval_s,
-            captured_t,
-        )
-
-        if frame is None:
-            if not _window_exists(self.hwnd):
-                return None
-            if self._last_native_frame is None:
-                return None
-            frame = self._last_native_frame
-        else:
-            frame = self._resize_frame_if_needed(frame)
-            self._last_native_frame = frame
-
-        self._last_frame_index += 1
-        idx = int(self._last_frame_index)
-        pts_sec = max(0.0, captured_t - self._capture_started_perf)
-        return idx, float(pts_sec), float(captured_t), frame
+    def set_fps(self, fps: float) -> float:
+        # Browser Window Capture now runs uncapped from fresh WinRT frames.
+        # Keep this setter as a compatibility no-op for older worker/UI code.
+        next_fps = max(1.0, float(fps))
+        self.fps = next_fps
+        with self._payload_cond:
+            self._payload_cond.notify_all()
+        return next_fps
 
     def _reader_loop(self):
         while not self._stopped:
-            payload = self._native_capture_payload()
-            if payload is None:
+            frame, _width, _height = _capture_native_window_frame(
+                self.hwnd,
+                wait_timeout_s=self._capture_wait_timeout_s(),
+            )
+            captured_t = time.perf_counter()
+            if frame is None:
                 if _window_exists(self.hwnd):
                     continue
-                try:
-                    self._queue.put_nowait(self._sentinel)
-                except Exception:
-                    pass
                 break
-            while not self._stopped:
-                try:
-                    self._queue.put_nowait(payload)
-                    break
-                except queue.Full:
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        break
+
+            frame = self._resize_frame_if_needed(frame)
+
+            self._last_frame_index += 1
+            idx = int(self._last_frame_index)
+            pts_sec = max(0.0, captured_t - self._capture_started_perf)
+            payload = (idx, float(pts_sec), float(captured_t), frame)
+            with self._payload_cond:
+                self._latest_payload = payload
+                self._payload_cond.notify_all()
+
+        self._stopped = True
+        with self._payload_cond:
+            self._payload_cond.notify_all()
 
     def read_with_meta(self):
-        if self._queue is not None:
-            item = self._queue.get()
-            if item is self._sentinel:
-                return False, None, -1, 0.0
-            idx, pts_sec, captured_t, frame = item
-            self.last_capture_perf_counter = float(captured_t)
-            return True, frame, int(idx), float(pts_sec)
-
         while not self._stopped:
-            payload = self._native_capture_payload()
-            if payload is None:
-                if _window_exists(self.hwnd):
-                    continue
-                return False, None, -1, 0.0
-            idx, pts_sec, captured_t, frame = payload
-            self.last_capture_perf_counter = float(captured_t)
-            return True, frame, int(idx), float(pts_sec)
+            with self._payload_cond:
+                payload = self._latest_payload
+                if payload is not None:
+                    idx, pts_sec, captured_t, frame = payload
+                    if int(idx) > self._delivered_seq:
+                        self._delivered_seq = int(idx)
+                        self.last_capture_perf_counter = float(captured_t)
+                        return True, frame, int(idx), float(pts_sec)
+                if not _window_exists(self.hwnd):
+                    return False, None, -1, 0.0
+                self._payload_cond.wait(timeout=self._capture_wait_timeout_s())
         return False, None, -1, 0.0
 
     def seek(self, frame_number):
@@ -1065,6 +1051,8 @@ class WindowCaptureSource:
 
     def release(self):
         self._stopped = True
+        with self._payload_cond:
+            self._payload_cond.notify_all()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=0.5)
         _release_cached_winrt_window_capture(self.hwnd)

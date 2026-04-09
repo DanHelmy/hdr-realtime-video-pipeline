@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 BRIDGE_HOST = os.environ.get("HDRTVNET_TAB_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1"
 BRIDGE_PORT = max(1024, int(os.environ.get("HDRTVNET_TAB_BRIDGE_PORT", "39091")))
 _SESSION_TIMEOUT_S = max(10.0, float(os.environ.get("HDRTVNET_TAB_SESSION_TIMEOUT_S", "45.0")))
-_CLEANUP_INTERVAL_S = 1.0
+_CLEANUP_INTERVAL_S = 2.0
 _REVOKED_SESSION_TTL_S = max(5.0, float(os.environ.get("HDRTVNET_TAB_REVOKED_SESSION_TTL_S", "30.0")))
 
 
