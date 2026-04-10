@@ -59,7 +59,7 @@ class PipelineWorkerModelMixin:
         key,
         announce_ready: bool = True,
         *,
-        compile_model: bool = True,
+        compile_model: bool | None = None,
     ):
         cfg = PRECISIONS.get(key, {})
         path = _select_model_path(key, self._use_hg)
@@ -91,6 +91,12 @@ class PipelineWorkerModelMixin:
             torch._dynamo.reset()
         except (AssertionError, RuntimeError):
             pass
+
+        if compile_model is None:
+            compile_model = (
+                str(getattr(self, "_runtime_execution_mode", "compile")).strip().lower()
+                != "eager"
+            )
 
         self._processor = HDRTVNetTorch(
             path,

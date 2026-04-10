@@ -59,6 +59,7 @@ class UiBuilderMixin:
         file_menu.addAction("E&xit", self.close)
 
         tools_menu = menu_bar.addMenu("&Tools")
+        tools_menu.addAction("\U0001F9EA  Runtime Execution Mode ...", self._choose_runtime_execution_mode)
         tools_menu.addAction("\U0001F9EE  INT8 &Pre-dequantization ...", self._choose_predequantize_mode)
         tools_menu.addAction("\u2699  &Pre-compile Kernels ...", self._precompile_kernels)
         tools_menu.addSeparator()

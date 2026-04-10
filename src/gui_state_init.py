@@ -174,6 +174,7 @@ class StateInitMixin:
         self._last_open_dir = root_dir
         self._last_export_dir = root_dir
         self._predequantize_mode = "auto"
+        self._runtime_execution_mode = "compile"
         self._suppress_hip_sdk_warning = False
         self._startup_hip_sdk_warning_shown = False
         self._suppress_octave_compare_warning = False

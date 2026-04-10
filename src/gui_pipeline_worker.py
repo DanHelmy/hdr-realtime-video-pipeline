@@ -79,6 +79,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
 
 
+def _normalize_runtime_execution_mode(mode: str | None) -> str:
+    text = str(mode or "").strip().lower()
+    if text == "eager":
+        return "eager"
+    return "compile"
+
+
 def _choose_live_present_target_fps(
     source_fps: float,
     sustainable_fps: float,
@@ -162,6 +169,7 @@ class PipelineWorker(
         self._pause_event.set()  # not paused
         self._pending_precision = None
         self._pending_predequantize_mode: str | None = None
+        self._pending_runtime_execution_mode: str | None = None
         self._pending_capture_fps: float | None = None
         self._paused_control_wake = False
         self._paused_control_refresh_frame: int | None = None
@@ -199,6 +207,7 @@ class PipelineWorker(
         self._app_vram_poll_thread: threading.Thread | None = None
         self._realtime_drop_frames: int = 0
         self._predequantize_mode: str = "auto"
+        self._runtime_execution_mode: str = "compile"
         self._objective_metrics_enabled: bool = False
         self._hdr_ground_truth_path: str | None = None
         self._pending_metrics_cfg: tuple[bool, str | None] | None = None
@@ -214,6 +223,7 @@ class PipelineWorker(
                   output_w=MAX_W, output_h=MAX_H, input_is_hdr=False,
                   use_hg=True,
                   predequantize_mode: str = "auto",
+                  runtime_execution_mode: str = "compile",
                   objective_metrics_enabled=False,
                   hdr_ground_truth_path: str | None = None,
                   capture_target: dict | None = None):
@@ -232,6 +242,10 @@ class PipelineWorker(
             mode = "auto"
         self._predequantize_mode = mode
         self._pending_predequantize_mode = None
+        self._runtime_execution_mode = _normalize_runtime_execution_mode(
+            runtime_execution_mode
+        )
+        self._pending_runtime_execution_mode = None
         self._pending_capture_fps = None
         self._objective_metrics_enabled = bool(objective_metrics_enabled)
         self._hdr_ground_truth_path = (
@@ -320,6 +334,10 @@ class PipelineWorker(
         if m not in {"auto", "on", "off"}:
             m = "auto"
         self._pending_predequantize_mode = m
+        self._wake_for_paused_control_change()
+
+    def request_runtime_execution_mode(self, mode: str):
+        self._pending_runtime_execution_mode = _normalize_runtime_execution_mode(mode)
         self._wake_for_paused_control_change()
 
     def request_resolution_change(self, proc_w: int, proc_h: int):
@@ -517,6 +535,7 @@ class PipelineWorker(
         self._stop_flag = False
         self._pending_precision = None
         self._pending_predequantize_mode = None
+        self._pending_runtime_execution_mode = None
 
         if self._input_is_hdr:
             # No SDR->HDR inference when source is already HDR.
@@ -664,6 +683,23 @@ class PipelineWorker(
                 self._predequantize_mode = pending_predeq
                 self.status_message.emit(
                     f"Pre-dequantization mode -> {self._predequantize_mode}. Reloading model ..."
+                )
+                if not self._load_model(self._precision_key):
+                    continue
+                self._reset_enhance_history()
+
+            pending_exec_mode = self._pending_runtime_execution_mode
+            if pending_exec_mode is not None and pending_exec_mode == self._runtime_execution_mode:
+                self._pending_runtime_execution_mode = None
+            if (
+                (not self._input_is_hdr)
+                and pending_exec_mode is not None
+                and pending_exec_mode != self._runtime_execution_mode
+            ):
+                self._pending_runtime_execution_mode = None
+                self._runtime_execution_mode = pending_exec_mode
+                self.status_message.emit(
+                    f"Runtime execution mode -> {self._runtime_execution_mode}. Reloading model ..."
                 )
                 if not self._load_model(self._precision_key):
                     continue

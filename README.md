@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v3.1-blue)
+![Version](https://img.shields.io/badge/version-v3.1.1-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,14 +12,16 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, compile caching, export, and live browser-window viewing.
 
-`v3.1` builds on the browser-window update with more practical live-viewer polish:
+`v3.1.1` builds on the browser-window update with more practical live-viewer polish and safer kernel/cache behavior:
 
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
 - Chrome Audio Sync extension kept audio-only, with manual start/stop in Chrome
 - Browser Window Capture now follows fresh Chrome window frames dynamically instead of using a manual capture-FPS cap
+- Browser Window Capture now uses adaptive paced presentation from a curated live target ladder instead of coarse divisor-only stepping
 - cleaner startup logging by filtering harmless Qt DPI-awareness warning spam
-- cleaner compile-cache reuse for compatible kernels
+- project-scoped kernel caches so separate local clones do not reuse or delete each other's kernels
+- bounded cached-kernel verification with clear-and-recompile recovery when an incompatible cache would otherwise hang warmup
 - continued playback/export cleanup from the `v2.x` and `v3.0` work
 
 Windows-only project with **NVIDIA CUDA**, **AMD ROCm-Windows**, and **CPU** backends.
@@ -99,11 +101,13 @@ Important:
 - Chrome Audio Sync now stays active until you stop it manually in the extension.
 - HDRTVNet++ stays silent during browser-window playback.
 - Browser-window capture now follows fresh Chrome window frames dynamically; there is no manual Browser Window capture-FPS cap anymore.
+- Browser-window playback uses adaptive paced presentation internally, but the FPS metric still shows observed live output cadence rather than a rounded target rung.
 - Without Chrome Audio Sync, Chrome keeps playing audio locally and it can lead the video.
+- If the Chrome source window disappears unexpectedly, HDRTVNet++ now treats that as source loss and restarts cleanly instead of holding onto a dead browser feed.
 
 ---
 
-## GUI (v3.1)
+## GUI (v3.1.1)
 
 ```bash
 python src/gui.py
@@ -111,7 +115,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, and live browser-window viewing.
 
-### Grand Update v3.1 Highlights
+### Grand Update v3.1.1 Highlights
 
 - **Native Browser Window Capture replaces the old browser-video bridge**
   - HDRTVNet++ now captures browser video directly from the visible Chrome window
@@ -126,11 +130,15 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 - **Browser Window Capture is more usable as a live viewer**
   - Browser Window Capture now follows fresh Chrome window frames dynamically instead of exposing a manual live capture-FPS cap
   - the direct-window capture path remains the only active browser-video path
+  - live browser presentation now picks from a curated pacing ladder (`60 / 50 / 48 / 45 / 40 / 36 / 30 / 25 / 24 / 20 ...`) instead of only dropping to coarse divisor steps
+  - if the Chrome source window disappears unexpectedly, the app now restarts cleanly instead of leaving a dead live source attached
 - **Startup logging is cleaner**
   - harmless Qt DPI-awareness warnings are filtered so launch logs stay focused on real problems
-- **Kernel cache reuse is more robust**
-  - compatible older compile-profile namespaces can be reused instead of acting like the cache disappeared
-  - FP16 and predequantized mixed INT8 cache markers now line up more consistently
+- **Kernel cache behavior is safer and more local**
+  - compile caches are now scoped per local project checkout, so multiple local copies no longer reuse or wipe each other's kernels
+  - FP16 and predequantized mixed INT8 cache markers now line up consistently in both directions when they share the same effective compiled graph
+  - cached-kernel verification now detects incompatible "compiled" caches before playback/export enters a stuck warmup path
+  - when a cache is incompatible, the app can prompt to clear only the current project's cache and recompile
 - **Export workflow remains production-oriented**
   - separate `File > Export Video...` flow with independent precision/model/HG selection
   - source-native resolution/FPS defaults
@@ -162,7 +170,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | Feature | Description |
 |---|---|
 | **Open any video** | Browse or drag-and-drop — playback starts automatically |
-| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with bundled Chrome Audio Sync; capture follows fresh Chrome window frames dynamically |
+| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with bundled Chrome Audio Sync; capture follows fresh Chrome window frames dynamically and uses adaptive paced presentation |
 | **Modular codebase** | GUI and worker logic split into maintainable mixins/modules for easier iteration |
 | **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
 | **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |
@@ -176,7 +184,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
-| **Automatic compilation** | Triton kernels compile in a clean subprocess; cached kernels load instantly |
+| **Automatic compilation** | Triton kernels compile in a clean subprocess; caches are project-scoped and verified before reuse |
 | **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
 | **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
 | **Film grain** | Optional film grain restoration (mpv shader) |
@@ -187,10 +195,11 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Keyboard shortcuts** | `F11` borderless full-window, `Esc` exit borderless mode, `Space` pause/resume |
 | **Cursor idle hide** | Optional auto-hide cursor during playback |
 | **INT8 pre-dequantization control** | Tools-menu toggle for `Auto` / `On` / `Off` on INT8 runtimes |
+| **Runtime execution mode** | Tools-menu toggle for `Compile (recommended)` / `Eager (not recommended)`; Eager is for controlled testing and can be much slower (for example ~13 FPS vs ~30 FPS with max-autotune on the same setup) |
 | **Pre-compile kernels** | Compile for any resolution/precision ahead of time |
-| **Clear kernel cache** | Force recompilation (e.g. after PyTorch/driver update) |
+| **Clear kernel cache** | Force recompilation for the current project checkout (e.g. after a PyTorch / driver update) |
 | **Dark theme** | Modern dark UI, auto-applied |
-| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, view/tab, upscale, film grain, metrics visibility, HG toggle, volume, audio track, cursor hide, last-open directory) |
+| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, view/tab, upscale, film grain, metrics visibility, HG toggle, pre-dequantization mode, runtime execution mode, volume, audio track, cursor hide, last-open directory) |
 
 ### GUI Launch Flags
 
@@ -264,6 +273,8 @@ Compiled kernels are **cached to disk**, so:
 
 - subsequent playback on an exact cache hit skips the clean precompile subprocess
 - export max-autotune reuses the same compile cache and only compiles cleanly on a real cache miss
+- caches are now scoped to the current local project checkout instead of being shared implicitly across different local copies of the repo
+- if an old or incompatible cache looks "compiled" but would hang warmup, the app can now stop early and ask to clear/recompile the current project's cache
 
 ---
 

@@ -104,6 +104,13 @@ def _normalize_predequantize_mode(mode: str) -> str:
     return "auto"
 
 
+def _normalize_runtime_execution_mode(mode: str) -> str:
+    m = str(mode).strip().lower()
+    if m == "eager":
+        return "eager"
+    return "compile"
+
+
 class PlaybackRuntimeMixin:
     """Playback, restart/apply settings, and compile/file tool flows for MainWindow."""
 
@@ -190,6 +197,78 @@ class PlaybackRuntimeMixin:
         if os.name == "nt" and _IS_ROCM and not _HAS_HIP_SDK:
             return False
         return True
+
+    def _runtime_execution_mode_uses_compile(self) -> bool:
+        return _normalize_runtime_execution_mode(
+            getattr(self, "_runtime_execution_mode", "compile")
+        ) == "compile"
+
+    def _runtime_execution_mode_label(self) -> str:
+        mode = _normalize_runtime_execution_mode(
+            getattr(self, "_runtime_execution_mode", "compile")
+        )
+        if mode == "eager":
+            return "Eager (not recommended)"
+        return "Compile (recommended)"
+
+    def _choose_runtime_execution_mode(self):
+        options = ["Compile (recommended)", "Eager (not recommended)"]
+        current_label = self._runtime_execution_mode_label()
+        try:
+            current_idx = options.index(current_label)
+        except ValueError:
+            current_idx = 0
+
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Runtime Execution Mode",
+            "Choose runtime execution mode:",
+            options,
+            current_idx,
+            False,
+        )
+        if not ok:
+            return
+
+        mode = (
+            "eager"
+            if str(selected or "").strip().lower().startswith("eager")
+            else "compile"
+        )
+        mode = _normalize_runtime_execution_mode(mode)
+        if mode == getattr(self, "_runtime_execution_mode", "compile"):
+            return
+
+        self._runtime_execution_mode = mode
+        try:
+            self._save_user_settings()
+        except Exception:
+            pass
+
+        if self._playing and self._worker is not None:
+            self.statusBar().showMessage(
+                f"Runtime execution mode -> {mode}. Restarting playback to apply."
+            )
+            self._restart_with_active_source(
+                resolution=self._cmb_res.currentText(),
+                precision=self._cmb_prec.currentText(),
+                view=self._cmb_view.currentText(),
+                use_hg=self._chk_hg.isChecked(),
+                upscale=self._cmb_upscale.currentText()
+                if hasattr(self, "_cmb_upscale")
+                else DEFAULT_UPSCALER,
+                film_grain=self._chk_film_grain.isChecked()
+                if hasattr(self, "_chk_film_grain")
+                else None,
+                hdr_gt=self._hdr_ground_truth_path,
+                autoplay=True,
+                start_frame=int(self._seek_slider.value()) if hasattr(self, "_seek_slider") else 0,
+            )
+            return
+
+        self.statusBar().showMessage(
+            f"Runtime execution mode set to {self._runtime_execution_mode_label()}."
+        )
 
     def _effective_predequantize_mode_for_precision(
         self,
@@ -948,35 +1027,36 @@ class PlaybackRuntimeMixin:
                     active_gui_prec,
                     self._chk_hg.isChecked(),
                 )
-                if not self._is_compile_ready_for_runtime(
-                    cur_pw,
-                    cur_ph,
-                    active_prec_arg,
-                    model_path=target_model_path,
-                    use_hg=self._chk_hg.isChecked(),
-                    selected_predequantize_mode=mode,
-                ):
-                    self.statusBar().showMessage(
-                        f"INT8 pre-dequantization mode '{mode}' not compiled at "
-                        f"{cur_pw}x{cur_ph}; restarting for clean compile."
-                    )
-                    self._save_user_settings()
-                    self._restart_with_active_source(
-                        resolution=self._cmb_res.currentText(),
-                        precision=active_gui_prec,
-                        view=self._cmb_view.currentText(),
+                if self._runtime_execution_mode_uses_compile():
+                    if not self._is_compile_ready_for_runtime(
+                        cur_pw,
+                        cur_ph,
+                        active_prec_arg,
+                        model_path=target_model_path,
                         use_hg=self._chk_hg.isChecked(),
-                        upscale=self._cmb_upscale.currentText()
-                        if hasattr(self, "_cmb_upscale")
-                        else DEFAULT_UPSCALER,
-                        film_grain=self._chk_film_grain.isChecked()
-                        if hasattr(self, "_chk_film_grain")
-                        else None,
-                        hdr_gt=self._hdr_ground_truth_path,
-                        autoplay=True,
-                        start_frame=int(self._seek_slider.value()),
-                    )
-                    return
+                        selected_predequantize_mode=mode,
+                    ):
+                        self.statusBar().showMessage(
+                            f"INT8 pre-dequantization mode '{mode}' not compiled at "
+                            f"{cur_pw}x{cur_ph}; restarting for clean compile."
+                        )
+                        self._save_user_settings()
+                        self._restart_with_active_source(
+                            resolution=self._cmb_res.currentText(),
+                            precision=active_gui_prec,
+                            view=self._cmb_view.currentText(),
+                            use_hg=self._chk_hg.isChecked(),
+                            upscale=self._cmb_upscale.currentText()
+                            if hasattr(self, "_cmb_upscale")
+                            else DEFAULT_UPSCALER,
+                            film_grain=self._chk_film_grain.isChecked()
+                            if hasattr(self, "_chk_film_grain")
+                            else None,
+                            hdr_gt=self._hdr_ground_truth_path,
+                            autoplay=True,
+                            start_frame=int(self._seek_slider.value()),
+                        )
+                        return
                 self._pause_for_precision_swap(active_gui_prec)
                 self._worker.request_predequantize_mode(mode)
                 self._schedule_precision_audio_resync()
@@ -2320,59 +2400,61 @@ class PlaybackRuntimeMixin:
         # If the Triton + Inductor cache is already warm from a previous
         # compile, the subprocess finishes in seconds and auto-closes.
         model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
-        compile_ready = self._is_compile_ready_for_runtime(
-            pw,
-            ph,
-            prec_arg,
-            model_path=model_path,
-            use_hg=self._chk_hg.isChecked(),
-            selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
-        )
-        self._autotune_warning_needed = not compile_ready
-        if not compile_ready:
-            self._autotune_warning_needed = self._compile_cache_missing_for_any(
-                [f"{pw}x{ph}"],
-                prec_arg,
-                model_path=model_path,
-                use_hg=self._chk_hg.isChecked(),
-            )
-        if not compile_ready:
-            if not self._confirm_autotune_precompile_ready():
-                return
-            dlg = _PrecompileDialog(
-                [f"{pw}x{ph}"],
-                precision=prec_arg,
-                model_path=model_path,
-                use_hg=self._chk_hg.isChecked(),
-                hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
-                predequantize_mode=self._effective_precompile_predequantize_mode(
-                    prec_arg,
-                    getattr(self, "_predequantize_mode", "auto"),
-                ),
-                parent=self,
-            )
-            dlg.exec()  # modal - blocks until done
-            if not dlg.succeeded:
-                # Compile failed or user closed early - don't start playback
-                return
-            self._mark_runtime_compile_verified(
+        self._autotune_warning_needed = False
+        if self._runtime_execution_mode_uses_compile():
+            compile_ready = self._is_compile_ready_for_runtime(
                 pw,
                 ph,
                 prec_arg,
-                model_path,
-                self._chk_hg.isChecked(),
+                model_path=model_path,
+                use_hg=self._chk_hg.isChecked(),
                 selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
             )
-        elif not self._ensure_runtime_compile_cache_usable(
-            w=pw,
-            h=ph,
-            precision=prec_arg,
-            model_path=model_path,
-            use_hg=self._chk_hg.isChecked(),
-            selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
-            workflow_name="Playback",
-        ):
-            return
+            self._autotune_warning_needed = not compile_ready
+            if not compile_ready:
+                self._autotune_warning_needed = self._compile_cache_missing_for_any(
+                    [f"{pw}x{ph}"],
+                    prec_arg,
+                    model_path=model_path,
+                    use_hg=self._chk_hg.isChecked(),
+                )
+            if not compile_ready:
+                if not self._confirm_autotune_precompile_ready():
+                    return
+                dlg = _PrecompileDialog(
+                    [f"{pw}x{ph}"],
+                    precision=prec_arg,
+                    model_path=model_path,
+                    use_hg=self._chk_hg.isChecked(),
+                    hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+                    predequantize_mode=self._effective_precompile_predequantize_mode(
+                        prec_arg,
+                        getattr(self, "_predequantize_mode", "auto"),
+                    ),
+                    parent=self,
+                )
+                dlg.exec()  # modal - blocks until done
+                if not dlg.succeeded:
+                    # Compile failed or user closed early - don't start playback
+                    return
+                self._mark_runtime_compile_verified(
+                    pw,
+                    ph,
+                    prec_arg,
+                    model_path,
+                    self._chk_hg.isChecked(),
+                    selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+                )
+            elif not self._ensure_runtime_compile_cache_usable(
+                w=pw,
+                h=ph,
+                precision=prec_arg,
+                model_path=model_path,
+                use_hg=self._chk_hg.isChecked(),
+                selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+                workflow_name="Playback",
+            ):
+                return
 
         # Start playback
         self._last_res = (pw, ph)
@@ -2471,6 +2553,9 @@ class PlaybackRuntimeMixin:
             use_hg=self._chk_hg.isChecked(),
             predequantize_mode=_normalize_predequantize_mode(
                 getattr(self, "_predequantize_mode", "auto")
+            ),
+            runtime_execution_mode=_normalize_runtime_execution_mode(
+                getattr(self, "_runtime_execution_mode", "compile")
             ),
             objective_metrics_enabled=self._objective_metrics_enabled,
             hdr_ground_truth_path=self._hdr_ground_truth_path,
@@ -2958,32 +3043,33 @@ class PlaybackRuntimeMixin:
             cur_pw, cur_ph = self._last_res if self._last_res else (MAX_W, MAX_H)
             target_prec_arg = _precision_to_compile_arg(new_prec)
             target_model_path = _select_model_path(new_prec, self._chk_hg.isChecked())
-            if not self._is_compile_ready_for_runtime(
-                cur_pw,
-                cur_ph,
-                target_prec_arg,
-                model_path=target_model_path,
-                use_hg=self._chk_hg.isChecked(),
-                selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
-            ):
-                self.statusBar().showMessage(
-                    f"Precision {new_prec} not precompiled at {cur_pw}x{cur_ph}; restarting for clean compile."
-                )
-                self._save_user_settings()
-                self._restart_with_active_source(
-                    resolution=new_res,
-                    precision=new_prec,
-                    view=self._cmb_view.currentText(),
+            if self._runtime_execution_mode_uses_compile():
+                if not self._is_compile_ready_for_runtime(
+                    cur_pw,
+                    cur_ph,
+                    target_prec_arg,
+                    model_path=target_model_path,
                     use_hg=self._chk_hg.isChecked(),
-                    upscale=current_upscale,
-                    film_grain=self._chk_film_grain.isChecked()
-                    if hasattr(self, "_chk_film_grain")
-                    else None,
-                    hdr_gt=self._hdr_ground_truth_path,
-                    autoplay=True,
-                    start_frame=int(self._seek_slider.value()),
-                )
-                return
+                    selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+                ):
+                    self.statusBar().showMessage(
+                        f"Precision {new_prec} not precompiled at {cur_pw}x{cur_ph}; restarting for clean compile."
+                    )
+                    self._save_user_settings()
+                    self._restart_with_active_source(
+                        resolution=new_res,
+                        precision=new_prec,
+                        view=self._cmb_view.currentText(),
+                        use_hg=self._chk_hg.isChecked(),
+                        upscale=current_upscale,
+                        film_grain=self._chk_film_grain.isChecked()
+                        if hasattr(self, "_chk_film_grain")
+                        else None,
+                        hdr_gt=self._hdr_ground_truth_path,
+                        autoplay=True,
+                        start_frame=int(self._seek_slider.value()),
+                    )
+                    return
             self._pause_for_precision_swap(new_prec)
             self._worker.request_precision_change(new_prec)
             if self._playing:

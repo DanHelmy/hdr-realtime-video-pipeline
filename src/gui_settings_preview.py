@@ -31,6 +31,13 @@ from gui_scaling import (
     DEFAULT_UPSCALER,
 )
 
+
+def _normalize_runtime_execution_mode(mode: str | None) -> str:
+    text = str(mode or "").strip().lower()
+    if text in {"eager", "compile"}:
+        return text
+    return "compile"
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _PREFS_PATH = os.path.join(_ROOT, ".gui_prefs.json")
@@ -225,6 +232,9 @@ class SettingsPreviewMixin:
         if predeq_mode not in {"auto", "on", "off"}:
             predeq_mode = "auto"
         self._predequantize_mode = predeq_mode
+        self._runtime_execution_mode = _normalize_runtime_execution_mode(
+            data.get("runtime_execution_mode", "compile")
+        )
 
         self._suppress_hip_sdk_warning = bool(
             data.get("suppress_hip_sdk_warning", False)
@@ -271,6 +281,11 @@ class SettingsPreviewMixin:
             "hide_cursor_idle": bool(self._cursor_idle_enabled),
             "predequantize_mode": str(
                 getattr(self, "_predequantize_mode", "auto")
+            ),
+            "runtime_execution_mode": str(
+                _normalize_runtime_execution_mode(
+                    getattr(self, "_runtime_execution_mode", "compile")
+                )
             ),
             "suppress_hip_sdk_warning": bool(
                 getattr(self, "_suppress_hip_sdk_warning", False)
