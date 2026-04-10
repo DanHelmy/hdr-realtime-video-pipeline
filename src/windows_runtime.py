@@ -35,6 +35,7 @@ def default_cache_root() -> str:
     return os.path.join(tempfile.gettempdir(), "HDRTVNetCache")
 
 
+_PROJECT_CACHE_LAYOUT_VERSION = "p1"
 _COMPILE_NAMESPACE_VERSION = "v2"
 _COMPILE_NAMESPACE_CACHE: dict[str, str] = {}
 
@@ -115,71 +116,38 @@ def compile_cache_namespace(current_file: str | None = None) -> str:
     return ns
 
 
+def _project_cache_root_base(current_file: str | None = None) -> str:
+    """Return a cache base unique to this local project checkout."""
+    project_root = pathlib.Path(project_root_from_path(current_file)).resolve()
+    project_name = project_root.name or "project"
+    safe_name = "".join(
+        ch if (ch.isalnum() or ch in ("-", "_")) else "_"
+        for ch in project_name
+    ).strip("_") or "project"
+    normalized_path = os.path.normcase(str(project_root))
+    digest = hashlib.sha256()
+    digest.update(_PROJECT_CACHE_LAYOUT_VERSION.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(normalized_path.encode("utf-8", errors="surrogatepass"))
+    project_id = digest.hexdigest()[:16]
+    return os.path.join(
+        default_cache_root(),
+        "projects",
+        f"{safe_name}_{project_id}",
+    )
+
+
 def _compile_profiles_root(base: str) -> str:
     return os.path.join(base, "compile_profiles")
 
-
-def _profile_marker_path(profile_root: str) -> str:
-    return os.path.join(profile_root, "triton", "cache", "hdrtvnet_compiled.txt")
-
-
-def _profile_has_compiled_markers(profile_root: str) -> bool:
-    marker = _profile_marker_path(profile_root)
-    return os.path.isfile(marker) and os.path.getsize(marker) > 0
-
-
-def _profile_has_any_entries(profile_root: str) -> bool:
-    try:
-        with os.scandir(profile_root) as it:
-            for _entry in it:
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _resolve_compile_profile_root(base: str, namespace: str) -> str:
-    profiles_root = _compile_profiles_root(base)
-    current_root = os.path.join(profiles_root, namespace)
-    if _profile_has_compiled_markers(current_root):
-        return current_root
-    if _profile_has_any_entries(current_root):
-        return current_root
-
-    candidates: list[tuple[float, str]] = []
-    try:
-        with os.scandir(profiles_root) as it:
-            for entry in it:
-                if not entry.is_dir():
-                    continue
-                if entry.name == namespace:
-                    continue
-                if not entry.name.startswith(f"{_COMPILE_NAMESPACE_VERSION}_"):
-                    continue
-                if not _profile_has_compiled_markers(entry.path):
-                    continue
-                try:
-                    mtime = float(entry.stat().st_mtime)
-                except Exception:
-                    mtime = 0.0
-                candidates.append((mtime, entry.path))
-    except Exception:
-        return current_root
-
-    if not candidates:
-        return current_root
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
-
-
 def project_cache_root(current_file: str | None = None) -> str:
-    """Return the default cache root for this repo's compile ABI."""
+    """Return the cache root for this local checkout and compile namespace."""
     explicit = os.environ.get("HDRTVNET_CACHE_DIR")
     if explicit:
         return explicit
-    base = default_cache_root()
+    base = _project_cache_root_base(current_file)
     ns = compile_cache_namespace(current_file)
-    return _resolve_compile_profile_root(base, ns)
+    return os.path.join(_compile_profiles_root(base), ns)
 
 
 def enable_high_resolution_timer(period_ms: int = 1) -> bool:

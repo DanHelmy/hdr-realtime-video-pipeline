@@ -96,6 +96,29 @@ def _mark_compiled(
     )
 
 
+def _is_marked_compiled(
+    w: int,
+    h: int,
+    precision: str,
+    *,
+    model_path: str,
+    use_hg: bool,
+    predequantize_mode: str,
+) -> bool:
+    from gui_compile_cache import _is_compiled as _is_compiled_cache
+
+    return bool(
+        _is_compiled_cache(
+            w,
+            h,
+            precision,
+            model_path=model_path,
+            use_hg=bool(use_hg),
+            predequantize_mode=str(predequantize_mode or "auto"),
+        )
+    )
+
+
 def _effective_marker_predequantize_mode(
     precision: str,
     args_predequantize: str,
@@ -200,6 +223,14 @@ def main():
             "'auto' (default), 'on' (force), 'off' (disable)."
         ),
     )
+    parser.add_argument(
+        "--verify-cache-only",
+        action="store_true",
+        help=(
+            "Verify an existing compile cache by running warmup in a clean "
+            "process. Fails instead of compiling when markers are missing."
+        ),
+    )
     args = parser.parse_args()
 
     # Parse resolutions first (fail fast on bad input)
@@ -255,34 +286,61 @@ def main():
     )
 
     if not (hasattr(processor, "_compiled") and processor._compiled):
+        if args.verify_cache_only:
+            print(
+                "[verify] torch.compile is not active in the verification subprocess.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         print("[compile] WARNING: torch.compile not active - nothing to compile.")
         sys.exit(0)
 
     total = len(parsed_res)
+    effective_marker_mode = _effective_marker_predequantize_mode(
+        args.precision,
+        args.predequantize,
+        processor,
+    )
     for i, (w, h) in enumerate(parsed_res, 1):
-        print(f"[compile] ({i}/{total}) Compiling kernels for {w}x{h} ...")
-        sys.stdout.flush()
-        t0 = time.perf_counter()
-        processor.warmup_compile(w, h)
-        elapsed = time.perf_counter() - t0
-        print(f"[compile] ({i}/{total}) {w}x{h} done in {elapsed:.1f}s")
-        sys.stdout.flush()
-
-        # Write marker so the GUI knows this resolution is compiled
-        _mark_compiled(
+        if args.verify_cache_only and not _is_marked_compiled(
             w,
             h,
             args.precision,
             model_path=model_path,
             use_hg=str(args.use_hg).strip() != "0",
-            predequantize_mode=_effective_marker_predequantize_mode(
-                args.precision,
-                args.predequantize,
-                processor,
-            ),
-        )
+            predequantize_mode=effective_marker_mode,
+        ):
+            print(
+                f"[verify] Missing compile marker for {w}x{h}; cache is not ready.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
-    print("[compile] All resolutions compiled successfully.")
+        prefix = "[verify]" if args.verify_cache_only else "[compile]"
+        action = "Verifying cached kernels" if args.verify_cache_only else "Compiling kernels"
+        print(f"{prefix} ({i}/{total}) {action} for {w}x{h} ...")
+        sys.stdout.flush()
+        t0 = time.perf_counter()
+        processor.warmup_compile(w, h)
+        elapsed = time.perf_counter() - t0
+        print(f"{prefix} ({i}/{total}) {w}x{h} done in {elapsed:.1f}s")
+        sys.stdout.flush()
+
+        if not args.verify_cache_only:
+            # Write marker so the GUI knows this resolution is compiled
+            _mark_compiled(
+                w,
+                h,
+                args.precision,
+                model_path=model_path,
+                use_hg=str(args.use_hg).strip() != "0",
+                predequantize_mode=effective_marker_mode,
+            )
+
+    if args.verify_cache_only:
+        print("[verify] Cached kernels verified successfully.")
+    else:
+        print("[compile] All resolutions compiled successfully.")
     sys.stdout.flush()
 
 

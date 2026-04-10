@@ -8,7 +8,7 @@ import webbrowser
 import cv2
 import torch
 
-from PyQt6.QtCore import Qt, QThread, QTimer
+from PyQt6.QtCore import Qt, QEventLoop, QProcess, QProcessEnvironment, QThread, QTimer
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -314,6 +314,342 @@ class PlaybackRuntimeMixin:
             ):
                 return True
         return False
+
+    def _runtime_compile_verified_keys(self) -> set[tuple]:
+        verified = getattr(self, "_runtime_compile_verified", None)
+        if not isinstance(verified, set):
+            verified = set()
+            self._runtime_compile_verified = verified
+        return verified
+
+    def _runtime_compile_verify_key(
+        self,
+        w: int,
+        h: int,
+        precision: str,
+        model_path: str,
+        use_hg: bool,
+        *,
+        selected_predequantize_mode: str | None = None,
+    ) -> tuple:
+        effective_pdq = self._effective_precompile_predequantize_mode(
+            precision,
+            selected_mode=selected_predequantize_mode,
+        )
+        return (
+            os.path.normcase(project_cache_root(__file__)),
+            int(w),
+            int(h),
+            str(precision),
+            os.path.normcase(os.path.abspath(model_path)),
+            bool(use_hg),
+            str(effective_pdq),
+        )
+
+    def _mark_runtime_compile_verified(
+        self,
+        w: int,
+        h: int,
+        precision: str,
+        model_path: str,
+        use_hg: bool,
+        *,
+        selected_predequantize_mode: str | None = None,
+    ) -> None:
+        self._runtime_compile_verified_keys().add(
+            self._runtime_compile_verify_key(
+                w,
+                h,
+                precision,
+                model_path,
+                use_hg,
+                selected_predequantize_mode=selected_predequantize_mode,
+            )
+        )
+
+    def _clear_runtime_compile_verified(self) -> None:
+        self._runtime_compile_verified = set()
+
+    def _current_project_kernel_cache_targets(self):
+        import pathlib
+
+        cache_root = project_cache_root(__file__)
+        triton_root = pathlib.Path(
+            os.environ.get("TRITON_CACHE_DIR", os.path.join(cache_root, "triton"))
+        )
+        inductor_root = pathlib.Path(
+            os.environ.get(
+                "TORCHINDUCTOR_CACHE_DIR",
+                os.path.join(cache_root, "torchinductor"),
+            )
+        )
+        marker_path = _compiled_marker_path()
+        return [triton_root / "cache", inductor_root], marker_path
+
+    def _clear_current_project_kernel_cache_now(self) -> bool:
+        import shutil
+
+        dirs, marker_path = self._current_project_kernel_cache_targets()
+        ok = True
+        for d in dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                ok = False
+        try:
+            if marker_path.exists():
+                marker_path.unlink()
+        except Exception:
+            ok = False
+        self._clear_runtime_compile_verified()
+        return ok
+
+    def _recover_incompatible_runtime_compile_cache(
+        self,
+        *,
+        w: int,
+        h: int,
+        precision: str,
+        model_path: str,
+        use_hg: bool,
+        selected_predequantize_mode: str | None = None,
+        timed_out: bool,
+        process_output: str = "",
+        workflow_name: str = "Playback",
+    ) -> bool:
+        reason = (
+            "Cached-kernel verification timed out before warmup completed."
+            if timed_out
+            else "Cached-kernel verification failed before warmup completed."
+        )
+        details = str(process_output or "").strip()
+        detail_tail = ""
+        if details:
+            lines = [ln.strip() for ln in details.splitlines() if ln.strip()]
+            if lines:
+                detail_tail = "\n\nLast log lines:\n" + "\n".join(lines[-6:])
+
+        answer = QMessageBox.warning(
+            self,
+            "Kernel Cache Looks Incompatible",
+            f"{workflow_name} detected a cached-kernel problem for {w}x{h} / {precision}.\n\n"
+            f"{reason}\n\n"
+            "Clear this local project's kernel cache and recompile now?"
+            f"{detail_tail}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(
+                "Cached-kernel verification failed. Playback/export was canceled."
+            )
+            return False
+
+        progress = QProgressDialog("Clearing this project's kernel cache ...", None, 0, 0, self)
+        progress.setWindowTitle("Clear Kernel Cache")
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            cleared_ok = self._clear_current_project_kernel_cache_now()
+        finally:
+            progress.close()
+            QApplication.processEvents()
+        if not cleared_ok:
+            QMessageBox.warning(
+                self,
+                "Kernel Cache",
+                "Failed to fully clear this project's kernel cache.",
+            )
+            return False
+
+        dlg = _PrecompileDialog(
+            [f"{int(w)}x{int(h)}"],
+            precision=precision,
+            model_path=model_path,
+            use_hg=bool(use_hg),
+            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+            predequantize_mode=self._effective_precompile_predequantize_mode(
+                precision,
+                selected_predequantize_mode,
+            ),
+            parent=self,
+        )
+        dlg.exec()
+        if not dlg.succeeded:
+            self.statusBar().showMessage(
+                "Kernel recompile was canceled after clearing the cache."
+            )
+            return False
+
+        self._mark_runtime_compile_verified(
+            w,
+            h,
+            precision,
+            model_path,
+            use_hg,
+            selected_predequantize_mode=selected_predequantize_mode,
+        )
+        return True
+
+    def _ensure_runtime_compile_cache_usable(
+        self,
+        *,
+        w: int,
+        h: int,
+        precision: str,
+        model_path: str,
+        use_hg: bool,
+        selected_predequantize_mode: str | None = None,
+        workflow_name: str = "Playback",
+    ) -> bool:
+        if not self._can_run_autotune_compile():
+            return True
+        if not self._is_compile_ready_for_runtime(
+            w,
+            h,
+            precision,
+            model_path=model_path,
+            use_hg=bool(use_hg),
+            selected_predequantize_mode=selected_predequantize_mode,
+        ):
+            return True
+
+        verify_key = self._runtime_compile_verify_key(
+            w,
+            h,
+            precision,
+            model_path,
+            use_hg,
+            selected_predequantize_mode=selected_predequantize_mode,
+        )
+        if verify_key in self._runtime_compile_verified_keys():
+            return True
+
+        progress = QProgressDialog("Verifying cached kernels ...", None, 0, 0, self)
+        progress.setWindowTitle("Verify Kernel Cache")
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.show()
+        QApplication.processEvents()
+
+        script = os.path.join(_HERE, "compile_kernels.py")
+        args = [
+            script,
+            f"{int(w)}x{int(h)}",
+            "--precision",
+            str(precision),
+            "--model",
+            str(model_path),
+            "--use-hg",
+            "1" if bool(use_hg) else "0",
+            "--predequantize",
+            self._effective_precompile_predequantize_mode(
+                precision,
+                selected_predequantize_mode,
+            ),
+            "--verify-cache-only",
+        ]
+        if os.path.isfile(_HG_WEIGHTS_PATH):
+            args += ["--hg-weights", _HG_WEIGHTS_PATH]
+
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        env = process.processEnvironment()
+        if env.isEmpty():
+            env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+        if os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+            env.insert("TORCHINDUCTOR_CACHE_DIR", os.environ["TORCHINDUCTOR_CACHE_DIR"])
+        if os.environ.get("TRITON_CACHE_DIR"):
+            env.insert("TRITON_CACHE_DIR", os.environ["TRITON_CACHE_DIR"])
+        process.setProcessEnvironment(env)
+
+        output_chunks: list[str] = []
+
+        def _drain_output() -> None:
+            data = process.readAllStandardOutput()
+            if not data:
+                return
+            output_chunks.append(bytes(data).decode("utf-8", errors="replace"))
+
+        process.readyReadStandardOutput.connect(_drain_output)
+
+        loop = QEventLoop(self)
+        timeout = QTimer(self)
+        timeout.setSingleShot(True)
+        state = {"timed_out": False}
+
+        def _on_timeout() -> None:
+            state["timed_out"] = True
+            try:
+                if process.state() != QProcess.ProcessState.NotRunning:
+                    process.kill()
+            except Exception:
+                pass
+            loop.quit()
+
+        process.finished.connect(loop.quit)
+        timeout.timeout.connect(_on_timeout)
+
+        process.start(sys.executable, ["-u"] + args)
+        if not process.waitForStarted(5000):
+            progress.close()
+            QApplication.processEvents()
+            return self._recover_incompatible_runtime_compile_cache(
+                w=w,
+                h=h,
+                precision=precision,
+                model_path=model_path,
+                use_hg=use_hg,
+                selected_predequantize_mode=selected_predequantize_mode,
+                timed_out=False,
+                process_output="Failed to start cache verification subprocess.",
+                workflow_name=workflow_name,
+            )
+
+        timeout.start(45000)
+        loop.exec()
+        timeout.stop()
+        _drain_output()
+        if process.state() != QProcess.ProcessState.NotRunning:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            process.waitForFinished(3000)
+        progress.close()
+        QApplication.processEvents()
+
+        exit_ok = (
+            not state["timed_out"]
+            and process.exitStatus() == QProcess.ExitStatus.NormalExit
+            and process.exitCode() == 0
+        )
+        process_output = "".join(output_chunks).strip()
+        process.deleteLater()
+        timeout.deleteLater()
+
+        if exit_ok:
+            self._runtime_compile_verified_keys().add(verify_key)
+            return True
+
+        return self._recover_incompatible_runtime_compile_cache(
+            w=w,
+            h=h,
+            precision=precision,
+            model_path=model_path,
+            use_hg=use_hg,
+            selected_predequantize_mode=selected_predequantize_mode,
+            timed_out=bool(state["timed_out"]),
+            process_output=process_output,
+            workflow_name=workflow_name,
+        )
 
     def _show_startup_runtime_warnings(self):
         if not self._enforce_required_clone_assets():
@@ -1013,6 +1349,7 @@ class PlaybackRuntimeMixin:
                     "No matching compile cache records were found.",
                 )
             else:
+                self._clear_runtime_compile_verified()
                 QMessageBox.information(
                     self,
                     "Kernel Cache",
@@ -1077,6 +1414,7 @@ class PlaybackRuntimeMixin:
                 self._cache_clear_worker = None
                 self._cache_clear_thread = None
                 marker_ok = _write_marker_lines([])
+                self._clear_runtime_compile_verified()
                 if ok and marker_ok:
                     QMessageBox.information(
                         self,
@@ -1111,6 +1449,7 @@ class PlaybackRuntimeMixin:
             return
 
         if _write_marker_lines([]):
+            self._clear_runtime_compile_verified()
             QMessageBox.information(
                 self,
                 "Kernel Cache",
@@ -1265,7 +1604,15 @@ class PlaybackRuntimeMixin:
         )
         self._autotune_warning_needed = not compile_ready
         if compile_ready:
-            return True
+            return self._ensure_runtime_compile_cache_usable(
+                w=int(config.width),
+                h=int(config.height),
+                precision=prec_arg,
+                model_path=model_path,
+                use_hg=bool(config.use_hg),
+                selected_predequantize_mode=selected_pdq_mode,
+                workflow_name="Export",
+            )
         if not self._confirm_autotune_precompile_ready():
             return False
 
@@ -1283,6 +1630,14 @@ class PlaybackRuntimeMixin:
         )
         dlg.exec()
         if dlg.succeeded:
+            self._mark_runtime_compile_verified(
+                int(config.width),
+                int(config.height),
+                prec_arg,
+                model_path,
+                bool(config.use_hg),
+                selected_predequantize_mode=selected_pdq_mode,
+            )
             return True
 
         self.statusBar().showMessage("Export kernel compile was canceled.")
@@ -2000,6 +2355,24 @@ class PlaybackRuntimeMixin:
             if not dlg.succeeded:
                 # Compile failed or user closed early - don't start playback
                 return
+            self._mark_runtime_compile_verified(
+                pw,
+                ph,
+                prec_arg,
+                model_path,
+                self._chk_hg.isChecked(),
+                selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+            )
+        elif not self._ensure_runtime_compile_cache_usable(
+            w=pw,
+            h=ph,
+            precision=prec_arg,
+            model_path=model_path,
+            use_hg=self._chk_hg.isChecked(),
+            selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+            workflow_name="Playback",
+        ):
+            return
 
         # Start playback
         self._last_res = (pw, ph)

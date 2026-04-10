@@ -180,8 +180,18 @@ class WorkerSlotsMixin:
             self._resume_after_precision_swap(force=True)
 
     def _on_finished(self):
+        is_window_source = (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        )
         restart_on_eof = bool(
             self._video_path
+            and (not self._suppress_eof_restart_once)
+            and (not self._ui_closing)
+        )
+        restart_on_capture_loss = bool(
+            is_window_source
+            and self._capture_target is not None
             and (not self._suppress_eof_restart_once)
             and (not self._ui_closing)
         )
@@ -193,8 +203,20 @@ class WorkerSlotsMixin:
             self._disp_sdr_mpv.stop_playback()
         self._stop_audio_playback()
         self._set_process_priority(False)
+        if restart_on_capture_loss:
+            self._video_path = None
+            self._capture_target = None
+            self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
+            self._reset_hdr_ground_truth()
         self._reset_controls()
-        if restart_on_eof:
+        if restart_on_capture_loss:
+            if self._lbl_file is not None:
+                self._lbl_file.setText("No browser window selected")
+            self.statusBar().showMessage(
+                "Browser window capture lost. Restarting app ..."
+            )
+            QTimer.singleShot(0, self._restart_app_clean)
+        elif restart_on_eof:
             self.statusBar().showMessage("Playback finished. Restarting app ...")
             QTimer.singleShot(0, self._restart_app_clean)
         else:

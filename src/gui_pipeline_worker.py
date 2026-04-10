@@ -44,10 +44,77 @@ _METRICS_EMIT_INTERVAL_S = 0.20
 _LIVE_PRESENT_INTERVAL_MIN_S = 1.0 / 120.0
 _LIVE_PRESENT_INTERVAL_MAX_S = 1.0 / 18.0
 _LIVE_PRESENT_INTERVAL_SMOOTHING = 0.20
+_LIVE_PROCESS_INTERVAL_MAX_S = 0.250
+_LIVE_PRESENT_PROCESS_SMOOTHING = 0.18
+_LIVE_PRESENT_PROCESS_HEADROOM = 1.08
+_LIVE_PRESENT_TARGET_FPS = (
+    120.0,
+    100.0,
+    90.0,
+    72.0,
+    60.0,
+    50.0,
+    48.0,
+    45.0,
+    40.0,
+    36.0,
+    30.0,
+    25.0,
+    24.0,
+    20.0,
+    18.0,
+    15.0,
+    12.0,
+    10.0,
+    8.0,
+    6.0,
+)
+_LIVE_PRESENT_SOURCE_TOLERANCE_FPS = 0.75
+_LIVE_PRESENT_UPSHIFT_HEADROOM = 1.04
+_LIVE_PRESENT_DOWNSHIFT_HEADROOM = 0.98
 _LIVE_PRESENT_BUFFER_FRAMES = 1.25
 _LIVE_PRESENT_MIN_BUFFER_S = 0.012
+_LIVE_PRESENT_MAX_LEAD_FRAMES = 2.0
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
+
+
+def _choose_live_present_target_fps(
+    source_fps: float,
+    sustainable_fps: float,
+    current_target_fps: float,
+) -> float:
+    source_fps = max(1.0, float(source_fps))
+    sustainable_fps = max(1.0, float(sustainable_fps))
+    current_target_fps = max(1.0, float(current_target_fps))
+
+    source_limit_fps = source_fps + _LIVE_PRESENT_SOURCE_TOLERANCE_FPS
+    candidates = [
+        fps for fps in _LIVE_PRESENT_TARGET_FPS
+        if fps <= source_limit_fps
+    ]
+    if not candidates:
+        return max(1.0, min(source_fps, sustainable_fps))
+
+    desired_target_fps = next(
+        (fps for fps in candidates if fps <= sustainable_fps),
+        max(1.0, min(source_fps, sustainable_fps)),
+    )
+
+    if current_target_fps not in candidates:
+        return float(desired_target_fps)
+
+    if desired_target_fps < current_target_fps:
+        if sustainable_fps <= (current_target_fps * _LIVE_PRESENT_DOWNSHIFT_HEADROOM):
+            return float(desired_target_fps)
+        return float(current_target_fps)
+
+    if desired_target_fps > current_target_fps:
+        if sustainable_fps >= (desired_target_fps * _LIVE_PRESENT_UPSHIFT_HEADROOM):
+            return float(desired_target_fps)
+        return float(current_target_fps)
+
+    return float(current_target_fps)
 
 class PipelineWorker(
     PipelineWorkerModelMixin,
@@ -530,7 +597,10 @@ class PipelineWorker(
         objective_warned_gt_eof = False
         live_present_t = 0.0
         live_capture_prev_perf = 0.0
-        live_present_interval_s = 1.0 / 48.0
+        live_source_interval_s = 1.0 / 48.0
+        live_process_interval_s = 1.0 / 48.0
+        live_present_target_fps = 48.0
+        live_present_interval_s = 1.0 / live_present_target_fps
         (
             psnr_avg,
             sssim_avg,
@@ -688,6 +758,10 @@ class PipelineWorker(
                 metrics_warmup_frames = 4
                 live_present_t = 0.0
                 live_capture_prev_perf = 0.0
+                live_source_interval_s = 1.0 / 48.0
+                live_process_interval_s = 1.0 / 48.0
+                live_present_target_fps = 48.0
+                live_present_interval_s = 1.0 / live_present_target_fps
 
             # Pause gate
             paused_before_wait = not self._pause_event.is_set()
@@ -702,6 +776,10 @@ class PipelineWorker(
                 metrics_warmup_frames = 4
                 live_present_t = 0.0
                 live_capture_prev_perf = 0.0
+                live_source_interval_s = 1.0 / 48.0
+                live_process_interval_s = 1.0 / 48.0
+                live_present_target_fps = 48.0
+                live_present_interval_s = 1.0 / live_present_target_fps
             if (
                 self._user_paused
                 and self._paused_control_wake
@@ -813,23 +891,45 @@ class PipelineWorker(
                             _LIVE_PRESENT_INTERVAL_MAX_S,
                             max(_LIVE_PRESENT_INTERVAL_MIN_S, raw_interval_s),
                         )
-                        live_present_interval_s = (
+                        live_source_interval_s = (
                             (1.0 - _LIVE_PRESENT_INTERVAL_SMOOTHING)
-                            * live_present_interval_s
+                            * live_source_interval_s
                             + (_LIVE_PRESENT_INTERVAL_SMOOTHING * clamped_interval_s)
                         )
+                    required_interval_s = max(
+                        live_source_interval_s,
+                        live_process_interval_s * _LIVE_PRESENT_PROCESS_HEADROOM,
+                    )
+                    source_fps = 1.0 / max(live_source_interval_s, 1e-6)
+                    sustainable_fps = 1.0 / max(required_interval_s, 1e-6)
+                    live_present_target_fps = _choose_live_present_target_fps(
+                        source_fps,
+                        sustainable_fps,
+                        live_present_target_fps,
+                    )
+                    live_present_interval_s = 1.0 / max(
+                        live_present_target_fps,
+                        1e-6,
+                    )
                     buffer_s = max(
                         _LIVE_PRESENT_MIN_BUFFER_S,
                         live_present_interval_s * _LIVE_PRESENT_BUFFER_FRAMES,
                     )
                     now_t = time.perf_counter()
+                    max_lead_s = max(
+                        buffer_s,
+                        live_present_interval_s * _LIVE_PRESENT_MAX_LEAD_FRAMES,
+                    )
                     if live_present_t <= 0.0:
                         live_present_t = now_t + buffer_s
                     else:
                         live_present_t += live_present_interval_s
                         min_present_t = now_t + _LIVE_PRESENT_MIN_BUFFER_S
+                        max_present_t = now_t + max_lead_s
                         if live_present_t < min_present_t:
                             live_present_t = min_present_t
+                        elif live_present_t > max_present_t:
+                            live_present_t = max_present_t
                     present_t = live_present_t
             else:
                 present_t = max(next_frame_t, time.perf_counter())
@@ -911,6 +1011,16 @@ class PipelineWorker(
             else:
                 next_frame_t += frame_interval_s
             frame_ms = (t1 - t0) * 1000.0
+            if is_live_capture and frame_ms > 0.0:
+                process_interval_s = min(
+                    _LIVE_PROCESS_INTERVAL_MAX_S,
+                    max(_LIVE_PRESENT_INTERVAL_MIN_S, frame_ms / 1000.0),
+                )
+                live_process_interval_s = (
+                    (1.0 - _LIVE_PRESENT_PROCESS_SMOOTHING)
+                    * live_process_interval_s
+                    + (_LIVE_PRESENT_PROCESS_SMOOTHING * process_interval_s)
+                )
             frame_times.append(frame_ms)
             if model_latency_ms > 0.0:
                 model_times.append(float(model_latency_ms))

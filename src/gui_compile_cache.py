@@ -67,6 +67,35 @@ def _compiled_key(
     return f"{_CACHE_NAMESPACE}:{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_{mh}"
 
 
+def _payload_shares_fp16_predequantized_graph(
+    payload: str,
+    *,
+    w: int,
+    h: int,
+    precision: str,
+    use_hg: bool,
+    compile_mode: str,
+    predequantize_mode: str,
+) -> bool:
+    text = str(payload or "").strip()
+    if not text:
+        return False
+    prefix_base = f"{w}x{h}_"
+    if not text.startswith(prefix_base):
+        return False
+
+    if str(precision).startswith("int8") and str(predequantize_mode) == "on":
+        fp16_prefix = f"{w}x{h}_fp16_hg{int(use_hg)}_{compile_mode}_"
+        return text.startswith(fp16_prefix)
+
+    if str(precision) == "fp16":
+        int8_prefix = f"{w}x{h}_int8-"
+        int8_suffix = f"_hg{int(use_hg)}_{compile_mode}_on_"
+        return text.startswith(int8_prefix) and int8_suffix in text
+
+    return False
+
+
 def _legacy_compiled_keys(
     w: int,
     h: int,
@@ -117,6 +146,17 @@ def _is_compiled(
             return True
         for line in lines:
             if _marker_payload(line) == key_payload:
+                return True
+        for line in lines:
+            if _payload_shares_fp16_predequantized_graph(
+                _marker_payload(line),
+                w=w,
+                h=h,
+                precision=str(precision),
+                use_hg=bool(use_hg),
+                compile_mode=str(compile_mode),
+                predequantize_mode=str(pdq),
+            ):
                 return True
         if not str(precision).startswith("int8"):
             # FP16/FP32 do not have distinct runtime graphs for pre-dequantize
