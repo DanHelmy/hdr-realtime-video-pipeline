@@ -2,7 +2,6 @@
 
 ![Version](https://img.shields.io/badge/version-v4.0-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
-![Focus](https://img.shields.io/badge/focus-GUI%20Grand%20Update-orange)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
 ---
