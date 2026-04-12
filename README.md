@@ -64,8 +64,6 @@ Manual fallback assets:
 
 ![TODO-main-ui-overview](docs/images/v4-main-ui-overview.png)
 
-> Replace with a full-window screenshot showing tabs, transport controls, and metrics panel.
-
 ### 2. Browser Window Capture (Experimental)
 
 - Direct visible-window Chrome capture for video path
@@ -74,16 +72,12 @@ Manual fallback assets:
 
 ![TODO-browser-capture-flow](docs/images/v4-browser-capture-flow.png)
 
-> Replace with screenshot showing source selection on Browser Window Capture and active playback.
-
 ### 3. Compare / Objective Metrics Dialog
 
 - 3-way comparison: SDR input, HDR reference, HDR output
 - Metrics: PSNR, SSSIM, DeltaEITP, normalized variants, optional HDR-VDP3
 
 ![TODO-compare-dialog](docs/images/v4-compare-dialog.png)
-
-> Replace with screenshot of compare window including metric values and frame preview panes.
 
 ### 4. Export Dialog
 
@@ -93,8 +87,6 @@ Manual fallback assets:
 - Advanced controls for compile reuse and INT8 pre-dequantization override
 
 ![TODO-export-dialog](docs/images/v4-export-dialog.png)
-
-> Replace with screenshot of export dialog (basic + advanced tabs).
 
 ---
 
