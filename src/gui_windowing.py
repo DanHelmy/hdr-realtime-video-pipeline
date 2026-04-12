@@ -215,10 +215,12 @@ class WindowingMixin:
             return
 
         targets = {
+            "row0": self._row0_widget,
             "row1": self._row1_widget,
             "row2": self._row2_widget,
             "metrics": self._grp_metrics,
             "hdr": self._grp_hdr,
+            "inspector": getattr(self, "_inspector_workspace", None),
         }
 
         def _ensure_effect(widget: QWidget) -> QGraphicsOpacityEffect:
@@ -358,9 +360,9 @@ class WindowingMixin:
 
     def _set_pause_button_labels(self, paused: bool):
         if paused:
-            self._btn_pause.setText("▶  Resume")
+            self._btn_pause.setText("Resume")
         else:
-            self._btn_pause.setText("⏸  Pause")
+            self._btn_pause.setText("Pause")
 
     @staticmethod
     def _screen_signature(screen) -> str | None:

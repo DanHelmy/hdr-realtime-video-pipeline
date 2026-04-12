@@ -84,7 +84,7 @@ class WindowCaptureDialog(QDialog):
         root.addWidget(self._lbl_capture_mode)
 
         self._lbl_status = QLabel("")
-        self._lbl_status.setStyleSheet("color: #9ecbff;")
+        self._lbl_status.setProperty("accentText", True)
         self._lbl_status.setWordWrap(True)
         root.addWidget(self._lbl_status)
 

@@ -22,13 +22,13 @@ class GroundTruthMixin:
             name = os.path.basename(path)
             self._lbl_hdr_gt.setText(f"HDR GT: {name}")
             self._lbl_hdr_gt.setToolTip(path)
-            self._lbl_hdr_gt.setStyleSheet("color: #9ecbff;")
+            self._lbl_hdr_gt.setStyleSheet("color: #c2c6cb;")
         else:
             self._lbl_hdr_gt.setText("HDR GT: none")
             self._lbl_hdr_gt.setToolTip(
                 "Select HDR ground-truth video for compare view."
             )
-            self._lbl_hdr_gt.setStyleSheet("color: #999;")
+            self._lbl_hdr_gt.setStyleSheet("color: #a2a7ae;")
 
     def _reset_hdr_ground_truth(self, status_message: str | None = None):
         had_gt = bool(self._hdr_ground_truth_path)

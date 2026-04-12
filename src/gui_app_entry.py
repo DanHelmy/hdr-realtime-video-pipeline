@@ -5,28 +5,10 @@ import os
 import sys
 
 from PyQt6.QtCore import qInstallMessageHandler
-from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
+from gui_theme import apply_app_theme
 from windows_runtime import ensure_windows_supported
-
-def _apply_dark_theme(app: QApplication):
-    app.setStyle("Fusion")
-    p = QPalette()
-    p.setColor(QPalette.ColorRole.Window,          QColor(30, 30, 30))
-    p.setColor(QPalette.ColorRole.WindowText,      QColor(208, 208, 208))
-    p.setColor(QPalette.ColorRole.Base,            QColor(22, 22, 22))
-    p.setColor(QPalette.ColorRole.AlternateBase,   QColor(35, 35, 35))
-    p.setColor(QPalette.ColorRole.ToolTipBase,     QColor(40, 40, 40))
-    p.setColor(QPalette.ColorRole.ToolTipText,     QColor(208, 208, 208))
-    p.setColor(QPalette.ColorRole.Text,            QColor(208, 208, 208))
-    p.setColor(QPalette.ColorRole.Button,          QColor(45, 45, 45))
-    p.setColor(QPalette.ColorRole.ButtonText,      QColor(208, 208, 208))
-    p.setColor(QPalette.ColorRole.BrightText,      QColor(255, 51, 51))
-    p.setColor(QPalette.ColorRole.Link,            QColor(42, 130, 218))
-    p.setColor(QPalette.ColorRole.Highlight,       QColor(42, 130, 218))
-    p.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
-    app.setPalette(p)
 
 
 def _install_qt_log_filter():
@@ -114,7 +96,7 @@ def run_gui(window_cls, root_dir: str, argv: list[str] | None = None):
             pass
     app_argv = sys.argv if argv is None else argv
     app = QApplication(app_argv)
-    _apply_dark_theme(app)
+    apply_app_theme(app)
     win = window_cls(
         initial_video=args.video,
         initial_resolution=args.resolution,

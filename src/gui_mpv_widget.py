@@ -40,7 +40,7 @@ class MpvHDRWidget(QWidget):
         self.setMinimumSize(320, 180)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setStyleSheet("background: #111;")
+        self.setProperty("videoSurface", True)
         self._player = None
         self._pipe_name: str | None = None
         self._pipe_handle = None

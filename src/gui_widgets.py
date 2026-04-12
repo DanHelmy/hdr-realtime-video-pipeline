@@ -46,11 +46,12 @@ class VideoDisplay(QLabel):
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self._title = title
+        self.setObjectName("VideoDisplay")
+        self.setProperty("videoSurface", True)
         self.setMinimumSize(320, 180)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setStyleSheet("QLabel { background: #111; color: #555; "
-                           "font-size: 14px; }")
+        self.setFont(QFont("Segoe UI", 10))
         self.setText(title)
 
     def update_frame(self, bgr: np.ndarray):
@@ -85,6 +86,7 @@ class _CompareVideoPane(QWidget):
         parent=None,
     ):
         super().__init__(parent)
+        self.setObjectName("CompareVideoPane")
         self._title = str(title)
         self._force_hdr_metadata = bool(force_hdr_metadata)
         self._last_size: tuple[int, int] | None = None
@@ -99,7 +101,7 @@ class _CompareVideoPane(QWidget):
 
         self._lbl_title = QLabel(self._title)
         self._lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_title.setStyleSheet("color: #d8e6ff; font-weight: 600;")
+        self._lbl_title.setProperty("eyebrow", True)
         root.addWidget(self._lbl_title)
 
         self._cpu = VideoDisplay(self._title)
@@ -182,6 +184,7 @@ class CompareFrameDialog(QDialog):
         # parent-owned top-level window is minimized, Qt/Windows can collapse it
         # into a tiny corner stub instead of treating it like a normal window.
         super().__init__(None)
+        self.setObjectName("CompareFrameDialog")
         self._owner_widget = parent
         self.setWindowFlag(Qt.WindowType.Dialog, True)
         self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
@@ -196,17 +199,17 @@ class CompareFrameDialog(QDialog):
         root.setSpacing(6)
 
         self._lbl_meta = QLabel("Frame: -")
-        self._lbl_meta.setStyleSheet("color: #bbb;")
+        self._lbl_meta.setProperty("pill", True)
         root.addWidget(self._lbl_meta)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
         self._lbl_compare_prec = QLabel("Compare precision:")
-        self._lbl_compare_prec.setStyleSheet("color: #bbb;")
+        self._lbl_compare_prec.setProperty("muted", True)
         self._cmb_compare_prec = QComboBox()
         self._cmb_compare_prec.setMinimumWidth(190)
         self._lbl_compare_frame = QLabel("Frame:")
-        self._lbl_compare_frame.setStyleSheet("color: #bbb;")
+        self._lbl_compare_frame.setProperty("muted", True)
         self._spn_compare_frame = QSpinBox()
         self._spn_compare_frame.setMinimumWidth(110)
         self._spn_compare_frame.setRange(0, 0)
@@ -214,6 +217,7 @@ class CompareFrameDialog(QDialog):
         self._spn_compare_frame.setKeyboardTracking(False)
         self._btn_recompare = QPushButton("Refresh")
         self._btn_recompare.setMinimumWidth(110)
+        self._btn_recompare.setProperty("role", "primary")
         controls.addWidget(self._lbl_compare_prec)
         controls.addWidget(self._cmb_compare_prec)
         controls.addWidget(self._lbl_compare_frame)
@@ -252,6 +256,7 @@ class CompareFrameDialog(QDialog):
         )
         self._split_compare = QSplitter(Qt.Orientation.Horizontal)
         self._split_compare.setChildrenCollapsible(False)
+        self._split_compare.setHandleWidth(12)
         self._split_compare.addWidget(self._disp_sdr)
         self._split_compare.addWidget(self._disp_gt)
         self._split_compare.addWidget(self._disp_algo)
@@ -262,10 +267,11 @@ class CompareFrameDialog(QDialog):
         self._reset_splitter_on_show = True
 
         self._grp_acc = QGroupBox("Accuracy Metrics")
+        self._grp_acc.setObjectName("MetricsCard")
         acc_grid = QGridLayout(self._grp_acc)
         acc_grid.setContentsMargins(10, 6, 10, 8)
         acc_grid.setHorizontalSpacing(14)
-        acc_grid.setVerticalSpacing(4)
+        acc_grid.setVerticalSpacing(8)
         mono = QFont("Consolas", 9)
         self._acc = {}
         acc_keys = (
@@ -277,12 +283,13 @@ class CompareFrameDialog(QDialog):
             lbl = QLabel(f"{key}: -")
             lbl.setFont(mono)
             lbl.setMinimumWidth(170)
+            lbl.setProperty("metricChip", True)
             acc_grid.addWidget(lbl, idx // 3, idx % 3)
             self._acc[key] = lbl
         root.addWidget(self._grp_acc)
 
         self._lbl_note = QLabel("")
-        self._lbl_note.setStyleSheet("color: #9ecbff;")
+        self._lbl_note.setProperty("accentText", True)
         root.addWidget(self._lbl_note)
 
     def _restore_parent_video_cursor(self):
@@ -488,6 +495,7 @@ class DetachedVideoWindow(QWidget):
 
     def __init__(self, key: str, title: str, parent=None):
         super().__init__(parent)
+        self.setObjectName("DetachedVideoWindow")
         self._key = str(key)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setWindowFlag(Qt.WindowType.Window, True)

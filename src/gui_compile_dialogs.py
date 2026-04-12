@@ -41,7 +41,7 @@ class _CompileDialog(QDialog):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(8)
 
-        title = QLabel("\u2699  Compiling optimized GPU kernels \u2026")
+        title = QLabel("Compiling optimized GPU kernels...")
         title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         layout.addWidget(title)
 
@@ -49,7 +49,7 @@ class _CompileDialog(QDialog):
             "First run at this resolution may take 2\u20135 minutes.\n"
             "Subsequent runs load from cache in seconds."
         )
-        detail.setStyleSheet("color: #aaa;")
+        detail.setProperty("muted", True)
         layout.addWidget(detail)
 
         bar = QProgressBar()
@@ -59,7 +59,7 @@ class _CompileDialog(QDialog):
         layout.addWidget(bar)
 
         self._lbl_status = QLabel("")
-        self._lbl_status.setStyleSheet("color: #6af;")
+        self._lbl_status.setProperty("accentText", True)
         layout.addWidget(self._lbl_status)
 
     def set_status(self, text: str):
@@ -167,7 +167,7 @@ class _PrecompileDialog(QDialog):
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(8)
 
-        title = QLabel("\u2699  Compiling optimised GPU kernels \u2026")
+        title = QLabel("Compiling optimized GPU kernels...")
         title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         layout.addWidget(title)
 
@@ -178,7 +178,7 @@ class _PrecompileDialog(QDialog):
             "If autotune quality looks unusually bad, restarting the PC before "
             "recompiling can help."
         )
-        detail.setStyleSheet("color: #aaa;")
+        detail.setProperty("muted", True)
         layout.addWidget(detail)
 
         self._bar = QProgressBar()
@@ -190,9 +190,6 @@ class _PrecompileDialog(QDialog):
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFont(QFont("Consolas", 9))
-        self._log.setStyleSheet(
-            "QTextEdit { background: #111; color: #ccc; border: 1px solid #333; }"
-        )
         layout.addWidget(self._log, 1)
 
         btn_row = QHBoxLayout()
@@ -258,12 +255,12 @@ class _PrecompileDialog(QDialog):
 
         if exit_code == 0:
             self._finished_ok = True
-            self._log.append("\n\u2705  Done — kernels cached to disk.")
+            self._log.append("\nDone - kernels cached to disk.")
             self._log.append("Starting playback ...")
             # Auto-close after a brief pause so the user sees the result
             QTimer.singleShot(800, self.accept)
         else:
-            self._log.append(f"\n\u274c  Process exited with code {exit_code}.")
+            self._log.append(f"\nProcess exited with code {exit_code}.")
             self._log.append("Check the log above for errors.")
 
         sb = self._log.verticalScrollBar()
