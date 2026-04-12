@@ -246,7 +246,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 ### Objective Metrics (PSNR / SSSIM / DeltaEITP / HDR-VDP3)
 
 - Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
-- In `v2.0`, objective scoring is compare-driven by default (instead of a continuously updating runtime panel) for cleaner playback behavior.
+- In `v4.0`, objective scoring is compare-driven by default (instead of a continuously updating runtime panel) for cleaner playback behavior.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
