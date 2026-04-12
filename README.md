@@ -89,41 +89,6 @@ Manual fallback assets:
 
 ---
 
-## Screenshot Plan (What To Capture)
-
-Use this checklist to add polished visuals quickly:
-
-1. **Hero screenshot**
-- Full app window while processing a visually rich SDR scene
-- Include tabs + metrics panel + active controls
-- Suggested filename: `docs/images/v4-main-ui-overview.png`
-
-2. **Browser capture setup screenshot**
-- Source mode set to Browser Window Capture (Experimental)
-- Chrome window visible in frame, extension active
-- Suggested filename: `docs/images/v4-browser-capture-flow.png`
-
-3. **Compare dialog screenshot**
-- Show all three frames and metrics table
-- Use a frame with obvious highlights/colors to show HDR reconstruction differences
-- Suggested filename: `docs/images/v4-compare-dialog.png`
-
-4. **Export workflow screenshot**
-- Export dialog with resolution/FPS + model/precision settings visible
-- Optional second image for Advanced tab if you want deeper docs
-- Suggested filename: `docs/images/v4-export-dialog.png`
-
-5. **Tools menu screenshot**
-- Capture open Tools menu showing pre-dequantization and kernel actions
-- Suggested filename: `docs/images/v4-tools-menu.png`
-
-Optional bonus visuals:
-- Before/after SDR vs HDR still frame comparison strip
-- Performance panel close-up during steady playback
-- Kernel compile progress dialog screenshot (first-run compile)
-
----
-
 ## Browser Audio Sync Extension (Chrome)
 
 The extension is bundled in this repo and is now audio-only.
