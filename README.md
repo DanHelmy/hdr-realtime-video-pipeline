@@ -141,7 +141,7 @@ Important:
 
 ---
 
-## GUI (v3.1.1)
+## GUI (v4.0)
 
 ```bash
 python src/gui.py
@@ -149,7 +149,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, and live browser-window viewing.
 
-### Grand Update v3.1.1 Highlights
+### Grand Update v4.0 Highlights
 
 - **Native Browser Window Capture replaces the old browser-video bridge**
   - HDRTVNet++ now captures browser video directly from the visible Chrome window
