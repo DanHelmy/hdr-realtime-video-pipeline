@@ -1,5 +1,5 @@
 -r requirements-common.txt
---index-url https://download.pytorch.org/whl/cu124
+--index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.org/simple
 
 torch==2.9.1
