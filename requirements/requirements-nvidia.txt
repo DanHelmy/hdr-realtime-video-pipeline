@@ -1,9 +1,10 @@
 -r requirements-common.txt
 --index-url https://download.pytorch.org/whl/cu124
 --extra-index-url https://pypi.org/simple
-torch
-torchvision
-torchaudio
 
-# Optional but recommended for torch.compile on CUDA-Windows
-triton-windows==3.2.0.post19
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
+
+# MUST match PyTorch 2.9
+triton-windows==3.5.0
