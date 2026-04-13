@@ -6,4 +6,4 @@ torchvision
 torchaudio
 
 # Optional but recommended for torch.compile on CUDA-Windows
-triton-windows
+triton-windows==3.2.0.post19
