@@ -242,31 +242,6 @@ class BrowserTabBridgeManager:
         with session.cond:
             session.cond.notify_all()
 
-    def get_session(self, session_id: str) -> BrowserTabSessionInfo | None:
-        session_id = str(session_id or "").strip()
-        if not session_id:
-            return None
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                return None
-            info = session.info
-            return BrowserTabSessionInfo(
-                session_id=info.session_id,
-                title=info.title,
-                browser_name=info.browser_name,
-                process_name=info.process_name,
-                source_url=info.source_url,
-                width=info.width,
-                height=info.height,
-                fps=info.fps,
-                has_audio=info.has_audio,
-                audio_sample_rate=info.audio_sample_rate,
-                audio_channels=info.audio_channels,
-                audio_bits_per_sample=info.audio_bits_per_sample,
-                last_seen_perf=session.last_seen_perf,
-            )
-
     def list_sessions(self) -> list[BrowserTabSessionInfo]:
         with self._lock:
             items = [
@@ -462,20 +437,8 @@ def ensure_browser_tab_bridge_running() -> BrowserTabBridgeManager:
     return _MANAGER.ensure_running()
 
 
-def browser_tab_bridge_url() -> str:
-    return ensure_browser_tab_bridge_running().address()
-
-
 def list_browser_tab_sessions() -> list[BrowserTabSessionInfo]:
     return ensure_browser_tab_bridge_running().list_sessions()
-
-
-def get_browser_tab_session(session_id: str) -> BrowserTabSessionInfo | None:
-    return ensure_browser_tab_bridge_running().get_session(session_id)
-
-
-def close_browser_tab_session(session_id: str) -> None:
-    ensure_browser_tab_bridge_running().close_session(session_id)
 
 
 def close_browser_tab_bridge() -> None:

@@ -10,12 +10,155 @@ import torch
 from gui_mpv_widget import MpvHDRWidget
 from timer import sleep_until
 
+_LIVE_SMOOTH_PRESENT_FPS = 60.0
+_LIVE_SMOOTH_PRESENT_INTERVAL_S = 1.0 / _LIVE_SMOOTH_PRESENT_FPS
+_LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.050
+_LIVE_PLL_DELAY_DEFAULT_S = 0.040
+_LIVE_PLL_DELAY_MIN_S = 0.018
+_LIVE_PLL_DELAY_MAX_S = 0.110
+_LIVE_PLL_SOURCE_SMOOTHING = 0.12
+_LIVE_PLL_DELAY_SMOOTHING = 0.15
+_LIVE_PLL_PHASE_CORRECTION_GAIN = 0.08
+_LIVE_PLL_PHASE_CORRECTION_CLAMP_S = 0.0025
+_LIVE_PLL_DRIFT_RESET_S = 0.350
+
 
 class PipelineWorkerFeedersMixin:
     """HDR/SDR mpv feeder thread helpers for PipelineWorker."""
 
-    def _hdr_feeder_fn(self, hdr_q: _queue.Queue, mpv_widget: MpvHDRWidget):
+    def _hdr_feeder_fn(
+        self,
+        hdr_q: _queue.Queue,
+        mpv_widget: MpvHDRWidget,
+        live_smooth_cadence: bool,
+    ):
         """Drain HDR queue, convert tensors to RGB48LE, and feed mpv."""
+        if live_smooth_cadence:
+            no_item = object()
+            next_present_t = 0.0
+            latest_rgb48_bytes: bytes | None = None
+            last_source_t = 0.0
+            source_interval_s = _LIVE_SMOOTH_PRESENT_INTERVAL_S
+            source_to_present_delay_s = _LIVE_PLL_DELAY_DEFAULT_S
+            while True:
+                now = time.perf_counter()
+                wait_timeout = 0.2
+                if latest_rgb48_bytes is not None and next_present_t > 0.0:
+                    wait_timeout = max(
+                        0.0,
+                        min(_LIVE_SMOOTH_MAX_QUEUE_WAIT_S, next_present_t - now),
+                    )
+
+                item = no_item
+                try:
+                    item = hdr_q.get(timeout=wait_timeout)
+                except _queue.Empty:
+                    item = no_item
+
+                if item is None:
+                    break
+
+                if item is not no_item:
+                    while True:
+                        try:
+                            newer = hdr_q.get_nowait()
+                            if newer is None:
+                                item = None
+                                break
+                            item = newer
+                        except _queue.Empty:
+                            break
+                    if item is None:
+                        break
+
+                    ready_event = None
+                    source_t = 0.0
+                    if isinstance(item, tuple) and len(item) == 3:
+                        source_t, tensor, ready_event = item
+                    elif isinstance(item, tuple) and len(item) == 2:
+                        source_t, tensor = item
+                    else:
+                        tensor = item
+
+                    try:
+                        source_t = float(source_t or 0.0)
+                    except Exception:
+                        source_t = 0.0
+                    if source_t <= 0.0:
+                        source_t = time.perf_counter()
+
+                    if last_source_t > 0.0:
+                        raw_interval_s = max(
+                            1.0 / 240.0,
+                            min(1.0 / 10.0, source_t - last_source_t),
+                        )
+                        source_interval_s = (
+                            ((1.0 - _LIVE_PLL_SOURCE_SMOOTHING) * source_interval_s)
+                            + (_LIVE_PLL_SOURCE_SMOOTHING * raw_interval_s)
+                        )
+                    last_source_t = source_t
+
+                    desired_delay_s = max(
+                        _LIVE_PLL_DELAY_MIN_S,
+                        min(_LIVE_PLL_DELAY_MAX_S, source_interval_s * 2.0),
+                    )
+                    source_to_present_delay_s = (
+                        ((1.0 - _LIVE_PLL_DELAY_SMOOTHING) * source_to_present_delay_s)
+                        + (_LIVE_PLL_DELAY_SMOOTHING * desired_delay_s)
+                    )
+                    anchor_present_t = source_t + source_to_present_delay_s
+
+                    if ready_event is not None:
+                        try:
+                            ready_event.synchronize()
+                        except Exception:
+                            pass
+
+                    with torch.inference_mode():
+                        raw_cpu = (
+                            tensor.squeeze(0)
+                            .clamp_(0.0, 1.0)
+                            .permute(1, 2, 0)
+                            .contiguous()
+                            .cpu()
+                            .numpy()
+                        )
+                    hdr_u16 = (raw_cpu.astype(np.float32).__imul__(65535)).__add__(0.5)
+                    np.clip(hdr_u16, 0, 65535, out=hdr_u16)
+                    latest_rgb48_bytes = hdr_u16.astype(np.uint16).tobytes()
+
+                    now = time.perf_counter()
+                    if next_present_t <= 0.0:
+                        next_present_t = max(now, anchor_present_t)
+                    else:
+                        drift_s = anchor_present_t - next_present_t
+                        if abs(drift_s) > _LIVE_PLL_DRIFT_RESET_S:
+                            next_present_t = max(now, anchor_present_t)
+                        else:
+                            correction_s = max(
+                                -_LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
+                                min(
+                                    _LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
+                                    drift_s * _LIVE_PLL_PHASE_CORRECTION_GAIN,
+                                ),
+                            )
+                            next_present_t += correction_s
+
+                if latest_rgb48_bytes is None:
+                    continue
+
+                now = time.perf_counter()
+                if next_present_t <= 0.0:
+                    next_present_t = now
+                if now < next_present_t:
+                    continue
+
+                mpv_widget.feed_frame(latest_rgb48_bytes)
+                next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+                while next_present_t <= now:
+                    next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+            return
+
         while True:
             try:
                 item = hdr_q.get(timeout=0.2)
@@ -61,8 +204,124 @@ class PipelineWorkerFeedersMixin:
                     sleep_until(present_t)
             mpv_widget.feed_frame(hdr_u16.astype(np.uint16).data)
 
-    def _sdr_feeder_fn(self, sdr_q: _queue.Queue, mpv_widget: MpvHDRWidget):
+    def _sdr_feeder_fn(
+        self,
+        sdr_q: _queue.Queue,
+        mpv_widget: MpvHDRWidget,
+        live_smooth_cadence: bool,
+    ):
         """Drain SDR queue, convert BGR8 to RGB48LE, and feed mpv."""
+        if live_smooth_cadence:
+            no_item = object()
+            next_present_t = 0.0
+            latest_rgb48_bytes: bytes | None = None
+            last_source_t = 0.0
+            source_interval_s = _LIVE_SMOOTH_PRESENT_INTERVAL_S
+            source_to_present_delay_s = _LIVE_PLL_DELAY_DEFAULT_S
+            while True:
+                now = time.perf_counter()
+                wait_timeout = 0.2
+                if latest_rgb48_bytes is not None and next_present_t > 0.0:
+                    wait_timeout = max(
+                        0.0,
+                        min(_LIVE_SMOOTH_MAX_QUEUE_WAIT_S, next_present_t - now),
+                    )
+
+                item = no_item
+                try:
+                    item = sdr_q.get(timeout=wait_timeout)
+                except _queue.Empty:
+                    item = no_item
+
+                if item is None:
+                    break
+
+                if item is not no_item:
+                    while True:
+                        try:
+                            newer = sdr_q.get_nowait()
+                            if newer is None:
+                                item = None
+                                break
+                            item = newer
+                        except _queue.Empty:
+                            break
+                    if item is None:
+                        break
+
+                    source_t = 0.0
+                    if isinstance(item, tuple) and len(item) == 2:
+                        source_t, frame = item
+                    else:
+                        frame = item
+
+                    try:
+                        source_t = float(source_t or 0.0)
+                    except Exception:
+                        source_t = 0.0
+                    if source_t <= 0.0:
+                        source_t = time.perf_counter()
+
+                    if last_source_t > 0.0:
+                        raw_interval_s = max(
+                            1.0 / 240.0,
+                            min(1.0 / 10.0, source_t - last_source_t),
+                        )
+                        source_interval_s = (
+                            ((1.0 - _LIVE_PLL_SOURCE_SMOOTHING) * source_interval_s)
+                            + (_LIVE_PLL_SOURCE_SMOOTHING * raw_interval_s)
+                        )
+                    last_source_t = source_t
+
+                    desired_delay_s = max(
+                        _LIVE_PLL_DELAY_MIN_S,
+                        min(_LIVE_PLL_DELAY_MAX_S, source_interval_s * 2.0),
+                    )
+                    source_to_present_delay_s = (
+                        ((1.0 - _LIVE_PLL_DELAY_SMOOTHING) * source_to_present_delay_s)
+                        + (_LIVE_PLL_DELAY_SMOOTHING * desired_delay_s)
+                    )
+                    anchor_present_t = source_t + source_to_present_delay_s
+
+                    try:
+                        latest_rgb48_bytes = np.ascontiguousarray(
+                            frame[:, :, ::-1].astype(np.uint16) * 257
+                        ).tobytes()
+                    except Exception:
+                        latest_rgb48_bytes = None
+
+                    now = time.perf_counter()
+                    if next_present_t <= 0.0:
+                        next_present_t = max(now, anchor_present_t)
+                    else:
+                        drift_s = anchor_present_t - next_present_t
+                        if abs(drift_s) > _LIVE_PLL_DRIFT_RESET_S:
+                            next_present_t = max(now, anchor_present_t)
+                        else:
+                            correction_s = max(
+                                -_LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
+                                min(
+                                    _LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
+                                    drift_s * _LIVE_PLL_PHASE_CORRECTION_GAIN,
+                                ),
+                            )
+                            next_present_t += correction_s
+
+                if latest_rgb48_bytes is None:
+                    continue
+
+                now = time.perf_counter()
+                if next_present_t <= 0.0:
+                    next_present_t = now
+                if now < next_present_t:
+                    continue
+
+                mpv_widget.feed_frame(latest_rgb48_bytes)
+                next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+                while next_present_t <= now:
+                    next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+            return
+
         while True:
             try:
                 item = sdr_q.get(timeout=0.2)
@@ -98,10 +357,11 @@ class PipelineWorkerFeedersMixin:
                 pass
 
     def _start_hdr_feeder(self):
+        live_smooth_cadence = bool(getattr(self, "_capture_target", None))
         self._hdr_queue = _queue.Queue(maxsize=1)
         self._hdr_thread = threading.Thread(
             target=self._hdr_feeder_fn,
-            args=(self._hdr_queue, self._mpv_widget),
+            args=(self._hdr_queue, self._mpv_widget, live_smooth_cadence),
             daemon=True,
         )
         self._hdr_thread.start()
@@ -126,10 +386,11 @@ class PipelineWorkerFeedersMixin:
     def _start_sdr_feeder(self):
         if self._sdr_mpv_widget is None or self._sdr_queue is not None:
             return
+        live_smooth_cadence = bool(getattr(self, "_capture_target", None))
         self._sdr_queue = _queue.Queue(maxsize=1)
         self._sdr_thread = threading.Thread(
             target=self._sdr_feeder_fn,
-            args=(self._sdr_queue, self._sdr_mpv_widget),
+            args=(self._sdr_queue, self._sdr_mpv_widget, live_smooth_cadence),
             daemon=True,
         )
         self._sdr_thread.start()

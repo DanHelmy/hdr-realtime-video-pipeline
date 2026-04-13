@@ -17,8 +17,6 @@ from gui_config import (
     MAX_H,
     RESOLUTION_SCALES,
     SOURCE_MODE_LABELS,
-    _capture_fps_value_from_label,
-    _normalize_capture_fps_label,
     _normalize_source_mode,
     _source_mode_label,
     _max_processing_preset_for_source,
@@ -128,7 +126,6 @@ class SettingsPreviewMixin:
         initial_film_grain,
         initial_hdr_gt,
         initial_source_mode=None,
-        initial_capture_fps=None,
     ):
         """Load persisted GUI preferences unless explicitly overridden by CLI."""
         data = {}
@@ -151,14 +148,6 @@ class SettingsPreviewMixin:
         )
         self._source_mode = source_mode
         self._cmb_source_mode.setCurrentText(_source_mode_label(source_mode))
-        capture_fps_label = _normalize_capture_fps_label(
-            initial_capture_fps
-            if initial_capture_fps is not None
-            else data.get("capture_fps", self._capture_fps_label)
-        )
-        self._capture_fps_label = capture_fps_label
-        self._capture_fps_value = _capture_fps_value_from_label(capture_fps_label)
-        self._cmb_capture_fps.setCurrentText(capture_fps_label)
         if initial_resolution is None:
             r = data.get("resolution")
             if r in RESOLUTION_SCALES or r == "Source":
@@ -260,11 +249,6 @@ class SettingsPreviewMixin:
     def _save_user_settings(self):
         data = {
             "source_mode": str(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)),
-            "capture_fps": str(
-                self._cmb_capture_fps.currentText()
-                if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
-                else getattr(self, "_capture_fps_label", _normalize_capture_fps_label(None))
-            ),
             "precision": self._cmb_prec.currentText(),
             "resolution": self._cmb_res.currentText(),
             "upscale_mode": self._cmb_upscale.currentText()
@@ -365,15 +349,6 @@ class SettingsPreviewMixin:
             self._cmb_source_mode.setCurrentText(_source_mode_label(mode))
             self._cmb_source_mode.setEnabled(not self._playing)
             self._cmb_source_mode.blockSignals(False)
-        if hasattr(self, "_capture_fps_container") and self._capture_fps_container is not None:
-            self._capture_fps_container.setVisible(False)
-        if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None:
-            self._cmb_capture_fps.blockSignals(True)
-            self._cmb_capture_fps.setCurrentText(
-                _normalize_capture_fps_label(getattr(self, "_capture_fps_label", None))
-            )
-            self._cmb_capture_fps.setEnabled(False)
-            self._cmb_capture_fps.blockSignals(False)
         if hasattr(self, "_btn_file") and self._btn_file is not None:
             self._btn_file.setText("Choose Browser Window ..." if is_window else "Open Video ...")
         if hasattr(self, "_act_open_source") and self._act_open_source is not None:
@@ -608,10 +583,4 @@ class SettingsPreviewMixin:
             )
             return
         self._source_mode = new_mode
-        self._capture_fps_label = _normalize_capture_fps_label(
-            getattr(self, "_cmb_capture_fps", None).currentText()
-            if hasattr(self, "_cmb_capture_fps") and self._cmb_capture_fps is not None
-            else getattr(self, "_capture_fps_label", None)
-        )
-        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
         self._refresh_source_mode_ui()

@@ -91,7 +91,9 @@ class PipelineWorkerFrameProcessingMixin:
         mpv_w,
         use_cuda: bool,
     ) -> tuple[np.ndarray | None, np.ndarray, object, bool, float]:
-        is_live_capture = bool(getattr(self, "_capture_target", None))
+        # For live capture, present_t carries source capture timestamps so
+        # feeder threads can phase-lock smooth cadence to capture timing.
+        queue_present_t = present_t
         need_display_frame = self._input_is_hdr or self._sdr_visible or mpv_w is None
         display_frame = _letterbox_bgr(frame, out_w, out_h) if need_display_frame else None
         model_latency_ms = 0.0
@@ -115,10 +117,10 @@ class PipelineWorkerFrameProcessingMixin:
                 output = cv2.resize(output, (out_w, out_h), interpolation=cv2.INTER_AREA)
             if mpv_w is not None:
                 rgb16 = np.ascontiguousarray(output[:, :, ::-1].astype(np.uint16) * 257)
-                if present_t is not None:
+                if queue_present_t is not None:
                     now_t = time.perf_counter()
-                    if now_t < present_t:
-                        sleep_until(present_t)
+                    if now_t < queue_present_t:
+                        sleep_until(queue_present_t)
                 mpv_w.feed_frame(rgb16.data)
             if (
                 display_frame is not None
@@ -131,7 +133,7 @@ class PipelineWorkerFrameProcessingMixin:
                 else:
                     self._sdr_drop_until_frame = 0
                 if self._sdr_drop_until_frame == 0:
-                    self._queue_latest(self._sdr_queue, (present_t, display_frame))
+                    self._queue_latest(self._sdr_queue, (queue_present_t, display_frame))
             if self._sdr_visible:
                 need_hdr_cpu = True
             return display_frame, output, prepared_out, need_hdr_cpu, model_latency_ms
@@ -186,7 +188,7 @@ class PipelineWorkerFrameProcessingMixin:
                     ready_event.record(torch.cuda.current_stream())
                 self._queue_latest(
                     self._hdr_queue,
-                    (present_t, queued_tensor, ready_event),
+                    (queue_present_t, queued_tensor, ready_event),
                 )
 
         if (
@@ -200,7 +202,7 @@ class PipelineWorkerFrameProcessingMixin:
             else:
                 self._sdr_drop_until_frame = 0
             if self._sdr_drop_until_frame == 0:
-                self._queue_latest(self._sdr_queue, (present_t, display_frame))
+                self._queue_latest(self._sdr_queue, (queue_present_t, display_frame))
 
         need_hdr_cpu = (mpv_w is None)
         if need_hdr_cpu:

@@ -992,15 +992,6 @@ class WindowCaptureSource:
     def _capture_wait_timeout_s(self) -> float:
         return min(_WINDOW_CAPTURE_DUPLICATE_WAIT_S, 1.0 / 120.0)
 
-    def set_fps(self, fps: float) -> float:
-        # Browser Window Capture now runs uncapped from fresh WinRT frames.
-        # Keep this setter as a compatibility no-op for older worker/UI code.
-        next_fps = max(1.0, float(fps))
-        self.fps = next_fps
-        with self._payload_cond:
-            self._payload_cond.notify_all()
-        return next_fps
-
     def _reader_loop(self):
         while not self._stopped:
             frame, _width, _height = _capture_native_window_frame(

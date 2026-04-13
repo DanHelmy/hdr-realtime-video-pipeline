@@ -41,46 +41,6 @@ _REALTIME_MAX_CATCHUP_SKIP = 6
 _PLAYBACK_SOURCE_PREFETCH = 4
 _PLAYHEAD_UPDATE_STRIDE_PLAYING = 10
 _METRICS_EMIT_INTERVAL_S = 0.20
-_LIVE_PRESENT_INTERVAL_MIN_S = 1.0 / 120.0
-_LIVE_PRESENT_INTERVAL_MAX_S = 1.0 / 18.0
-_LIVE_PRESENT_INTERVAL_SMOOTHING = 0.20
-_LIVE_PROCESS_INTERVAL_MAX_S = 0.250
-_LIVE_PRESENT_PROCESS_SMOOTHING = 0.18
-_LIVE_PRESENT_PROCESS_HEADROOM = 1.08
-_LIVE_PRESENT_TARGET_FPS = (
-    120.0,
-    100.0,
-    90.0,
-    72.0,
-    60.0,
-    50.0,
-    48.0,
-    45.0,
-    40.0,
-    36.0,
-    30.0,
-    25.0,
-    24.0,
-    20.0,
-    18.0,
-    15.0,
-    12.0,
-    10.0,
-    8.0,
-    6.0,
-)
-_LIVE_PRESENT_SOURCE_TOLERANCE_FPS = 0.75
-_LIVE_PRESENT_UPSHIFT_HEADROOM = 1.04
-_LIVE_PRESENT_DOWNSHIFT_HEADROOM = 0.98
-_LIVE_PRESENT_BUFFER_FRAMES = 1.25
-_LIVE_PRESENT_MIN_BUFFER_S = 0.012
-_LIVE_PRESENT_MAX_LEAD_FRAMES = 2.0
-_LIVE_PRESENT_JITTER_SMOOTHING = 0.22
-_LIVE_PRESENT_JITTER_BUFFER_GAIN = 1.35
-_LIVE_PRESENT_LATE_BUDGET_MIN_S = 0.055
-_LIVE_PRESENT_LATE_BUDGET_MAX_S = 0.180
-_LIVE_PRESENT_LATE_BUDGET_FRAMES = 2.35
-_LIVE_PRESENT_LATE_DROP_STREAK_MAX = 4
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
 
@@ -90,44 +50,6 @@ def _normalize_runtime_execution_mode(mode: str | None) -> str:
     if text == "eager":
         return "eager"
     return "compile"
-
-
-def _choose_live_present_target_fps(
-    source_fps: float,
-    sustainable_fps: float,
-    current_target_fps: float,
-) -> float:
-    source_fps = max(1.0, float(source_fps))
-    sustainable_fps = max(1.0, float(sustainable_fps))
-    current_target_fps = max(1.0, float(current_target_fps))
-
-    source_limit_fps = source_fps + _LIVE_PRESENT_SOURCE_TOLERANCE_FPS
-    candidates = [
-        fps for fps in _LIVE_PRESENT_TARGET_FPS
-        if fps <= source_limit_fps
-    ]
-    if not candidates:
-        return max(1.0, min(source_fps, sustainable_fps))
-
-    desired_target_fps = next(
-        (fps for fps in candidates if fps <= sustainable_fps),
-        max(1.0, min(source_fps, sustainable_fps)),
-    )
-
-    if current_target_fps not in candidates:
-        return float(desired_target_fps)
-
-    if desired_target_fps < current_target_fps:
-        if sustainable_fps <= (current_target_fps * _LIVE_PRESENT_DOWNSHIFT_HEADROOM):
-            return float(desired_target_fps)
-        return float(current_target_fps)
-
-    if desired_target_fps > current_target_fps:
-        if sustainable_fps >= (desired_target_fps * _LIVE_PRESENT_UPSHIFT_HEADROOM):
-            return float(desired_target_fps)
-        return float(current_target_fps)
-
-    return float(current_target_fps)
 
 class PipelineWorker(
     PipelineWorkerModelMixin,
@@ -176,7 +98,6 @@ class PipelineWorker(
         self._pending_precision = None
         self._pending_predequantize_mode: str | None = None
         self._pending_runtime_execution_mode: str | None = None
-        self._pending_capture_fps: float | None = None
         self._paused_control_wake = False
         self._paused_control_refresh_frame: int | None = None
         self._mpv_widget: MpvHDRWidget | None = None
@@ -252,7 +173,6 @@ class PipelineWorker(
             runtime_execution_mode
         )
         self._pending_runtime_execution_mode = None
-        self._pending_capture_fps = None
         self._objective_metrics_enabled = bool(objective_metrics_enabled)
         self._hdr_ground_truth_path = (
             str(hdr_ground_truth_path).strip() if hdr_ground_truth_path else None
@@ -350,19 +270,6 @@ class PipelineWorker(
         """Request a processing-resolution change (thread-safe)."""
         self._pending_resolution = (proc_w, proc_h)
         self._wake_for_paused_control_change()
-
-    def request_capture_fps_change(self, fps: float):
-        """Request a live browser-window capture FPS cap change."""
-        next_fps = max(1.0, float(fps))
-        self._pending_capture_fps = next_fps
-        if isinstance(self._capture_target, dict):
-            self._capture_target["fps"] = next_fps
-        source = getattr(self, "_source", None)
-        if isinstance(source, WindowCaptureSource):
-            try:
-                source.set_fps(next_fps)
-            except Exception:
-                pass
 
     def _wake_for_paused_control_change(self):
         """Let paused playback process hot-swap work without fully resuming."""
@@ -620,14 +527,7 @@ class PipelineWorker(
         use_cuda = torch.cuda.is_available()
         objective_note = "Off"
         objective_warned_gt_eof = False
-        live_present_t = 0.0
         live_capture_prev_perf = 0.0
-        live_source_interval_s = 1.0 / 48.0
-        live_process_interval_s = 1.0 / 48.0
-        live_present_target_fps = 48.0
-        live_present_interval_s = 1.0 / live_present_target_fps
-        live_capture_jitter_s = 0.0
-        live_late_drop_streak = 0
         (
             psnr_avg,
             sssim_avg,
@@ -667,17 +567,6 @@ class PipelineWorker(
                     gt_source=gt_source,
                     cur_frame_idx=frame_idx,
                 )
-
-            pending_capture_fps = self._pending_capture_fps
-            if is_live_capture and pending_capture_fps is not None:
-                self._pending_capture_fps = None
-                try:
-                    source.set_fps(pending_capture_fps)
-                    self.status_message.emit(
-                        f"Live browser capture FPS -> {int(round(float(pending_capture_fps)))}"
-                    )
-                except Exception:
-                    pass
 
             pending_predeq = self._pending_predequantize_mode
             if pending_predeq is not None and pending_predeq == self._predequantize_mode:
@@ -800,14 +689,7 @@ class PipelineWorker(
                 frame_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
-                live_present_t = 0.0
                 live_capture_prev_perf = 0.0
-                live_source_interval_s = 1.0 / 48.0
-                live_process_interval_s = 1.0 / 48.0
-                live_present_target_fps = 48.0
-                live_present_interval_s = 1.0 / live_present_target_fps
-                live_capture_jitter_s = 0.0
-                live_late_drop_streak = 0
 
             # Pause gate
             paused_before_wait = not self._pause_event.is_set()
@@ -820,14 +702,7 @@ class PipelineWorker(
                 frame_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
-                live_present_t = 0.0
                 live_capture_prev_perf = 0.0
-                live_source_interval_s = 1.0 / 48.0
-                live_process_interval_s = 1.0 / 48.0
-                live_present_target_fps = 48.0
-                live_present_interval_s = 1.0 / live_present_target_fps
-                live_capture_jitter_s = 0.0
-                live_late_drop_streak = 0
             if (
                 self._user_paused
                 and self._paused_control_wake
@@ -925,89 +800,14 @@ class PipelineWorker(
                 continue
 
             if is_live_capture:
+                # For live capture, pass the source capture clock downstream
+                # so feeders can phase-lock stable presentation cadence.
                 present_t = None
                 if capture_perf_counter > 0.0:
-                    raw_interval_s = 0.0
-                    if live_capture_prev_perf > 0.0:
-                        raw_interval_s = max(
-                            0.0,
-                            float(capture_perf_counter) - float(live_capture_prev_perf),
-                        )
                     live_capture_prev_perf = float(capture_perf_counter)
-                    if raw_interval_s > 0.0:
-                        clamped_interval_s = min(
-                            _LIVE_PRESENT_INTERVAL_MAX_S,
-                            max(_LIVE_PRESENT_INTERVAL_MIN_S, raw_interval_s),
-                        )
-                        jitter_sample_s = abs(clamped_interval_s - live_source_interval_s)
-                        live_capture_jitter_s = (
-                            (1.0 - _LIVE_PRESENT_JITTER_SMOOTHING)
-                            * live_capture_jitter_s
-                            + (_LIVE_PRESENT_JITTER_SMOOTHING * jitter_sample_s)
-                        )
-                        live_source_interval_s = (
-                            (1.0 - _LIVE_PRESENT_INTERVAL_SMOOTHING)
-                            * live_source_interval_s
-                            + (_LIVE_PRESENT_INTERVAL_SMOOTHING * clamped_interval_s)
-                        )
-                    required_interval_s = max(
-                        live_source_interval_s,
-                        live_process_interval_s * _LIVE_PRESENT_PROCESS_HEADROOM,
-                    )
-                    source_fps = 1.0 / max(live_source_interval_s, 1e-6)
-                    sustainable_fps = 1.0 / max(required_interval_s, 1e-6)
-                    live_present_target_fps = _choose_live_present_target_fps(
-                        source_fps,
-                        sustainable_fps,
-                        live_present_target_fps,
-                    )
-                    live_present_interval_s = 1.0 / max(
-                        live_present_target_fps,
-                        1e-6,
-                    )
-                    buffer_s = max(
-                        _LIVE_PRESENT_MIN_BUFFER_S,
-                        (live_present_interval_s * _LIVE_PRESENT_BUFFER_FRAMES)
-                        + (live_capture_jitter_s * _LIVE_PRESENT_JITTER_BUFFER_GAIN),
-                    )
-                    now_t = time.perf_counter()
-                    max_lead_s = max(
-                        buffer_s,
-                        live_present_interval_s * _LIVE_PRESENT_MAX_LEAD_FRAMES,
-                    )
-                    if live_present_t <= 0.0:
-                        live_present_t = now_t + buffer_s
-                    else:
-                        live_present_t += live_present_interval_s
-                        min_present_t = now_t + _LIVE_PRESENT_MIN_BUFFER_S
-                        max_present_t = now_t + max_lead_s
-                        if live_present_t < min_present_t:
-                            live_present_t = min_present_t
-                        elif live_present_t > max_present_t:
-                            live_present_t = max_present_t
-                    present_t = live_present_t
+                    present_t = float(capture_perf_counter)
             else:
                 present_t = max(next_frame_t, time.perf_counter())
-
-            if is_live_capture and capture_perf_counter > 0.0 and present_t is not None:
-                predicted_latency_s = max(0.0, present_t - capture_perf_counter)
-                late_budget_s = min(
-                    _LIVE_PRESENT_LATE_BUDGET_MAX_S,
-                    max(
-                        _LIVE_PRESENT_LATE_BUDGET_MIN_S,
-                        (live_present_interval_s * _LIVE_PRESENT_LATE_BUDGET_FRAMES)
-                        + (live_capture_jitter_s * 1.2),
-                    ),
-                )
-                if (
-                    (not seek_frame_ready_pending)
-                    and predicted_latency_s > late_budget_s
-                    and live_late_drop_streak < _LIVE_PRESENT_LATE_DROP_STREAK_MAX
-                ):
-                    live_late_drop_streak += 1
-                    self._realtime_drop_frames += 1
-                    continue
-                live_late_drop_streak = 0
 
             t0 = time.perf_counter()
 
@@ -1086,16 +886,6 @@ class PipelineWorker(
             else:
                 next_frame_t += frame_interval_s
             frame_ms = (t1 - t0) * 1000.0
-            if is_live_capture and frame_ms > 0.0:
-                process_interval_s = min(
-                    _LIVE_PROCESS_INTERVAL_MAX_S,
-                    max(_LIVE_PRESENT_INTERVAL_MIN_S, frame_ms / 1000.0),
-                )
-                live_process_interval_s = (
-                    (1.0 - _LIVE_PRESENT_PROCESS_SMOOTHING)
-                    * live_process_interval_s
-                    + (_LIVE_PRESENT_PROCESS_SMOOTHING * process_interval_s)
-                )
             frame_times.append(frame_ms)
             if model_latency_ms > 0.0:
                 model_times.append(float(model_latency_ms))

@@ -24,7 +24,6 @@ from gui_config import (
     _available_precision_keys,
     RESOLUTION_SCALES,
     SOURCE_MODE_LABELS,
-    _capture_fps_label_options,
 )
 from gui_compare import _HAS_MPV
 from gui_scaling import UPSCALER_CHOICES, DEFAULT_UPSCALER
@@ -132,22 +131,6 @@ class UiBuilderMixin:
             "Choose whether HDRTVNet++ opens video files or uses the experimental Google Chrome browser-window path. Chrome's 'Use graphics acceleration when available' must be off for Browser Window Capture."
         )
         row0.addWidget(self._cmb_source_mode)
-
-        self._capture_fps_container = QWidget()
-        capture_row = QHBoxLayout(self._capture_fps_container)
-        capture_row.setContentsMargins(0, 0, 0, 0)
-        capture_row.setSpacing(6)
-        self._lbl_capture_fps = QLabel("Capture FPS:")
-        self._lbl_capture_fps.setProperty("muted", True)
-        capture_row.addWidget(self._lbl_capture_fps)
-        self._cmb_capture_fps = QComboBox()
-        self._cmb_capture_fps.addItems(_capture_fps_label_options())
-        self._cmb_capture_fps.setFixedWidth(90)
-        self._cmb_capture_fps.setToolTip(
-            "Applies only to Browser Window Capture mode."
-        )
-        capture_row.addWidget(self._cmb_capture_fps)
-        row0.addWidget(self._capture_fps_container)
 
         row0.addStretch(1)
         root.addWidget(self._row0_widget)

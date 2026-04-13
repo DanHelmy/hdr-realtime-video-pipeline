@@ -78,16 +78,6 @@ SOURCE_MODE_LABELS = {
     SOURCE_MODE_WINDOW: "Browser Window Capture (Experimental)",
 }
 
-CAPTURE_FPS_PRESETS = {
-    "24 FPS": 24.0,
-    "25 FPS": 25.0,
-    "30 FPS": 30.0,
-    "48 FPS": 48.0,
-    "50 FPS": 50.0,
-    "60 FPS": 60.0,
-}
-
-DEFAULT_CAPTURE_FPS_LABEL = "24 FPS"
 LIVE_CAPTURE_DISPLAY_FPS = 120.0
 
 
@@ -117,22 +107,6 @@ def _normalize_source_mode(mode: str | None) -> str:
 def _source_mode_label(mode: str | None) -> str:
     key = _normalize_source_mode(mode)
     return SOURCE_MODE_LABELS.get(key, SOURCE_MODE_LABELS[SOURCE_MODE_VIDEO])
-
-
-def _capture_fps_label_options() -> list[str]:
-    return list(CAPTURE_FPS_PRESETS.keys())
-
-
-def _capture_fps_value_from_label(label: str | None) -> float:
-    text = str(label or "").strip()
-    return float(CAPTURE_FPS_PRESETS.get(text, CAPTURE_FPS_PRESETS[DEFAULT_CAPTURE_FPS_LABEL]))
-
-
-def _normalize_capture_fps_label(label: str | None) -> str:
-    text = str(label or "").strip()
-    if text in CAPTURE_FPS_PRESETS:
-        return text
-    return DEFAULT_CAPTURE_FPS_LABEL
 
 
 # Resolution-scale presets (process lower resolution).

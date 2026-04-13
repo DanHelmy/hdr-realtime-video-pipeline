@@ -8,8 +8,6 @@ from gui_config import (
     PRECISIONS,
     RESOLUTION_SCALES,
     SOURCE_MODE_VIDEO,
-    _capture_fps_value_from_label,
-    _normalize_capture_fps_label,
     _normalize_source_mode,
 )
 from window_capture_source import target_from_hwnd
@@ -24,8 +22,6 @@ class StateInitMixin:
         self._source_mode = SOURCE_MODE_VIDEO
         self._source_mode_prompt_pending = False
         self._capture_target = None
-        self._capture_fps_label = _normalize_capture_fps_label(None)
-        self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
         self._playing = False
         self._compile_dlg = None
         self._pending_mpv_start = None
@@ -260,7 +256,6 @@ class StateInitMixin:
         initial_capture_browser_name,
         initial_capture_process_name,
         initial_capture_url,
-        initial_capture_fps,
         initial_resolution,
         initial_precision,
         initial_view,
@@ -284,11 +279,6 @@ class StateInitMixin:
                     self._cmb_upscale.setCurrentText(initial_upscale)
             if initial_view == "Tabbed":
                 self._cmb_view.setCurrentText("Tabbed")
-            if source_mode != SOURCE_MODE_VIDEO and initial_capture_fps:
-                self._capture_fps_label = _normalize_capture_fps_label(initial_capture_fps)
-                self._capture_fps_value = _capture_fps_value_from_label(self._capture_fps_label)
-                if hasattr(self, "_cmb_capture_fps"):
-                    self._cmb_capture_fps.setCurrentText(self._capture_fps_label)
             if source_mode != SOURCE_MODE_VIDEO and initial_capture_hwnd:
                 target = target_from_hwnd(
                     initial_capture_hwnd,

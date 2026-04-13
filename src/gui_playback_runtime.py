@@ -26,7 +26,6 @@ from gui_config import (
     SOURCE_MODE_WINDOW,
     _select_model_path,
     _available_precision_keys,
-    _normalize_capture_fps_label,
     _normalize_source_mode,
     MAX_W,
     MAX_H,
@@ -126,7 +125,6 @@ class PlaybackRuntimeMixin:
         "_btn_apply_settings",
         "_seek_slider",
         "_cmb_source_mode",
-        "_cmb_capture_fps",
         "_cmb_prec",
         "_chk_hg",
         "_cmb_res",
@@ -298,7 +296,6 @@ class PlaybackRuntimeMixin:
                 return "off" if has_int8_tc else "on"
             except Exception:
                 return "auto"
-        return "auto"
 
     def _is_compile_ready_for_runtime(
         self,
@@ -2005,7 +2002,6 @@ class PlaybackRuntimeMixin:
             browser_name=str(getattr(target, "browser_name", "") or "").strip(),
             source_url=str(getattr(target, "source_url", "") or "").strip(),
         )
-        self._capture_fps_value = float(LIVE_CAPTURE_DISPLAY_FPS)
         self._reset_hdr_ground_truth()
 
         if self._last_res is not None:
@@ -2039,12 +2035,14 @@ class PlaybackRuntimeMixin:
         self.statusBar().showMessage(
             (
                 f"Selected live browser window: {self._capture_target.label}. "
-                "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Press Play to start video. If Chrome Audio Sync is active, the extension will delay and play the tab audio locally while HDRTVNet++ stays silent."
+                "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Press Play to start video. If Chrome Audio Sync is active, the extension will delay and play the tab audio locally while HDRTVNet++ stays silent. "
+                "Live presentation cadence is phase-locked to capture timing for smoother pacing."
             )
             if has_tab_audio_sync
             else (
                 f"Selected live browser window: {self._capture_target.label}. "
-                "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Start Chrome Audio Sync in the extension before Play if you want delayed local browser audio. Without it, Chrome keeps playing audio locally and it can lead the video."
+                "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Start Chrome Audio Sync in the extension before Play if you want delayed local browser audio. Without it, Chrome keeps playing audio locally and it can lead the video. "
+                "Live presentation cadence is phase-locked to capture timing for smoother pacing."
             )
         )
         if auto_play:
@@ -2265,7 +2263,6 @@ class PlaybackRuntimeMixin:
                 browser_name=str(getattr(target, "browser_name", "") or "").strip(),
                 source_url=str(getattr(target, "source_url", "") or "").strip(),
             )
-            self._capture_fps_value = float(LIVE_CAPTURE_DISPLAY_FPS)
             self._set_source_resolution_options_for_dims(vw, vh)
             self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
             self._source_hdr_info = {"is_hdr": False, "reason": "browser_window_capture"}
@@ -2605,7 +2602,7 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage(
                 "Live browser window capture started. "
                 "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. "
-                "Capture runs dynamically from fresh Chrome window frames. HDRTVNet++ stays silent. "
+                "Capture runs dynamically from fresh Chrome window frames with phase-locked smooth cadence. HDRTVNet++ stays silent. "
                 "If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
             )
         elif self._audio_available:
@@ -2834,19 +2831,6 @@ class PlaybackRuntimeMixin:
         self._sync_upscale_controls()
         if self._playing:
             self._update_apply_button_state()
-
-    def _refresh_live_capture_playback_fps(self, fps: float):
-        del fps
-        return
-
-    def _on_capture_fps_changed(self, label: str):
-        self._capture_fps_label = _normalize_capture_fps_label(label)
-        self._capture_fps_value = float(LIVE_CAPTURE_DISPLAY_FPS)
-        if _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)) != SOURCE_MODE_WINDOW:
-            self._refresh_source_mode_ui()
-            return
-        self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
-        self._refresh_source_mode_ui()
 
     def _on_upscale_changed(self, _mode: str):
         self._sync_upscale_controls()

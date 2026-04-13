@@ -53,8 +53,6 @@ def _parse_gui_args(argv: list[str] | None = None):
                         help="Browser process-name hint for live capture mode")
     parser.add_argument("--capture-url", default=None,
                         help="Source URL hint for live capture mode")
-    parser.add_argument("--capture-fps", default=None,
-                        help="Initial capture FPS preset label (e.g. 24 FPS)")
     parser.add_argument("--resolution", default=None,
                         help="Initial resolution preset (1080p/720p/540p/Source)")
     parser.add_argument("--precision", default=None,
@@ -115,7 +113,6 @@ def run_gui(window_cls, root_dir: str, argv: list[str] | None = None):
         initial_capture_browser_name=args.capture_browser_name,
         initial_capture_process_name=args.capture_process_name,
         initial_capture_url=args.capture_url,
-        initial_capture_fps=args.capture_fps,
     )
     win.show()
     return app.exec()
