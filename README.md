@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v4.0-blue)
+![Version](https://img.shields.io/badge/version-v4.0.1-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,7 +12,7 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, compile caching, export, and live browser-window viewing.
 
-`v4.0` is the **Grand UI Update** release, and it keeps the full technical depth while improving visual documentation and usability guidance.
+`v4.0.1` is the current **Grand UI Update** release, and it keeps the full technical depth while improving visual documentation and usability guidance.
 
 Core updates include:
 
@@ -68,7 +68,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## UI Tour (v4.0)
+## UI Tour (v4.0.1)
 
 ### 1. Main Workspace
 
@@ -141,7 +141,7 @@ Important:
 
 ---
 
-## GUI (v4.0)
+## GUI (v4.0.1)
 
 ```bash
 python src/gui.py
@@ -149,7 +149,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, and live browser-window viewing.
 
-### Grand Update v4.0 Highlights
+### Grand Update v4.0.1 Highlights
 
 - **Native Browser Window Capture replaces the old browser-video bridge**
   - HDRTVNet++ now captures browser video directly from the visible Chrome window
@@ -193,6 +193,12 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 - **Live metrics are more thesis-friendly**
   - the `Latency` field now reflects model-stage latency instead of mixing in more source-path timing differences
   - app `VRAM` / `CPU` memory remain whole-app runtime metrics, which is more honest than pretending they are model-only allocations
+- **Playback session logging is built in**
+  - the playback toolbar now includes `Log Session`
+  - a logged session saves full runtime metrics such as `FPS`, `latency`, `VRAM`, `CPU`, model precision, and objective metric fields when present
+  - compare clicks also save per-frame compare metrics such as `PSNR`, `SSSIM`, `DeltaEITP`, normalized variants, and optional `HDR-VDP3`
+  - logs are written to `logs/playback_sessions/<timestamp>_<source>/`
+  - each session folder includes `summary.txt`, `session.json`, `runtime_metrics.csv`, and `compare_events.csv` when compare was used
 - **Experimental max-autotune export reuses the playback compile cache**
   - export uses the same compile/cache keying and compile dialogs as playback
   - max-autotune export uses full Stop behavior first to avoid stale GPU/MIOpen state
@@ -216,6 +222,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
+| **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Automatic compilation** | Triton kernels compile in a clean subprocess; caches are project-scoped and verified before reuse |
@@ -246,7 +253,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 ### Objective Metrics (PSNR / SSSIM / DeltaEITP / HDR-VDP3)
 
 - Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
-- In `v4.0`, objective scoring is compare-driven by default (instead of a continuously updating runtime panel) for cleaner playback behavior.
+- In `v4.0.1`, objective scoring is compare-driven by default (instead of a continuously updating runtime panel) for cleaner playback behavior.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
@@ -259,6 +266,19 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
   - Requires **GNU Octave** installed and available in `PATH`.
 - You can still override with your own command using env var `HDRTVNET_HDRVDP3_CMD`.
   - Template placeholders: `{test}` / `{pred}` and `{reference}` / `{ref}`.
+
+### Playback Session Logs
+
+- Click `Log Session` in the playback toolbar to arm logging for the next active playback session.
+- Stop playback, close the app, let playback finish, or click the button again to flush the session log to disk.
+- Logs are saved under:
+  - `logs/playback_sessions/<timestamp>_<source>/`
+- Saved files:
+  - `summary.txt` for a quick human-readable report
+  - `session.json` for the full structured session payload
+  - `runtime_metrics.csv` for the sampled runtime stream (`FPS`, latency, `VRAM`, `CPU`, frame index, precision, objective fields when present)
+  - `compare_events.csv` for per-click compare metrics (`PSNR`, `SSSIM`, `DeltaEITP`, normalized variants, `HDR-VDP3`, notes)
+- The worker summary also stores the exact average inference latency across logged inference frames.
 
 ### Tools Menu
 
