@@ -223,11 +223,19 @@ class CompareViewMixin:
             # Let the worker snapshot its actual current decoded frame. The
             # UI slider/labels are not always updated every frame while
             # playing, so using them here can drift by several frames.
+            self._note_compare_request_for_logging(
+                precision_key=req_precision or None,
+                frame_number=None,
+            )
             self._worker.request_compare_snapshot(
                 hdr_ground_truth_path=self._hdr_ground_truth_path,
                 precision_key=req_precision or None,
             )
         else:
+            self._note_compare_request_for_logging(
+                precision_key=req_precision or None,
+                frame_number=anchor_frame,
+            )
             self._worker.request_compare_snapshot(
                 max(0, int(anchor_frame)),
                 hdr_ground_truth_path=self._hdr_ground_truth_path,
@@ -269,6 +277,13 @@ class CompareViewMixin:
             self._last_sdr_frame = sdr
         if isinstance(hdr_algo, np.ndarray):
             self._last_hdr_frame = hdr_algo
+
+        self._resolve_compare_request_for_logging(
+            frame_number=frame_idx,
+            precision_key=algo_precision or None,
+            note=note,
+            metrics=metrics,
+        )
 
         dlg = self._ensure_compare_dialog()
         dlg.set_recompare_busy(False)

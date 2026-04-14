@@ -1960,6 +1960,7 @@ class PlaybackRuntimeMixin:
         self._btn_stop.setEnabled(False)
         self._btn_compare.setEnabled(False)
         self._btn_apply_settings.setEnabled(False)
+        self._update_playback_log_button()
         self._prepare_idle_timeline(path)
         self._show_idle_preview(path)
         self._refresh_source_mode_ui()
@@ -2030,6 +2031,7 @@ class PlaybackRuntimeMixin:
         self._btn_stop.setEnabled(False)
         self._btn_compare.setEnabled(False)
         self._btn_apply_settings.setEnabled(False)
+        self._update_playback_log_button()
         self.setWindowTitle(f"HDRTVNet++ - {self._capture_target.label}")
         has_tab_audio_sync = bool(str(getattr(self._capture_target, "session_id", "") or "").strip())
         self.statusBar().showMessage(
@@ -2072,6 +2074,7 @@ class PlaybackRuntimeMixin:
         if self._playing:
             self._worker.stop()
             self._worker.wait(5000)
+        self._finalize_playback_logging("playback restarted")
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:
@@ -2137,6 +2140,7 @@ class PlaybackRuntimeMixin:
         if self._playing:
             self._worker.stop()
             self._worker.wait(5000)
+        self._finalize_playback_logging("playback restarted")
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:
@@ -2579,6 +2583,7 @@ class PlaybackRuntimeMixin:
         self._compile_dlg = _CompileDialog(self)
         self._compile_dlg.show()
 
+        self._prepare_playback_logging_for_start()
         self._worker.start()
         self._set_process_priority(True)
         if pw != ow or ph != oh:
@@ -2744,6 +2749,7 @@ class PlaybackRuntimeMixin:
         self._suppress_eof_restart_once = True
         self._worker.stop()
         self._worker.wait(10000)
+        self._finalize_playback_logging("playback stopped")
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:
@@ -2794,6 +2800,7 @@ class PlaybackRuntimeMixin:
         if self._playing:
             self._worker.stop()
             self._worker.wait(5000)
+        self._finalize_playback_logging("app restarted")
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:

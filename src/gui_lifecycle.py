@@ -80,6 +80,7 @@ class LifecycleMixin:
         self._btn_stop.setEnabled(False)
         self._btn_compare.setEnabled(False)
         self._btn_file.setEnabled(True)
+        self._update_playback_log_button()
         if hasattr(self, "_cmb_source_mode") and self._cmb_source_mode is not None:
             self._cmb_source_mode.setEnabled(True)
         if self._btn_toggle_ui is not None:
@@ -166,6 +167,7 @@ class LifecycleMixin:
         if self._playing:
             self._worker.stop()
             self._worker.wait(10000)
+        self._finalize_playback_logging("app closed")
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:

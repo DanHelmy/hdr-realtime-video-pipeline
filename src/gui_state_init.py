@@ -178,6 +178,15 @@ class StateInitMixin:
         self._autotune_warning_needed = False
         self._hdr_ground_truth_path = None
         self._objective_metrics_enabled = False
+        self._playback_log_enabled = False
+        self._playback_log_session_started = False
+        self._playback_log_source_label = ""
+        self._playback_log_dir = os.path.join(root_dir, "logs", "playback_sessions")
+        self._playback_log_compare_events = []
+        self._playback_log_pending_compare_index = None
+        self._playback_log_runtime_samples = []
+        self._playback_log_started_wall_time = ""
+        self._playback_log_started_perf = 0.0
         self._borderless_full_window = False
         self._mpv_start_resync_t = 0.0
         self._ui_hidden = False

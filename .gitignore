@@ -20,6 +20,7 @@ libmpv-2.dll
 benchmark_results_*.csv
 int8_proof*.csv
 *.txt
+logs/
 
 # Benchmark scripts (development only, not part of pipeline)
 benchmark_*.py

@@ -143,6 +143,11 @@ class PipelineWorker(
         self._live_latency_smoothed_ms: float = 0.0
         self._metrics_emit_interval_s: float = _METRICS_EMIT_INTERVAL_S
         self._last_metrics_emit_t: float = 0.0
+        self._session_logging_lock = threading.Lock()
+        self._session_logging_enabled = False
+        self._session_logging_started_t = 0.0
+        self._session_logging_total_model_latency_ms = 0.0
+        self._session_logging_model_latency_count = 0
 
     # ── public API (called from main thread) ──
 
@@ -202,6 +207,41 @@ class PipelineWorker(
         if path and not os.path.isfile(path):
             path = None
         self._pending_metrics_cfg = (bool(enabled), path)
+
+    def _reset_session_logging_stats_locked(self):
+        self._session_logging_started_t = 0.0
+        self._session_logging_total_model_latency_ms = 0.0
+        self._session_logging_model_latency_count = 0
+
+    def start_session_logging(self):
+        with self._session_logging_lock:
+            self._session_logging_enabled = True
+            self._reset_session_logging_stats_locked()
+            self._session_logging_started_t = time.perf_counter()
+
+    def stop_session_logging(self):
+        with self._session_logging_lock:
+            self._session_logging_enabled = False
+
+    def consume_session_logging_summary(self) -> dict:
+        with self._session_logging_lock:
+            sample_count = int(self._session_logging_model_latency_count)
+            total_latency_ms = float(self._session_logging_total_model_latency_ms)
+            started_t = float(self._session_logging_started_t or 0.0)
+            summary = {
+                "model_latency_samples": sample_count,
+                "avg_model_latency_ms": (
+                    (total_latency_ms / sample_count) if sample_count > 0 else None
+                ),
+                "elapsed_s": (
+                    max(0.0, time.perf_counter() - started_t)
+                    if started_t > 0.0
+                    else 0.0
+                ),
+            }
+            self._session_logging_enabled = False
+            self._reset_session_logging_stats_locked()
+            return summary
 
     def request_compare_snapshot(
         self,
@@ -889,6 +929,12 @@ class PipelineWorker(
             frame_times.append(frame_ms)
             if model_latency_ms > 0.0:
                 model_times.append(float(model_latency_ms))
+                with self._session_logging_lock:
+                    if self._session_logging_enabled:
+                        self._session_logging_total_model_latency_ms += float(
+                            model_latency_ms
+                        )
+                        self._session_logging_model_latency_count += 1
             presentation_stamp = (
                 max(t1, present_t)
                 if (mpv_w is not None and present_t is not None)

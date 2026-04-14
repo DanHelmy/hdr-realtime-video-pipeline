@@ -41,6 +41,7 @@ from gui_ground_truth import GroundTruthMixin
 from gui_audio_playback import AudioPlaybackMixin
 from gui_windowing import WindowingMixin
 from gui_lifecycle import LifecycleMixin
+from gui_playback_logging import PlaybackLoggingMixin
 from gui_playback_runtime import PlaybackRuntimeMixin
 from gui_settings_preview import SettingsPreviewMixin
 from gui_worker_slots import WorkerSlotsMixin
@@ -83,6 +84,7 @@ class MainWindow(
     TimelineSeekMixin,
     GroundTruthMixin,
     AudioPlaybackMixin,
+    PlaybackLoggingMixin,
     UiBuilderMixin,
     StateInitMixin,
     SignalWiringMixin,
@@ -174,7 +176,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

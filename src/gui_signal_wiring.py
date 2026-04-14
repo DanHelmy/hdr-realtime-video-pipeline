@@ -16,6 +16,7 @@ class SignalWiringMixin:
         self._btn_pause.clicked.connect(self._toggle_pause)
         self._btn_stop.clicked.connect(self._stop_and_restart)
         self._btn_compare.clicked.connect(self._compare_current_frame)
+        self._btn_log.toggled.connect(self._toggle_playback_logging)
         self._btn_apply_settings.clicked.connect(self._apply_runtime_settings)
         self._btn_hdr_gt.clicked.connect(self._pick_hdr_ground_truth_file)
         self._chk_metrics.toggled.connect(

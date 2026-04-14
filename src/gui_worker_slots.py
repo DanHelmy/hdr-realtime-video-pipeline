@@ -70,6 +70,7 @@ class WorkerSlotsMixin:
             self._disp_hdr_cpu.update_frame(hdr)
 
     def _on_metrics(self, m):
+        self._record_runtime_metrics_for_logging(m)
         self._m["fps"].setText(f"FPS: {m['fps']:.1f}")
         is_window_source = (
             _normalize_source_mode(getattr(self, "_source_mode", None))
@@ -180,6 +181,7 @@ class WorkerSlotsMixin:
             self._resume_after_precision_swap(force=True)
 
     def _on_finished(self):
+        self._finalize_playback_logging("playback finished")
         is_window_source = (
             _normalize_source_mode(getattr(self, "_source_mode", None))
             == SOURCE_MODE_WINDOW

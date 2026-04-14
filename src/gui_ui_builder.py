@@ -240,6 +240,7 @@ class UiBuilderMixin:
         self._btn_pause = QPushButton("Pause")
         self._btn_stop = QPushButton("Stop")
         self._btn_compare = QPushButton("Compare")
+        self._btn_log = QPushButton("Log Session")
         for b in (self._btn_play, self._btn_pause, self._btn_stop):
             b.setFixedSize(100, 30)
             b.setProperty("toolbar", "compact")
@@ -255,6 +256,13 @@ class UiBuilderMixin:
         self._btn_compare.setToolTip(
             "Pause and open a 3-way frame compare (SDR, HDR GT, HDR Convert)."
         )
+        self._btn_log.setFixedSize(115, 30)
+        self._btn_log.setCheckable(True)
+        self._btn_log.setEnabled(False)
+        self._btn_log.setProperty("toolbar", "compact")
+        self._btn_log.setToolTip(
+            "Record runtime metrics and compare metrics for this playback session."
+        )
 
         transport_row = QHBoxLayout()
         transport_row.setContentsMargins(0, 0, 0, 0)
@@ -263,6 +271,7 @@ class UiBuilderMixin:
         transport_row.addWidget(self._btn_pause)
         transport_row.addWidget(self._btn_stop)
         transport_row.addWidget(self._btn_compare)
+        transport_row.addWidget(self._btn_log)
         transport_row.addStretch(1)
         row2_root.addLayout(transport_row)
 
