@@ -6,8 +6,10 @@ import shutil
 import webbrowser
 
 import numpy as np
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QCheckBox, QMessageBox
 
+from gui_hdr_io import FFMPEG_WINDOWS_DOWNLOAD_URL, hdr_ffmpeg_ready
 from gui_mpv_widget import MpvHDRWidget
 from gui_scaling import (
     BEST_MPV_SCALE,
@@ -254,6 +256,7 @@ class CompareViewMixin:
                 "Compare is only available in Video Player mode."
             )
             return
+        self._warn_if_ffmpeg_missing_for_compare()
         self._request_compare_snapshot()
 
     def _on_compare_requested(self, precision_key: str, frame_number: int):
@@ -261,6 +264,7 @@ class CompareViewMixin:
         if not key:
             return
         anchor = max(0, int(frame_number))
+        self._warn_if_ffmpeg_missing_for_compare()
         self._request_compare_snapshot(precision_key=key, frame_number=anchor)
 
     def _on_compare_snapshot_ready(self, payload: dict):
@@ -362,3 +366,34 @@ class CompareViewMixin:
                 self._save_user_settings()
             except Exception:
                 pass
+
+    def _warn_if_ffmpeg_missing_for_compare(self):
+        if getattr(self, "_compare_ffmpeg_warning_shown", False):
+            return
+        if hdr_ffmpeg_ready():
+            return
+        self._compare_ffmpeg_warning_shown = True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("FFmpeg Not Detected")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            "FFmpeg and ffprobe were not detected.<br><br>"
+            "Compare will still open, but HDR GT may fall back to 8-bit OpenCV decode "
+            "and the compare note will say HDR fallback.<br><br>"
+            f'Download FFmpeg for Windows:<br><a href="{FFMPEG_WINDOWS_DOWNLOAD_URL}">{FFMPEG_WINDOWS_DOWNLOAD_URL}</a>'
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        open_btn = box.addButton(
+            "Open FFmpeg Download Page",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        while True:
+            box.exec()
+            if box.clickedButton() is open_btn:
+                try:
+                    webbrowser.open(FFMPEG_WINDOWS_DOWNLOAD_URL, new=2)
+                except Exception:
+                    pass
+                continue
+            break

@@ -10,7 +10,7 @@ Features:
     - Play / Pause / Stop controls
     - Side-by-side SDR input vs HDR output (or single view)
     - Toggle real-time metrics panel (FPS, latency, GPU/CPU memory, model size)
-    - Optional objective metrics with HDR ground truth (PSNR, SSSIM, DeltaEITP, HDR-VDP3 hook)
+    - Optional objective metrics with HDR ground truth (PSNR, SSIM, DeltaEITP, HDR-VDP3 hook)
     - Dark theme
 """
 
@@ -176,7 +176,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

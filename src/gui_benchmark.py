@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 import threading
+import webbrowser
 from dataclasses import dataclass
 
 import cv2
@@ -47,6 +48,14 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import PRECISIONS, RESOLUTION_SCALES, _available_precision_keys, _select_model_path
+from gui_hdr_io import (
+    FFMPEG_WINDOWS_DOWNLOAD_URL,
+    hdr_ffmpeg_ready,
+    read_hdr_video_frame_rgb16,
+    read_image_any,
+    write_hdr_tiff,
+    tensor_to_bgr_u16,
+)
 from gui_media_probe import _content_similarity_score, _probe_hdr_input, _probe_video_timing_info
 from gui_objective_metrics import (
     _OBJECTIVE_METRIC_MAX_SIDE,
@@ -74,7 +83,7 @@ from gui_scaling import (
 from gui_widgets import _CompareVideoPane
 from models.hdrtvnet_torch import HDRTVNetTorch
 
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
 
 try:
@@ -155,11 +164,48 @@ def _read_media_frame(path: str, frame_idx: int | None = None) -> np.ndarray | N
     if not path or not os.path.isfile(path):
         return None
     if _is_image_path(path):
-        return cv2.imread(path, cv2.IMREAD_COLOR)
+        frame = read_image_any(path)
+        if frame is None:
+            return None
+        if frame.dtype == np.uint16:
+            return np.ascontiguousarray(
+                ((frame.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
+            )
+        return np.ascontiguousarray(frame.astype(np.uint8, copy=False))
     if _is_video_path(path):
         idx = max(0, int(frame_idx or 0))
         return _read_video_frame_at(path, idx)
     return None
+
+
+def _read_media_frame_hdr(path: str, frame_idx: int | None = None) -> np.ndarray | None:
+    frame, _mode = _read_media_frame_hdr_with_mode(path, frame_idx=frame_idx)
+    return frame
+
+
+def _read_media_frame_hdr_with_mode(
+    path: str,
+    frame_idx: int | None = None,
+) -> tuple[np.ndarray | None, str]:
+    if not path or not os.path.isfile(path):
+        return None, "missing"
+    if _is_image_path(path):
+        frame = read_image_any(path)
+        if frame is None:
+            return None, "missing"
+        if frame.dtype == np.uint16:
+            return np.ascontiguousarray(frame), "true_hdr_image"
+        return np.ascontiguousarray(frame.astype(np.uint16) * 257), "ldr_image_fallback"
+    if _is_video_path(path):
+        idx = max(0, int(frame_idx or 0))
+        rgb16 = read_hdr_video_frame_rgb16(path, idx)
+        if rgb16 is not None:
+            return np.ascontiguousarray(rgb16[:, :, ::-1]), "true_hdr_video"
+        frame = _read_video_frame_at(path, idx)
+        if frame is None:
+            return None, "missing"
+        return np.ascontiguousarray(frame.astype(np.uint16) * 257), "video_fallback"
+    return None, "missing"
 
 
 def _detect_distinct_video_frames(
@@ -321,9 +367,18 @@ class _BenchmarkWorker(QObject):
             out_w, out_h = _resolution_dims(cfg.resolution_key)
 
             rows: list[dict] = []
-            total = max(1, len(cfg.tasks))
+            ordered_tasks = sorted(
+                cfg.tasks,
+                key=lambda task: (
+                    str(task.gt_path or "").lower(),
+                    str(task.sdr_path or "").lower(),
+                    int(task.frame_idx if task.frame_idx is not None else -1),
+                    str(task.label or "").lower(),
+                ),
+            )
+            total = max(1, len(ordered_tasks))
 
-            for i, task in enumerate(cfg.tasks):
+            for i, task in enumerate(ordered_tasks):
                 if self._is_canceled():
                     self.canceled.emit("Benchmark canceled.")
                     return
@@ -335,6 +390,10 @@ class _BenchmarkWorker(QObject):
 
                 sdr_raw = _read_media_frame(task.sdr_path, frame_idx=task.frame_idx)
                 gt_raw = _read_media_frame(task.gt_path, frame_idx=task.frame_idx)
+                gt_hdr_raw, _gt_hdr_mode = _read_media_frame_hdr_with_mode(
+                    task.gt_path,
+                    frame_idx=task.frame_idx,
+                )
                 if sdr_raw is None or gt_raw is None:
                     note = "Missing frame/image data."
                     row = {
@@ -363,9 +422,19 @@ class _BenchmarkWorker(QObject):
 
                 sdr_eval = np.ascontiguousarray(_letterbox_bgr(sdr_raw, out_w, out_h))
                 gt_eval = np.ascontiguousarray(_letterbox_bgr(gt_raw, out_w, out_h))
-
+                gt_preview = None
+                if isinstance(gt_hdr_raw, np.ndarray):
+                    gt_preview = np.ascontiguousarray(_letterbox_bgr(gt_hdr_raw, out_w, out_h))
                 try:
                     pred_eval = np.ascontiguousarray(processor.process(sdr_eval))
+                    with torch.inference_mode():
+                        pred_tensor, pred_cond = processor.preprocess(sdr_eval)
+                        pred_raw = processor.infer((pred_tensor, pred_cond))
+                    pred_preview = np.ascontiguousarray(tensor_to_bgr_u16(pred_raw))
+                    if (pred_preview.shape[1], pred_preview.shape[0]) != (out_w, out_h):
+                        pred_preview = np.ascontiguousarray(
+                            cv2.resize(pred_preview, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                        )
                 except Exception as exc:
                     note = f"Inference failed: {exc}"
                     row = {
@@ -403,7 +472,6 @@ class _BenchmarkWorker(QObject):
                     "obj_note": "",
                     "hdr_vdp3_note": "",
                 }
-
                 try:
                     eval_pred, eval_ref = _prepare_metric_pair(
                         pred_eval,
@@ -436,40 +504,26 @@ class _BenchmarkWorker(QObject):
                     if task.frame_idx is not None
                     else "frame_000000"
                 )
+                sample_dir_name = frame_tag
                 if str(cfg.mode) == "dataset":
                     stem = _sanitize_name(
                         os.path.splitext(os.path.basename(task.sdr_path))[0]
                     )
                     sample_dir_name = f"{frame_tag}_{stem}"
-                else:
-                    sample_dir_name = frame_tag
                 sample_dir = self._choose_unique_dir(
                     os.path.join(cfg.session_dir, sample_dir_name)
                 )
                 os.makedirs(sample_dir, exist_ok=True)
 
                 sdr_path = os.path.join(sample_dir, "sdr.png")
-                gt_path = os.path.join(sample_dir, "hdr_gt.png")
-                pred_path = os.path.join(sample_dir, "hdr_convert.png")
+                gt_path = os.path.join(sample_dir, "hdr_gt.tiff")
+                pred_path = os.path.join(sample_dir, "hdr_convert.tiff")
                 cv2.imwrite(sdr_path, sdr_eval)
-                cv2.imwrite(gt_path, gt_eval)
-                cv2.imwrite(pred_path, pred_eval)
-
-                per_sample_json = os.path.join(sample_dir, "metrics.json")
-                try:
-                    with open(per_sample_json, "w", encoding="utf-8") as f:
-                        json.dump(
-                            {
-                                "task_id": task.task_id,
-                                "label": task.label,
-                                "frame": (int(task.frame_idx) + 1) if task.frame_idx is not None else None,
-                                "metrics": metrics,
-                            },
-                            f,
-                            indent=2,
-                        )
-                except Exception:
-                    pass
+                write_hdr_tiff(
+                    gt_path,
+                    gt_preview if isinstance(gt_preview, np.ndarray) else (gt_eval.astype(np.uint16) * 257),
+                )
+                write_hdr_tiff(pred_path, pred_preview)
 
                 row = {
                     "task_id": task.task_id,
@@ -479,6 +533,9 @@ class _BenchmarkWorker(QObject):
                     "sdr_image": sdr_path,
                     "hdr_gt_image": gt_path,
                     "hdr_convert_image": pred_path,
+                    "source_sdr_path": task.sdr_path,
+                    "source_gt_path": task.gt_path,
+                    "source_frame_idx": int(task.frame_idx) if task.frame_idx is not None else None,
                     "metrics": metrics,
                 }
                 rows.append(row)
@@ -596,7 +653,9 @@ class _BenchmarkWorker(QObject):
                     "mode": cfg.mode,
                     "source_name": cfg.source_name,
                     "precision": cfg.precision_key,
+                    "use_hg": bool(cfg.use_hg),
                     "resolution": cfg.resolution_key,
+                    "predequantize_mode": cfg.predequantize_mode,
                     "session_dir": cfg.session_dir,
                     "summary_csv": summary_csv,
                     "summary_json": summary_json,
@@ -702,6 +761,7 @@ class ModelBenchmarkDialog(QDialog):
         self.resize(1320, 860)
 
         self._suggested_dir = suggested_dir if os.path.isdir(suggested_dir) else os.getcwd()
+        self._last_source_dir = self._suggested_dir
         self._logs_root = logs_root
         self._dataset_pairs: list[BenchmarkTask] = []
         self._results: list[dict] = []
@@ -711,11 +771,17 @@ class ModelBenchmarkDialog(QDialog):
         self._result_source_name = ""
         self._result_precision = ""
         self._result_resolution = ""
+        self._result_use_hg: bool | None = None
+        self._result_predequantize_mode = ""
         self._result_sets: list[dict] = []
         self._benchmark_preview_splitter: QSplitter | None = None
         self._benchmark_results_splitter: QSplitter | None = None
         self._expanded_preview_pane: int | None = None
         self._reset_preview_splitter_on_show = True
+        self._ffmpeg_hdr_warning_shown = False
+        self._preview_processor_cache: dict[tuple[str, bool, str], HDRTVNetTorch] = {}
+        self._frame_detect_cache_path = os.path.join(self._logs_root, "benchmark_frame_cache.json")
+        self._frame_detect_cache = self._load_frame_detect_cache()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -945,10 +1011,10 @@ class ModelBenchmarkDialog(QDialog):
             [
                 "Item",
                 "PSNR",
-                "SSSIM",
+                "SSIM",
                 "DeltaEITP",
                 "PSNR-N",
-                "SSSIM-N",
+                "SSIM-N",
                 "DeltaEITP-N",
                 "HDR-VDP3",
                 "Note",
@@ -970,6 +1036,7 @@ class ModelBenchmarkDialog(QDialog):
             mpv_available=_HAS_MPV,
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
+            preview_scale_kernel="bicubic",
         )
         self._img_gt = _CompareVideoPane(
             "HDR GT",
@@ -977,6 +1044,7 @@ class ModelBenchmarkDialog(QDialog):
             mpv_available=_HAS_MPV,
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
+            preview_scale_kernel="bicubic",
         )
         self._img_pred = _CompareVideoPane(
             "HDR Convert",
@@ -984,6 +1052,7 @@ class ModelBenchmarkDialog(QDialog):
             mpv_available=_HAS_MPV,
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
+            preview_scale_kernel="bicubic",
         )
         previews.addWidget(self._img_sdr)
         previews.addWidget(self._img_gt)
@@ -1078,6 +1147,50 @@ class ModelBenchmarkDialog(QDialog):
             self._txt_video_gt.setText(initial_hdr_gt_path)
 
         self._sync_mode_ui()
+
+    def _load_frame_detect_cache(self) -> dict[str, list[int]]:
+        path = str(getattr(self, "_frame_detect_cache_path", "") or "").strip()
+        if not path or not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return {}
+            out: dict[str, list[int]] = {}
+            for key, value in payload.items():
+                if not isinstance(key, str) or not isinstance(value, list):
+                    continue
+                frames: list[int] = []
+                for item in value:
+                    try:
+                        frames.append(int(item))
+                    except Exception:
+                        continue
+                if frames:
+                    out[key] = frames
+            return out
+        except Exception:
+            return {}
+
+    def _save_frame_detect_cache(self) -> None:
+        path = str(getattr(self, "_frame_detect_cache_path", "") or "").strip()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._frame_detect_cache, f, indent=2)
+        except Exception:
+            pass
+
+    def _frame_detect_cache_key(self, video_path: str, desired_count: int) -> str:
+        try:
+            st = os.stat(video_path)
+            sig = f"{os.path.abspath(video_path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+        except Exception:
+            sig = os.path.abspath(video_path) if video_path else str(video_path or "")
+        return f"{sig}|count={int(max(1, desired_count))}"
         self._sync_subset_enabled()
         self._add_result_set_tab(
             {
@@ -1096,6 +1209,12 @@ class ModelBenchmarkDialog(QDialog):
     def last_session_dir(self) -> str | None:
         return self._session_dir
 
+    def last_source_dir(self) -> str | None:
+        path = str(self._last_source_dir or "").strip()
+        if path and os.path.isdir(path):
+            return path
+        return None
+
     def _set_all_checked(self, lst: QListWidget, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for i in range(lst.count()):
@@ -1112,6 +1231,8 @@ class ModelBenchmarkDialog(QDialog):
         source_name: str | None,
         precision: str | None,
         resolution: str | None,
+        use_hg: bool | None = None,
+        predequantize_mode: str | None = None,
         selected_row: int | None = None,
     ) -> dict:
         return {
@@ -1122,6 +1243,8 @@ class ModelBenchmarkDialog(QDialog):
             "source_name": str(source_name or "").strip(),
             "precision": str(precision or "").strip(),
             "resolution": str(resolution or "").strip(),
+            "use_hg": bool(use_hg) if use_hg is not None else None,
+            "predequantize_mode": str(predequantize_mode or "").strip() or None,
             "selected_row": (
                 int(selected_row)
                 if selected_row is not None and int(selected_row) >= 0
@@ -1202,6 +1325,8 @@ class ModelBenchmarkDialog(QDialog):
                 source_name="",
                 precision="",
                 resolution="",
+                use_hg=None,
+                predequantize_mode=None,
                 selected_row=None,
             )
             return
@@ -1213,6 +1338,8 @@ class ModelBenchmarkDialog(QDialog):
             source_name=str(data.get("source_name") or "").strip(),
             precision=str(data.get("precision") or "").strip(),
             resolution=str(data.get("resolution") or "").strip(),
+            use_hg=data.get("use_hg"),
+            predequantize_mode=data.get("predequantize_mode"),
             selected_row=data.get("selected_row"),
         )
 
@@ -1241,6 +1368,8 @@ class ModelBenchmarkDialog(QDialog):
                     "source_name": "",
                     "precision": "",
                     "resolution": "",
+                    "use_hg": None,
+                    "predequantize_mode": None,
                     "selected_row": None,
                 },
                 activate=True,
@@ -1255,6 +1384,37 @@ class ModelBenchmarkDialog(QDialog):
         self._status_label.setText(f"Status: {msg}")
         if percent is not None:
             self._status_progress.setValue(max(0, min(100, int(percent))))
+
+    def _warn_if_ffmpeg_missing_for_hdr_benchmark(self) -> bool:
+        if self._ffmpeg_hdr_warning_shown:
+            return False
+        if hdr_ffmpeg_ready():
+            return True
+        self._ffmpeg_hdr_warning_shown = True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("FFmpeg Not Detected")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            "FFmpeg and ffprobe were not detected.<br><br>"
+            "Benchmark cannot run until FFmpeg and ffprobe are installed and available on PATH.<br><br>"
+            f'Download FFmpeg for Windows:<br><a href="{FFMPEG_WINDOWS_DOWNLOAD_URL}">{FFMPEG_WINDOWS_DOWNLOAD_URL}</a>'
+        )
+        open_btn = box.addButton(
+            "Open FFmpeg Download Page",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        while True:
+            box.exec()
+            if box.clickedButton() is open_btn:
+                try:
+                    webbrowser.open(FFMPEG_WINDOWS_DOWNLOAD_URL, new=2)
+                except Exception:
+                    pass
+                continue
+            break
+        return False
 
     def _set_result_run_info(
         self,
@@ -1362,7 +1522,74 @@ class ModelBenchmarkDialog(QDialog):
         p = str(path or "").strip()
         if not p or not os.path.isfile(p):
             return None
-        return cv2.imread(p, cv2.IMREAD_COLOR)
+        return read_image_any(p)
+
+    def _preview_processor_for_current_result(self) -> HDRTVNetTorch | None:
+        precision = str(self._result_precision or "").strip()
+        use_hg = self._result_use_hg
+        predequantize_mode = str(self._result_predequantize_mode or "auto").strip() or "auto"
+        if not precision or use_hg is None:
+            return None
+        key = (precision, bool(use_hg), predequantize_mode)
+        cached = self._preview_processor_cache.get(key)
+        if cached is not None:
+            return cached
+        model_path = _select_model_path(precision, bool(use_hg))
+        if not model_path or not os.path.isfile(model_path):
+            return None
+        precision_cfg = PRECISIONS.get(precision, {})
+        model_precision = str(precision_cfg.get("precision") or "fp16")
+        try:
+            processor = HDRTVNetTorch(
+                model_path,
+                device="auto",
+                precision=model_precision,
+                compile_model=False,
+                compile_mode="default",
+                predequantize=_resolve_predequantize_arg(predequantize_mode),
+                use_hg=bool(use_hg),
+            )
+        except Exception:
+            return None
+        self._preview_processor_cache[key] = processor
+        return processor
+
+    def _generate_result_previews(self, row: dict) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        if not isinstance(row, dict):
+            return None, None, None
+        sdr_path = str(row.get("source_sdr_path") or "").strip()
+        gt_path = str(row.get("source_gt_path") or "").strip()
+        frame_raw = row.get("source_frame_idx")
+        try:
+            frame_idx = int(frame_raw) if frame_raw is not None else None
+        except Exception:
+            frame_idx = None
+
+        sdr_src = _read_media_frame(sdr_path, frame_idx=frame_idx)
+        gt_hdr_src, _gt_mode = _read_media_frame_hdr_with_mode(gt_path, frame_idx=frame_idx)
+        if sdr_src is None:
+            return None, None, None
+        out_w, out_h = _resolution_dims(self._result_resolution or "1080p")
+        sdr_preview = np.ascontiguousarray(_letterbox_bgr(sdr_src, out_w, out_h))
+        gt_preview = None
+        if isinstance(gt_hdr_src, np.ndarray):
+            gt_preview = np.ascontiguousarray(_letterbox_bgr(gt_hdr_src, out_w, out_h))
+
+        processor = self._preview_processor_for_current_result()
+        pred_preview = None
+        if processor is not None:
+            try:
+                with torch.inference_mode():
+                    pred_tensor, pred_cond = processor.preprocess(sdr_preview)
+                    pred_raw = processor.infer((pred_tensor, pred_cond))
+                pred_preview = np.ascontiguousarray(tensor_to_bgr_u16(pred_raw))
+                if (pred_preview.shape[1], pred_preview.shape[0]) != (out_w, out_h):
+                    pred_preview = np.ascontiguousarray(
+                        cv2.resize(pred_preview, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                    )
+            except Exception:
+                pred_preview = None
+        return sdr_preview, gt_preview, pred_preview
 
     def _set_result_previews(self, row: dict | None):
         if not isinstance(row, dict):
@@ -1373,6 +1600,8 @@ class ModelBenchmarkDialog(QDialog):
         sdr = self._read_preview_image(row.get("sdr_image"))
         gt = self._read_preview_image(row.get("hdr_gt_image"))
         pred = self._read_preview_image(row.get("hdr_convert_image"))
+        if sdr is None and gt is None and pred is None:
+            sdr, gt, pred = self._generate_result_previews(row)
         self._img_sdr.set_frame(sdr, "SDR\n(unavailable)")
         self._img_gt.set_frame(gt, "HDR GT\n(unavailable)")
         self._img_pred.set_frame(pred, "HDR Convert\n(unavailable)")
@@ -1393,9 +1622,13 @@ class ModelBenchmarkDialog(QDialog):
         source_name: str | None,
         precision: str | None,
         resolution: str | None,
+        use_hg: bool | None,
+        predequantize_mode: str | None,
         selected_row: int | None,
     ):
         self._results = list(rows or [])
+        self._result_use_hg = bool(use_hg) if use_hg is not None else None
+        self._result_predequantize_mode = str(predequantize_mode or "").strip()
         self._tbl.blockSignals(True)
         self._tbl.clearSelection()
         self._tbl.setRowCount(0)
@@ -1478,7 +1711,7 @@ class ModelBenchmarkDialog(QDialog):
     def _load_results_from_json(
         self,
         json_path: str,
-    ) -> tuple[list[dict], dict, str | None, dict[str, str]]:
+    ) -> tuple[list[dict], dict, str | None, dict[str, object]]:
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         rows = data.get("results")
@@ -1501,16 +1734,31 @@ class ModelBenchmarkDialog(QDialog):
                 sample_dir = os.path.normpath(os.path.join(base_dir, sample_dir))
             row["sample_dir"] = sample_dir
 
+            for src_key in ("source_sdr_path", "source_gt_path"):
+                src_p = str(row.get(src_key) or "").strip()
+                if src_p and not os.path.isabs(src_p):
+                    src_p = os.path.normpath(os.path.join(base_dir, src_p))
+                row[src_key] = src_p
+
             for key, fname in (
                 ("sdr_image", "sdr.png"),
-                ("hdr_gt_image", "hdr_gt.png"),
-                ("hdr_convert_image", "hdr_convert.png"),
+                ("hdr_gt_image", "hdr_gt.tiff"),
+                ("hdr_convert_image", "hdr_convert.tiff"),
             ):
                 p = str(row.get(key) or "").strip()
                 if p and not os.path.isabs(p):
                     p = os.path.normpath(os.path.join(base_dir, p))
                 if (not p) and sample_dir:
                     p = os.path.join(sample_dir, fname)
+                    if not os.path.isfile(p):
+                        legacy_candidates = [
+                            os.path.splitext(p)[0] + ".tiff",
+                            os.path.splitext(p)[0] + ".png",
+                        ]
+                        for legacy in legacy_candidates:
+                            if os.path.isfile(legacy):
+                                p = legacy
+                                break
                 row[key] = p
             norm_rows.append(row)
 
@@ -1522,6 +1770,8 @@ class ModelBenchmarkDialog(QDialog):
             "source_name": str(data.get("source_name") or "").strip(),
             "precision": str(data.get("precision") or "").strip(),
             "resolution": str(data.get("resolution") or "").strip(),
+            "use_hg": data.get("use_hg"),
+            "predequantize_mode": str(data.get("predequantize_mode") or "").strip(),
         }
         if not meta["source_name"]:
             meta["source_name"] = self._infer_source_name_from_session_dir(session_dir)
@@ -1530,7 +1780,7 @@ class ModelBenchmarkDialog(QDialog):
     def _load_results_from_csv(
         self,
         csv_path: str,
-    ) -> tuple[list[dict], dict, str | None, dict[str, str]]:
+    ) -> tuple[list[dict], dict, str | None, dict[str, object]]:
         rows: list[dict] = []
         base_dir = os.path.dirname(csv_path)
         with open(csv_path, "r", encoding="utf-8", newline="") as f:
@@ -1568,10 +1818,19 @@ class ModelBenchmarkDialog(QDialog):
                     "frame": frame_val,
                     "sample_dir": sample_dir,
                     "sdr_image": os.path.join(sample_dir, "sdr.png") if sample_dir else "",
-                    "hdr_gt_image": os.path.join(sample_dir, "hdr_gt.png") if sample_dir else "",
-                    "hdr_convert_image": os.path.join(sample_dir, "hdr_convert.png") if sample_dir else "",
-                    "metrics": metrics,
+                    "hdr_gt_image": os.path.join(sample_dir, "hdr_gt.tiff") if sample_dir else "",
+                    "hdr_convert_image": os.path.join(sample_dir, "hdr_convert.tiff") if sample_dir else "",
+                "metrics": metrics,
                 }
+                if sample_dir:
+                    if not os.path.isfile(row["hdr_gt_image"]):
+                        exr_path = os.path.join(sample_dir, "hdr_gt.exr")
+                        png_path = os.path.join(sample_dir, "hdr_gt.png")
+                        row["hdr_gt_image"] = exr_path if os.path.isfile(exr_path) else png_path
+                    if not os.path.isfile(row["hdr_convert_image"]):
+                        exr_path = os.path.join(sample_dir, "hdr_convert.exr")
+                        png_path = os.path.join(sample_dir, "hdr_convert.png")
+                        row["hdr_convert_image"] = exr_path if os.path.isfile(exr_path) else png_path
                 rows.append(row)
         average = self._compute_average_from_rows(rows)
 
@@ -1579,6 +1838,8 @@ class ModelBenchmarkDialog(QDialog):
             "source_name": "",
             "precision": "",
             "resolution": "",
+            "use_hg": None,
+            "predequantize_mode": "",
         }
         for sidecar_name in ("benchmark_summary.json", "benchmark_export_summary.json"):
             sidecar = os.path.join(base_dir, sidecar_name)
@@ -1591,6 +1852,11 @@ class ModelBenchmarkDialog(QDialog):
                     meta["source_name"] = str(sidecar_data.get("source_name") or meta["source_name"]).strip()
                     meta["precision"] = str(sidecar_data.get("precision") or meta["precision"]).strip()
                     meta["resolution"] = str(sidecar_data.get("resolution") or meta["resolution"]).strip()
+                    if sidecar_data.get("use_hg") is not None:
+                        meta["use_hg"] = bool(sidecar_data.get("use_hg"))
+                    meta["predequantize_mode"] = str(
+                        sidecar_data.get("predequantize_mode") or meta["predequantize_mode"]
+                    ).strip()
                 break
             except Exception:
                 continue
@@ -1728,6 +1994,8 @@ class ModelBenchmarkDialog(QDialog):
                     source_name=source_name,
                     precision=precision,
                     resolution=resolution,
+                    use_hg=meta.get("use_hg"),
+                    predequantize_mode=str(meta.get("predequantize_mode") or "").strip(),
                     selected_row=0,
                 )
                 idx = self._add_result_set_tab(payload, activate=False)
@@ -1805,7 +2073,7 @@ class ModelBenchmarkDialog(QDialog):
         self._spn_subset.setEnabled(mode == "subset")
 
     def _pick_video_sdr(self):
-        start = self._suggested_dir
+        start = self._last_source_dir or self._suggested_dir
         current = self._txt_video_sdr.text().strip()
         if current and os.path.isfile(current):
             start = os.path.dirname(current)
@@ -1816,7 +2084,16 @@ class ModelBenchmarkDialog(QDialog):
             "Video (*.mp4 *.avi *.mkv *.mov *.webm *.flv *.m4v);;All (*)",
         )
         if path:
+            hdr_info = _probe_hdr_input(path)
+            if bool(hdr_info.get("is_hdr", False)):
+                QMessageBox.warning(
+                    self,
+                    "SDR Video",
+                    f"Selected file appears HDR and cannot be used as the SDR source.\n\n{hdr_info.get('reason', 'HDR metadata detected')}",
+                )
+                return
             self._txt_video_sdr.setText(path)
+            self._last_source_dir = os.path.dirname(path) or self._last_source_dir
             self._lst_video_frames.clear()
             self._img_video_setup_preview.set_image_from_bgr(
                 None,
@@ -1824,7 +2101,7 @@ class ModelBenchmarkDialog(QDialog):
             )
 
     def _pick_video_gt(self):
-        start = self._suggested_dir
+        start = self._last_source_dir or self._suggested_dir
         current = self._txt_video_gt.text().strip()
         if current and os.path.isfile(current):
             start = os.path.dirname(current)
@@ -1835,19 +2112,30 @@ class ModelBenchmarkDialog(QDialog):
             "Video (*.mp4 *.avi *.mkv *.mov *.webm *.flv *.m4v);;All (*)",
         )
         if path:
+            hdr_info = _probe_hdr_input(path)
+            if not bool(hdr_info.get("is_hdr", False)):
+                QMessageBox.warning(
+                    self,
+                    "HDR GT Video",
+                    f"Selected file does not appear HDR and cannot be used as HDR ground truth.\n\n{hdr_info.get('reason', 'HDR metadata not detected')}",
+                )
+                return
             self._txt_video_gt.setText(path)
+            self._last_source_dir = os.path.dirname(path) or self._last_source_dir
 
     def _pick_dataset_sdr(self):
-        start = self._txt_dataset_sdr.text().strip() or self._suggested_dir
+        start = self._txt_dataset_sdr.text().strip() or self._last_source_dir or self._suggested_dir
         path = QFileDialog.getExistingDirectory(self, "Select SDR Dataset Folder", start)
         if path:
             self._txt_dataset_sdr.setText(path)
+            self._last_source_dir = path
 
     def _pick_dataset_gt(self):
-        start = self._txt_dataset_gt.text().strip() or self._suggested_dir
+        start = self._txt_dataset_gt.text().strip() or self._last_source_dir or self._suggested_dir
         path = QFileDialog.getExistingDirectory(self, "Select HDR GT Dataset Folder", start)
         if path:
             self._txt_dataset_gt.setText(path)
+            self._last_source_dir = path
 
     def _pick_session_root(self):
         start = self._txt_session_root.text().strip() or self._logs_root
@@ -1892,6 +2180,31 @@ class ModelBenchmarkDialog(QDialog):
 
         return True, f"Validated (content similarity {score:.2f})."
 
+    def _validate_dataset_pair(self, sdr_path: str, gt_path: str) -> tuple[bool, str]:
+        if not os.path.isfile(sdr_path):
+            return False, "SDR path is invalid."
+        if not os.path.isfile(gt_path):
+            return False, "HDR GT path is invalid."
+
+        sdr_is_video = _is_video_path(sdr_path)
+        gt_is_video = _is_video_path(gt_path)
+        if sdr_is_video != gt_is_video:
+            return False, "SDR/GT media types do not match."
+        if sdr_is_video and gt_is_video:
+            return self._validate_video_pair(sdr_path, gt_path)
+
+        # For image datasets, use bit depth as a coarse guard so obvious
+        # SDR-in-GT / HDR-in-SDR folder swaps are rejected.
+        sdr_img = read_image_any(sdr_path)
+        gt_img = read_image_any(gt_path)
+        if sdr_img is None or gt_img is None:
+            return False, "Could not read paired dataset image(s)."
+        if sdr_img.dtype == np.uint16:
+            return False, "SDR dataset image appears HDR/high-bit-depth."
+        if gt_img.dtype != np.uint16:
+            return False, "HDR GT dataset image does not appear HDR/high-bit-depth."
+        return True, "Validated image pair."
+
     def _detect_frames(self):
         sdr_path = self._txt_video_sdr.text().strip()
         gt_path = self._txt_video_gt.text().strip()
@@ -1901,14 +2214,24 @@ class ModelBenchmarkDialog(QDialog):
             return
 
         desired_count = max(1, int(self._spn_detect_frame_count.value()))
-        # Increase scan budget with requested count to keep higher-count runs useful,
-        # while keeping deterministic behavior for the same source+count.
-        scan_cap = min(4000, max(260, desired_count * 24))
-        frames = _detect_distinct_video_frames(
-            sdr_path,
-            desired_count=desired_count,
-            max_scan_points=scan_cap,
-        )
+        cache_key = self._frame_detect_cache_key(sdr_path, desired_count)
+        frames = list(self._frame_detect_cache.get(cache_key) or [])
+        used_cache = bool(frames)
+        if not frames:
+            # Increase scan budget with requested count to keep higher-count runs useful,
+            # while keeping deterministic behavior for the same source+count.
+            scan_cap = min(4000, max(260, desired_count * 24))
+            frames = _detect_distinct_video_frames(
+                sdr_path,
+                desired_count=desired_count,
+                max_scan_points=scan_cap,
+            )
+            if frames:
+                self._frame_detect_cache[cache_key] = list(frames)
+                while len(self._frame_detect_cache) > 64:
+                    oldest_key = next(iter(self._frame_detect_cache))
+                    self._frame_detect_cache.pop(oldest_key, None)
+                self._save_frame_detect_cache()
         if not frames:
             QMessageBox.warning(
                 self,
@@ -1929,7 +2252,8 @@ class ModelBenchmarkDialog(QDialog):
         self._refresh_video_frame_preview()
 
         self._lbl_video_note.setText(
-            f"{len(frames)} deterministic scene-diverse frames detected (requested {desired_count}). {note}"
+            f"{len(frames)} deterministic scene-diverse frames detected (requested {desired_count}, "
+            f"{'cache hit' if used_cache else 'fresh scan'}). {note}"
         )
 
     def _pair_dataset_files(self, sdr_root: str, gt_root: str) -> list[BenchmarkTask]:
@@ -1947,6 +2271,7 @@ class ModelBenchmarkDialog(QDialog):
             gt_stem_map.setdefault(stem, []).append(p)
 
         pairs: list[BenchmarkTask] = []
+        invalid_notes: list[str] = []
         for sdr_path in sdr_files:
             rel = os.path.relpath(sdr_path, sdr_root).replace("\\", "/")
             rel_no_ext = os.path.splitext(rel)[0].lower()
@@ -1959,6 +2284,11 @@ class ModelBenchmarkDialog(QDialog):
             if gt_path is None:
                 continue
 
+            ok, note = self._validate_dataset_pair(sdr_path, gt_path)
+            if not ok:
+                invalid_notes.append(f"{rel}: {note}")
+                continue
+
             task = BenchmarkTask(
                 task_id=_sanitize_name(rel_no_ext),
                 label=rel,
@@ -1969,6 +2299,7 @@ class ModelBenchmarkDialog(QDialog):
             pairs.append(task)
 
         pairs.sort(key=lambda t: t.label.lower())
+        self._last_dataset_pair_warnings = invalid_notes
         return pairs
 
     def _scan_dataset_pairs(self):
@@ -1997,6 +2328,17 @@ class ModelBenchmarkDialog(QDialog):
                 self,
                 "Dataset Benchmark",
                 "No SDR/HDR GT pairs were found. Pairing uses relative path first, then filename stem fallback.",
+            )
+        elif getattr(self, "_last_dataset_pair_warnings", None):
+            notes = list(self._last_dataset_pair_warnings[:8])
+            extra = len(self._last_dataset_pair_warnings) - len(notes)
+            if extra > 0:
+                notes.append(f"... and {extra} more invalid pair(s).")
+            QMessageBox.warning(
+                self,
+                "Dataset Benchmark",
+                "Some dataset pairs were skipped because benchmark only allows SDR source -> HDR GT pairs:\n\n"
+                + "\n".join(notes),
             )
 
     def _build_video_tasks(self) -> list[BenchmarkTask]:
@@ -2143,6 +2485,8 @@ class ModelBenchmarkDialog(QDialog):
             return
 
         source_name = self._derive_source_name(mode, tasks)
+        if not self._warn_if_ffmpeg_missing_for_hdr_benchmark():
+            return
         session_dir = self._new_session_dir(source_name, len(tasks))
         run_title = self._result_tab_title(
             source_name,
@@ -2157,6 +2501,8 @@ class ModelBenchmarkDialog(QDialog):
             source_name=source_name,
             precision=self._cmb_precision.currentText(),
             resolution=self._cmb_resolution.currentText(),
+            use_hg=bool(self._chk_use_hg.isChecked()),
+            predequantize_mode=str(self._cmb_predequantize.currentData() or "auto"),
             selected_row=0,
         )
         self._add_result_set_tab(run_payload, activate=True)
@@ -2265,6 +2611,8 @@ class ModelBenchmarkDialog(QDialog):
         source_name = str(payload.get("source_name") or "").strip()
         precision = str(payload.get("precision") or "").strip()
         resolution = str(payload.get("resolution") or "").strip()
+        use_hg = payload.get("use_hg")
+        predequantize_mode = str(payload.get("predequantize_mode") or "").strip()
         selected_row = self._selected_result_row()
         idx = int(self._result_sets_bar.currentIndex())
         self._update_result_set_tab(
@@ -2277,6 +2625,8 @@ class ModelBenchmarkDialog(QDialog):
                 source_name=source_name,
                 precision=precision,
                 resolution=resolution,
+                use_hg=use_hg,
+                predequantize_mode=predequantize_mode,
                 selected_row=selected_row,
             ),
         )
@@ -2290,6 +2640,8 @@ class ModelBenchmarkDialog(QDialog):
             source_name=source_name,
             precision=precision,
             resolution=resolution,
+            use_hg=use_hg,
+            predequantize_mode=predequantize_mode,
             selected_row=selected_row,
         )
 
@@ -2481,19 +2833,25 @@ class ModelBenchmarkDialog(QDialog):
             exported.append(copied)
 
         if not exported:
-            QMessageBox.warning(self, "Export", "No sample folders could be exported.")
-            return
+            exported = [dict(r) for r in rows]
 
         try:
             self._write_export_summary(export_root, exported)
         except Exception:
             pass
 
-        QMessageBox.information(
-            self,
-            "Export Complete",
-            f"Exported {len(exported)} result folder(s) to:\n{export_root}",
-        )
+        if any(str(r.get("sample_dir") or "").strip() for r in exported):
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported {len(exported)} result folder(s) to:\n{export_root}",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported summary only to:\n{export_root}",
+            )
 
     def _close_dialog(self):
         if self._worker_thread is not None:
@@ -2504,6 +2862,7 @@ class ModelBenchmarkDialog(QDialog):
             )
             return
         self._stop_result_preview_players()
+        self._preview_processor_cache.clear()
         self._reset_preview_splitter_on_show = True
         self.accept()
 
@@ -2517,6 +2876,7 @@ class ModelBenchmarkDialog(QDialog):
             )
             return
         self._stop_result_preview_players()
+        self._preview_processor_cache.clear()
         self._reset_preview_splitter_on_show = True
         super().closeEvent(event)
 

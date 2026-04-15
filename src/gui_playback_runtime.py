@@ -1772,6 +1772,10 @@ class PlaybackRuntimeMixin:
                 parent=self,
             )
             dlg.exec()
+            last_source_dir = dlg.last_source_dir()
+            if last_source_dir and os.path.isdir(last_source_dir):
+                self._last_open_dir = last_source_dir
+                self._save_user_settings()
             last_session = dlg.last_session_dir()
             if last_session and os.path.isdir(last_session):
                 self.statusBar().showMessage(

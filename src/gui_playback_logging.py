@@ -445,7 +445,7 @@ class PlaybackLoggingMixin:
             )
         for key, label, suffix in (
             ("psnr_db", "PSNR", " dB"),
-            ("sssim", "SSSIM", ""),
+            ("sssim", "SSIM", ""),
             ("delta_e_itp", "DeltaE ITP", ""),
             ("hdr_vdp3", "HDR-VDP3", ""),
         ):
@@ -487,10 +487,10 @@ class PlaybackLoggingMixin:
                     lines.append(f"     Note: {event.get('note')}")
                 for metric_key, label, suffix in (
                     ("psnr_db", "PSNR", " dB"),
-                    ("sssim", "SSSIM", ""),
+                    ("sssim", "SSIM", ""),
                     ("delta_e_itp", "DeltaEITP", ""),
                     ("psnr_norm_db", "PSNR-N", " dB"),
-                    ("sssim_norm", "SSSIM-N", ""),
+                    ("sssim_norm", "SSIM-N", ""),
                     ("delta_e_itp_norm", "DeltaEITP-N", ""),
                     ("hdr_vdp3", "HDR-VDP3", ""),
                 ):

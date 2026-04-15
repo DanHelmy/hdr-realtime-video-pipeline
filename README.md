@@ -92,7 +92,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 ### 3. Compare / Objective Metrics Dialog
 
 - Side-by-side objective frame comparison workflow
-- PSNR / SSSIM / DeltaEITP (+ optional HDR-VDP3)
+- PSNR / SSIM / DeltaEITP (+ optional HDR-VDP3)
 
 ![Compare Dialog](docs/images/v4-compare-dialog.png)
 
@@ -221,7 +221,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 - **Playback session logging is built in**
   - the playback toolbar now includes `Log Session`
   - a logged session saves full runtime metrics such as `FPS`, `latency`, `VRAM`, `CPU`, model precision, and objective metric fields when present
-  - compare clicks also save per-frame compare metrics such as `PSNR`, `SSSIM`, `DeltaEITP`, normalized variants, and optional `HDR-VDP3`
+  - compare clicks also save per-frame compare metrics such as `PSNR`, `SSIM`, `DeltaEITP`, normalized variants, and optional `HDR-VDP3`
   - logs are written to `logs/playback_sessions/<timestamp>_<source>/`
   - each session folder includes `summary.txt`, `session.json`, `runtime_metrics.csv`, and `compare_events.csv` when compare was used
 - **Experimental max-autotune export reuses the playback compile cache**
@@ -245,7 +245,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
-| **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
+| **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
@@ -276,7 +276,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200 --use-hg 1 --film-grain 1 --hdr-gt hdr_reference.mkv
 ```
 
-### Objective Metrics (PSNR / SSSIM / DeltaEITP / HDR-VDP3)
+### Objective Metrics (PSNR / SSIM / DeltaEITP / HDR-VDP3)
 
 - Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
 - In `v5.0`, objective scoring remains compare-driven for playback, and the `Model Quality Benchmark` tool provides dedicated batch evaluation workflows.
@@ -303,7 +303,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
   - `summary.txt` for a quick human-readable report
   - `session.json` for the full structured session payload
   - `runtime_metrics.csv` for the sampled runtime stream (`FPS`, latency, `VRAM`, `CPU`, frame index, precision, objective fields when present)
-  - `compare_events.csv` for per-click compare metrics (`PSNR`, `SSSIM`, `DeltaEITP`, normalized variants, `HDR-VDP3`, notes)
+  - `compare_events.csv` for per-click compare metrics (`PSNR`, `SSIM`, `DeltaEITP`, normalized variants, `HDR-VDP3`, notes)
 - The worker summary also stores the exact average inference latency across logged inference frames.
 
 ### Tools Menu

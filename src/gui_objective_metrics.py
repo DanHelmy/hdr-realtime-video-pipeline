@@ -22,6 +22,22 @@ _OBJECTIVE_HDRVDP3_MAX_SIDE = 256
 _HDRVDP3_CMD_ENV = "HDRTVNET_HDRVDP3_CMD"
 
 
+def _frame_peak_value(frame: np.ndarray) -> float:
+    if frame is None:
+        return 255.0
+    if frame.dtype == np.uint16:
+        return 65535.0
+    if np.issubdtype(frame.dtype, np.integer):
+        return float(np.iinfo(frame.dtype).max)
+    max_val = float(np.max(frame)) if np.size(frame) else 1.0
+    return 1.0 if max_val <= 1.0 else 65535.0
+
+
+def _to_unit_float(frame: np.ndarray) -> np.ndarray:
+    peak = max(1.0, _frame_peak_value(frame))
+    return frame.astype(np.float32) / peak
+
+
 def _default_hdrvdp3_cmd_template() -> str:
     """Return built-in HDR-VDP3 bridge command template if available."""
     bridge = os.path.join(_ROOT, "scripts", "hdrvdp3_bridge.py")
@@ -113,13 +129,16 @@ def _grade_normalize_pred_to_ref(
             gain = sr / sp
         bias = mr - (gain * mp)
         out[:, :, c] = (p * gain) + bias
-    out = np.clip(out, 0.0, 255.0).astype(np.uint8)
-    return out, ref_bgr
+    peak = max(_frame_peak_value(pred_bgr), _frame_peak_value(ref_bgr))
+    dtype = np.uint16 if peak > 255.0 else np.uint8
+    out = np.clip(out, 0.0, peak).astype(dtype)
+    ref = np.clip(ref, 0.0, peak).astype(dtype)
+    return out, ref
 
 
 def _psnr_bgr(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> float:
-    a = pred_bgr.astype(np.float32) / 255.0
-    b = ref_bgr.astype(np.float32) / 255.0
+    a = _to_unit_float(pred_bgr)
+    b = _to_unit_float(ref_bgr)
     mse = float(np.mean((a - b) ** 2, dtype=np.float64))
     if mse <= 1e-12:
         return 99.0
@@ -144,8 +163,8 @@ def _ssim_single_channel(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _ssim_bgr(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> float:
-    a = pred_bgr.astype(np.float32) / 255.0
-    b = ref_bgr.astype(np.float32) / 255.0
+    a = _to_unit_float(pred_bgr)
+    b = _to_unit_float(ref_bgr)
     vals = [
         _ssim_single_channel(a[:, :, 0], b[:, :, 0]),
         _ssim_single_channel(a[:, :, 1], b[:, :, 1]),
@@ -169,8 +188,8 @@ def _rgb_to_ictcp(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _delta_e_itp_bgr(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> float:
-    pr = pred_bgr[:, :, ::-1].astype(np.float32) / 255.0
-    rr = ref_bgr[:, :, ::-1].astype(np.float32) / 255.0
+    pr = _to_unit_float(pred_bgr[:, :, ::-1])
+    rr = _to_unit_float(ref_bgr[:, :, ::-1])
     i1, t1, p1 = _rgb_to_ictcp(pr)
     i2, t2, p2 = _rgb_to_ictcp(rr)
     di = i1 - i2
@@ -195,8 +214,8 @@ def _hdrvdp3_cli_score(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> tuple[float
         pred_bgr, ref_bgr, max_side=_OBJECTIVE_HDRVDP3_MAX_SIDE
     )
     with tempfile.TemporaryDirectory(prefix="hdrtvnet_vdp3_") as td:
-        test_path = os.path.join(td, "test.png")
-        ref_path = os.path.join(td, "reference.png")
+        test_path = os.path.join(td, "test.tiff")
+        ref_path = os.path.join(td, "reference.tiff")
         if not cv2.imwrite(test_path, pred_small):
             return None, "HDR-VDP3 write failed (test frame)."
         if not cv2.imwrite(ref_path, ref_small):
@@ -244,4 +263,3 @@ def _hdrvdp3_cli_score(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> tuple[float
             return float(nums[-1]), ""
         except Exception:
             return None, "HDR-VDP3 parse failed."
-

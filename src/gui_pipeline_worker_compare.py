@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from gui_hdr_io import read_hdr_video_frame_rgb16, tensor_to_bgr_u16
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _OBJECTIVE_METRIC_MAX_SIDE,
@@ -189,14 +190,11 @@ class PipelineWorkerCompareMixin:
             try:
                 # Reuse the already-processed paused frame when possible so
                 # compare does not trigger a second compile/infer pass.
-                cmp_hdr_algo = np.ascontiguousarray(
-                    self._render_hdr_output(
-                        prepared_out,
-                        compare_out_w,
-                        compare_out_h,
-                        copy_input=True,
+                cmp_hdr_algo = np.ascontiguousarray(tensor_to_bgr_u16(prepared_out.clone()))
+                if (cmp_hdr_algo.shape[1], cmp_hdr_algo.shape[0]) != (compare_out_w, compare_out_h):
+                    cmp_hdr_algo = np.ascontiguousarray(
+                        _letterbox_bgr(cmp_hdr_algo, compare_out_w, compare_out_h)
                     )
-                )
             except Exception as exc:
                 msg = f"HDR Convert snapshot reuse failed ({exc}); rerendering."
                 cmp_note = f"{cmp_note} {msg}".strip()
@@ -224,24 +222,30 @@ class PipelineWorkerCompareMixin:
                 finally:
                     self._restore_enhance_history(saved_enhance_state)
 
-                cmp_hdr_algo = np.ascontiguousarray(
-                    self._render_hdr_output(
-                        cmp_prepared_out,
-                        compare_out_w,
-                        compare_out_h,
-                        copy_input=True,
+                cmp_hdr_algo = np.ascontiguousarray(tensor_to_bgr_u16(cmp_prepared_out))
+                if (cmp_hdr_algo.shape[1], cmp_hdr_algo.shape[0]) != (compare_out_w, compare_out_h):
+                    cmp_hdr_algo = np.ascontiguousarray(
+                        _letterbox_bgr(cmp_hdr_algo, compare_out_w, compare_out_h)
                     )
-                )
             except Exception as exc:
                 cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
                 msg = f"HDR Convert snapshot failed ({exc}); using SDR fallback."
                 cmp_note = f"{cmp_note} {msg}".strip()
 
         cmp_hdr_gt = None
+        gt_hdr_mode_note = "HDR fallback (8-bit/OpenCV)"
         if compare_gt_path:
-            gt_probe = _read_video_frame_at(compare_gt_path, cmp_seek_idx)
-            if gt_probe is None and cmp_seek_idx > 0:
-                gt_probe = _read_video_frame_at(compare_gt_path, cmp_seek_idx - 1)
+            gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, cmp_seek_idx)
+            if gt_rgb16 is None and cmp_seek_idx > 0:
+                gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, cmp_seek_idx - 1)
+            gt_probe = None
+            if gt_rgb16 is not None:
+                gt_probe = np.ascontiguousarray(gt_rgb16[:, :, ::-1])
+                gt_hdr_mode_note = "true 16-bit HDR decode"
+            else:
+                gt_probe = _read_video_frame_at(compare_gt_path, cmp_seek_idx)
+                if gt_probe is None and cmp_seek_idx > 0:
+                    gt_probe = _read_video_frame_at(compare_gt_path, cmp_seek_idx - 1)
             if gt_probe is not None:
                 cmp_hdr_gt = np.ascontiguousarray(
                     _letterbox_bgr(gt_probe, compare_out_w, compare_out_h)
@@ -250,6 +254,8 @@ class PipelineWorkerCompareMixin:
                 msg = "HDR GT frame unavailable at this position."
                 cmp_note = f"{cmp_note} {msg}".strip()
         elif gt_frame is not None:
+            if isinstance(gt_frame, np.ndarray) and gt_frame.dtype == np.uint16:
+                gt_hdr_mode_note = "true 16-bit HDR decode"
             cmp_hdr_gt = np.ascontiguousarray(
                 _letterbox_bgr(gt_frame, compare_out_w, compare_out_h)
             )
@@ -278,6 +284,11 @@ class PipelineWorkerCompareMixin:
             "obj_note": "",
             "hdr_vdp3_note": "",
         }
+        algo_hdr_mode_note = (
+            "true 16-bit HDR convert"
+            if isinstance(cmp_hdr_algo, np.ndarray) and cmp_hdr_algo.dtype == np.uint16
+            else "HDR convert fallback"
+        )
         if isinstance(cmp_hdr_algo, np.ndarray) and isinstance(cmp_hdr_gt, np.ndarray):
             try:
                 eval_pred, eval_ref = _prepare_metric_pair(
@@ -290,7 +301,9 @@ class PipelineWorkerCompareMixin:
                 cmp_metrics["psnr_norm_db"] = _psnr_bgr(norm_pred, norm_ref)
                 cmp_metrics["sssim_norm"] = _ssim_bgr(norm_pred, norm_ref)
                 cmp_metrics["delta_e_itp_norm"] = _delta_e_itp_bgr(norm_pred, norm_ref)
-                cmp_metrics["obj_note"] = "Computed (raw + normalized)"
+                cmp_metrics["obj_note"] = (
+                    f"Computed (raw + normalized, {algo_hdr_mode_note}, {gt_hdr_mode_note})"
+                )
             except Exception as exc:
                 cmp_metrics["obj_note"] = f"Error ({exc})"
             vdp_score, vdp_note = _hdrvdp3_cli_score(cmp_hdr_algo, cmp_hdr_gt)
@@ -304,6 +317,10 @@ class PipelineWorkerCompareMixin:
             cmp_metrics["obj_note"] = "Need HDR GT"
         else:
             cmp_metrics["obj_note"] = "Unavailable"
+
+        cmp_note = (
+            f"{cmp_note} HDR path: {algo_hdr_mode_note}; HDR GT: {gt_hdr_mode_note}."
+        ).strip()
 
         if (
             compare_precision_swapped

@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gui_hdr_io import frame_to_rgb48_bytes
+
 
 class _KernelCacheClearWorker(QObject):
     finished = pyqtSignal(bool)
@@ -85,6 +87,11 @@ class _CompareVideoPane(QWidget):
         mpv_available: bool,
         mpv_widget_factory,
         best_mpv_scale: str,
+        preview_scale_kernel: str | None = None,
+        preview_fps: float = 1.0,
+        preview_scale_antiring: float | None = None,
+        preview_cas_strength: float | None = None,
+        preview_film_grain: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -96,6 +103,15 @@ class _CompareVideoPane(QWidget):
         self._stack: QStackedWidget | None = None
         self._mpv_widget_factory = mpv_widget_factory
         self._best_mpv_scale = str(best_mpv_scale)
+        self._preview_scale_kernel = str(preview_scale_kernel or best_mpv_scale)
+        self._preview_fps = float(preview_fps) if preview_fps and preview_fps > 0 else 1.0
+        self._preview_scale_antiring = (
+            None if preview_scale_antiring is None else float(preview_scale_antiring)
+        )
+        self._preview_cas_strength = (
+            None if preview_cas_strength is None else float(preview_cas_strength)
+        )
+        self._preview_film_grain = bool(preview_film_grain)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -135,10 +151,12 @@ class _CompareVideoPane(QWidget):
         self._mpv.start_playback(
             width=int(w),
             height=int(h),
-            fps=1.0,
-            scale_kernel=self._best_mpv_scale,
+            fps=float(self._preview_fps),
+            scale_kernel=self._preview_scale_kernel,
+            scale_antiring=self._preview_scale_antiring,
+            cas_strength=self._preview_cas_strength,
             force_hdr_metadata=self._force_hdr_metadata,
-            film_grain=False,
+            film_grain=self._preview_film_grain,
         )
 
     def set_frame(self, bgr: np.ndarray | None, unavailable_text: str):
@@ -159,15 +177,17 @@ class _CompareVideoPane(QWidget):
         if self._mpv is not None and self._stack is not None:
             try:
                 self._ensure_mpv(w, h)
-                rgb16 = np.ascontiguousarray(bgr[:, :, ::-1].astype(np.uint16) * 257)
-                self._mpv.feed_frame(rgb16.data)
+                self._mpv.feed_frame(frame_to_rgb48_bytes(bgr))
                 self._stack.setCurrentWidget(self._mpv)
                 return
             except Exception:
                 # Graceful fallback to CPU preview when mpv path fails.
                 pass
 
-        self._cpu.update_frame(np.ascontiguousarray(bgr))
+        cpu_frame = np.ascontiguousarray(bgr)
+        if cpu_frame.dtype == np.uint16:
+            cpu_frame = ((cpu_frame.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
+        self._cpu.update_frame(cpu_frame)
         if self._stack is not None:
             self._stack.setCurrentWidget(self._cpu)
 
@@ -251,6 +271,7 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
+            preview_scale_kernel=best_mpv_scale,
         )
         self._disp_gt = _CompareVideoPane(
             "HDR GT",
@@ -258,6 +279,7 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
+            preview_scale_kernel=best_mpv_scale,
         )
         self._disp_algo = _CompareVideoPane(
             "HDR Convert",
@@ -265,6 +287,7 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
+            preview_scale_kernel=best_mpv_scale,
         )
         self._split_compare = QSplitter(Qt.Orientation.Horizontal)
         self._split_compare.setChildrenCollapsible(False)
@@ -437,13 +460,13 @@ class CompareFrameDialog(QDialog):
         self._acc["psnr"].setText(
             f"PSNR: {_fmt_metric(metrics.get('psnr_db'), '.2f', ' dB')}"
         )
-        self._acc["sssim"].setText(f"SSSIM: {_fmt_metric(metrics.get('sssim'), '.4f')}")
+        self._acc["sssim"].setText(f"SSIM: {_fmt_metric(metrics.get('sssim'), '.4f')}")
         self._acc["deitp"].setText(f"DeltaEITP: {_fmt_metric(metrics.get('delta_e_itp'), '.2f')}")
         self._acc["psnr_norm"].setText(
             f"PSNR-N: {_fmt_metric(metrics.get('psnr_norm_db'), '.2f', ' dB')}"
         )
         self._acc["sssim_norm"].setText(
-            f"SSSIM-N: {_fmt_metric(metrics.get('sssim_norm'), '.4f')}"
+            f"SSIM-N: {_fmt_metric(metrics.get('sssim_norm'), '.4f')}"
         )
         self._acc["deitp_norm"].setText(
             f"DeltaEITP-N: {_fmt_metric(metrics.get('delta_e_itp_norm'), '.2f')}"

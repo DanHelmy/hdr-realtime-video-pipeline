@@ -308,7 +308,13 @@ class SettingsPreviewMixin:
             QEvent.Type.KeyPress,
         ):
             self._show_cursor()
-            self._arm_cursor_idle_timer()
+            is_video_surface = self._widget_is_video_surface(obj)
+            if is_video_surface:
+                self._arm_cursor_idle_timer(video_surface=True)
+            else:
+                if self._cursor_idle_timer is not None:
+                    self._cursor_idle_timer.stop()
+                self._show_cursor()
             if self._ui_hidden:
                 self._show_ui_overlay_temporarily()
         return super().eventFilter(obj, event)
