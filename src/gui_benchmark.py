@@ -712,6 +712,9 @@ class ModelBenchmarkDialog(QDialog):
         self._result_precision = ""
         self._result_resolution = ""
         self._result_sets: list[dict] = []
+        self._benchmark_preview_splitter: QSplitter | None = None
+        self._expanded_preview_pane: int | None = None
+        self._reset_preview_splitter_on_show = True
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -957,6 +960,9 @@ class ModelBenchmarkDialog(QDialog):
         self._tbl.horizontalHeader().setStretchLastSection(True)
 
         previews = QSplitter(Qt.Orientation.Horizontal)
+        self._benchmark_preview_splitter = previews
+        previews.setChildrenCollapsible(False)
+        previews.setHandleWidth(12)
         self._img_sdr = _CompareVideoPane(
             "SDR",
             force_hdr_metadata=False,
@@ -984,6 +990,9 @@ class ModelBenchmarkDialog(QDialog):
         previews.setStretchFactor(0, 1)
         previews.setStretchFactor(1, 1)
         previews.setStretchFactor(2, 1)
+        self._img_sdr.expand_requested.connect(lambda: self._toggle_benchmark_preview_expand(0))
+        self._img_gt.expand_requested.connect(lambda: self._toggle_benchmark_preview_expand(1))
+        self._img_pred.expand_requested.connect(lambda: self._toggle_benchmark_preview_expand(2))
 
         result_layout.addWidget(self._tbl, 1)
         result_layout.addWidget(previews, 1)
@@ -1071,6 +1080,7 @@ class ModelBenchmarkDialog(QDialog):
                 "source_name": "",
                 "precision": "",
                 "resolution": "",
+                "selected_row": None,
             },
             activate=True,
         )
@@ -1094,6 +1104,7 @@ class ModelBenchmarkDialog(QDialog):
         source_name: str | None,
         precision: str | None,
         resolution: str | None,
+        selected_row: int | None = None,
     ) -> dict:
         return {
             "title": str(title or "Results").strip() or "Results",
@@ -1103,6 +1114,11 @@ class ModelBenchmarkDialog(QDialog):
             "source_name": str(source_name or "").strip(),
             "precision": str(precision or "").strip(),
             "resolution": str(resolution or "").strip(),
+            "selected_row": (
+                int(selected_row)
+                if selected_row is not None and int(selected_row) >= 0
+                else None
+            ),
         }
 
     def _infer_precision_from_session_dir(self, session_dir: str | None) -> str:
@@ -1178,6 +1194,7 @@ class ModelBenchmarkDialog(QDialog):
                 source_name="",
                 precision="",
                 resolution="",
+                selected_row=None,
             )
             return
         data = self._result_sets[idx]
@@ -1188,6 +1205,7 @@ class ModelBenchmarkDialog(QDialog):
             source_name=str(data.get("source_name") or "").strip(),
             precision=str(data.get("precision") or "").strip(),
             resolution=str(data.get("resolution") or "").strip(),
+            selected_row=data.get("selected_row"),
         )
 
     def _on_result_set_tab_changed(self, idx: int):
@@ -1215,6 +1233,7 @@ class ModelBenchmarkDialog(QDialog):
                     "source_name": "",
                     "precision": "",
                     "resolution": "",
+                    "selected_row": None,
                 },
                 activate=True,
             )
@@ -1253,6 +1272,50 @@ class ModelBenchmarkDialog(QDialog):
         else:
             cfg = "-"
         self._lbl_result_config.setText(cfg)
+
+    def _selected_result_row(self) -> int | None:
+        rows = self._tbl.selectionModel().selectedRows() if self._tbl.selectionModel() else []
+        if not rows:
+            return None
+        idx = self._result_row_to_index(rows[0].row())
+        if idx is None:
+            return None
+        return int(idx)
+
+    def _remember_current_result_selection(self):
+        idx = int(self._result_sets_bar.currentIndex())
+        if idx < 0 or idx >= len(self._result_sets):
+            return
+        self._result_sets[idx]["selected_row"] = self._selected_result_row()
+
+    def _reset_benchmark_preview_splitter_sizes(self):
+        splitter = self._benchmark_preview_splitter
+        if splitter is None or splitter.count() < 3:
+            return
+        total = int(splitter.size().width())
+        if total <= 0:
+            total = max(3, int(self.size().width()) - 32)
+        one = max(1, total // 3)
+        splitter.setSizes([one, one, max(1, total - (2 * one))])
+        self._expanded_preview_pane = None
+
+    def _toggle_benchmark_preview_expand(self, pane_idx: int):
+        splitter = self._benchmark_preview_splitter
+        if splitter is None or splitter.count() < 3:
+            return
+        target = int(pane_idx)
+        if self._expanded_preview_pane == target:
+            self._reset_benchmark_preview_splitter_sizes()
+            return
+        total = int(splitter.size().width())
+        if total <= 0:
+            total = max(3, int(self.size().width()) - 32)
+        big = max(1, int(total * 0.7))
+        small = max(1, (total - big) // 2)
+        sizes = [small, small, small]
+        sizes[target] = max(1, total - (2 * small))
+        splitter.setSizes(sizes)
+        self._expanded_preview_pane = target
 
     def _infer_source_name_from_session_dir(self, session_dir: str | None) -> str:
         s = str(session_dir or "").strip()
@@ -1301,9 +1364,13 @@ class ModelBenchmarkDialog(QDialog):
         source_name: str | None,
         precision: str | None,
         resolution: str | None,
+        selected_row: int | None,
     ):
         self._results = list(rows or [])
+        self._tbl.blockSignals(True)
+        self._tbl.clearSelection()
         self._tbl.setRowCount(0)
+        self._tbl.blockSignals(False)
         self._set_result_previews(None)
 
         for row in self._results:
@@ -1346,7 +1413,13 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_export_all.setEnabled(bool(self._results))
 
         if self._tbl.rowCount() > 0:
-            self._tbl.selectRow(0)
+            row_to_select = 0
+            if selected_row is not None:
+                try:
+                    row_to_select = max(0, min(int(selected_row), len(self._results) - 1))
+                except Exception:
+                    row_to_select = 0
+            self._tbl.selectRow(row_to_select)
             self._on_result_selection_changed()
 
     def _compute_average_from_rows(self, rows: list[dict]) -> dict[str, float | None]:
@@ -1626,6 +1699,7 @@ class ModelBenchmarkDialog(QDialog):
                     source_name=source_name,
                     precision=precision,
                     resolution=resolution,
+                    selected_row=0,
                 )
                 idx = self._add_result_set_tab(payload, activate=False)
                 if first_loaded_idx is None:
@@ -2054,6 +2128,7 @@ class ModelBenchmarkDialog(QDialog):
             source_name=source_name,
             precision=self._cmb_precision.currentText(),
             resolution=self._cmb_resolution.currentText(),
+            selected_row=0,
         )
         self._add_result_set_tab(run_payload, activate=True)
 
@@ -2161,6 +2236,7 @@ class ModelBenchmarkDialog(QDialog):
         source_name = str(payload.get("source_name") or "").strip()
         precision = str(payload.get("precision") or "").strip()
         resolution = str(payload.get("resolution") or "").strip()
+        selected_row = self._selected_result_row()
         idx = int(self._result_sets_bar.currentIndex())
         self._update_result_set_tab(
             idx,
@@ -2172,6 +2248,7 @@ class ModelBenchmarkDialog(QDialog):
                 source_name=source_name,
                 precision=precision,
                 resolution=resolution,
+                selected_row=selected_row,
             ),
         )
         self._progress.setValue(100)
@@ -2184,6 +2261,7 @@ class ModelBenchmarkDialog(QDialog):
             source_name=source_name,
             precision=precision,
             resolution=resolution,
+            selected_row=selected_row,
         )
 
     def _on_worker_failed(self, message: str):
@@ -2211,6 +2289,7 @@ class ModelBenchmarkDialog(QDialog):
         idx = self._result_row_to_index(rows[0].row())
         if idx is None:
             return
+        self._remember_current_result_selection()
         row = self._results[idx]
         self._set_result_previews(row)
 
@@ -2396,6 +2475,7 @@ class ModelBenchmarkDialog(QDialog):
             )
             return
         self._stop_result_preview_players()
+        self._reset_preview_splitter_on_show = True
         self.accept()
 
     def closeEvent(self, event):
@@ -2408,4 +2488,11 @@ class ModelBenchmarkDialog(QDialog):
             )
             return
         self._stop_result_preview_players()
+        self._reset_preview_splitter_on_show = True
         super().closeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if bool(getattr(self, "_reset_preview_splitter_on_show", False)):
+            self._reset_preview_splitter_on_show = False
+            self._reset_benchmark_preview_splitter_sizes()

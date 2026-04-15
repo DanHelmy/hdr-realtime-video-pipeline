@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QTimer, QEvent, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -76,6 +76,8 @@ class VideoDisplay(QLabel):
 class _CompareVideoPane(QWidget):
     """Single compare pane with mpv color-managed path + CPU fallback."""
 
+    expand_requested = pyqtSignal()
+
     def __init__(
         self,
         title: str,
@@ -114,6 +116,10 @@ class _CompareVideoPane(QWidget):
             root.addWidget(self._stack, 1)
         else:
             root.addWidget(self._cpu, 1)
+
+        for widget in (self, self._lbl_title, self._cpu, self._stack, self._mpv):
+            if widget is not None:
+                widget.installEventFilter(self)
 
     def set_title(self, title: str):
         self._title = str(title or "")
@@ -172,6 +178,12 @@ class _CompareVideoPane(QWidget):
             except Exception:
                 pass
         self._last_size = None
+
+    def eventFilter(self, watched, event):
+        if event is not None and event.type() == QEvent.Type.MouseButtonDblClick:
+            self.expand_requested.emit()
+            return True
+        return super().eventFilter(watched, event)
 
 
 class CompareFrameDialog(QDialog):
