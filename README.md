@@ -109,9 +109,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 - Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
 - Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
 
-![Benchmark Tab]()
-
-_Replace this placeholder with a dedicated benchmark-tab screenshot when available._
+![Benchmark Tab](docs/images/v5-benchmark-tab.png)
 
 ---
 
