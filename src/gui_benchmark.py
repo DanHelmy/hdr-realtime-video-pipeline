@@ -713,6 +713,7 @@ class ModelBenchmarkDialog(QDialog):
         self._result_resolution = ""
         self._result_sets: list[dict] = []
         self._benchmark_preview_splitter: QSplitter | None = None
+        self._benchmark_results_splitter: QSplitter | None = None
         self._expanded_preview_pane: int | None = None
         self._reset_preview_splitter_on_show = True
 
@@ -994,8 +995,15 @@ class ModelBenchmarkDialog(QDialog):
         self._img_gt.expand_requested.connect(lambda: self._toggle_benchmark_preview_expand(1))
         self._img_pred.expand_requested.connect(lambda: self._toggle_benchmark_preview_expand(2))
 
-        result_layout.addWidget(self._tbl, 1)
-        result_layout.addWidget(previews, 1)
+        results_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._benchmark_results_splitter = results_splitter
+        results_splitter.setChildrenCollapsible(False)
+        results_splitter.setHandleWidth(10)
+        results_splitter.addWidget(self._tbl)
+        results_splitter.addWidget(previews)
+        results_splitter.setStretchFactor(0, 3)
+        results_splitter.setStretchFactor(1, 2)
+        result_layout.addWidget(results_splitter, 1)
 
         export_group = QGroupBox("Export")
         export_layout = QGridLayout(export_group)
@@ -1289,32 +1297,53 @@ class ModelBenchmarkDialog(QDialog):
         self._result_sets[idx]["selected_row"] = self._selected_result_row()
 
     def _reset_benchmark_preview_splitter_sizes(self):
-        splitter = self._benchmark_preview_splitter
-        if splitter is None or splitter.count() < 3:
+        preview_splitter = self._benchmark_preview_splitter
+        if preview_splitter is None or preview_splitter.count() < 3:
             return
-        total = int(splitter.size().width())
-        if total <= 0:
-            total = max(3, int(self.size().width()) - 32)
-        one = max(1, total // 3)
-        splitter.setSizes([one, one, max(1, total - (2 * one))])
+
+        total_w = int(preview_splitter.size().width())
+        if total_w <= 0:
+            total_w = max(3, int(self.size().width()) - 32)
+        one = max(1, total_w // 3)
+        preview_splitter.setSizes([one, one, max(1, total_w - (2 * one))])
+
+        results_splitter = self._benchmark_results_splitter
+        if results_splitter is not None and results_splitter.count() >= 2:
+            total_h = int(results_splitter.size().height())
+            if total_h <= 0:
+                total_h = max(2, int(self.size().height()) - 240)
+            preview_h = max(1, int(total_h * 0.42))
+            table_h = max(1, total_h - preview_h)
+            results_splitter.setSizes([table_h, preview_h])
+
         self._expanded_preview_pane = None
 
     def _toggle_benchmark_preview_expand(self, pane_idx: int):
-        splitter = self._benchmark_preview_splitter
-        if splitter is None or splitter.count() < 3:
+        preview_splitter = self._benchmark_preview_splitter
+        if preview_splitter is None or preview_splitter.count() < 3:
             return
+
+        total_w = int(preview_splitter.size().width())
+        if total_w <= 0:
+            total_w = max(3, int(self.size().width()) - 32)
+        one = max(1, total_w // 3)
+        preview_splitter.setSizes([one, one, max(1, total_w - (2 * one))])
+
+        results_splitter = self._benchmark_results_splitter
+        if results_splitter is None or results_splitter.count() < 2:
+            return
+
         target = int(pane_idx)
         if self._expanded_preview_pane == target:
             self._reset_benchmark_preview_splitter_sizes()
             return
-        total = int(splitter.size().width())
-        if total <= 0:
-            total = max(3, int(self.size().width()) - 32)
-        big = max(1, int(total * 0.7))
-        small = max(1, (total - big) // 2)
-        sizes = [small, small, small]
-        sizes[target] = max(1, total - (2 * small))
-        splitter.setSizes(sizes)
+
+        total_h = int(results_splitter.size().height())
+        if total_h <= 0:
+            total_h = max(2, int(self.size().height()) - 240)
+        preview_h = max(1, int(total_h * 0.72))
+        table_h = max(1, total_h - preview_h)
+        results_splitter.setSizes([table_h, preview_h])
         self._expanded_preview_pane = target
 
     def _infer_source_name_from_session_dir(self, session_dir: str | None) -> str:
