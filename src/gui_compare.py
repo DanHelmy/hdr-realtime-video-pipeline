@@ -180,6 +180,11 @@ class CompareViewMixin:
                 "Compare is locked while export is running. Finish or cancel the export first."
             )
             return
+        if bool(getattr(self, "_benchmark_interaction_locked", False)):
+            self.statusBar().showMessage(
+                "Compare is locked while benchmark is open. Close benchmark first."
+            )
+            return
         if not self._playing:
             self.statusBar().showMessage("Start playback first, then use Compare.")
             return

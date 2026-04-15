@@ -43,6 +43,7 @@ from gui_compile_dialogs import (
     _PrecompileOptionsDialog,
     _PrecompileDialog,
 )
+from gui_benchmark import ModelBenchmarkDialog
 from gui_export import ExportOptionsDialog, VideoExportWorker
 from gui_media_probe import (
     _probe_hdr_input,
@@ -138,17 +139,26 @@ class PlaybackRuntimeMixin:
         "_btn_toggle_ui",
         "_cmb_view",
     )
+    _BENCHMARK_LOCK_WIDGET_NAMES = _EXPORT_LOCK_WIDGET_NAMES
 
     def _export_controls_locked(self) -> bool:
         return bool(getattr(self, "_export_interaction_locked", False))
 
+    def _benchmark_controls_locked(self) -> bool:
+        return bool(getattr(self, "_benchmark_interaction_locked", False))
+
     def _show_export_lock_message(self, action: str = "Playback") -> bool:
-        if not self._export_controls_locked():
-            return False
-        self.statusBar().showMessage(
-            f"{action} is locked while export is running. Finish or cancel the export first."
-        )
-        return True
+        if self._export_controls_locked():
+            self.statusBar().showMessage(
+                f"{action} is locked while export is running. Finish or cancel the export first."
+            )
+            return True
+        if self._benchmark_controls_locked():
+            self.statusBar().showMessage(
+                f"{action} is locked while benchmark is open. Close the benchmark tool first."
+            )
+            return True
+        return False
 
     def _set_export_interaction_locked(self, locked: bool):
         if bool(locked):
@@ -174,6 +184,43 @@ class PlaybackRuntimeMixin:
         saved = dict(getattr(self, "_export_saved_enabled_states", {}) or {})
         self._export_saved_enabled_states = {}
         self._export_interaction_locked = False
+        for name, was_enabled in saved.items():
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.setEnabled(bool(was_enabled))
+            except Exception:
+                continue
+        if self._playing:
+            self._btn_apply_settings.setEnabled(self._has_pending_setting_changes())
+        else:
+            self._btn_apply_settings.setEnabled(False)
+
+    def _set_benchmark_interaction_locked(self, locked: bool):
+        if bool(locked):
+            if self._benchmark_controls_locked():
+                return
+            saved = {}
+            for name in self._BENCHMARK_LOCK_WIDGET_NAMES:
+                widget = getattr(self, name, None)
+                if widget is None:
+                    continue
+                try:
+                    saved[name] = bool(widget.isEnabled())
+                    widget.setEnabled(False)
+                except Exception:
+                    continue
+            self._benchmark_saved_enabled_states = saved
+            self._benchmark_interaction_locked = True
+            self.statusBar().showMessage(
+                "Playback controls are locked while benchmark is open."
+            )
+            return
+
+        saved = dict(getattr(self, "_benchmark_saved_enabled_states", {}) or {})
+        self._benchmark_saved_enabled_states = {}
+        self._benchmark_interaction_locked = False
         for name, was_enabled in saved.items():
             widget = getattr(self, name, None)
             if widget is None:
@@ -1661,6 +1708,91 @@ class PlaybackRuntimeMixin:
                 self._toggle_pause()
 
         self._start_export_job(config, resume_if_aborted=resume_after_dialog)
+
+    def _open_benchmark_dialog(self):
+        if self._show_export_lock_message("Benchmark"):
+            return
+        if self._export_thread is not None:
+            QMessageBox.information(
+                self,
+                "Benchmark",
+                "Export is currently running. Finish or cancel export before opening benchmark.",
+            )
+            return
+
+        source_mode = _normalize_source_mode(
+            getattr(self, "_source_mode", SOURCE_MODE_VIDEO)
+        )
+        was_running = bool(self._playing and self._worker is not None)
+        resume_after_dialog = False
+        paused_live_directly = False
+
+        if was_running:
+            answer = QMessageBox.question(
+                self,
+                "Open Benchmark Tool",
+                "Playback will be frozen while the benchmark tool is open.\n\n"
+                "Benchmark runs in eager mode and is intended for quality testing.\n"
+                "You can review SDR / HDR GT / HDR Convert images and export metrics + images after the run.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        if was_running:
+            if source_mode == SOURCE_MODE_WINDOW:
+                if not self._worker.is_paused:
+                    self._worker.pause()
+                    if self._disp_hdr_mpv is not None:
+                        self._disp_hdr_mpv.set_paused(True)
+                    if self._disp_sdr_mpv is not None:
+                        self._disp_sdr_mpv.set_paused(True)
+                    if self._audio_available:
+                        self._set_audio_paused(True)
+                    paused_live_directly = True
+                    resume_after_dialog = True
+            else:
+                if not self._worker.is_paused:
+                    self._toggle_pause()
+                    resume_after_dialog = True
+
+        logs_root = os.path.join(_ROOT, "logs", "benchmark_sessions")
+        self._set_benchmark_interaction_locked(True)
+        try:
+            dlg = ModelBenchmarkDialog(
+                initial_video_path=self._video_path if self._video_path else None,
+                initial_hdr_gt_path=self._hdr_ground_truth_path,
+                suggested_dir=self._last_open_dir if os.path.isdir(self._last_open_dir) else _ROOT,
+                initial_precision_key=self._cmb_prec.currentText(),
+                initial_use_hg=self._chk_hg.isChecked(),
+                initial_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+                logs_root=logs_root,
+                parent=self,
+            )
+            dlg.exec()
+            last_session = dlg.last_session_dir()
+            if last_session and os.path.isdir(last_session):
+                self.statusBar().showMessage(
+                    f"Benchmark session saved: {last_session}"
+                )
+        finally:
+            self._set_benchmark_interaction_locked(False)
+            if (
+                resume_after_dialog
+                and self._playing
+                and self._worker is not None
+                and self._worker.is_paused
+            ):
+                if source_mode == SOURCE_MODE_WINDOW and paused_live_directly:
+                    self._worker.resume()
+                    if self._disp_hdr_mpv is not None:
+                        self._disp_hdr_mpv.set_paused(False)
+                    if self._disp_sdr_mpv is not None:
+                        self._disp_sdr_mpv.set_paused(False)
+                elif source_mode != SOURCE_MODE_WINDOW:
+                    self._toggle_pause()
 
     def _prepare_export_compile_cache(self, config) -> bool:
         if not getattr(config, "use_max_autotune", False):

@@ -102,6 +102,7 @@ class UiBuilderMixin:
         tools_menu = menu_bar.addMenu("&Tools")
         tools_menu.addAction("Runtime Execution Mode ...", self._choose_runtime_execution_mode)
         tools_menu.addAction("INT8 &Pre-dequantization ...", self._choose_predequantize_mode)
+        tools_menu.addAction("Model Quality &Benchmark ...", self._open_benchmark_dialog)
         tools_menu.addAction("&Pre-compile Kernels ...", self._precompile_kernels)
         tools_menu.addSeparator()
         tools_menu.addAction("Clear &Kernel Cache ...", self._clear_kernel_cache)

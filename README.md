@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v4.0.1-blue)
+![Version](https://img.shields.io/badge/version-v5.0-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,10 +12,15 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, compile caching, export, and live browser-window viewing.
 
-`v4.0.1` is the current **Grand UI Update** release, and it keeps the full technical depth while improving visual documentation and usability guidance.
+`v5.0` is the current **Grand Benchmark Update** release, adding a full in-app quality benchmarking workflow while preserving the previous playback/export/live-capture improvements.
 
 Core updates include:
 
+- new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking
+- deterministic frame/pair selection options with eager-mode quality runs for repeatable objective comparisons
+- benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
+- benchmark session hierarchy (`source_name/timestamp/precision/...`) plus exportable metrics and sample images
+- benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
 - Chrome Audio Sync extension kept audio-only, with manual start/stop in Chrome
@@ -68,7 +73,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## UI Tour (v4.0.1)
+## UI Tour (v5.0)
 
 ### 1. Main Workspace
 
@@ -97,6 +102,12 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 - Resolution/FPS/model/precision export controls
 
 ![Export Dialog](docs/images/v4-export-dialog.png)
+
+### 5. Model Quality Benchmark Tool
+
+- Open from `Tools -> Model Quality Benchmark ...`
+- Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
+- Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
 
 ---
 
@@ -141,15 +152,25 @@ Important:
 
 ---
 
-## GUI (v4.0.1)
+## GUI (v5.0)
 
 ```bash
 python src/gui.py
 ```
 
-The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, and live browser-window viewing.
+The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, dedicated objective benchmarking, and live browser-window viewing.
 
-### Grand Update v4.0.1 Highlights
+### Grand Update v5.0 Highlights
+
+- **Model Quality Benchmark tool is now built in (Tools menu)**
+  - supports two workflows: `Video (SDR + HDR GT)` and `Dataset Folders (SDR + HDR GT)`
+  - runs quality benchmarking in eager mode for deterministic/repeatable metric evaluation
+  - video workflow includes deterministic distinct-frame detection and manual frame checkboxes
+  - dataset workflow includes paired-file scanning with averaging modes (`selected`, `all`, deterministic subset)
+  - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
+  - result previews now use the same compare-style color-managed display path for `SDR`, `HDR GT`, and `HDR Convert`
+  - session outputs are structured under `logs/benchmark_sessions/<source>/<timestamp>/<precision>/...`
+  - benchmark locks playback interactions while open and compare is blocked until benchmark closes
 
 - **Native Browser Window Capture replaces the old browser-video bridge**
   - HDRTVNet++ now captures browser video directly from the visible Chrome window
@@ -221,6 +242,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
+| **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
@@ -253,7 +275,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 ### Objective Metrics (PSNR / SSSIM / DeltaEITP / HDR-VDP3)
 
 - Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
-- In `v4.0.1`, objective scoring is compare-driven by default (instead of a continuously updating runtime panel) for cleaner playback behavior.
+- In `v5.0`, objective scoring remains compare-driven for playback, and the `Model Quality Benchmark` tool provides dedicated batch evaluation workflows.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
@@ -282,6 +304,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 
 ### Tools Menu
 
+- **Model Quality Benchmark** — quality benchmarking dialog for video or dataset workflows, with previews, averages, and result export/load
 - **INT8 Pre-dequantization** — choose `Auto`, `On`, or `Off` for INT8 runtime loading behavior
 - **Pre-compile Kernels** — compile for any resolution(s) ahead of time
 - **Clear Kernel Cache** — force recompilation (e.g. after a PyTorch / driver update)

@@ -248,6 +248,8 @@ class StateInitMixin:
         self._export_compile_dlg = None
         self._export_interaction_locked = False
         self._export_saved_enabled_states = {}
+        self._benchmark_interaction_locked = False
+        self._benchmark_saved_enabled_states = {}
         try:
             self._startup_seek_frame = (
                 int(initial_start_frame) if initial_start_frame is not None else None

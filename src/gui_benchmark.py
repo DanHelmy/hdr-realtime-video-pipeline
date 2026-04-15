@@ -1,0 +1,2104 @@
+from __future__ import annotations
+
+import csv
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import tempfile
+import threading
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+import torch
+
+from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from gui_config import PRECISIONS, RESOLUTION_SCALES, _available_precision_keys, _select_model_path
+from gui_media_probe import _content_similarity_score, _probe_hdr_input, _probe_video_timing_info
+from gui_objective_metrics import (
+    _OBJECTIVE_METRIC_MAX_SIDE,
+    _delta_e_itp_bgr,
+    _grade_normalize_pred_to_ref,
+    _hdrvdp3_cli_score,
+    _prepare_metric_pair,
+    _psnr_bgr,
+    _read_video_frame_at,
+    _ssim_bgr,
+)
+from gui_pipeline_worker_model import _resolve_predequantize_arg
+from gui_mpv_widget import MpvHDRWidget
+from gui_scaling import (
+    BEST_MPV_SCALE,
+    FILMGRAIN_SHADER_PATH,
+    FSR_SHADER_PATH,
+    SSIM_SUPERRES_SHADER_PATH,
+    _ensure_filmgrain_shader,
+    _ensure_fsr_shader,
+    _ensure_ssim_superres_shader,
+    _letterbox_bgr,
+    _normalize_shader_paths,
+)
+from gui_widgets import _CompareVideoPane
+from models.hdrtvnet_torch import HDRTVNetTorch
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+_VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
+
+try:
+    import mpv as mpv_lib
+
+    _HAS_MPV = True
+except (OSError, ImportError):
+    mpv_lib = None
+    _HAS_MPV = False
+
+_MPV_DIAG = os.environ.get("HDRTVNET_MPV_DIAG", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _new_mpv_widget() -> MpvHDRWidget:
+    return MpvHDRWidget(
+        mpv_lib=mpv_lib,
+        mpv_diag=_MPV_DIAG,
+        normalize_shader_paths=_normalize_shader_paths,
+        ensure_fsr_shader=_ensure_fsr_shader,
+        ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
+        ensure_filmgrain_shader=_ensure_filmgrain_shader,
+        best_mpv_scale=BEST_MPV_SCALE,
+        fsr_shader_path=FSR_SHADER_PATH,
+        ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
+        filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
+    )
+
+
+def _is_image_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _IMAGE_EXTS
+
+
+def _is_video_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _VIDEO_EXTS
+
+
+def _sanitize_name(text: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(text or "").strip())
+    safe = re.sub(r"_+", "_", safe).strip("._-")
+    return safe or "sample"
+
+
+def _resolution_dims(res_key: str) -> tuple[int, int]:
+    dims = RESOLUTION_SCALES.get(str(res_key or ""))
+    if dims is None:
+        return 1920, 1080
+    return int(dims[0]), int(dims[1])
+
+
+def _fmt_metric(v, fmt: str = ".4f", suffix: str = "") -> str:
+    try:
+        fv = float(v)
+    except Exception:
+        return "-"
+    if not np.isfinite(fv):
+        return "-"
+    return f"{format(fv, fmt)}{suffix}"
+
+
+def _sorted_media_files(root_dir: str) -> list[str]:
+    out: list[str] = []
+    for base, _dirs, files in os.walk(root_dir):
+        for name in files:
+            p = os.path.join(base, name)
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _IMAGE_EXTS or ext in _VIDEO_EXTS:
+                out.append(p)
+    out.sort()
+    return out
+
+
+def _read_media_frame(path: str, frame_idx: int | None = None) -> np.ndarray | None:
+    if not path or not os.path.isfile(path):
+        return None
+    if _is_image_path(path):
+        return cv2.imread(path, cv2.IMREAD_COLOR)
+    if _is_video_path(path):
+        idx = max(0, int(frame_idx or 0))
+        return _read_video_frame_at(path, idx)
+    return None
+
+
+def _detect_distinct_video_frames(
+    video_path: str,
+    desired_count: int = 10,
+    max_scan_points: int = 260,
+) -> list[int]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return []
+
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 1:
+            return [1]
+
+        scan_points = max(desired_count * 18, 80)
+        scan_points = min(scan_points, max_scan_points, total)
+        idxs = np.linspace(0, total - 1, num=scan_points, dtype=np.int64)
+
+        prev_hist = None
+        prev_luma = None
+        scored: list[tuple[float, int]] = []
+
+        for idx in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+            luma = float(np.mean(gray))
+            texture = float(np.std(gray)) / 64.0
+            score = texture
+            if prev_hist is not None:
+                scene = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+                luma_jump = abs(luma - float(prev_luma or 0.0)) / 255.0
+                score = (scene * 0.78) + (luma_jump * 0.18) + (texture * 0.04)
+            scored.append((float(score), int(idx)))
+            prev_hist = hist
+            prev_luma = luma
+
+        if not scored:
+            return [1]
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        min_spacing = max(1, total // max(2, desired_count * 2))
+
+        chosen: list[int] = []
+
+        def _accept(candidate: int) -> bool:
+            for c in chosen:
+                if abs(int(candidate) - int(c)) < min_spacing:
+                    return False
+            return True
+
+        for _score, idx in scored:
+            if _accept(idx):
+                chosen.append(int(idx))
+            if len(chosen) >= desired_count:
+                break
+
+        anchors = [0.08, 0.22, 0.38, 0.52, 0.68, 0.82, 0.92]
+        for ratio in anchors:
+            idx = int(round((total - 1) * float(ratio)))
+            if _accept(idx):
+                chosen.append(idx)
+            if len(chosen) >= desired_count:
+                break
+
+        chosen = sorted({max(0, min(total - 1, int(v))) for v in chosen})
+        if not chosen:
+            chosen = [0]
+        # UI displays 1-based frame numbering.
+        return [int(v) + 1 for v in chosen]
+    finally:
+        cap.release()
+
+
+@dataclass
+class BenchmarkTask:
+    task_id: str
+    label: str
+    sdr_path: str
+    gt_path: str
+    frame_idx: int | None = None
+
+
+@dataclass
+class BenchmarkRunConfig:
+    mode: str
+    source_name: str
+    precision_key: str
+    use_hg: bool
+    resolution_key: str
+    predequantize_mode: str
+    tasks: list[BenchmarkTask]
+    session_dir: str
+
+
+class _BenchmarkWorker(QObject):
+    progress = pyqtSignal(int, str)
+    sample_ready = pyqtSignal(dict)
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+    canceled = pyqtSignal(str)
+
+    def __init__(self, config: BenchmarkRunConfig):
+        super().__init__()
+        self._config = config
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def _is_canceled(self) -> bool:
+        return bool(self._cancel.is_set())
+
+    def _choose_unique_dir(self, base_dir: str) -> str:
+        if not os.path.exists(base_dir):
+            return base_dir
+        n = 2
+        while True:
+            candidate = f"{base_dir}_{n}"
+            if not os.path.exists(candidate):
+                return candidate
+            n += 1
+
+    def run(self):
+        processor = None
+        try:
+            cfg = self._config
+            if not cfg.tasks:
+                self.failed.emit("No benchmark items were provided.")
+                return
+
+            model_path = _select_model_path(cfg.precision_key, cfg.use_hg)
+            if not model_path or not os.path.isfile(model_path):
+                self.failed.emit(f"Model weights not found:\n{model_path}")
+                return
+
+            precision_cfg = PRECISIONS.get(cfg.precision_key, {})
+            model_precision = str(precision_cfg.get("precision") or "fp16")
+
+            self.progress.emit(0, "Loading model in eager mode ...")
+            processor = HDRTVNetTorch(
+                model_path,
+                device="auto",
+                precision=model_precision,
+                compile_model=False,
+                compile_mode="default",
+                predequantize=_resolve_predequantize_arg(str(cfg.predequantize_mode)),
+                use_hg=bool(cfg.use_hg),
+            )
+            out_w, out_h = _resolution_dims(cfg.resolution_key)
+
+            rows: list[dict] = []
+            total = max(1, len(cfg.tasks))
+
+            for i, task in enumerate(cfg.tasks):
+                if self._is_canceled():
+                    self.canceled.emit("Benchmark canceled.")
+                    return
+
+                self.progress.emit(
+                    int((100.0 * i) / float(total)),
+                    f"Processing {i + 1}/{total}: {task.label}",
+                )
+
+                sdr_raw = _read_media_frame(task.sdr_path, frame_idx=task.frame_idx)
+                gt_raw = _read_media_frame(task.gt_path, frame_idx=task.frame_idx)
+                if sdr_raw is None or gt_raw is None:
+                    note = "Missing frame/image data."
+                    row = {
+                        "task_id": task.task_id,
+                        "label": task.label,
+                        "frame": (int(task.frame_idx) + 1) if task.frame_idx is not None else None,
+                        "sample_dir": "",
+                        "sdr_image": "",
+                        "hdr_gt_image": "",
+                        "hdr_convert_image": "",
+                        "metrics": {
+                            "psnr_db": None,
+                            "sssim": None,
+                            "delta_e_itp": None,
+                            "psnr_norm_db": None,
+                            "sssim_norm": None,
+                            "delta_e_itp_norm": None,
+                            "hdr_vdp3": None,
+                            "obj_note": note,
+                            "hdr_vdp3_note": "",
+                        },
+                    }
+                    rows.append(row)
+                    self.sample_ready.emit(row)
+                    continue
+
+                sdr_eval = np.ascontiguousarray(_letterbox_bgr(sdr_raw, out_w, out_h))
+                gt_eval = np.ascontiguousarray(_letterbox_bgr(gt_raw, out_w, out_h))
+
+                try:
+                    pred_eval = np.ascontiguousarray(processor.process(sdr_eval))
+                except Exception as exc:
+                    note = f"Inference failed: {exc}"
+                    row = {
+                        "task_id": task.task_id,
+                        "label": task.label,
+                        "frame": (int(task.frame_idx) + 1) if task.frame_idx is not None else None,
+                        "sample_dir": "",
+                        "sdr_image": "",
+                        "hdr_gt_image": "",
+                        "hdr_convert_image": "",
+                        "metrics": {
+                            "psnr_db": None,
+                            "sssim": None,
+                            "delta_e_itp": None,
+                            "psnr_norm_db": None,
+                            "sssim_norm": None,
+                            "delta_e_itp_norm": None,
+                            "hdr_vdp3": None,
+                            "obj_note": note,
+                            "hdr_vdp3_note": "",
+                        },
+                    }
+                    rows.append(row)
+                    self.sample_ready.emit(row)
+                    continue
+
+                metrics = {
+                    "psnr_db": None,
+                    "sssim": None,
+                    "delta_e_itp": None,
+                    "psnr_norm_db": None,
+                    "sssim_norm": None,
+                    "delta_e_itp_norm": None,
+                    "hdr_vdp3": None,
+                    "obj_note": "",
+                    "hdr_vdp3_note": "",
+                }
+
+                try:
+                    eval_pred, eval_ref = _prepare_metric_pair(
+                        pred_eval,
+                        gt_eval,
+                        max_side=_OBJECTIVE_METRIC_MAX_SIDE,
+                    )
+                    metrics["psnr_db"] = float(_psnr_bgr(eval_pred, eval_ref))
+                    metrics["sssim"] = float(_ssim_bgr(eval_pred, eval_ref))
+                    metrics["delta_e_itp"] = float(_delta_e_itp_bgr(eval_pred, eval_ref))
+
+                    norm_pred, norm_ref = _grade_normalize_pred_to_ref(eval_pred, eval_ref)
+                    metrics["psnr_norm_db"] = float(_psnr_bgr(norm_pred, norm_ref))
+                    metrics["sssim_norm"] = float(_ssim_bgr(norm_pred, norm_ref))
+                    metrics["delta_e_itp_norm"] = float(_delta_e_itp_bgr(norm_pred, norm_ref))
+                    metrics["obj_note"] = "Computed (raw + normalized)"
+                except Exception as exc:
+                    metrics["obj_note"] = f"Metric error: {exc}"
+
+                try:
+                    vdp_score, vdp_note = _hdrvdp3_cli_score(pred_eval, gt_eval)
+                    if vdp_score is not None:
+                        metrics["hdr_vdp3"] = float(vdp_score)
+                    elif vdp_note:
+                        metrics["hdr_vdp3_note"] = str(vdp_note)
+                except Exception as exc:
+                    metrics["hdr_vdp3_note"] = f"HDR-VDP3 error: {exc}"
+
+                frame_tag = (
+                    f"frame_{int(task.frame_idx) + 1:06d}"
+                    if task.frame_idx is not None
+                    else "frame_000000"
+                )
+                if str(cfg.mode) == "dataset":
+                    stem = _sanitize_name(
+                        os.path.splitext(os.path.basename(task.sdr_path))[0]
+                    )
+                    sample_dir_name = f"{frame_tag}_{stem}"
+                else:
+                    sample_dir_name = frame_tag
+                sample_dir = self._choose_unique_dir(
+                    os.path.join(cfg.session_dir, sample_dir_name)
+                )
+                os.makedirs(sample_dir, exist_ok=True)
+
+                sdr_path = os.path.join(sample_dir, "sdr.png")
+                gt_path = os.path.join(sample_dir, "hdr_gt.png")
+                pred_path = os.path.join(sample_dir, "hdr_convert.png")
+                cv2.imwrite(sdr_path, sdr_eval)
+                cv2.imwrite(gt_path, gt_eval)
+                cv2.imwrite(pred_path, pred_eval)
+
+                per_sample_json = os.path.join(sample_dir, "metrics.json")
+                try:
+                    with open(per_sample_json, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "task_id": task.task_id,
+                                "label": task.label,
+                                "frame": (int(task.frame_idx) + 1) if task.frame_idx is not None else None,
+                                "metrics": metrics,
+                            },
+                            f,
+                            indent=2,
+                        )
+                except Exception:
+                    pass
+
+                row = {
+                    "task_id": task.task_id,
+                    "label": task.label,
+                    "frame": (int(task.frame_idx) + 1) if task.frame_idx is not None else None,
+                    "sample_dir": sample_dir,
+                    "sdr_image": sdr_path,
+                    "hdr_gt_image": gt_path,
+                    "hdr_convert_image": pred_path,
+                    "metrics": metrics,
+                }
+                rows.append(row)
+                self.sample_ready.emit(row)
+
+            averages: dict[str, float | None] = {}
+            keys = [
+                "psnr_db",
+                "sssim",
+                "delta_e_itp",
+                "psnr_norm_db",
+                "sssim_norm",
+                "delta_e_itp_norm",
+                "hdr_vdp3",
+            ]
+            for key in keys:
+                vals = []
+                for r in rows:
+                    m = r.get("metrics") or {}
+                    v = m.get(key)
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    if np.isfinite(fv):
+                        vals.append(fv)
+                averages[key] = float(np.mean(vals)) if vals else None
+
+            summary_csv = os.path.join(cfg.session_dir, "benchmark_summary.csv")
+            summary_json = os.path.join(cfg.session_dir, "benchmark_summary.json")
+
+            try:
+                with open(summary_csv, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            "item",
+                            "frame",
+                            "psnr_db",
+                            "sssim",
+                            "delta_e_itp",
+                            "psnr_norm_db",
+                            "sssim_norm",
+                            "delta_e_itp_norm",
+                            "hdr_vdp3",
+                            "obj_note",
+                            "hdr_vdp3_note",
+                            "sample_dir",
+                        ]
+                    )
+                    for r in rows:
+                        m = r.get("metrics") or {}
+                        writer.writerow(
+                            [
+                                r.get("label"),
+                                r.get("frame"),
+                                m.get("psnr_db"),
+                                m.get("sssim"),
+                                m.get("delta_e_itp"),
+                                m.get("psnr_norm_db"),
+                                m.get("sssim_norm"),
+                                m.get("delta_e_itp_norm"),
+                                m.get("hdr_vdp3"),
+                                m.get("obj_note"),
+                                m.get("hdr_vdp3_note"),
+                                r.get("sample_dir"),
+                            ]
+                        )
+                    writer.writerow([])
+                    writer.writerow(["AVERAGE"])
+                    writer.writerow(
+                        [
+                            "",
+                            "",
+                            averages.get("psnr_db"),
+                            averages.get("sssim"),
+                            averages.get("delta_e_itp"),
+                            averages.get("psnr_norm_db"),
+                            averages.get("sssim_norm"),
+                            averages.get("delta_e_itp_norm"),
+                            averages.get("hdr_vdp3"),
+                            "",
+                            "",
+                            cfg.session_dir,
+                        ]
+                    )
+            except Exception:
+                pass
+
+            try:
+                with open(summary_json, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "mode": cfg.mode,
+                            "source_name": cfg.source_name,
+                            "precision": cfg.precision_key,
+                            "use_hg": bool(cfg.use_hg),
+                            "resolution": cfg.resolution_key,
+                            "predequantize_mode": cfg.predequantize_mode,
+                            "session_dir": cfg.session_dir,
+                            "average": averages,
+                            "results": rows,
+                        },
+                        f,
+                        indent=2,
+                    )
+            except Exception:
+                pass
+
+            self.progress.emit(100, "Benchmark completed.")
+            self.finished.emit(
+                {
+                    "mode": cfg.mode,
+                    "source_name": cfg.source_name,
+                    "precision": cfg.precision_key,
+                    "resolution": cfg.resolution_key,
+                    "session_dir": cfg.session_dir,
+                    "summary_csv": summary_csv,
+                    "summary_json": summary_json,
+                    "average": averages,
+                    "count": len(rows),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            try:
+                if processor is not None and hasattr(processor, "model"):
+                    del processor.model
+            except Exception:
+                pass
+            try:
+                del processor
+            except Exception:
+                pass
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+
+class _ImagePreviewLabel(QLabel):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._title = str(title)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(260, 160)
+        self.setProperty("videoSurface", True)
+        self.setWordWrap(True)
+        self.setText(self._title)
+
+    def set_image_from_path(self, path: str | None, fallback: str = ""):
+        if not path or not os.path.isfile(path):
+            self.clear()
+            self.setText(fallback or self._title)
+            return
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            self.clear()
+            self.setText(fallback or self._title)
+            return
+        self.set_image_from_bgr(img, fallback=fallback)
+
+    def set_image_from_bgr(self, bgr: np.ndarray | None, fallback: str = ""):
+        if not isinstance(bgr, np.ndarray):
+            self.clear()
+            self.setText(fallback or self._title)
+            return
+        img = np.ascontiguousarray(bgr)
+        h, w = img.shape[:2]
+        qimg = QImage(img.data, w, h, 3 * w, QImage.Format.Format_BGR888).copy()
+        pix = QPixmap.fromImage(qimg)
+        self.setPixmap(
+            pix.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep existing pixmap responsive to size changes.
+        pix = self.pixmap()
+        if pix is not None and not pix.isNull():
+            self.setPixmap(
+                pix.scaled(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+
+class ModelBenchmarkDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        initial_video_path: str | None,
+        initial_hdr_gt_path: str | None,
+        suggested_dir: str,
+        initial_precision_key: str | None,
+        initial_use_hg: bool,
+        initial_predequantize_mode: str,
+        logs_root: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Model Quality Benchmark")
+        self.setModal(True)
+        self.resize(1320, 860)
+
+        self._suggested_dir = suggested_dir if os.path.isdir(suggested_dir) else os.getcwd()
+        self._logs_root = logs_root
+        self._dataset_pairs: list[BenchmarkTask] = []
+        self._results: list[dict] = []
+        self._session_dir: str | None = None
+        self._worker_thread: QThread | None = None
+        self._worker: _BenchmarkWorker | None = None
+        self._result_source_name = ""
+        self._result_precision = ""
+        self._result_resolution = ""
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        intro = QLabel(
+            "Benchmark model quality in eager mode only. "
+            "You can benchmark a single SDR/HDR-GT video pair or a paired SDR/HDR-GT dataset, "
+            "review images (SDR, HDR GT, HDR Convert), and export metrics with images."
+        )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        tabs = QTabWidget()
+        self._tabs = tabs
+        root.addWidget(tabs, 1)
+
+        config_tab = QWidget()
+        cfg_layout = QVBoxLayout(config_tab)
+        cfg_layout.setContentsMargins(0, 6, 0, 0)
+        cfg_layout.setSpacing(10)
+        tabs.addTab(config_tab, "Setup")
+
+        mode_group = QGroupBox("Mode")
+        mode_form = QFormLayout(mode_group)
+        self._cmb_mode = QComboBox()
+        self._cmb_mode.addItem("Video (SDR + HDR GT)", "video")
+        self._cmb_mode.addItem("Dataset Folders (SDR + HDR GT)", "dataset")
+        mode_form.addRow("Benchmark mode:", self._cmb_mode)
+        cfg_layout.addWidget(mode_group)
+
+        self._stack_mode = QStackedWidget()
+
+        video_page = QWidget()
+        video_layout = QVBoxLayout(video_page)
+        video_layout.setContentsMargins(4, 8, 4, 8)
+        video_layout.setSpacing(8)
+
+        video_form = QFormLayout()
+        self._txt_video_sdr = QLineEdit()
+        self._btn_video_sdr = QPushButton("Browse ...")
+        row_sdr = QWidget()
+        row_sdr_l = QHBoxLayout(row_sdr)
+        row_sdr_l.setContentsMargins(0, 0, 0, 0)
+        row_sdr_l.setSpacing(6)
+        row_sdr_l.addWidget(self._txt_video_sdr, 1)
+        row_sdr_l.addWidget(self._btn_video_sdr)
+
+        self._txt_video_gt = QLineEdit()
+        self._btn_video_gt = QPushButton("Browse ...")
+        row_gt = QWidget()
+        row_gt_l = QHBoxLayout(row_gt)
+        row_gt_l.setContentsMargins(0, 0, 0, 0)
+        row_gt_l.setSpacing(6)
+        row_gt_l.addWidget(self._txt_video_gt, 1)
+        row_gt_l.addWidget(self._btn_video_gt)
+
+        video_form.addRow("SDR video:", row_sdr)
+        video_form.addRow("HDR GT video:", row_gt)
+        video_layout.addLayout(video_form)
+
+        frames_bar = QHBoxLayout()
+        self._btn_detect_frames = QPushButton("Detect Distinct Frames")
+        self._btn_select_all_frames = QPushButton("Check All Frames")
+        self._btn_clear_frames = QPushButton("Clear")
+        self._btn_select_all_frames.setToolTip(
+            "Mark all detected frame checkboxes so every detected frame is benchmarked."
+        )
+        self._btn_clear_frames.setToolTip(
+            "Uncheck all detected frame checkboxes."
+        )
+        frames_bar.addWidget(self._btn_detect_frames)
+        frames_bar.addWidget(self._btn_select_all_frames)
+        frames_bar.addWidget(self._btn_clear_frames)
+        frames_bar.addStretch(1)
+        video_layout.addLayout(frames_bar)
+
+        self._lst_video_frames = QListWidget()
+        self._lst_video_frames.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._lbl_video_note = QLabel("Detect frames, then keep the frames you want to benchmark.")
+        self._lbl_video_note.setWordWrap(True)
+        video_layout.addWidget(self._lst_video_frames, 1)
+        video_layout.addWidget(self._lbl_video_note)
+        self._img_video_setup_preview = _ImagePreviewLabel("Selected SDR Frame Preview")
+        self._img_video_setup_preview.setMinimumHeight(220)
+        video_layout.addWidget(self._img_video_setup_preview)
+
+        dataset_page = QWidget()
+        dataset_layout = QVBoxLayout(dataset_page)
+        dataset_layout.setContentsMargins(4, 8, 4, 8)
+        dataset_layout.setSpacing(8)
+
+        dataset_form = QFormLayout()
+        self._txt_dataset_sdr = QLineEdit()
+        self._btn_dataset_sdr = QPushButton("Browse ...")
+        ds_sdr_row = QWidget()
+        ds_sdr_layout = QHBoxLayout(ds_sdr_row)
+        ds_sdr_layout.setContentsMargins(0, 0, 0, 0)
+        ds_sdr_layout.setSpacing(6)
+        ds_sdr_layout.addWidget(self._txt_dataset_sdr, 1)
+        ds_sdr_layout.addWidget(self._btn_dataset_sdr)
+
+        self._txt_dataset_gt = QLineEdit()
+        self._btn_dataset_gt = QPushButton("Browse ...")
+        ds_gt_row = QWidget()
+        ds_gt_layout = QHBoxLayout(ds_gt_row)
+        ds_gt_layout.setContentsMargins(0, 0, 0, 0)
+        ds_gt_layout.setSpacing(6)
+        ds_gt_layout.addWidget(self._txt_dataset_gt, 1)
+        ds_gt_layout.addWidget(self._btn_dataset_gt)
+
+        dataset_form.addRow("SDR folder:", ds_sdr_row)
+        dataset_form.addRow("HDR GT folder:", ds_gt_row)
+        dataset_layout.addLayout(dataset_form)
+
+        ds_toolbar = QHBoxLayout()
+        self._btn_scan_dataset = QPushButton("Scan and Pair Files")
+        self._btn_select_all_pairs = QPushButton("Select All")
+        self._btn_clear_pairs = QPushButton("Clear")
+        self._lbl_pair_count = QLabel("Pairs: 0")
+        ds_toolbar.addWidget(self._btn_scan_dataset)
+        ds_toolbar.addWidget(self._btn_select_all_pairs)
+        ds_toolbar.addWidget(self._btn_clear_pairs)
+        ds_toolbar.addWidget(self._lbl_pair_count)
+        ds_toolbar.addStretch(1)
+        dataset_layout.addLayout(ds_toolbar)
+
+        self._lst_dataset_pairs = QListWidget()
+        self._lst_dataset_pairs.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        dataset_layout.addWidget(self._lst_dataset_pairs, 1)
+
+        avg_form = QFormLayout()
+        self._cmb_avg_mode = QComboBox()
+        self._cmb_avg_mode.addItem("Average selected items", "selected")
+        self._cmb_avg_mode.addItem("Average all paired dataset items", "all")
+        self._cmb_avg_mode.addItem("Average deterministic subset", "subset")
+        self._spn_subset = QSpinBox()
+        self._spn_subset.setRange(1, 5000)
+        self._spn_subset.setValue(24)
+        avg_form.addRow("Average mode:", self._cmb_avg_mode)
+        avg_form.addRow("Subset size:", self._spn_subset)
+        dataset_layout.addLayout(avg_form)
+
+        self._stack_mode.addWidget(video_page)
+        self._stack_mode.addWidget(dataset_page)
+        cfg_layout.addWidget(self._stack_mode, 1)
+
+        opt_group = QGroupBox("Benchmark Options")
+        opt_form = QFormLayout(opt_group)
+        self._cmb_precision = QComboBox()
+        self._cmb_precision.addItems(_available_precision_keys())
+        if initial_precision_key and initial_precision_key in _available_precision_keys():
+            self._cmb_precision.setCurrentText(initial_precision_key)
+        self._chk_use_hg = QCheckBox("Use HG highlight refinement")
+        self._chk_use_hg.setChecked(bool(initial_use_hg))
+
+        self._cmb_resolution = QComboBox()
+        self._cmb_resolution.addItems(list(RESOLUTION_SCALES.keys()))
+        self._cmb_resolution.setCurrentText("1080p")
+
+        self._cmb_predequantize = QComboBox()
+        self._cmb_predequantize.addItem("Auto", "auto")
+        self._cmb_predequantize.addItem("Force On", "on")
+        self._cmb_predequantize.addItem("Force Off", "off")
+        p_mode = str(initial_predequantize_mode or "auto").strip().lower()
+        idx = self._cmb_predequantize.findData(p_mode)
+        self._cmb_predequantize.setCurrentIndex(idx if idx >= 0 else 0)
+
+        self._txt_session_root = QLineEdit()
+        self._txt_session_root.setText(self._logs_root)
+        self._btn_session_root = QPushButton("Browse ...")
+        root_row = QWidget()
+        root_row_l = QHBoxLayout(root_row)
+        root_row_l.setContentsMargins(0, 0, 0, 0)
+        root_row_l.setSpacing(6)
+        root_row_l.addWidget(self._txt_session_root, 1)
+        root_row_l.addWidget(self._btn_session_root)
+
+        opt_form.addRow("Precision:", self._cmb_precision)
+        opt_form.addRow("", self._chk_use_hg)
+        opt_form.addRow("Benchmark resolution:", self._cmb_resolution)
+        opt_form.addRow("INT8 pre-dequantize:", self._cmb_predequantize)
+        opt_form.addRow("Session logs root:", root_row)
+        cfg_layout.addWidget(opt_group)
+
+        result_tab = QWidget()
+        result_layout = QVBoxLayout(result_tab)
+        result_layout.setContentsMargins(0, 6, 0, 0)
+        result_layout.setSpacing(8)
+        tabs.addTab(result_tab, "Results")
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._lbl_progress = QLabel("Ready.")
+        result_layout.addWidget(self._progress)
+        result_layout.addWidget(self._lbl_progress)
+
+        info_group = QGroupBox("Run Info")
+        info_form = QFormLayout(info_group)
+        self._lbl_result_source = QLabel("-")
+        self._lbl_result_config = QLabel("-")
+        info_form.addRow("Source:", self._lbl_result_source)
+        info_form.addRow("Precision / Resolution:", self._lbl_result_config)
+        result_layout.addWidget(info_group)
+
+        self._tbl = QTableWidget(0, 9)
+        self._tbl.setHorizontalHeaderLabels(
+            [
+                "Item",
+                "PSNR",
+                "SSSIM",
+                "DeltaEITP",
+                "PSNR-N",
+                "SSSIM-N",
+                "DeltaEITP-N",
+                "HDR-VDP3",
+                "Note",
+            ]
+        )
+        self._tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tbl.verticalHeader().setVisible(False)
+        self._tbl.horizontalHeader().setStretchLastSection(True)
+
+        previews = QSplitter(Qt.Orientation.Horizontal)
+        self._img_sdr = _CompareVideoPane(
+            "SDR",
+            force_hdr_metadata=False,
+            mpv_available=_HAS_MPV,
+            mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
+            best_mpv_scale=BEST_MPV_SCALE,
+        )
+        self._img_gt = _CompareVideoPane(
+            "HDR GT",
+            force_hdr_metadata=True,
+            mpv_available=_HAS_MPV,
+            mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
+            best_mpv_scale=BEST_MPV_SCALE,
+        )
+        self._img_pred = _CompareVideoPane(
+            "HDR Convert",
+            force_hdr_metadata=True,
+            mpv_available=_HAS_MPV,
+            mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
+            best_mpv_scale=BEST_MPV_SCALE,
+        )
+        previews.addWidget(self._img_sdr)
+        previews.addWidget(self._img_gt)
+        previews.addWidget(self._img_pred)
+        previews.setStretchFactor(0, 1)
+        previews.setStretchFactor(1, 1)
+        previews.setStretchFactor(2, 1)
+
+        result_layout.addWidget(self._tbl, 1)
+        result_layout.addWidget(previews, 1)
+
+        export_group = QGroupBox("Export")
+        export_layout = QGridLayout(export_group)
+        self._lbl_session_dir = QLabel("Session: -")
+        self._btn_open_session = QPushButton("Open Session Folder")
+        self._btn_load_existing = QPushButton("Load Existing Result ...")
+        self._btn_export_selected = QPushButton("Export Selected Result")
+        self._btn_export_all = QPushButton("Export All Results")
+        self._btn_open_session.setEnabled(False)
+        self._btn_export_selected.setEnabled(False)
+        self._btn_export_all.setEnabled(False)
+        export_layout.addWidget(self._lbl_session_dir, 0, 0, 1, 3)
+        export_layout.addWidget(self._btn_open_session, 1, 0)
+        export_layout.addWidget(self._btn_load_existing, 1, 1)
+        export_layout.addWidget(self._btn_export_selected, 1, 2)
+        export_layout.addWidget(self._btn_export_all, 2, 1, 1, 2)
+        result_layout.addWidget(export_group)
+
+        status_row = QHBoxLayout()
+        self._status_label = QLabel("Status: Ready")
+        self._status_progress = QProgressBar()
+        self._status_progress.setRange(0, 100)
+        self._status_progress.setValue(0)
+        self._status_progress.setFixedWidth(220)
+        status_row.addWidget(self._status_label, 1)
+        status_row.addWidget(self._status_progress)
+        root.addLayout(status_row)
+
+        bottom = QHBoxLayout()
+        self._btn_run = QPushButton("Run Benchmark")
+        self._btn_run.setProperty("role", "primary")
+        self._btn_cancel = QPushButton("Cancel Run")
+        self._btn_cancel.setEnabled(False)
+        self._btn_close = QPushButton("Close")
+        bottom.addWidget(self._btn_run)
+        bottom.addWidget(self._btn_cancel)
+        bottom.addStretch(1)
+        bottom.addWidget(self._btn_close)
+        root.addLayout(bottom)
+
+        self._cmb_mode.currentIndexChanged.connect(self._sync_mode_ui)
+        self._btn_video_sdr.clicked.connect(self._pick_video_sdr)
+        self._btn_video_gt.clicked.connect(self._pick_video_gt)
+        self._btn_detect_frames.clicked.connect(self._detect_frames)
+        self._btn_select_all_frames.clicked.connect(lambda: self._set_all_checked(self._lst_video_frames, True))
+        self._btn_clear_frames.clicked.connect(lambda: self._set_all_checked(self._lst_video_frames, False))
+        self._lst_video_frames.currentItemChanged.connect(lambda _cur, _prev: self._refresh_video_frame_preview())
+
+        self._btn_dataset_sdr.clicked.connect(self._pick_dataset_sdr)
+        self._btn_dataset_gt.clicked.connect(self._pick_dataset_gt)
+        self._btn_scan_dataset.clicked.connect(self._scan_dataset_pairs)
+        self._btn_select_all_pairs.clicked.connect(lambda: self._set_all_checked(self._lst_dataset_pairs, True))
+        self._btn_clear_pairs.clicked.connect(lambda: self._set_all_checked(self._lst_dataset_pairs, False))
+        self._cmb_avg_mode.currentIndexChanged.connect(self._sync_subset_enabled)
+
+        self._btn_session_root.clicked.connect(self._pick_session_root)
+        self._btn_run.clicked.connect(self._start_benchmark)
+        self._btn_cancel.clicked.connect(self._cancel_benchmark)
+        self._btn_close.clicked.connect(self._close_dialog)
+
+        self._tbl.itemSelectionChanged.connect(self._on_result_selection_changed)
+        self._btn_open_session.clicked.connect(self._open_session_folder)
+        self._btn_load_existing.clicked.connect(self._load_existing_results_dialog)
+        self._btn_export_selected.clicked.connect(lambda: self._export_results(selected_only=True))
+        self._btn_export_all.clicked.connect(lambda: self._export_results(selected_only=False))
+
+        if initial_video_path and os.path.isfile(initial_video_path):
+            self._txt_video_sdr.setText(initial_video_path)
+        if initial_hdr_gt_path and os.path.isfile(initial_hdr_gt_path):
+            self._txt_video_gt.setText(initial_hdr_gt_path)
+
+        self._sync_mode_ui()
+        self._sync_subset_enabled()
+        self._set_result_run_info(None, None, None)
+
+    def last_session_dir(self) -> str | None:
+        return self._session_dir
+
+    def _set_all_checked(self, lst: QListWidget, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(lst.count()):
+            item = lst.item(i)
+            item.setCheckState(state)
+
+    def _set_status(self, text: str, percent: int | None = None):
+        msg = str(text or "").strip() or "Ready"
+        self._status_label.setText(f"Status: {msg}")
+        if percent is not None:
+            self._status_progress.setValue(max(0, min(100, int(percent))))
+
+    def _set_result_run_info(
+        self,
+        source_name: str | None,
+        precision: str | None,
+        resolution: str | None,
+    ):
+        src = str(source_name or "").strip()
+        prec = str(precision or "").strip()
+        res = str(resolution or "").strip()
+
+        self._result_source_name = src
+        self._result_precision = prec
+        self._result_resolution = res
+
+        self._lbl_result_source.setText(src or "-")
+        if prec and res:
+            cfg = f"{prec} @ {res}"
+        elif prec:
+            cfg = prec
+        elif res:
+            cfg = res
+        else:
+            cfg = "-"
+        self._lbl_result_config.setText(cfg)
+
+    def _infer_source_name_from_session_dir(self, session_dir: str | None) -> str:
+        s = str(session_dir or "").strip()
+        if not s:
+            return ""
+        parts = [p for p in os.path.normpath(s).split(os.sep) if p]
+        if len(parts) >= 3 and re.match(r"^\d{8}_\d{6}$", parts[-2]):
+            return parts[-3]
+        return os.path.basename(os.path.normpath(s))
+
+    def _read_preview_image(self, path: str | None) -> np.ndarray | None:
+        p = str(path or "").strip()
+        if not p or not os.path.isfile(p):
+            return None
+        return cv2.imread(p, cv2.IMREAD_COLOR)
+
+    def _set_result_previews(self, row: dict | None):
+        if not isinstance(row, dict):
+            self._img_sdr.set_frame(None, "SDR\n(unavailable)")
+            self._img_gt.set_frame(None, "HDR GT\n(unavailable)")
+            self._img_pred.set_frame(None, "HDR Convert\n(unavailable)")
+            return
+        sdr = self._read_preview_image(row.get("sdr_image"))
+        gt = self._read_preview_image(row.get("hdr_gt_image"))
+        pred = self._read_preview_image(row.get("hdr_convert_image"))
+        self._img_sdr.set_frame(sdr, "SDR\n(unavailable)")
+        self._img_gt.set_frame(gt, "HDR GT\n(unavailable)")
+        self._img_pred.set_frame(pred, "HDR Convert\n(unavailable)")
+
+    def _stop_result_preview_players(self):
+        for pane in (self._img_sdr, self._img_gt, self._img_pred):
+            try:
+                pane.stop()
+            except Exception:
+                continue
+
+    def _populate_results_view(
+        self,
+        *,
+        rows: list[dict],
+        average: dict | None,
+        session_dir: str | None,
+        source_name: str | None,
+        precision: str | None,
+        resolution: str | None,
+    ):
+        self._results = list(rows or [])
+        self._tbl.setRowCount(0)
+        self._set_result_previews(None)
+
+        for row in self._results:
+            self._add_table_row(row)
+
+        avg = average or {}
+        if self._results:
+            r = self._tbl.rowCount()
+            self._tbl.insertRow(r)
+            avg_label = QTableWidgetItem(f"AVERAGE (N={len(self._results)})")
+            bold = QFont()
+            bold.setBold(True)
+            avg_label.setFont(bold)
+            self._tbl.setItem(r, 0, avg_label)
+            avg_values = [
+                _fmt_metric(avg.get("psnr_db"), ".2f", " dB"),
+                _fmt_metric(avg.get("sssim"), ".4f"),
+                _fmt_metric(avg.get("delta_e_itp"), ".2f"),
+                _fmt_metric(avg.get("psnr_norm_db"), ".2f", " dB"),
+                _fmt_metric(avg.get("sssim_norm"), ".4f"),
+                _fmt_metric(avg.get("delta_e_itp_norm"), ".2f"),
+                _fmt_metric(avg.get("hdr_vdp3"), ".3f"),
+                "",
+            ]
+            for col, text in enumerate(avg_values, start=1):
+                it = QTableWidgetItem(text)
+                it.setFont(bold)
+                self._tbl.setItem(r, col, it)
+
+        self._session_dir = session_dir if session_dir and os.path.isdir(session_dir) else None
+        if self._session_dir:
+            self._lbl_session_dir.setText(f"Session: {self._session_dir}")
+        else:
+            self._lbl_session_dir.setText("Session: -")
+
+        self._set_result_run_info(source_name, precision, resolution)
+
+        self._btn_open_session.setEnabled(bool(self._session_dir))
+        self._btn_export_selected.setEnabled(bool(self._results))
+        self._btn_export_all.setEnabled(bool(self._results))
+
+        if self._tbl.rowCount() > 0:
+            self._tbl.selectRow(0)
+            self._on_result_selection_changed()
+
+    def _compute_average_from_rows(self, rows: list[dict]) -> dict[str, float | None]:
+        keys = [
+            "psnr_db",
+            "sssim",
+            "delta_e_itp",
+            "psnr_norm_db",
+            "sssim_norm",
+            "delta_e_itp_norm",
+            "hdr_vdp3",
+        ]
+        avg: dict[str, float | None] = {}
+        for key in keys:
+            vals = []
+            for row in rows:
+                v = (row.get("metrics") or {}).get(key)
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    vals.append(fv)
+            avg[key] = float(np.mean(vals)) if vals else None
+        return avg
+
+    def _load_results_from_json(
+        self,
+        json_path: str,
+    ) -> tuple[list[dict], dict, str | None, dict[str, str]]:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = data.get("results")
+        if not isinstance(rows, list):
+            raise RuntimeError("JSON file does not contain a valid 'results' list.")
+
+        base_dir = os.path.dirname(json_path)
+        norm_rows: list[dict] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            m = row.get("metrics")
+            if not isinstance(m, dict):
+                m = {}
+            row["metrics"] = dict(m)
+
+            sample_dir = str(row.get("sample_dir") or "").strip()
+            if sample_dir and not os.path.isabs(sample_dir):
+                sample_dir = os.path.normpath(os.path.join(base_dir, sample_dir))
+            row["sample_dir"] = sample_dir
+
+            for key, fname in (
+                ("sdr_image", "sdr.png"),
+                ("hdr_gt_image", "hdr_gt.png"),
+                ("hdr_convert_image", "hdr_convert.png"),
+            ):
+                p = str(row.get(key) or "").strip()
+                if p and not os.path.isabs(p):
+                    p = os.path.normpath(os.path.join(base_dir, p))
+                if (not p) and sample_dir:
+                    p = os.path.join(sample_dir, fname)
+                row[key] = p
+            norm_rows.append(row)
+
+        average = data.get("average") if isinstance(data.get("average"), dict) else self._compute_average_from_rows(norm_rows)
+        session_dir = str(data.get("session_dir") or "").strip() or base_dir
+        if session_dir and not os.path.isabs(session_dir):
+            session_dir = os.path.normpath(os.path.join(base_dir, session_dir))
+        meta = {
+            "source_name": str(data.get("source_name") or "").strip(),
+            "precision": str(data.get("precision") or "").strip(),
+            "resolution": str(data.get("resolution") or "").strip(),
+        }
+        if not meta["source_name"]:
+            meta["source_name"] = self._infer_source_name_from_session_dir(session_dir)
+        return norm_rows, average, session_dir, meta
+
+    def _load_results_from_csv(
+        self,
+        csv_path: str,
+    ) -> tuple[list[dict], dict, str | None, dict[str, str]]:
+        rows: list[dict] = []
+        base_dir = os.path.dirname(csv_path)
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise RuntimeError("CSV file is empty or invalid.")
+            for rec in reader:
+                label = str(rec.get("item") or "").strip()
+                if not label or label.upper().startswith("AVERAGE"):
+                    continue
+                sample_dir = str(rec.get("sample_dir") or rec.get("exported_folder") or "").strip()
+                if sample_dir and not os.path.isabs(sample_dir):
+                    sample_dir = os.path.normpath(os.path.join(base_dir, sample_dir))
+                metrics = {
+                    "psnr_db": rec.get("psnr_db"),
+                    "sssim": rec.get("sssim"),
+                    "delta_e_itp": rec.get("delta_e_itp"),
+                    "psnr_norm_db": rec.get("psnr_norm_db"),
+                    "sssim_norm": rec.get("sssim_norm"),
+                    "delta_e_itp_norm": rec.get("delta_e_itp_norm"),
+                    "hdr_vdp3": rec.get("hdr_vdp3"),
+                    "obj_note": rec.get("obj_note") or "",
+                    "hdr_vdp3_note": rec.get("hdr_vdp3_note") or "",
+                }
+                frame_raw = str(rec.get("frame") or "").strip()
+                frame_val = None
+                if frame_raw:
+                    try:
+                        frame_val = int(float(frame_raw))
+                    except Exception:
+                        frame_val = None
+                row = {
+                    "task_id": _sanitize_name(label),
+                    "label": label,
+                    "frame": frame_val,
+                    "sample_dir": sample_dir,
+                    "sdr_image": os.path.join(sample_dir, "sdr.png") if sample_dir else "",
+                    "hdr_gt_image": os.path.join(sample_dir, "hdr_gt.png") if sample_dir else "",
+                    "hdr_convert_image": os.path.join(sample_dir, "hdr_convert.png") if sample_dir else "",
+                    "metrics": metrics,
+                }
+                rows.append(row)
+        average = self._compute_average_from_rows(rows)
+
+        meta = {
+            "source_name": "",
+            "precision": "",
+            "resolution": "",
+        }
+        for sidecar_name in ("benchmark_summary.json", "benchmark_export_summary.json"):
+            sidecar = os.path.join(base_dir, sidecar_name)
+            if not os.path.isfile(sidecar):
+                continue
+            try:
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    sidecar_data = json.load(f)
+                if isinstance(sidecar_data, dict):
+                    meta["source_name"] = str(sidecar_data.get("source_name") or meta["source_name"]).strip()
+                    meta["precision"] = str(sidecar_data.get("precision") or meta["precision"]).strip()
+                    meta["resolution"] = str(sidecar_data.get("resolution") or meta["resolution"]).strip()
+                break
+            except Exception:
+                continue
+
+        if not meta["precision"]:
+            parts = [p for p in os.path.normpath(base_dir).split(os.sep) if p]
+            if len(parts) >= 2 and re.match(r"^\d{8}_\d{6}$", parts[-2]):
+                meta["precision"] = parts[-1]
+        if not meta["source_name"]:
+            meta["source_name"] = self._infer_source_name_from_session_dir(base_dir)
+
+        return rows, average, base_dir, meta
+
+    def _load_existing_results_dialog(self):
+        if self._worker_thread is not None:
+            QMessageBox.information(self, "Benchmark", "Cancel the running benchmark first.")
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Load Benchmark Results")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Load results from a summary file or a benchmark folder.")
+        btn_file = box.addButton("Choose File", QMessageBox.ButtonRole.AcceptRole)
+        btn_folder = box.addButton("Choose Folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+
+        path = ""
+        if clicked is btn_file:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Benchmark Result File",
+                self._session_dir or self._txt_session_root.text().strip() or self._suggested_dir,
+                "Result Files (*.json *.csv);;JSON (*.json);;CSV (*.csv);;All (*)",
+            )
+        elif clicked is btn_folder:
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Select Benchmark Result Folder",
+                self._session_dir or self._txt_session_root.text().strip() or self._suggested_dir,
+            )
+        else:
+            return
+
+        if not path:
+            return
+
+        try:
+            if os.path.isdir(path):
+                candidates = [
+                    os.path.join(path, "benchmark_summary.json"),
+                    os.path.join(path, "benchmark_export_summary.json"),
+                    os.path.join(path, "benchmark_summary.csv"),
+                    os.path.join(path, "benchmark_export_summary.csv"),
+                ]
+                selected = ""
+                for cand in candidates:
+                    if os.path.isfile(cand):
+                        selected = cand
+                        break
+                if not selected:
+                    raise RuntimeError("No supported result summary file found in the selected folder.")
+                path = selected
+
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".json":
+                rows, average, session_dir, meta = self._load_results_from_json(path)
+            elif ext == ".csv":
+                rows, average, session_dir, meta = self._load_results_from_csv(path)
+            else:
+                raise RuntimeError("Unsupported result file type. Use JSON or CSV.")
+
+            if not rows:
+                raise RuntimeError("The selected result source has no benchmark rows.")
+
+            self._populate_results_view(
+                rows=rows,
+                average=average,
+                session_dir=session_dir,
+                source_name=str(meta.get("source_name") or "").strip(),
+                precision=str(meta.get("precision") or "").strip(),
+                resolution=str(meta.get("resolution") or "").strip(),
+            )
+            self._set_status(f"Loaded existing results ({len(rows)} rows)", percent=100)
+            self._lbl_progress.setText("Loaded existing results.")
+            self._progress.setValue(100)
+            self._tabs.setCurrentIndex(1)
+        except Exception as exc:
+            QMessageBox.warning(self, "Load Benchmark Results", str(exc))
+
+    def _sync_mode_ui(self):
+        mode = self._cmb_mode.currentData()
+        self._stack_mode.setCurrentIndex(0 if mode == "video" else 1)
+
+    def _current_video_frame_1b(self) -> int | None:
+        item = self._lst_video_frames.currentItem()
+        if item is None and self._lst_video_frames.count() > 0:
+            item = self._lst_video_frames.item(0)
+        if item is None:
+            return None
+        try:
+            return int(item.data(Qt.ItemDataRole.UserRole))
+        except Exception:
+            return None
+
+    def _refresh_video_frame_preview(self):
+        sdr_path = self._txt_video_sdr.text().strip()
+        if not sdr_path or not os.path.isfile(sdr_path):
+            self._img_video_setup_preview.set_image_from_bgr(
+                None,
+                "Selected SDR Frame Preview",
+            )
+            return
+        frame_1b = self._current_video_frame_1b()
+        if frame_1b is None:
+            self._img_video_setup_preview.set_image_from_bgr(
+                None,
+                "Select a detected frame to preview.",
+            )
+            return
+        frame = _read_video_frame_at(sdr_path, max(0, int(frame_1b) - 1))
+        self._img_video_setup_preview.set_image_from_bgr(
+            frame,
+            f"Frame {int(frame_1b)} preview unavailable.",
+        )
+
+    def _sync_subset_enabled(self):
+        mode = str(self._cmb_avg_mode.currentData() or "selected")
+        self._spn_subset.setEnabled(mode == "subset")
+
+    def _pick_video_sdr(self):
+        start = self._suggested_dir
+        current = self._txt_video_sdr.text().strip()
+        if current and os.path.isfile(current):
+            start = os.path.dirname(current)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select SDR Video",
+            start,
+            "Video (*.mp4 *.avi *.mkv *.mov *.webm *.flv *.m4v);;All (*)",
+        )
+        if path:
+            self._txt_video_sdr.setText(path)
+            self._lst_video_frames.clear()
+            self._img_video_setup_preview.set_image_from_bgr(
+                None,
+                "Detect distinct frames to preview.",
+            )
+
+    def _pick_video_gt(self):
+        start = self._suggested_dir
+        current = self._txt_video_gt.text().strip()
+        if current and os.path.isfile(current):
+            start = os.path.dirname(current)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select HDR GT Video",
+            start,
+            "Video (*.mp4 *.avi *.mkv *.mov *.webm *.flv *.m4v);;All (*)",
+        )
+        if path:
+            self._txt_video_gt.setText(path)
+
+    def _pick_dataset_sdr(self):
+        start = self._txt_dataset_sdr.text().strip() or self._suggested_dir
+        path = QFileDialog.getExistingDirectory(self, "Select SDR Dataset Folder", start)
+        if path:
+            self._txt_dataset_sdr.setText(path)
+
+    def _pick_dataset_gt(self):
+        start = self._txt_dataset_gt.text().strip() or self._suggested_dir
+        path = QFileDialog.getExistingDirectory(self, "Select HDR GT Dataset Folder", start)
+        if path:
+            self._txt_dataset_gt.setText(path)
+
+    def _pick_session_root(self):
+        start = self._txt_session_root.text().strip() or self._logs_root
+        path = QFileDialog.getExistingDirectory(self, "Select Benchmark Session Root", start)
+        if path:
+            self._txt_session_root.setText(path)
+
+    def _validate_video_pair(self, sdr_path: str, gt_path: str) -> tuple[bool, str]:
+        if not os.path.isfile(sdr_path):
+            return False, "SDR video path is invalid."
+        if not os.path.isfile(gt_path):
+            return False, "HDR GT video path is invalid."
+
+        sdr_hdr = _probe_hdr_input(sdr_path)
+        if bool(sdr_hdr.get("is_hdr", False)):
+            return False, f"SDR source appears HDR ({sdr_hdr.get('reason', 'HDR metadata detected')})."
+
+        gt_hdr = _probe_hdr_input(gt_path)
+        if not bool(gt_hdr.get("is_hdr", False)):
+            return False, f"HDR GT does not look HDR ({gt_hdr.get('reason', 'HDR metadata not detected')})."
+
+        sdr_meta = _probe_video_timing_info(sdr_path)
+        gt_meta = _probe_video_timing_info(gt_path)
+        if sdr_meta is None or gt_meta is None:
+            return False, "Could not read video metadata."
+
+        sdr_fps = float(sdr_meta.get("fps") or 0.0)
+        gt_fps = float(gt_meta.get("fps") or 0.0)
+        if sdr_fps > 0.0 and gt_fps > 0.0 and abs(sdr_fps - gt_fps) > 0.25:
+            return False, f"FPS mismatch: SDR {sdr_fps:.3f} vs GT {gt_fps:.3f}."
+
+        sdr_n = int(sdr_meta.get("frame_count") or 0)
+        gt_n = int(gt_meta.get("frame_count") or 0)
+        if sdr_n > 0 and gt_n > 0 and abs(sdr_n - gt_n) > 2:
+            return False, f"Frame-count mismatch: SDR {sdr_n} vs GT {gt_n}."
+
+        score, sampled = _content_similarity_score(sdr_path, gt_path, sample_count=5)
+        if score is None or sampled < 3:
+            return False, "Could not verify content alignment from sampled frames."
+        if score < 0.34:
+            return False, f"Content mismatch (similarity {score:.2f})."
+
+        return True, f"Validated (content similarity {score:.2f})."
+
+    def _detect_frames(self):
+        sdr_path = self._txt_video_sdr.text().strip()
+        gt_path = self._txt_video_gt.text().strip()
+        ok, note = self._validate_video_pair(sdr_path, gt_path)
+        if not ok:
+            QMessageBox.warning(self, "Video Benchmark", note)
+            return
+
+        frames = _detect_distinct_video_frames(sdr_path, desired_count=10)
+        if not frames:
+            QMessageBox.warning(
+                self,
+                "Video Benchmark",
+                "Could not detect representative frames from the selected video.",
+            )
+            return
+
+        self._lst_video_frames.clear()
+        for fidx in frames:
+            item = QListWidgetItem(f"Frame {int(fidx)}")
+            item.setData(Qt.ItemDataRole.UserRole, int(fidx))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self._lst_video_frames.addItem(item)
+        if self._lst_video_frames.count() > 0:
+            self._lst_video_frames.setCurrentRow(0)
+        self._refresh_video_frame_preview()
+
+        self._lbl_video_note.setText(
+            f"{len(frames)} deterministic scene-diverse frames detected. {note}"
+        )
+
+    def _pair_dataset_files(self, sdr_root: str, gt_root: str) -> list[BenchmarkTask]:
+        sdr_files = _sorted_media_files(sdr_root)
+        gt_files = _sorted_media_files(gt_root)
+
+        gt_rel_map: dict[str, str] = {}
+        gt_stem_map: dict[str, list[str]] = {}
+
+        for p in gt_files:
+            rel = os.path.relpath(p, gt_root).replace("\\", "/")
+            rel_no_ext = os.path.splitext(rel)[0].lower()
+            gt_rel_map[rel_no_ext] = p
+            stem = os.path.splitext(os.path.basename(p))[0].lower()
+            gt_stem_map.setdefault(stem, []).append(p)
+
+        pairs: list[BenchmarkTask] = []
+        for sdr_path in sdr_files:
+            rel = os.path.relpath(sdr_path, sdr_root).replace("\\", "/")
+            rel_no_ext = os.path.splitext(rel)[0].lower()
+            gt_path = gt_rel_map.get(rel_no_ext)
+            if gt_path is None:
+                stem = os.path.splitext(os.path.basename(sdr_path))[0].lower()
+                cands = sorted(gt_stem_map.get(stem, []))
+                if cands:
+                    gt_path = cands[0]
+            if gt_path is None:
+                continue
+
+            task = BenchmarkTask(
+                task_id=_sanitize_name(rel_no_ext),
+                label=rel,
+                sdr_path=sdr_path,
+                gt_path=gt_path,
+                frame_idx=0 if _is_video_path(sdr_path) else None,
+            )
+            pairs.append(task)
+
+        pairs.sort(key=lambda t: t.label.lower())
+        return pairs
+
+    def _scan_dataset_pairs(self):
+        sdr_root = self._txt_dataset_sdr.text().strip()
+        gt_root = self._txt_dataset_gt.text().strip()
+        if not os.path.isdir(sdr_root):
+            QMessageBox.warning(self, "Dataset Benchmark", "Choose a valid SDR dataset folder.")
+            return
+        if not os.path.isdir(gt_root):
+            QMessageBox.warning(self, "Dataset Benchmark", "Choose a valid HDR GT dataset folder.")
+            return
+
+        pairs = self._pair_dataset_files(sdr_root, gt_root)
+        self._dataset_pairs = pairs
+        self._lst_dataset_pairs.clear()
+        for task in pairs:
+            item = QListWidgetItem(task.label)
+            item.setData(Qt.ItemDataRole.UserRole, task.task_id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self._lst_dataset_pairs.addItem(item)
+
+        self._lbl_pair_count.setText(f"Pairs: {len(pairs)}")
+        if not pairs:
+            QMessageBox.information(
+                self,
+                "Dataset Benchmark",
+                "No SDR/HDR GT pairs were found. Pairing uses relative path first, then filename stem fallback.",
+            )
+
+    def _build_video_tasks(self) -> list[BenchmarkTask]:
+        sdr_path = self._txt_video_sdr.text().strip()
+        gt_path = self._txt_video_gt.text().strip()
+        ok, note = self._validate_video_pair(sdr_path, gt_path)
+        if not ok:
+            raise RuntimeError(note)
+
+        frames: list[int] = []
+        for i in range(self._lst_video_frames.count()):
+            item = self._lst_video_frames.item(i)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            try:
+                frames.append(int(item.data(Qt.ItemDataRole.UserRole)))
+            except Exception:
+                continue
+        if not frames:
+            raise RuntimeError("Select at least one frame for video benchmarking.")
+
+        tasks: list[BenchmarkTask] = []
+        for frame_1b in sorted(set(frames)):
+            frame_0b = max(0, int(frame_1b) - 1)
+            task_id = f"frame_{int(frame_1b)}"
+            tasks.append(
+                BenchmarkTask(
+                    task_id=task_id,
+                    label=f"Frame {int(frame_1b)}",
+                    sdr_path=sdr_path,
+                    gt_path=gt_path,
+                    frame_idx=frame_0b,
+                )
+            )
+        return tasks
+
+    def _deterministic_subset(self, tasks: list[BenchmarkTask], count: int) -> list[BenchmarkTask]:
+        if count <= 0 or len(tasks) <= count:
+            return list(tasks)
+        if count == 1:
+            return [tasks[len(tasks) // 2]]
+        step = float(len(tasks) - 1) / float(count - 1)
+        idxs = sorted({int(round(i * step)) for i in range(count)})
+        return [tasks[max(0, min(len(tasks) - 1, idx))] for idx in idxs]
+
+    def _build_dataset_tasks(self) -> list[BenchmarkTask]:
+        if not self._dataset_pairs:
+            raise RuntimeError("Scan dataset pairs first.")
+
+        checked_ids: set[str] = set()
+        for i in range(self._lst_dataset_pairs.count()):
+            item = self._lst_dataset_pairs.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                checked_ids.add(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+
+        selected = [p for p in self._dataset_pairs if p.task_id in checked_ids]
+        if not selected:
+            selected = list(self._dataset_pairs)
+
+        avg_mode = str(self._cmb_avg_mode.currentData() or "selected")
+        if avg_mode == "all":
+            return list(self._dataset_pairs)
+        if avg_mode == "subset":
+            subset_n = max(1, int(self._spn_subset.value()))
+            base = selected if selected else list(self._dataset_pairs)
+            base_sorted = sorted(base, key=lambda x: x.label.lower())
+            return self._deterministic_subset(base_sorted, subset_n)
+        return selected
+
+    def _derive_source_name(self, mode: str, tasks: list[BenchmarkTask]) -> str:
+        if mode == "video":
+            path = self._txt_video_sdr.text().strip()
+            if path:
+                return os.path.splitext(os.path.basename(path))[0]
+        else:
+            root = self._txt_dataset_sdr.text().strip()
+            if root:
+                return os.path.basename(root.rstrip("\\/"))
+
+        if tasks:
+            first = tasks[0]
+            base = os.path.splitext(os.path.basename(first.sdr_path))[0]
+            if base:
+                return base
+        return "benchmark_source"
+
+    def _new_session_dir(self, source_name: str) -> str:
+        root_dir = self._txt_session_root.text().strip() or self._logs_root
+        if not os.path.isdir(root_dir):
+            os.makedirs(root_dir, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        pkey = _sanitize_name(self._cmb_precision.currentText().lower().replace(" ", "_"))
+        source_key = _sanitize_name(source_name)
+        session = os.path.join(root_dir, source_key, ts, pkey)
+        os.makedirs(session, exist_ok=True)
+        return session
+
+    def _set_running_state(self, running: bool):
+        self._btn_run.setEnabled(not running)
+        self._btn_cancel.setEnabled(running)
+        self._btn_close.setEnabled(not running)
+        for w in (
+            self._cmb_mode,
+            self._btn_video_sdr,
+            self._btn_video_gt,
+            self._btn_detect_frames,
+            self._btn_dataset_sdr,
+            self._btn_dataset_gt,
+            self._btn_scan_dataset,
+            self._cmb_precision,
+            self._chk_use_hg,
+            self._cmb_resolution,
+            self._cmb_predequantize,
+            self._btn_session_root,
+            self._cmb_avg_mode,
+            self._spn_subset,
+            self._btn_select_all_frames,
+            self._btn_clear_frames,
+            self._btn_select_all_pairs,
+            self._btn_clear_pairs,
+            self._btn_load_existing,
+        ):
+            w.setEnabled(not running)
+
+    def _start_benchmark(self):
+        if self._worker_thread is not None:
+            return
+
+        mode = str(self._cmb_mode.currentData() or "video")
+        try:
+            if mode == "video":
+                tasks = self._build_video_tasks()
+            else:
+                tasks = self._build_dataset_tasks()
+        except Exception as exc:
+            QMessageBox.warning(self, "Benchmark", str(exc))
+            return
+
+        source_name = self._derive_source_name(mode, tasks)
+        session_dir = self._new_session_dir(source_name)
+        self._session_dir = session_dir
+        self._lbl_session_dir.setText(f"Session: {session_dir}")
+        self._lbl_progress.setText("Benchmark started ...")
+        self._progress.setValue(0)
+        self._set_status("Benchmark started", percent=0)
+        self._set_result_run_info(
+            source_name,
+            self._cmb_precision.currentText(),
+            self._cmb_resolution.currentText(),
+        )
+        self._tabs.setCurrentIndex(1)
+
+        self._results = []
+        self._tbl.setRowCount(0)
+        self._set_result_previews(None)
+
+        run_cfg = BenchmarkRunConfig(
+            mode=mode,
+            source_name=source_name,
+            precision_key=self._cmb_precision.currentText(),
+            use_hg=bool(self._chk_use_hg.isChecked()),
+            resolution_key=self._cmb_resolution.currentText(),
+            predequantize_mode=str(self._cmb_predequantize.currentData() or "auto"),
+            tasks=tasks,
+            session_dir=session_dir,
+        )
+
+        thread = QThread(self)
+        worker = _BenchmarkWorker(run_cfg)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_worker_progress)
+        worker.sample_ready.connect(self._on_worker_sample_ready)
+        worker.finished.connect(self._on_worker_finished)
+        worker.failed.connect(self._on_worker_failed)
+        worker.canceled.connect(self._on_worker_canceled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.canceled.connect(thread.quit)
+        thread.finished.connect(self._cleanup_worker)
+
+        self._worker_thread = thread
+        self._worker = worker
+        self._set_running_state(True)
+        self._btn_open_session.setEnabled(False)
+        self._btn_export_selected.setEnabled(False)
+        self._btn_export_all.setEnabled(False)
+        thread.start()
+
+    def _cancel_benchmark(self):
+        if self._worker is not None:
+            self._worker.cancel()
+            self._lbl_progress.setText("Canceling benchmark ...")
+            self._set_status("Canceling benchmark ...")
+
+    def _cleanup_worker(self):
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+        self._set_running_state(False)
+
+    def _on_worker_progress(self, percent: int, message: str):
+        self._progress.setValue(max(0, min(100, int(percent))))
+        self._lbl_progress.setText(str(message or ""))
+        self._set_status(str(message or "Running"), percent=percent)
+
+    def _add_table_row(self, row: dict):
+        metrics = row.get("metrics") or {}
+        r = self._tbl.rowCount()
+        self._tbl.insertRow(r)
+
+        values = [
+            str(row.get("label") or "-"),
+            _fmt_metric(metrics.get("psnr_db"), ".2f", " dB"),
+            _fmt_metric(metrics.get("sssim"), ".4f"),
+            _fmt_metric(metrics.get("delta_e_itp"), ".2f"),
+            _fmt_metric(metrics.get("psnr_norm_db"), ".2f", " dB"),
+            _fmt_metric(metrics.get("sssim_norm"), ".4f"),
+            _fmt_metric(metrics.get("delta_e_itp_norm"), ".2f"),
+            _fmt_metric(metrics.get("hdr_vdp3"), ".3f"),
+            str(metrics.get("obj_note") or metrics.get("hdr_vdp3_note") or ""),
+        ]
+        for c, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            self._tbl.setItem(r, c, item)
+
+    def _on_worker_sample_ready(self, row: dict):
+        self._results.append(row)
+        self._add_table_row(row)
+        self._tbl.scrollToBottom()
+        if self._tbl.rowCount() == 1:
+            self._tbl.selectRow(0)
+            self._on_result_selection_changed()
+
+    def _on_worker_finished(self, payload: dict):
+        avg = payload.get("average") or {}
+        session_dir = str(payload.get("session_dir") or self._session_dir or "")
+        self._progress.setValue(100)
+        self._lbl_progress.setText("Benchmark completed.")
+        self._set_status("Benchmark completed", percent=100)
+        self._populate_results_view(
+            rows=self._results,
+            average=avg,
+            session_dir=session_dir,
+            source_name=str(payload.get("source_name") or "").strip(),
+            precision=str(payload.get("precision") or "").strip(),
+            resolution=str(payload.get("resolution") or "").strip(),
+        )
+
+    def _on_worker_failed(self, message: str):
+        self._lbl_progress.setText("Benchmark failed.")
+        self._set_status("Benchmark failed")
+        QMessageBox.warning(self, "Benchmark Failed", str(message or "Unknown error."))
+
+    def _on_worker_canceled(self, message: str):
+        self._lbl_progress.setText("Benchmark canceled.")
+        self._set_status("Benchmark canceled")
+        if message:
+            QMessageBox.information(self, "Benchmark", message)
+
+    def _result_row_to_index(self, row_idx: int) -> int | None:
+        if row_idx < 0:
+            return None
+        if row_idx >= len(self._results):
+            return None
+        return row_idx
+
+    def _on_result_selection_changed(self):
+        rows = self._tbl.selectionModel().selectedRows() if self._tbl.selectionModel() else []
+        if not rows:
+            return
+        idx = self._result_row_to_index(rows[0].row())
+        if idx is None:
+            return
+        row = self._results[idx]
+        self._set_result_previews(row)
+
+    def _open_session_folder(self):
+        if not self._session_dir or not os.path.isdir(self._session_dir):
+            return
+        try:
+            os.startfile(self._session_dir)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Session Folder", f"Could not open folder:\n{exc}")
+
+    def _selected_results(self) -> list[dict]:
+        rows = self._tbl.selectionModel().selectedRows() if self._tbl.selectionModel() else []
+        if not rows:
+            return []
+        out = []
+        for m_idx in rows:
+            idx = self._result_row_to_index(m_idx.row())
+            if idx is None:
+                continue
+            out.append(self._results[idx])
+        return out
+
+    def _write_export_summary(self, folder: str, rows: list[dict]):
+        summary_csv = os.path.join(folder, "benchmark_export_summary.csv")
+        summary_json = os.path.join(folder, "benchmark_export_summary.json")
+
+        avg = {}
+        keys = [
+            "psnr_db",
+            "sssim",
+            "delta_e_itp",
+            "psnr_norm_db",
+            "sssim_norm",
+            "delta_e_itp_norm",
+            "hdr_vdp3",
+        ]
+        for key in keys:
+            vals = []
+            for r in rows:
+                v = (r.get("metrics") or {}).get(key)
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    vals.append(fv)
+            avg[key] = float(np.mean(vals)) if vals else None
+
+        with open(summary_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "item",
+                    "frame",
+                    "psnr_db",
+                    "sssim",
+                    "delta_e_itp",
+                    "psnr_norm_db",
+                    "sssim_norm",
+                    "delta_e_itp_norm",
+                    "hdr_vdp3",
+                    "obj_note",
+                    "hdr_vdp3_note",
+                    "exported_folder",
+                ]
+            )
+            for r in rows:
+                m = r.get("metrics") or {}
+                writer.writerow(
+                    [
+                        r.get("label"),
+                        r.get("frame"),
+                        m.get("psnr_db"),
+                        m.get("sssim"),
+                        m.get("delta_e_itp"),
+                        m.get("psnr_norm_db"),
+                        m.get("sssim_norm"),
+                        m.get("delta_e_itp_norm"),
+                        m.get("hdr_vdp3"),
+                        m.get("obj_note"),
+                        m.get("hdr_vdp3_note"),
+                        r.get("sample_dir"),
+                    ]
+                )
+            writer.writerow([])
+            writer.writerow(["AVERAGE"])
+            writer.writerow(
+                [
+                    "",
+                    "",
+                    avg.get("psnr_db"),
+                    avg.get("sssim"),
+                    avg.get("delta_e_itp"),
+                    avg.get("psnr_norm_db"),
+                    avg.get("sssim_norm"),
+                    avg.get("delta_e_itp_norm"),
+                    avg.get("hdr_vdp3"),
+                    "",
+                    "",
+                    folder,
+                ]
+            )
+
+        with open(summary_json, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "source_name": self._result_source_name,
+                    "precision": self._result_precision,
+                    "resolution": self._result_resolution,
+                    "average": avg,
+                    "results": rows,
+                },
+                f,
+                indent=2,
+            )
+
+    def _copy_sample_folder(self, src: str, dest_root: str) -> str:
+        base = os.path.basename(src.rstrip("\\/"))
+        if not base:
+            base = "sample"
+        dst = os.path.join(dest_root, base)
+        n = 2
+        while os.path.exists(dst):
+            dst = os.path.join(dest_root, f"{base}_{n}")
+            n += 1
+        shutil.copytree(src, dst)
+        return dst
+
+    def _export_results(self, selected_only: bool):
+        if not self._results:
+            QMessageBox.information(self, "Export", "No benchmark results are available yet.")
+            return
+
+        rows = self._selected_results() if selected_only else list(self._results)
+        if not rows:
+            QMessageBox.information(self, "Export", "Select a result row first.")
+            return
+
+        start = self._session_dir or self._suggested_dir
+        export_root = QFileDialog.getExistingDirectory(
+            self,
+            "Select Export Folder",
+            start,
+        )
+        if not export_root:
+            return
+
+        exported: list[dict] = []
+        for row in rows:
+            src = str(row.get("sample_dir") or "")
+            if not src or not os.path.isdir(src):
+                continue
+            try:
+                dst = self._copy_sample_folder(src, export_root)
+            except Exception:
+                continue
+            copied = dict(row)
+            copied["sample_dir"] = dst
+            exported.append(copied)
+
+        if not exported:
+            QMessageBox.warning(self, "Export", "No sample folders could be exported.")
+            return
+
+        try:
+            self._write_export_summary(export_root, exported)
+        except Exception:
+            pass
+
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Exported {len(exported)} result folder(s) to:\n{export_root}",
+        )
+
+    def _close_dialog(self):
+        if self._worker_thread is not None:
+            QMessageBox.information(
+                self,
+                "Benchmark Running",
+                "Cancel the running benchmark first.",
+            )
+            return
+        self._stop_result_preview_players()
+        self.accept()
+
+    def closeEvent(self, event):
+        if self._worker_thread is not None:
+            event.ignore()
+            QMessageBox.information(
+                self,
+                "Benchmark Running",
+                "Cancel the running benchmark first.",
+            )
+            return
+        self._stop_result_preview_players()
+        super().closeEvent(event)
