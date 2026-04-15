@@ -1112,6 +1112,10 @@ class ModelBenchmarkDialog(QDialog):
         parts = [p for p in os.path.normpath(s).split(os.sep) if p]
         if len(parts) >= 2 and re.match(r"^\d{8}_\d{6}$", parts[-2]):
             return parts[-1]
+        leaf = parts[-1] if parts else ""
+        m = re.match(r"^\d{8}_\d{6}__(.+?)(?:__.+)?$", leaf)
+        if m:
+            return str(m.group(1) or "").strip()
         return ""
 
     def _result_tab_title(
@@ -1257,6 +1261,9 @@ class ModelBenchmarkDialog(QDialog):
         parts = [p for p in os.path.normpath(s).split(os.sep) if p]
         if len(parts) >= 3 and re.match(r"^\d{8}_\d{6}$", parts[-2]):
             return parts[-3]
+        leaf = parts[-1] if parts else ""
+        if re.match(r"^\d{8}_\d{6}__(.+?)(?:__.+)?$", leaf) and len(parts) >= 2:
+            return parts[-2]
         return os.path.basename(os.path.normpath(s))
 
     def _read_preview_image(self, path: str | None) -> np.ndarray | None:
@@ -1973,14 +1980,19 @@ class ModelBenchmarkDialog(QDialog):
                 return base
         return "benchmark_source"
 
-    def _new_session_dir(self, source_name: str) -> str:
+    def _new_session_dir(self, source_name: str, task_count: int) -> str:
         root_dir = self._txt_session_root.text().strip() or self._logs_root
         if not os.path.isdir(root_dir):
             os.makedirs(root_dir, exist_ok=True)
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         pkey = _sanitize_name(self._cmb_precision.currentText().lower().replace(" ", "_"))
+        rkey = _sanitize_name(self._cmb_resolution.currentText().lower().replace(" ", "_"))
         source_key = _sanitize_name(source_name)
-        session = os.path.join(root_dir, source_key, ts, pkey)
+        session_name = f"{ts}__{pkey}"
+        if rkey:
+            session_name = f"{session_name}__{rkey}"
+        session_name = f"{session_name}__n{max(0, int(task_count))}"
+        session = os.path.join(root_dir, source_key, session_name)
         os.makedirs(session, exist_ok=True)
         return session
 
@@ -2028,7 +2040,7 @@ class ModelBenchmarkDialog(QDialog):
             return
 
         source_name = self._derive_source_name(mode, tasks)
-        session_dir = self._new_session_dir(source_name)
+        session_dir = self._new_session_dir(source_name, len(tasks))
         run_title = self._result_tab_title(
             source_name,
             self._cmb_precision.currentText(),

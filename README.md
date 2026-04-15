@@ -19,7 +19,7 @@ Core updates include:
 - new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking
 - deterministic frame/pair selection options with eager-mode quality runs for repeatable objective comparisons
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
-- benchmark session hierarchy (`source_name/timestamp/precision/...`) plus exportable metrics and sample images
+- benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
@@ -169,7 +169,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
   - dataset workflow includes paired-file scanning with averaging modes (`selected`, `all`, deterministic subset)
   - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
   - result previews now use the same compare-style color-managed display path for `SDR`, `HDR GT`, and `HDR Convert`
-  - session outputs are structured under `logs/benchmark_sessions/<source>/<timestamp>/<precision>/...`
+  - session outputs are structured under `logs/benchmark_sessions/<source>/<timestamp>__<precision>__<resolution>__n<count>/...`
   - benchmark locks playback interactions while open and compare is blocked until benchmark closes
 
 - **Native Browser Window Capture replaces the old browser-video bridge**
