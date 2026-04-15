@@ -768,6 +768,13 @@ class ModelBenchmarkDialog(QDialog):
         video_layout.addLayout(video_form)
 
         frames_bar = QHBoxLayout()
+        self._lbl_detect_frame_count = QLabel("Count:")
+        self._spn_detect_frame_count = QSpinBox()
+        self._spn_detect_frame_count.setRange(1, 240)
+        self._spn_detect_frame_count.setValue(10)
+        self._spn_detect_frame_count.setToolTip(
+            "Number of distinct frames to detect. For the same video and count, detection is deterministic."
+        )
         self._btn_detect_frames = QPushButton("Detect Distinct Frames")
         self._btn_select_all_frames = QPushButton("Check All Frames")
         self._btn_clear_frames = QPushButton("Clear")
@@ -777,6 +784,8 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_clear_frames.setToolTip(
             "Uncheck all detected frame checkboxes."
         )
+        frames_bar.addWidget(self._lbl_detect_frame_count)
+        frames_bar.addWidget(self._spn_detect_frame_count)
         frames_bar.addWidget(self._btn_detect_frames)
         frames_bar.addWidget(self._btn_select_all_frames)
         frames_bar.addWidget(self._btn_clear_frames)
@@ -1537,7 +1546,15 @@ class ModelBenchmarkDialog(QDialog):
             QMessageBox.warning(self, "Video Benchmark", note)
             return
 
-        frames = _detect_distinct_video_frames(sdr_path, desired_count=10)
+        desired_count = max(1, int(self._spn_detect_frame_count.value()))
+        # Increase scan budget with requested count to keep higher-count runs useful,
+        # while keeping deterministic behavior for the same source+count.
+        scan_cap = min(4000, max(260, desired_count * 24))
+        frames = _detect_distinct_video_frames(
+            sdr_path,
+            desired_count=desired_count,
+            max_scan_points=scan_cap,
+        )
         if not frames:
             QMessageBox.warning(
                 self,
@@ -1558,7 +1575,7 @@ class ModelBenchmarkDialog(QDialog):
         self._refresh_video_frame_preview()
 
         self._lbl_video_note.setText(
-            f"{len(frames)} deterministic scene-diverse frames detected. {note}"
+            f"{len(frames)} deterministic scene-diverse frames detected (requested {desired_count}). {note}"
         )
 
     def _pair_dataset_files(self, sdr_root: str, gt_root: str) -> list[BenchmarkTask]:
@@ -1731,6 +1748,7 @@ class ModelBenchmarkDialog(QDialog):
             self._cmb_mode,
             self._btn_video_sdr,
             self._btn_video_gt,
+            self._spn_detect_frame_count,
             self._btn_detect_frames,
             self._btn_dataset_sdr,
             self._btn_dataset_gt,
