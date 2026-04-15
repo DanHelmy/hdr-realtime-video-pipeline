@@ -223,13 +223,15 @@ def _detect_distinct_video_frames(
 
         anchors = [0.08, 0.22, 0.38, 0.52, 0.68, 0.82, 0.92]
         for ratio in anchors:
+            if len(chosen) >= desired_count:
+                break
             idx = int(round((total - 1) * float(ratio)))
             if _accept(idx):
                 chosen.append(idx)
-            if len(chosen) >= desired_count:
-                break
 
         chosen = sorted({max(0, min(total - 1, int(v))) for v in chosen})
+        if len(chosen) > desired_count:
+            chosen = chosen[:desired_count]
         if not chosen:
             chosen = [0]
         # UI displays 1-based frame numbering.
