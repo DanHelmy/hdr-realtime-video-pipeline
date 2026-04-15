@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import torch
 
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, Qt, QDir, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -30,15 +30,18 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QListView,
     QMessageBox,
     QPushButton,
     QProgressBar,
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -708,6 +711,7 @@ class ModelBenchmarkDialog(QDialog):
         self._result_source_name = ""
         self._result_precision = ""
         self._result_resolution = ""
+        self._result_sets: list[dict] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -915,6 +919,15 @@ class ModelBenchmarkDialog(QDialog):
         result_layout.addWidget(self._progress)
         result_layout.addWidget(self._lbl_progress)
 
+        self._result_sets_bar = QTabBar()
+        self._result_sets_bar.setDocumentMode(True)
+        self._result_sets_bar.setMovable(True)
+        self._result_sets_bar.setTabsClosable(True)
+        self._result_sets_bar.setExpanding(False)
+        self._result_sets_bar.setDrawBase(False)
+        self._result_sets_bar.setToolTip("Opened benchmark result sets")
+        result_layout.addWidget(self._result_sets_bar)
+
         info_group = QGroupBox("Run Info")
         info_form = QFormLayout(info_group)
         self._lbl_result_source = QLabel("-")
@@ -979,7 +992,7 @@ class ModelBenchmarkDialog(QDialog):
         export_layout = QGridLayout(export_group)
         self._lbl_session_dir = QLabel("Session: -")
         self._btn_open_session = QPushButton("Open Session Folder")
-        self._btn_load_existing = QPushButton("Load Existing Result ...")
+        self._btn_load_existing = QPushButton("Load Existing Result(s) ...")
         self._btn_export_selected = QPushButton("Export Selected Result")
         self._btn_export_all = QPushButton("Export All Results")
         self._btn_open_session.setEnabled(False)
@@ -1035,6 +1048,8 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_close.clicked.connect(self._close_dialog)
 
         self._tbl.itemSelectionChanged.connect(self._on_result_selection_changed)
+        self._result_sets_bar.currentChanged.connect(self._on_result_set_tab_changed)
+        self._result_sets_bar.tabCloseRequested.connect(self._on_result_set_tab_close_requested)
         self._btn_open_session.clicked.connect(self._open_session_folder)
         self._btn_load_existing.clicked.connect(self._load_existing_results_dialog)
         self._btn_export_selected.clicked.connect(lambda: self._export_results(selected_only=True))
@@ -1047,7 +1062,18 @@ class ModelBenchmarkDialog(QDialog):
 
         self._sync_mode_ui()
         self._sync_subset_enabled()
-        self._set_result_run_info(None, None, None)
+        self._add_result_set_tab(
+            {
+                "title": "Current Run",
+                "rows": [],
+                "average": {},
+                "session_dir": None,
+                "source_name": "",
+                "precision": "",
+                "resolution": "",
+            },
+            activate=True,
+        )
 
     def last_session_dir(self) -> str | None:
         return self._session_dir
@@ -1057,6 +1083,141 @@ class ModelBenchmarkDialog(QDialog):
         for i in range(lst.count()):
             item = lst.item(i)
             item.setCheckState(state)
+
+    def _result_tab_payload(
+        self,
+        *,
+        title: str,
+        rows: list[dict],
+        average: dict | None,
+        session_dir: str | None,
+        source_name: str | None,
+        precision: str | None,
+        resolution: str | None,
+    ) -> dict:
+        return {
+            "title": str(title or "Results").strip() or "Results",
+            "rows": list(rows or []),
+            "average": dict(average or {}),
+            "session_dir": str(session_dir or "").strip() or None,
+            "source_name": str(source_name or "").strip(),
+            "precision": str(precision or "").strip(),
+            "resolution": str(resolution or "").strip(),
+        }
+
+    def _infer_precision_from_session_dir(self, session_dir: str | None) -> str:
+        s = str(session_dir or "").strip()
+        if not s:
+            return ""
+        parts = [p for p in os.path.normpath(s).split(os.sep) if p]
+        if len(parts) >= 2 and re.match(r"^\d{8}_\d{6}$", parts[-2]):
+            return parts[-1]
+        return ""
+
+    def _result_tab_title(
+        self,
+        source_name: str | None,
+        precision: str | None,
+        session_dir: str | None,
+    ) -> str:
+        src = str(source_name or "").strip() or self._infer_source_name_from_session_dir(session_dir)
+        prec = str(precision or "").strip() or self._infer_precision_from_session_dir(session_dir)
+        if not src:
+            src = "Results"
+        return f"{src} [{prec}]" if prec else src
+
+    def _unique_result_tab_title(self, base: str, exclude_idx: int | None = None) -> str:
+        title = str(base or "Results").strip() or "Results"
+        taken = {
+            self._result_sets_bar.tabText(i)
+            for i in range(self._result_sets_bar.count())
+            if exclude_idx is None or i != int(exclude_idx)
+        }
+        if title not in taken:
+            return title
+        n = 2
+        while True:
+            candidate = f"{title} ({n})"
+            if candidate not in taken:
+                return candidate
+            n += 1
+
+    def _add_result_set_tab(self, payload: dict, activate: bool) -> int:
+        title = self._unique_result_tab_title(str(payload.get("title") or "Results"))
+        data = dict(payload)
+        data["title"] = title
+        idx = self._result_sets_bar.addTab(title)
+        self._result_sets.append(data)
+        if bool(activate):
+            self._result_sets_bar.setCurrentIndex(idx)
+        return idx
+
+    def _update_result_set_tab(self, idx: int, payload: dict):
+        if idx < 0 or idx >= len(self._result_sets):
+            self._add_result_set_tab(payload, activate=True)
+            return
+        title = self._unique_result_tab_title(
+            str(payload.get("title") or self._result_sets[idx].get("title") or "Results"),
+            exclude_idx=idx,
+        )
+        data = dict(payload)
+        data["title"] = title
+        self._result_sets[idx] = data
+        self._result_sets_bar.setTabText(idx, title)
+
+    def _apply_result_set_tab(self, idx: int):
+        if idx < 0 or idx >= len(self._result_sets):
+            self._populate_results_view(
+                rows=[],
+                average={},
+                session_dir=None,
+                source_name="",
+                precision="",
+                resolution="",
+            )
+            return
+        data = self._result_sets[idx]
+        self._populate_results_view(
+            rows=list(data.get("rows") or []),
+            average=data.get("average") or {},
+            session_dir=data.get("session_dir"),
+            source_name=str(data.get("source_name") or "").strip(),
+            precision=str(data.get("precision") or "").strip(),
+            resolution=str(data.get("resolution") or "").strip(),
+        )
+
+    def _on_result_set_tab_changed(self, idx: int):
+        self._apply_result_set_tab(int(idx))
+
+    def _on_result_set_tab_close_requested(self, idx: int):
+        if self._worker_thread is not None:
+            QMessageBox.information(self, "Benchmark", "Cancel the running benchmark first.")
+            return
+        if idx < 0 or idx >= len(self._result_sets):
+            return
+        self._result_sets_bar.blockSignals(True)
+        try:
+            self._result_sets_bar.removeTab(idx)
+            del self._result_sets[idx]
+        finally:
+            self._result_sets_bar.blockSignals(False)
+        if not self._result_sets:
+            self._add_result_set_tab(
+                {
+                    "title": "Current Run",
+                    "rows": [],
+                    "average": {},
+                    "session_dir": None,
+                    "source_name": "",
+                    "precision": "",
+                    "resolution": "",
+                },
+                activate=True,
+            )
+            return
+        next_idx = min(max(0, idx), len(self._result_sets) - 1)
+        self._result_sets_bar.setCurrentIndex(next_idx)
+        self._apply_result_set_tab(next_idx)
 
     def _set_status(self, text: str, percent: int | None = None):
         msg = str(text or "").strip() or "Ready"
@@ -1334,6 +1495,63 @@ class ModelBenchmarkDialog(QDialog):
 
         return rows, average, base_dir, meta
 
+    def _pick_result_folders_multi(self, start_dir: str) -> list[str]:
+        dlg = QFileDialog(self, "Select Benchmark Result Folder(s)", start_dir)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot | QDir.Filter.Drives)
+        dlg.setNameFilter("Folders")
+        for view in dlg.findChildren(QListView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for view in dlg.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if not dlg.exec():
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in dlg.selectedFiles():
+            norm = os.path.normpath(str(p))
+            if not os.path.isdir(norm):
+                continue
+            key = norm.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(norm)
+        return out
+
+    def _resolve_result_summary_path(self, path: str) -> str:
+        p = os.path.normpath(str(path or "").strip())
+        if not p:
+            raise RuntimeError("Result path is empty.")
+        if os.path.isdir(p):
+            candidates = [
+                os.path.join(p, "benchmark_summary.json"),
+                os.path.join(p, "benchmark_export_summary.json"),
+                os.path.join(p, "benchmark_summary.csv"),
+                os.path.join(p, "benchmark_export_summary.csv"),
+            ]
+            for cand in candidates:
+                if os.path.isfile(cand):
+                    return cand
+            raise RuntimeError(f"No supported result summary file found in folder: {p}")
+        if not os.path.isfile(p):
+            raise RuntimeError(f"Path does not exist: {p}")
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in {".json", ".csv"}:
+            raise RuntimeError(f"Unsupported result file type: {p}")
+        return p
+
+    def _load_result_source(self, source_path: str) -> tuple[list[dict], dict, str | None, dict[str, str]]:
+        path = self._resolve_result_summary_path(source_path)
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
+            return self._load_results_from_json(path)
+        if ext == ".csv":
+            return self._load_results_from_csv(path)
+        raise RuntimeError("Unsupported result file type. Use JSON or CSV.")
+
     def _load_existing_results_dialog(self):
         if self._worker_thread is not None:
             QMessageBox.information(self, "Benchmark", "Cancel the running benchmark first.")
@@ -1342,75 +1560,99 @@ class ModelBenchmarkDialog(QDialog):
         box = QMessageBox(self)
         box.setWindowTitle("Load Benchmark Results")
         box.setIcon(QMessageBox.Icon.Question)
-        box.setText("Load results from a summary file or a benchmark folder.")
-        btn_file = box.addButton("Choose File", QMessageBox.ButtonRole.AcceptRole)
-        btn_folder = box.addButton("Choose Folder", QMessageBox.ButtonRole.ActionRole)
+        box.setText("Load one or more result files or result folders into separate tabs.")
+        btn_file = box.addButton("Choose File(s)", QMessageBox.ButtonRole.AcceptRole)
+        btn_folder = box.addButton("Choose Folder(s)", QMessageBox.ButtonRole.ActionRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
         box.exec()
         clicked = box.clickedButton()
 
-        path = ""
+        base_start = self._session_dir or self._txt_session_root.text().strip() or self._suggested_dir
+        chosen_paths: list[str] = []
         if clicked is btn_file:
-            path, _ = QFileDialog.getOpenFileName(
+            chosen_paths, _ = QFileDialog.getOpenFileNames(
                 self,
-                "Select Benchmark Result File",
-                self._session_dir or self._txt_session_root.text().strip() or self._suggested_dir,
+                "Select Benchmark Result File(s)",
+                base_start,
                 "Result Files (*.json *.csv);;JSON (*.json);;CSV (*.csv);;All (*)",
             )
         elif clicked is btn_folder:
-            path = QFileDialog.getExistingDirectory(
-                self,
-                "Select Benchmark Result Folder",
-                self._session_dir or self._txt_session_root.text().strip() or self._suggested_dir,
-            )
+            chosen_paths = self._pick_result_folders_multi(base_start)
         else:
             return
 
-        if not path:
+        normalized_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for raw in chosen_paths:
+            norm = os.path.normpath(str(raw or "").strip())
+            if not norm:
+                continue
+            key = norm.lower()
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            normalized_paths.append(norm)
+        chosen_paths = normalized_paths
+
+        if not chosen_paths:
             return
 
-        try:
-            if os.path.isdir(path):
-                candidates = [
-                    os.path.join(path, "benchmark_summary.json"),
-                    os.path.join(path, "benchmark_export_summary.json"),
-                    os.path.join(path, "benchmark_summary.csv"),
-                    os.path.join(path, "benchmark_export_summary.csv"),
-                ]
-                selected = ""
-                for cand in candidates:
-                    if os.path.isfile(cand):
-                        selected = cand
-                        break
-                if not selected:
-                    raise RuntimeError("No supported result summary file found in the selected folder.")
-                path = selected
+        loaded_count = 0
+        loaded_rows = 0
+        first_loaded_idx: int | None = None
+        failures: list[str] = []
 
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".json":
-                rows, average, session_dir, meta = self._load_results_from_json(path)
-            elif ext == ".csv":
-                rows, average, session_dir, meta = self._load_results_from_csv(path)
-            else:
-                raise RuntimeError("Unsupported result file type. Use JSON or CSV.")
+        for src in chosen_paths:
+            try:
+                rows, average, session_dir, meta = self._load_result_source(src)
+                if not rows:
+                    raise RuntimeError("Result source has no benchmark rows.")
+                source_name = str(meta.get("source_name") or "").strip()
+                precision = str(meta.get("precision") or "").strip()
+                resolution = str(meta.get("resolution") or "").strip()
+                title = self._result_tab_title(source_name, precision, session_dir)
+                payload = self._result_tab_payload(
+                    title=title,
+                    rows=rows,
+                    average=average,
+                    session_dir=session_dir,
+                    source_name=source_name,
+                    precision=precision,
+                    resolution=resolution,
+                )
+                idx = self._add_result_set_tab(payload, activate=False)
+                if first_loaded_idx is None:
+                    first_loaded_idx = idx
+                loaded_count += 1
+                loaded_rows += len(rows)
+            except Exception as exc:
+                failures.append(f"{src}: {exc}")
 
-            if not rows:
-                raise RuntimeError("The selected result source has no benchmark rows.")
+        if loaded_count <= 0:
+            if failures:
+                QMessageBox.warning(
+                    self,
+                    "Load Benchmark Results",
+                    "No result source was loaded.\n\n" + "\n".join(failures[:6]),
+                )
+            return
 
-            self._populate_results_view(
-                rows=rows,
-                average=average,
-                session_dir=session_dir,
-                source_name=str(meta.get("source_name") or "").strip(),
-                precision=str(meta.get("precision") or "").strip(),
-                resolution=str(meta.get("resolution") or "").strip(),
+        if first_loaded_idx is not None:
+            self._result_sets_bar.setCurrentIndex(first_loaded_idx)
+        self._set_status(
+            f"Loaded {loaded_count} result set(s) ({loaded_rows} rows)",
+            percent=100,
+        )
+        self._lbl_progress.setText("Loaded existing results.")
+        self._progress.setValue(100)
+        self._tabs.setCurrentIndex(1)
+
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Load Benchmark Results",
+                "Some sources could not be loaded:\n\n" + "\n".join(failures[:6]),
             )
-            self._set_status(f"Loaded existing results ({len(rows)} rows)", percent=100)
-            self._lbl_progress.setText("Loaded existing results.")
-            self._progress.setValue(100)
-            self._tabs.setCurrentIndex(1)
-        except Exception as exc:
-            QMessageBox.warning(self, "Load Benchmark Results", str(exc))
 
     def _sync_mode_ui(self):
         mode = self._cmb_mode.currentData()
@@ -1767,6 +2009,7 @@ class ModelBenchmarkDialog(QDialog):
             self._btn_select_all_pairs,
             self._btn_clear_pairs,
             self._btn_load_existing,
+            self._result_sets_bar,
         ):
             w.setEnabled(not running)
 
@@ -1786,6 +2029,22 @@ class ModelBenchmarkDialog(QDialog):
 
         source_name = self._derive_source_name(mode, tasks)
         session_dir = self._new_session_dir(source_name)
+        run_title = self._result_tab_title(
+            source_name,
+            self._cmb_precision.currentText(),
+            session_dir,
+        )
+        run_payload = self._result_tab_payload(
+            title=run_title,
+            rows=[],
+            average={},
+            session_dir=session_dir,
+            source_name=source_name,
+            precision=self._cmb_precision.currentText(),
+            resolution=self._cmb_resolution.currentText(),
+        )
+        self._add_result_set_tab(run_payload, activate=True)
+
         self._session_dir = session_dir
         self._lbl_session_dir.setText(f"Session: {session_dir}")
         self._lbl_progress.setText("Benchmark started ...")
@@ -1887,6 +2146,22 @@ class ModelBenchmarkDialog(QDialog):
     def _on_worker_finished(self, payload: dict):
         avg = payload.get("average") or {}
         session_dir = str(payload.get("session_dir") or self._session_dir or "")
+        source_name = str(payload.get("source_name") or "").strip()
+        precision = str(payload.get("precision") or "").strip()
+        resolution = str(payload.get("resolution") or "").strip()
+        idx = int(self._result_sets_bar.currentIndex())
+        self._update_result_set_tab(
+            idx,
+            self._result_tab_payload(
+                title=self._result_tab_title(source_name, precision, session_dir),
+                rows=self._results,
+                average=avg,
+                session_dir=session_dir,
+                source_name=source_name,
+                precision=precision,
+                resolution=resolution,
+            ),
+        )
         self._progress.setValue(100)
         self._lbl_progress.setText("Benchmark completed.")
         self._set_status("Benchmark completed", percent=100)
@@ -1894,9 +2169,9 @@ class ModelBenchmarkDialog(QDialog):
             rows=self._results,
             average=avg,
             session_dir=session_dir,
-            source_name=str(payload.get("source_name") or "").strip(),
-            precision=str(payload.get("precision") or "").strip(),
-            resolution=str(payload.get("resolution") or "").strip(),
+            source_name=source_name,
+            precision=precision,
+            resolution=resolution,
         )
 
     def _on_worker_failed(self, message: str):
