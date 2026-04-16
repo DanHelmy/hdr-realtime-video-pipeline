@@ -15,7 +15,7 @@ import torch
 
 FFMPEG_WINDOWS_DOWNLOAD_URL = "https://ffmpeg.org/download.html#build-windows"
 _FFPROBE_STREAM_CACHE: OrderedDict[str, dict | None] = OrderedDict()
-_HDR_FRAME_CACHE: OrderedDict[tuple[str, int], np.ndarray | None] = OrderedDict()
+_HDR_FRAME_CACHE: OrderedDict[tuple[str, int, int], np.ndarray | None] = OrderedDict()
 _HDR_FRAME_CACHE_MAX = 8
 _STREAM_CACHE_MAX = 16
 _HDR_FAST_SEEK_ENABLED = str(
@@ -152,13 +152,23 @@ def _frame_idx_to_seek_timestamp(frame_idx: int, fps: float) -> str | None:
     return f"{ts:.9f}"
 
 
-def read_hdr_video_frame_rgb16(path: str, frame_idx: int) -> np.ndarray | None:
-    cache_key: tuple[str, int] | None = None
+def read_hdr_video_frame_rgb16(
+    path: str,
+    frame_idx: int,
+    prefer_fast_seek: bool | None = None,
+) -> np.ndarray | None:
+    use_fast_seek = (
+        _HDR_FAST_SEEK_ENABLED
+        if prefer_fast_seek is None
+        else bool(prefer_fast_seek)
+    )
+    cache_key: tuple[str, int, int] | None = None
     try:
         st = os.stat(path)
         cache_key = (
             f"{os.path.abspath(path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}",
             max(0, int(frame_idx)),
+            1 if use_fast_seek else 0,
         )
         if cache_key in _HDR_FRAME_CACHE:
             cached = _HDR_FRAME_CACHE[cache_key]
@@ -188,7 +198,7 @@ def read_hdr_video_frame_rgb16(path: str, frame_idx: int) -> np.ndarray | None:
     # Fast path: timestamp seek. For CFR media this avoids scanning from frame 0
     # while preserving 16-bit linear decode (rgb48le).
     seek_ts = _frame_idx_to_seek_timestamp(idx, fps)
-    if seek_ts is not None and _HDR_FAST_SEEK_ENABLED:
+    if seek_ts is not None and use_fast_seek:
         fast_cmd = [
             ffmpeg,
             "-v",

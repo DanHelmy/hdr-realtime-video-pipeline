@@ -56,7 +56,12 @@ from gui_hdr_io import (
     write_hdr_tiff,
     tensor_to_bgr_u16,
 )
-from gui_media_probe import _content_similarity_score, _probe_hdr_input, _probe_video_timing_info
+from gui_media_probe import (
+    _content_similarity_score,
+    _frame_structure_similarity,
+    _probe_hdr_input,
+    _probe_video_timing_info,
+)
 from gui_objective_metrics import (
     _OBJECTIVE_METRIC_MAX_SIDE,
     _delta_e_itp_bgr,
@@ -101,6 +106,14 @@ _MPV_DIAG = os.environ.get("HDRTVNET_MPV_DIAG", "1").strip().lower() in {
     "yes",
     "on",
 }
+_BENCHMARK_HDR_GT_MODE = str(
+    os.environ.get("HDRTVNET_BENCHMARK_HDR_GT_MODE", "auto")
+).strip().lower()
+if _BENCHMARK_HDR_GT_MODE not in {"auto", "fast", "exact"}:
+    _BENCHMARK_HDR_GT_MODE = "auto"
+# Low threshold to catch obvious frame drift while tolerating SDR/HDR tone differences.
+_BENCHMARK_FAST_GT_ALIGN_MIN_SCORE = 0.18
+_BENCHMARK_FAST_GT_ALIGN_SCORE_MARGIN = 0.02
 
 
 def _new_mpv_widget() -> MpvHDRWidget:
@@ -187,6 +200,7 @@ def _read_media_frame_hdr(path: str, frame_idx: int | None = None) -> np.ndarray
 def _read_media_frame_hdr_with_mode(
     path: str,
     frame_idx: int | None = None,
+    sdr_reference: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, str]:
     if not path or not os.path.isfile(path):
         return None, "missing"
@@ -199,9 +213,50 @@ def _read_media_frame_hdr_with_mode(
         return None, f"unsupported_image_dtype:{frame.dtype}"
     if _is_video_path(path):
         idx = max(0, int(frame_idx or 0))
-        rgb16 = read_hdr_video_frame_rgb16(path, idx)
+        mode = str(_BENCHMARK_HDR_GT_MODE)
+        prefer_fast = (mode != "exact")
+        rgb16 = read_hdr_video_frame_rgb16(path, idx, prefer_fast_seek=prefer_fast)
+        if rgb16 is None and prefer_fast:
+            # Safety net: if fast read fails, retry exact before declaring decode failure.
+            rgb16 = read_hdr_video_frame_rgb16(path, idx, prefer_fast_seek=False)
         if rgb16 is not None:
-            return np.ascontiguousarray(rgb16[:, :, ::-1]), "true_hdr_video"
+            gt_bgr16 = np.ascontiguousarray(rgb16[:, :, ::-1])
+            if mode == "auto" and prefer_fast and isinstance(sdr_reference, np.ndarray):
+                try:
+                    sdr_u8 = np.ascontiguousarray(
+                        sdr_reference.astype(np.uint8, copy=False)
+                    )
+                    gt_fast_u8 = np.ascontiguousarray(
+                        ((gt_bgr16.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
+                    )
+                    fast_score = _frame_structure_similarity(sdr_u8, gt_fast_u8)
+                except Exception:
+                    fast_score = None
+                if (
+                    fast_score is not None
+                    and float(fast_score) < _BENCHMARK_FAST_GT_ALIGN_MIN_SCORE
+                ):
+                    strict_rgb16 = read_hdr_video_frame_rgb16(
+                        path,
+                        idx,
+                        prefer_fast_seek=False,
+                    )
+                    if strict_rgb16 is not None:
+                        strict_bgr16 = np.ascontiguousarray(strict_rgb16[:, :, ::-1])
+                        try:
+                            strict_u8 = np.ascontiguousarray(
+                                ((strict_bgr16.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
+                            )
+                            strict_score = _frame_structure_similarity(sdr_u8, strict_u8)
+                        except Exception:
+                            strict_score = None
+                        if (
+                            strict_score is None
+                            or float(strict_score)
+                            >= (float(fast_score) + _BENCHMARK_FAST_GT_ALIGN_SCORE_MARGIN)
+                        ):
+                            gt_bgr16 = strict_bgr16
+            return gt_bgr16, "true_hdr_video"
         return None, "hdr_video_decode_failed"
     return None, "missing"
 
@@ -523,6 +578,7 @@ class _BenchmarkWorker(QObject):
                 gt_hdr_raw, gt_hdr_mode = _read_media_frame_hdr_with_mode(
                     task.gt_path,
                     frame_idx=task.frame_idx,
+                    sdr_reference=sdr_raw,
                 )
                 if sdr_raw is None:
                     note = "Missing frame/image data."
@@ -1633,7 +1689,11 @@ class ModelBenchmarkDialog(QDialog):
             frame_idx = None
 
         sdr_src = _read_media_frame(sdr_path, frame_idx=frame_idx)
-        gt_hdr_src, _gt_mode = _read_media_frame_hdr_with_mode(gt_path, frame_idx=frame_idx)
+        gt_hdr_src, _gt_mode = _read_media_frame_hdr_with_mode(
+            gt_path,
+            frame_idx=frame_idx,
+            sdr_reference=sdr_src,
+        )
         if sdr_src is None:
             return None, None, None
         out_w, out_h = _resolution_dims(self._result_resolution or "1080p")
