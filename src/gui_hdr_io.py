@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import math
+import re
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
@@ -15,12 +16,22 @@ import torch
 
 FFMPEG_WINDOWS_DOWNLOAD_URL = "https://ffmpeg.org/download.html#build-windows"
 _FFPROBE_STREAM_CACHE: OrderedDict[str, dict | None] = OrderedDict()
-_HDR_FRAME_CACHE: OrderedDict[tuple[str, int, int], np.ndarray | None] = OrderedDict()
+_HDR_FRAME_CACHE: OrderedDict[tuple[str, int, int, int], np.ndarray | None] = OrderedDict()
 _HDR_FRAME_CACHE_MAX = 8
 _STREAM_CACHE_MAX = 16
 _HDR_FAST_SEEK_ENABLED = str(
     os.environ.get("HDRTVNET_HDR_FAST_SEEK", "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
+_HDR_FAST_SEEK_PTS_GUARD_ENABLED = str(
+    os.environ.get("HDRTVNET_HDR_FAST_SEEK_PTS_GUARD", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+try:
+    _HDR_FAST_SEEK_PTS_TOL_FRAMES = max(
+        0.10,
+        float(os.environ.get("HDRTVNET_HDR_FAST_SEEK_PTS_TOL_FRAMES", "0.60")),
+    )
+except Exception:
+    _HDR_FAST_SEEK_PTS_TOL_FRAMES = 0.60
 
 
 def hdr_ffmpeg_ready() -> bool:
@@ -142,6 +153,38 @@ def _decode_rgb48_frame(cmd: list[str], width: int, height: int) -> np.ndarray |
     return np.ascontiguousarray(frame)
 
 
+def _decode_rgb48_frame_with_pts(
+    cmd: list[str],
+    width: int,
+    height: int,
+) -> tuple[np.ndarray | None, float | None]:
+    try:
+        cp = subprocess.run(cmd, capture_output=True, check=True)
+    except Exception:
+        return None, None
+    expected = int(width) * int(height) * 3 * 2
+    data = cp.stdout or b""
+    if len(data) < expected:
+        return None, None
+    try:
+        frame = np.frombuffer(data[:expected], dtype=np.uint16).reshape((height, width, 3))
+    except Exception:
+        return None, None
+
+    pts = None
+    try:
+        stderr_text = (cp.stderr or b"").decode("utf-8", errors="ignore")
+        matches = re.findall(r"pts_time:([+-]?(?:\d+\.?\d*|\.\d+))", stderr_text)
+        if matches:
+            candidate = float(matches[-1])
+            if math.isfinite(candidate):
+                pts = float(candidate)
+    except Exception:
+        pts = None
+
+    return np.ascontiguousarray(frame), pts
+
+
 def _frame_idx_to_seek_timestamp(frame_idx: int, fps: float) -> str | None:
     if fps <= 0.0 or not math.isfinite(fps):
         return None
@@ -156,19 +199,26 @@ def read_hdr_video_frame_rgb16(
     path: str,
     frame_idx: int,
     prefer_fast_seek: bool | None = None,
+    fast_seek_pts_guard: bool | None = None,
 ) -> np.ndarray | None:
     use_fast_seek = (
         _HDR_FAST_SEEK_ENABLED
         if prefer_fast_seek is None
         else bool(prefer_fast_seek)
     )
-    cache_key: tuple[str, int, int] | None = None
+    use_fast_seek_pts_guard = (
+        _HDR_FAST_SEEK_PTS_GUARD_ENABLED
+        if fast_seek_pts_guard is None
+        else bool(fast_seek_pts_guard)
+    )
+    cache_key: tuple[str, int, int, int] | None = None
     try:
         st = os.stat(path)
         cache_key = (
             f"{os.path.abspath(path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}",
             max(0, int(frame_idx)),
             1 if use_fast_seek else 0,
+            1 if use_fast_seek_pts_guard else 0,
         )
         if cache_key in _HDR_FRAME_CACHE:
             cached = _HDR_FRAME_CACHE[cache_key]
@@ -199,28 +249,62 @@ def read_hdr_video_frame_rgb16(
     # while preserving 16-bit linear decode (rgb48le).
     seek_ts = _frame_idx_to_seek_timestamp(idx, fps)
     if seek_ts is not None and use_fast_seek:
-        fast_cmd = [
-            ffmpeg,
-            "-v",
-            "error",
-            "-ss",
-            seek_ts,
-            "-i",
-            path,
-            "-map",
-            "0:v:0",
-            "-frames:v",
-            "1",
-            "-an",
-            "-sn",
-            "-dn",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb48le",
-            "-",
-        ]
-        out = _decode_rgb48_frame(fast_cmd, width, height)
+        if use_fast_seek_pts_guard and fps > 0.0:
+            fast_cmd = [
+                ffmpeg,
+                "-v",
+                "info",
+                "-ss",
+                seek_ts,
+                "-i",
+                path,
+                "-map",
+                "0:v:0",
+                "-vf",
+                "showinfo",
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-dn",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb48le",
+                "-",
+            ]
+            out, pts_time = _decode_rgb48_frame_with_pts(fast_cmd, width, height)
+            if out is not None:
+                target_pts = float(idx) / float(fps)
+                tol_s = max(
+                    1e-3,
+                    float(_HDR_FAST_SEEK_PTS_TOL_FRAMES) / float(fps),
+                )
+                if pts_time is None or abs(float(pts_time) - target_pts) > tol_s:
+                    out = None
+        else:
+            fast_cmd = [
+                ffmpeg,
+                "-v",
+                "error",
+                "-ss",
+                seek_ts,
+                "-i",
+                path,
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-dn",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb48le",
+                "-",
+            ]
+            out = _decode_rgb48_frame(fast_cmd, width, height)
 
     # Fallback path: exact frame index via select filter.
     if out is None:

@@ -111,9 +111,29 @@ _BENCHMARK_HDR_GT_MODE = str(
 ).strip().lower()
 if _BENCHMARK_HDR_GT_MODE not in {"auto", "fast", "exact"}:
     _BENCHMARK_HDR_GT_MODE = "auto"
-# Low threshold to catch obvious frame drift while tolerating SDR/HDR tone differences.
-_BENCHMARK_FAST_GT_ALIGN_MIN_SCORE = 0.18
-_BENCHMARK_FAST_GT_ALIGN_SCORE_MARGIN = 0.02
+# Auto mode policy: fast first pass, then exact recheck only for suspicious rows.
+_BENCHMARK_AUTO_POST_VERIFY_ENABLED = str(
+    os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY", "1")
+).strip().lower() in {"1", "true", "yes", "on"}
+try:
+    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = max(
+        0,
+        int(os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS", "24")),
+    )
+except Exception:
+    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = 24
+try:
+    _BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE = float(
+        os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE", "0.10")
+    )
+except Exception:
+    _BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE = 0.10
+try:
+    _BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN = float(
+        os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN", "0.04")
+    )
+except Exception:
+    _BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN = 0.04
 
 
 def _new_mpv_widget() -> MpvHDRWidget:
@@ -215,48 +235,26 @@ def _read_media_frame_hdr_with_mode(
         idx = max(0, int(frame_idx or 0))
         mode = str(_BENCHMARK_HDR_GT_MODE)
         prefer_fast = (mode != "exact")
-        rgb16 = read_hdr_video_frame_rgb16(path, idx, prefer_fast_seek=prefer_fast)
-        if rgb16 is None and prefer_fast:
-            # Safety net: if fast read fails, retry exact before declaring decode failure.
+        decode_mode = "exact"
+        if prefer_fast:
+            # First pass should stay fast. Auto mode can repair suspicious rows
+            # in a deferred exact verification pass at the end of the run.
+            rgb16 = read_hdr_video_frame_rgb16(
+                path,
+                idx,
+                prefer_fast_seek=True,
+                fast_seek_pts_guard=False,
+            )
+            decode_mode = "fast"
+            if rgb16 is None:
+                rgb16 = read_hdr_video_frame_rgb16(path, idx, prefer_fast_seek=False)
+                decode_mode = "exact_fallback"
+        else:
             rgb16 = read_hdr_video_frame_rgb16(path, idx, prefer_fast_seek=False)
+            decode_mode = "exact"
         if rgb16 is not None:
             gt_bgr16 = np.ascontiguousarray(rgb16[:, :, ::-1])
-            if mode == "auto" and prefer_fast and isinstance(sdr_reference, np.ndarray):
-                try:
-                    sdr_u8 = np.ascontiguousarray(
-                        sdr_reference.astype(np.uint8, copy=False)
-                    )
-                    gt_fast_u8 = np.ascontiguousarray(
-                        ((gt_bgr16.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
-                    )
-                    fast_score = _frame_structure_similarity(sdr_u8, gt_fast_u8)
-                except Exception:
-                    fast_score = None
-                if (
-                    fast_score is not None
-                    and float(fast_score) < _BENCHMARK_FAST_GT_ALIGN_MIN_SCORE
-                ):
-                    strict_rgb16 = read_hdr_video_frame_rgb16(
-                        path,
-                        idx,
-                        prefer_fast_seek=False,
-                    )
-                    if strict_rgb16 is not None:
-                        strict_bgr16 = np.ascontiguousarray(strict_rgb16[:, :, ::-1])
-                        try:
-                            strict_u8 = np.ascontiguousarray(
-                                ((strict_bgr16.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
-                            )
-                            strict_score = _frame_structure_similarity(sdr_u8, strict_u8)
-                        except Exception:
-                            strict_score = None
-                        if (
-                            strict_score is None
-                            or float(strict_score)
-                            >= (float(fast_score) + _BENCHMARK_FAST_GT_ALIGN_SCORE_MARGIN)
-                        ):
-                            gt_bgr16 = strict_bgr16
-            return gt_bgr16, "true_hdr_video"
+            return gt_bgr16, f"true_hdr_video_{decode_mode}"
         return None, "hdr_video_decode_failed"
     return None, "missing"
 
@@ -523,6 +521,74 @@ class _BenchmarkWorker(QObject):
         except Exception:
             pass
 
+    @staticmethod
+    def _to_u8_for_alignment(frame: np.ndarray | None) -> np.ndarray | None:
+        if not isinstance(frame, np.ndarray):
+            return None
+        arr = np.ascontiguousarray(frame)
+        if arr.dtype == np.uint8:
+            return arr
+        if arr.dtype == np.uint16:
+            return np.ascontiguousarray(
+                ((arr.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
+            )
+        if np.issubdtype(arr.dtype, np.integer):
+            info = np.iinfo(arr.dtype)
+            peak = max(1.0, float(info.max))
+            return np.ascontiguousarray(
+                (arr.astype(np.float32) * (255.0 / peak)).clip(0.0, 255.0).astype(np.uint8)
+            )
+        arr_f = arr.astype(np.float32)
+        peak = float(np.max(arr_f)) if arr_f.size else 1.0
+        if peak <= 1.0:
+            arr_f = arr_f * 255.0
+        return np.ascontiguousarray(arr_f.clip(0.0, 255.0).astype(np.uint8))
+
+    def _compute_metrics_for_pair(
+        self,
+        pred_eval: np.ndarray,
+        gt_eval: np.ndarray,
+    ) -> dict:
+        metrics = {
+            "psnr_db": None,
+            "sssim": None,
+            "delta_e_itp": None,
+            "psnr_norm_db": None,
+            "sssim_norm": None,
+            "delta_e_itp_norm": None,
+            "hdr_vdp3": None,
+            "obj_note": "",
+            "hdr_vdp3_note": "",
+        }
+        try:
+            eval_pred, eval_ref = _prepare_metric_pair(
+                pred_eval,
+                gt_eval,
+                max_side=_OBJECTIVE_METRIC_MAX_SIDE,
+            )
+            metrics["psnr_db"] = float(_psnr_bgr(eval_pred, eval_ref))
+            metrics["sssim"] = float(_ssim_bgr(eval_pred, eval_ref))
+            metrics["delta_e_itp"] = float(_delta_e_itp_bgr(eval_pred, eval_ref))
+
+            norm_pred, norm_ref = _grade_normalize_pred_to_ref(eval_pred, eval_ref)
+            metrics["psnr_norm_db"] = float(_psnr_bgr(norm_pred, norm_ref))
+            metrics["sssim_norm"] = float(_ssim_bgr(norm_pred, norm_ref))
+            metrics["delta_e_itp_norm"] = float(_delta_e_itp_bgr(norm_pred, norm_ref))
+            metrics["obj_note"] = "Computed (raw + normalized)"
+        except Exception as exc:
+            metrics["obj_note"] = f"Metric error: {exc}"
+
+        try:
+            vdp_score, vdp_note = _hdrvdp3_cli_score(pred_eval, gt_eval)
+            if vdp_score is not None:
+                metrics["hdr_vdp3"] = float(vdp_score)
+            elif vdp_note:
+                metrics["hdr_vdp3_note"] = str(vdp_note)
+        except Exception as exc:
+            metrics["hdr_vdp3_note"] = f"HDR-VDP3 error: {exc}"
+
+        return metrics
+
     def run(self):
         processor = None
         try:
@@ -562,6 +628,12 @@ class _BenchmarkWorker(QObject):
                 ),
             )
             total = max(1, len(ordered_tasks))
+            allow_post_verify = (
+                str(_BENCHMARK_HDR_GT_MODE) != "exact"
+                and _BENCHMARK_AUTO_POST_VERIFY_ENABLED
+                and _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS > 0
+            )
+            post_verify_candidates: list[tuple[int, BenchmarkTask, float]] = []
 
             for i, task in enumerate(ordered_tasks):
                 if self._is_canceled():
@@ -637,6 +709,15 @@ class _BenchmarkWorker(QObject):
 
                 sdr_eval = np.ascontiguousarray(_letterbox_bgr(sdr_raw, out_w, out_h))
                 gt_eval = np.ascontiguousarray(_letterbox_bgr(gt_hdr_raw, out_w, out_h))
+                fast_gt_align_score = None
+                if allow_post_verify and str(gt_hdr_mode).startswith("true_hdr_video_fast"):
+                    sdr_u8 = self._to_u8_for_alignment(sdr_eval)
+                    gt_u8 = self._to_u8_for_alignment(gt_eval)
+                    if sdr_u8 is not None and gt_u8 is not None:
+                        try:
+                            fast_gt_align_score = _frame_structure_similarity(sdr_u8, gt_u8)
+                        except Exception:
+                            fast_gt_align_score = None
                 try:
                     with torch.inference_mode():
                         pred_tensor, pred_cond = processor.preprocess(sdr_eval)
@@ -673,43 +754,7 @@ class _BenchmarkWorker(QObject):
                     self.sample_ready.emit(row)
                     continue
 
-                metrics = {
-                    "psnr_db": None,
-                    "sssim": None,
-                    "delta_e_itp": None,
-                    "psnr_norm_db": None,
-                    "sssim_norm": None,
-                    "delta_e_itp_norm": None,
-                    "hdr_vdp3": None,
-                    "obj_note": "",
-                    "hdr_vdp3_note": "",
-                }
-                try:
-                    eval_pred, eval_ref = _prepare_metric_pair(
-                        pred_eval,
-                        gt_eval,
-                        max_side=_OBJECTIVE_METRIC_MAX_SIDE,
-                    )
-                    metrics["psnr_db"] = float(_psnr_bgr(eval_pred, eval_ref))
-                    metrics["sssim"] = float(_ssim_bgr(eval_pred, eval_ref))
-                    metrics["delta_e_itp"] = float(_delta_e_itp_bgr(eval_pred, eval_ref))
-
-                    norm_pred, norm_ref = _grade_normalize_pred_to_ref(eval_pred, eval_ref)
-                    metrics["psnr_norm_db"] = float(_psnr_bgr(norm_pred, norm_ref))
-                    metrics["sssim_norm"] = float(_ssim_bgr(norm_pred, norm_ref))
-                    metrics["delta_e_itp_norm"] = float(_delta_e_itp_bgr(norm_pred, norm_ref))
-                    metrics["obj_note"] = "Computed (raw + normalized)"
-                except Exception as exc:
-                    metrics["obj_note"] = f"Metric error: {exc}"
-
-                try:
-                    vdp_score, vdp_note = _hdrvdp3_cli_score(pred_eval, gt_eval)
-                    if vdp_score is not None:
-                        metrics["hdr_vdp3"] = float(vdp_score)
-                    elif vdp_note:
-                        metrics["hdr_vdp3_note"] = str(vdp_note)
-                except Exception as exc:
-                    metrics["hdr_vdp3_note"] = f"HDR-VDP3 error: {exc}"
+                metrics = self._compute_metrics_for_pair(pred_eval, gt_eval)
 
                 frame_tag = (
                     f"frame_{int(task.frame_idx) + 1:06d}"
@@ -745,11 +790,119 @@ class _BenchmarkWorker(QObject):
                     "source_sdr_path": task.sdr_path,
                     "source_gt_path": task.gt_path,
                     "source_frame_idx": int(task.frame_idx) if task.frame_idx is not None else None,
+                    "gt_decode_mode": str(gt_hdr_mode or ""),
+                    "fast_gt_align_score": fast_gt_align_score,
                     "metrics": metrics,
                 }
                 rows.append(row)
                 self._write_frame_result_file(cfg, row)
                 self.sample_ready.emit(row)
+                if allow_post_verify and str(gt_hdr_mode).startswith("true_hdr_video_fast"):
+                    if (
+                        isinstance(fast_gt_align_score, (int, float))
+                        and np.isfinite(float(fast_gt_align_score))
+                    ):
+                        candidate_score = float(fast_gt_align_score)
+                    else:
+                        candidate_score = 1.0
+                    post_verify_candidates.append((len(rows) - 1, task, candidate_score))
+
+            if allow_post_verify and post_verify_candidates:
+                suspects = sorted(post_verify_candidates, key=lambda x: x[2])
+                max_verify = int(_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS)
+                if max_verify > 0 and len(suspects) > max_verify:
+                    suspects = suspects[:max_verify]
+                total_verify = max(1, len(suspects))
+                for j, (row_idx, task, fast_score) in enumerate(suspects):
+                    if self._is_canceled():
+                        self._write_session_summaries(cfg, rows)
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
+
+                    verify_pct = 90 + int((9.0 * j) / float(total_verify))
+                    self.progress.emit(
+                        min(99, max(90, verify_pct)),
+                        f"Post-verify {j + 1}/{total_verify}: {task.label}",
+                    )
+
+                    strict_rgb16 = read_hdr_video_frame_rgb16(
+                        task.gt_path,
+                        max(0, int(task.frame_idx or 0)),
+                        prefer_fast_seek=False,
+                    )
+                    if strict_rgb16 is None:
+                        continue
+
+                    row = rows[row_idx]
+                    strict_gt_eval = np.ascontiguousarray(
+                        _letterbox_bgr(
+                            np.ascontiguousarray(strict_rgb16[:, :, ::-1]),
+                            out_w,
+                            out_h,
+                        )
+                    )
+
+                    sdr_eval_saved = self._to_u8_for_alignment(
+                        read_image_any(str(row.get("sdr_image") or ""))
+                    )
+                    strict_u8 = self._to_u8_for_alignment(strict_gt_eval)
+                    if sdr_eval_saved is None or strict_u8 is None:
+                        continue
+                    try:
+                        strict_score = _frame_structure_similarity(
+                            sdr_eval_saved,
+                            strict_u8,
+                        )
+                    except Exception:
+                        strict_score = None
+                    if strict_score is None:
+                        continue
+
+                    score_gate = max(
+                        float(_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE),
+                        float(fast_score) + float(_BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN),
+                    )
+                    if float(strict_score) < score_gate:
+                        continue
+
+                    pred_eval_saved = read_image_any(str(row.get("hdr_convert_image") or ""))
+                    if pred_eval_saved is None:
+                        continue
+                    pred_eval_saved = np.ascontiguousarray(pred_eval_saved)
+                    if pred_eval_saved.dtype != np.uint16:
+                        if pred_eval_saved.dtype == np.uint8:
+                            pred_eval_saved = np.ascontiguousarray(
+                                pred_eval_saved.astype(np.uint16) * 257
+                            )
+                        else:
+                            arrf = pred_eval_saved.astype(np.float32)
+                            peak = float(np.max(arrf)) if arrf.size else 1.0
+                            if peak <= 1.0:
+                                arrf = arrf * 65535.0
+                            pred_eval_saved = np.ascontiguousarray(
+                                np.clip(arrf, 0.0, 65535.0).astype(np.uint16)
+                            )
+                    if (pred_eval_saved.shape[1], pred_eval_saved.shape[0]) != (out_w, out_h):
+                        pred_eval_saved = np.ascontiguousarray(
+                            cv2.resize(pred_eval_saved, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                        )
+
+                    strict_metrics = self._compute_metrics_for_pair(
+                        pred_eval_saved,
+                        strict_gt_eval,
+                    )
+                    if strict_metrics.get("obj_note"):
+                        strict_metrics["obj_note"] = (
+                            f"{strict_metrics['obj_note']} [exact rerun]"
+                        )
+                    row["metrics"] = strict_metrics
+                    row["gt_decode_mode"] = "true_hdr_video_exact_rerun"
+                    row["fast_gt_align_score"] = float(strict_score)
+
+                    gt_path_saved = str(row.get("hdr_gt_image") or "").strip()
+                    if gt_path_saved:
+                        write_hdr_tiff(gt_path_saved, strict_gt_eval)
+                    self._write_frame_result_file(cfg, row)
 
             summary_csv, summary_json, averages = self._write_session_summaries(cfg, rows)
 
@@ -767,6 +920,7 @@ class _BenchmarkWorker(QObject):
                     "summary_json": summary_json,
                     "average": averages,
                     "count": len(rows),
+                    "rows": rows,
                 }
             )
         except Exception as exc:
@@ -2883,6 +3037,9 @@ class ModelBenchmarkDialog(QDialog):
 
     def _on_worker_finished(self, payload: dict):
         avg = payload.get("average") or {}
+        final_rows = payload.get("rows")
+        if isinstance(final_rows, list):
+            self._results = list(final_rows)
         session_dir = str(payload.get("session_dir") or self._session_dir or "")
         source_name = str(payload.get("source_name") or "").strip()
         precision = str(payload.get("precision") or "").strip()
