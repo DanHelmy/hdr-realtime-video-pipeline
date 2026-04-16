@@ -787,6 +787,11 @@ class ModelBenchmarkDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.Dialog, True)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        self.setSizeGripEnabled(True)
         self.setWindowTitle("Model Quality Benchmark")
         self.setModal(True)
         self.resize(1320, 860)
