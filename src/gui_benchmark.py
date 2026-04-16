@@ -196,16 +196,13 @@ def _read_media_frame_hdr_with_mode(
             return None, "missing"
         if frame.dtype == np.uint16:
             return np.ascontiguousarray(frame), "true_hdr_image"
-        return np.ascontiguousarray(frame.astype(np.uint16) * 257), "ldr_image_fallback"
+        return None, f"unsupported_image_dtype:{frame.dtype}"
     if _is_video_path(path):
         idx = max(0, int(frame_idx or 0))
         rgb16 = read_hdr_video_frame_rgb16(path, idx)
         if rgb16 is not None:
             return np.ascontiguousarray(rgb16[:, :, ::-1]), "true_hdr_video"
-        frame = _read_video_frame_at(path, idx)
-        if frame is None:
-            return None, "missing"
-        return np.ascontiguousarray(frame.astype(np.uint16) * 257), "video_fallback"
+        return None, "hdr_video_decode_failed"
     return None, "missing"
 
 
@@ -523,12 +520,11 @@ class _BenchmarkWorker(QObject):
                 )
 
                 sdr_raw = _read_media_frame(task.sdr_path, frame_idx=task.frame_idx)
-                gt_raw = _read_media_frame(task.gt_path, frame_idx=task.frame_idx)
-                gt_hdr_raw, _gt_hdr_mode = _read_media_frame_hdr_with_mode(
+                gt_hdr_raw, gt_hdr_mode = _read_media_frame_hdr_with_mode(
                     task.gt_path,
                     frame_idx=task.frame_idx,
                 )
-                if sdr_raw is None or gt_raw is None:
+                if sdr_raw is None:
                     note = "Missing frame/image data."
                     row = {
                         "task_id": task.task_id,
@@ -554,21 +550,47 @@ class _BenchmarkWorker(QObject):
                     self.sample_ready.emit(row)
                     continue
 
+                if gt_hdr_raw is None:
+                    note = (
+                        "HDR GT must decode as true uint16 linear data "
+                        f"(mode={gt_hdr_mode})."
+                    )
+                    row = {
+                        "task_id": task.task_id,
+                        "label": task.label,
+                        "frame": (int(task.frame_idx) + 1) if task.frame_idx is not None else None,
+                        "sample_dir": "",
+                        "sdr_image": "",
+                        "hdr_gt_image": "",
+                        "hdr_convert_image": "",
+                        "metrics": {
+                            "psnr_db": None,
+                            "sssim": None,
+                            "delta_e_itp": None,
+                            "psnr_norm_db": None,
+                            "sssim_norm": None,
+                            "delta_e_itp_norm": None,
+                            "hdr_vdp3": None,
+                            "obj_note": note,
+                            "hdr_vdp3_note": "",
+                        },
+                    }
+                    rows.append(row)
+                    self.sample_ready.emit(row)
+                    continue
+
                 sdr_eval = np.ascontiguousarray(_letterbox_bgr(sdr_raw, out_w, out_h))
-                gt_eval = np.ascontiguousarray(_letterbox_bgr(gt_raw, out_w, out_h))
-                gt_preview = None
-                if isinstance(gt_hdr_raw, np.ndarray):
-                    gt_preview = np.ascontiguousarray(_letterbox_bgr(gt_hdr_raw, out_w, out_h))
+                gt_eval = np.ascontiguousarray(_letterbox_bgr(gt_hdr_raw, out_w, out_h))
                 try:
-                    pred_eval = np.ascontiguousarray(processor.process(sdr_eval))
                     with torch.inference_mode():
                         pred_tensor, pred_cond = processor.preprocess(sdr_eval)
                         pred_raw = processor.infer((pred_tensor, pred_cond))
-                    pred_preview = np.ascontiguousarray(tensor_to_bgr_u16(pred_raw))
-                    if (pred_preview.shape[1], pred_preview.shape[0]) != (out_w, out_h):
-                        pred_preview = np.ascontiguousarray(
-                            cv2.resize(pred_preview, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                    pred_eval = np.ascontiguousarray(tensor_to_bgr_u16(pred_raw))
+                    if (pred_eval.shape[1], pred_eval.shape[0]) != (out_w, out_h):
+                        pred_eval = np.ascontiguousarray(
+                            cv2.resize(pred_eval, (out_w, out_h), interpolation=cv2.INTER_AREA)
                         )
+                    pred_preview = np.ascontiguousarray(pred_eval)
                 except Exception as exc:
                     note = f"Inference failed: {exc}"
                     row = {
@@ -653,10 +675,7 @@ class _BenchmarkWorker(QObject):
                 gt_path = os.path.join(sample_dir, "hdr_gt.tiff")
                 pred_path = os.path.join(sample_dir, "hdr_convert.tiff")
                 cv2.imwrite(sdr_path, sdr_eval)
-                write_hdr_tiff(
-                    gt_path,
-                    gt_preview if isinstance(gt_preview, np.ndarray) else (gt_eval.astype(np.uint16) * 257),
-                )
+                write_hdr_tiff(gt_path, gt_eval)
                 write_hdr_tiff(pred_path, pred_preview)
 
                 row = {

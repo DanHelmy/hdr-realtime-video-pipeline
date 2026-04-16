@@ -180,7 +180,24 @@ class PipelineWorkerCompareMixin:
             )
 
         if cmp_hdr_algo is None and self._input_is_hdr:
-            cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
+            src_rgb16 = None
+            if self._video_path:
+                src_rgb16 = read_hdr_video_frame_rgb16(self._video_path, cmp_seek_idx)
+                if src_rgb16 is None and cmp_seek_idx > 0:
+                    src_rgb16 = read_hdr_video_frame_rgb16(
+                        self._video_path, cmp_seek_idx - 1
+                    )
+            if src_rgb16 is not None:
+                src_hdr_bgr = np.ascontiguousarray(src_rgb16[:, :, ::-1])
+                cmp_hdr_algo = np.ascontiguousarray(
+                    _letterbox_bgr(src_hdr_bgr, compare_out_w, compare_out_h)
+                )
+            else:
+                msg = (
+                    "Source HDR frame unavailable as true 16-bit linear decode; "
+                    "HDR compare fallback is disabled."
+                )
+                cmp_note = f"{cmp_note} {msg}".strip()
         elif (
             cmp_hdr_algo is None
             and compare_is_current_frame
@@ -228,37 +245,42 @@ class PipelineWorkerCompareMixin:
                         _letterbox_bgr(cmp_hdr_algo, compare_out_w, compare_out_h)
                     )
             except Exception as exc:
-                cmp_hdr_algo = np.ascontiguousarray(cmp_sdr.copy())
-                msg = f"HDR Convert snapshot failed ({exc}); using SDR fallback."
+                cmp_hdr_algo = None
+                msg = (
+                    f"HDR Convert snapshot failed ({exc}); strict HDR mode "
+                    "requires uint16 linear output."
+                )
                 cmp_note = f"{cmp_note} {msg}".strip()
 
         cmp_hdr_gt = None
-        gt_hdr_mode_note = "HDR fallback (8-bit/OpenCV)"
+        gt_hdr_mode_note = "missing 16-bit HDR GT"
         if compare_gt_path:
             gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, cmp_seek_idx)
             if gt_rgb16 is None and cmp_seek_idx > 0:
                 gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, cmp_seek_idx - 1)
-            gt_probe = None
             if gt_rgb16 is not None:
                 gt_probe = np.ascontiguousarray(gt_rgb16[:, :, ::-1])
                 gt_hdr_mode_note = "true 16-bit HDR decode"
-            else:
-                gt_probe = _read_video_frame_at(compare_gt_path, cmp_seek_idx)
-                if gt_probe is None and cmp_seek_idx > 0:
-                    gt_probe = _read_video_frame_at(compare_gt_path, cmp_seek_idx - 1)
-            if gt_probe is not None:
                 cmp_hdr_gt = np.ascontiguousarray(
                     _letterbox_bgr(gt_probe, compare_out_w, compare_out_h)
                 )
             else:
-                msg = "HDR GT frame unavailable at this position."
+                msg = (
+                    "HDR GT frame unavailable as true 16-bit linear decode at "
+                    "this position; fallback is disabled."
+                )
                 cmp_note = f"{cmp_note} {msg}".strip()
         elif gt_frame is not None:
             if isinstance(gt_frame, np.ndarray) and gt_frame.dtype == np.uint16:
                 gt_hdr_mode_note = "true 16-bit HDR decode"
-            cmp_hdr_gt = np.ascontiguousarray(
-                _letterbox_bgr(gt_frame, compare_out_w, compare_out_h)
-            )
+                cmp_hdr_gt = np.ascontiguousarray(
+                    _letterbox_bgr(gt_frame, compare_out_w, compare_out_h)
+                )
+            else:
+                msg = (
+                    "Runtime HDR GT frame is not uint16 linear; fallback is disabled."
+                )
+                cmp_note = f"{cmp_note} {msg}".strip()
         else:
             msg = "Select HDR GT video to include ground truth in compare view."
             cmp_note = f"{cmp_note} {msg}".strip()
@@ -287,9 +309,14 @@ class PipelineWorkerCompareMixin:
         algo_hdr_mode_note = (
             "true 16-bit HDR convert"
             if isinstance(cmp_hdr_algo, np.ndarray) and cmp_hdr_algo.dtype == np.uint16
-            else "HDR convert fallback"
+            else "missing 16-bit HDR convert"
         )
-        if isinstance(cmp_hdr_algo, np.ndarray) and isinstance(cmp_hdr_gt, np.ndarray):
+        if (
+            isinstance(cmp_hdr_algo, np.ndarray)
+            and isinstance(cmp_hdr_gt, np.ndarray)
+            and cmp_hdr_algo.dtype == np.uint16
+            and cmp_hdr_gt.dtype == np.uint16
+        ):
             try:
                 eval_pred, eval_ref = _prepare_metric_pair(
                     cmp_hdr_algo, cmp_hdr_gt, max_side=_OBJECTIVE_METRIC_MAX_SIDE
@@ -313,10 +340,14 @@ class PipelineWorkerCompareMixin:
                 cmp_metrics["hdr_vdp3_note"] = str(vdp_note)
                 msg = f"HDR-VDP3 unavailable: {vdp_note}"
                 cmp_note = f"{cmp_note} {msg}".strip()
+        elif not (
+            isinstance(cmp_hdr_algo, np.ndarray) and cmp_hdr_algo.dtype == np.uint16
+        ):
+            cmp_metrics["obj_note"] = "Need uint16 HDR Convert"
         elif cmp_hdr_gt is None:
             cmp_metrics["obj_note"] = "Need HDR GT"
         else:
-            cmp_metrics["obj_note"] = "Unavailable"
+            cmp_metrics["obj_note"] = "Need uint16 HDR GT"
 
         cmp_note = (
             f"{cmp_note} HDR path: {algo_hdr_mode_note}; HDR GT: {gt_hdr_mode_note}."

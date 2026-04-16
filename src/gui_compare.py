@@ -379,8 +379,8 @@ class CompareViewMixin:
         box.setTextFormat(Qt.TextFormat.RichText)
         box.setText(
             "FFmpeg and ffprobe were not detected.<br><br>"
-            "Compare will still open, but HDR GT may fall back to 8-bit OpenCV decode "
-            "and the compare note will say HDR fallback.<br><br>"
+            "Compare strict HDR mode requires true 16-bit linear decode. "
+            "Without FFmpeg/ffprobe, HDR GT and HDR metrics may be unavailable.<br><br>"
             f'Download FFmpeg for Windows:<br><a href="{FFMPEG_WINDOWS_DOWNLOAD_URL}">{FFMPEG_WINDOWS_DOWNLOAD_URL}</a>'
         )
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
