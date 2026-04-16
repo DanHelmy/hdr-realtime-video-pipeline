@@ -85,6 +85,7 @@ from models.hdrtvnet_torch import HDRTVNetTorch
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
+_FRAME_RESULT_FILE = "benchmark_frame_result.json"
 
 try:
     import mpv as mpv_lib
@@ -338,6 +339,138 @@ class _BenchmarkWorker(QObject):
                 return candidate
             n += 1
 
+    def _compute_average_from_rows(self, rows: list[dict]) -> dict[str, float | None]:
+        keys = [
+            "psnr_db",
+            "sssim",
+            "delta_e_itp",
+            "psnr_norm_db",
+            "sssim_norm",
+            "delta_e_itp_norm",
+            "hdr_vdp3",
+        ]
+        averages: dict[str, float | None] = {}
+        for key in keys:
+            vals = []
+            for r in rows:
+                m = r.get("metrics") or {}
+                v = m.get(key)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    vals.append(fv)
+            averages[key] = float(np.mean(vals)) if vals else None
+        return averages
+
+    def _write_session_summaries(self, cfg: BenchmarkRunConfig, rows: list[dict]) -> tuple[str, str, dict[str, float | None]]:
+        summary_csv = os.path.join(cfg.session_dir, "benchmark_summary.csv")
+        summary_json = os.path.join(cfg.session_dir, "benchmark_summary.json")
+        averages = self._compute_average_from_rows(rows)
+
+        try:
+            with open(summary_csv, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "item",
+                        "frame",
+                        "psnr_db",
+                        "sssim",
+                        "delta_e_itp",
+                        "psnr_norm_db",
+                        "sssim_norm",
+                        "delta_e_itp_norm",
+                        "hdr_vdp3",
+                        "obj_note",
+                        "hdr_vdp3_note",
+                        "sample_dir",
+                    ]
+                )
+                for r in rows:
+                    m = r.get("metrics") or {}
+                    writer.writerow(
+                        [
+                            r.get("label"),
+                            r.get("frame"),
+                            m.get("psnr_db"),
+                            m.get("sssim"),
+                            m.get("delta_e_itp"),
+                            m.get("psnr_norm_db"),
+                            m.get("sssim_norm"),
+                            m.get("delta_e_itp_norm"),
+                            m.get("hdr_vdp3"),
+                            m.get("obj_note"),
+                            m.get("hdr_vdp3_note"),
+                            r.get("sample_dir"),
+                        ]
+                    )
+                writer.writerow([])
+                writer.writerow(["AVERAGE"])
+                writer.writerow(
+                    [
+                        "",
+                        "",
+                        averages.get("psnr_db"),
+                        averages.get("sssim"),
+                        averages.get("delta_e_itp"),
+                        averages.get("psnr_norm_db"),
+                        averages.get("sssim_norm"),
+                        averages.get("delta_e_itp_norm"),
+                        averages.get("hdr_vdp3"),
+                        "",
+                        "",
+                        cfg.session_dir,
+                    ]
+                )
+        except Exception:
+            pass
+
+        try:
+            with open(summary_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "mode": cfg.mode,
+                        "source_name": cfg.source_name,
+                        "precision": cfg.precision_key,
+                        "use_hg": bool(cfg.use_hg),
+                        "resolution": cfg.resolution_key,
+                        "predequantize_mode": cfg.predequantize_mode,
+                        "session_dir": cfg.session_dir,
+                        "average": averages,
+                        "results": rows,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception:
+            pass
+
+        return summary_csv, summary_json, averages
+
+    def _write_frame_result_file(self, cfg: BenchmarkRunConfig, row: dict) -> None:
+        sample_dir = str(row.get("sample_dir") or "").strip()
+        if not sample_dir:
+            return
+        try:
+            os.makedirs(sample_dir, exist_ok=True)
+            payload = {
+                "source_name": cfg.source_name,
+                "precision": cfg.precision_key,
+                "resolution": cfg.resolution_key,
+                "use_hg": bool(cfg.use_hg),
+                "predequantize_mode": cfg.predequantize_mode,
+                "session_dir": cfg.session_dir,
+                "row": dict(row),
+            }
+            with open(os.path.join(sample_dir, _FRAME_RESULT_FILE), "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
+
     def run(self):
         processor = None
         try:
@@ -380,6 +513,7 @@ class _BenchmarkWorker(QObject):
 
             for i, task in enumerate(ordered_tasks):
                 if self._is_canceled():
+                    self._write_session_summaries(cfg, rows)
                     self.canceled.emit("Benchmark canceled.")
                     return
 
@@ -539,113 +673,10 @@ class _BenchmarkWorker(QObject):
                     "metrics": metrics,
                 }
                 rows.append(row)
+                self._write_frame_result_file(cfg, row)
                 self.sample_ready.emit(row)
 
-            averages: dict[str, float | None] = {}
-            keys = [
-                "psnr_db",
-                "sssim",
-                "delta_e_itp",
-                "psnr_norm_db",
-                "sssim_norm",
-                "delta_e_itp_norm",
-                "hdr_vdp3",
-            ]
-            for key in keys:
-                vals = []
-                for r in rows:
-                    m = r.get("metrics") or {}
-                    v = m.get(key)
-                    if v is None:
-                        continue
-                    try:
-                        fv = float(v)
-                    except Exception:
-                        continue
-                    if np.isfinite(fv):
-                        vals.append(fv)
-                averages[key] = float(np.mean(vals)) if vals else None
-
-            summary_csv = os.path.join(cfg.session_dir, "benchmark_summary.csv")
-            summary_json = os.path.join(cfg.session_dir, "benchmark_summary.json")
-
-            try:
-                with open(summary_csv, "w", encoding="utf-8", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(
-                        [
-                            "item",
-                            "frame",
-                            "psnr_db",
-                            "sssim",
-                            "delta_e_itp",
-                            "psnr_norm_db",
-                            "sssim_norm",
-                            "delta_e_itp_norm",
-                            "hdr_vdp3",
-                            "obj_note",
-                            "hdr_vdp3_note",
-                            "sample_dir",
-                        ]
-                    )
-                    for r in rows:
-                        m = r.get("metrics") or {}
-                        writer.writerow(
-                            [
-                                r.get("label"),
-                                r.get("frame"),
-                                m.get("psnr_db"),
-                                m.get("sssim"),
-                                m.get("delta_e_itp"),
-                                m.get("psnr_norm_db"),
-                                m.get("sssim_norm"),
-                                m.get("delta_e_itp_norm"),
-                                m.get("hdr_vdp3"),
-                                m.get("obj_note"),
-                                m.get("hdr_vdp3_note"),
-                                r.get("sample_dir"),
-                            ]
-                        )
-                    writer.writerow([])
-                    writer.writerow(["AVERAGE"])
-                    writer.writerow(
-                        [
-                            "",
-                            "",
-                            averages.get("psnr_db"),
-                            averages.get("sssim"),
-                            averages.get("delta_e_itp"),
-                            averages.get("psnr_norm_db"),
-                            averages.get("sssim_norm"),
-                            averages.get("delta_e_itp_norm"),
-                            averages.get("hdr_vdp3"),
-                            "",
-                            "",
-                            cfg.session_dir,
-                        ]
-                    )
-            except Exception:
-                pass
-
-            try:
-                with open(summary_json, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "mode": cfg.mode,
-                            "source_name": cfg.source_name,
-                            "precision": cfg.precision_key,
-                            "use_hg": bool(cfg.use_hg),
-                            "resolution": cfg.resolution_key,
-                            "predequantize_mode": cfg.predequantize_mode,
-                            "session_dir": cfg.session_dir,
-                            "average": averages,
-                            "results": rows,
-                        },
-                        f,
-                        indent=2,
-                    )
-            except Exception:
-                pass
+            summary_csv, summary_json, averages = self._write_session_summaries(cfg, rows)
 
             self.progress.emit(100, "Benchmark completed.")
             self.finished.emit(
@@ -1147,6 +1178,22 @@ class ModelBenchmarkDialog(QDialog):
             self._txt_video_gt.setText(initial_hdr_gt_path)
 
         self._sync_mode_ui()
+        self._sync_subset_enabled()
+        self._add_result_set_tab(
+            {
+                "title": "Current Run",
+                "rows": [],
+                "average": {},
+                "session_dir": None,
+                "source_name": "",
+                "precision": "",
+                "resolution": "",
+                "use_hg": None,
+                "predequantize_mode": None,
+                "selected_row": None,
+            },
+            activate=True,
+        )
 
     def _load_frame_detect_cache(self) -> dict[str, list[int]]:
         path = str(getattr(self, "_frame_detect_cache_path", "") or "").strip()
@@ -1191,20 +1238,6 @@ class ModelBenchmarkDialog(QDialog):
         except Exception:
             sig = os.path.abspath(video_path) if video_path else str(video_path or "")
         return f"{sig}|count={int(max(1, desired_count))}"
-        self._sync_subset_enabled()
-        self._add_result_set_tab(
-            {
-                "title": "Current Run",
-                "rows": [],
-                "average": {},
-                "session_dir": None,
-                "source_name": "",
-                "precision": "",
-                "resolution": "",
-                "selected_row": None,
-            },
-            activate=True,
-        )
 
     def last_session_dir(self) -> str | None:
         return self._session_dir
@@ -1300,8 +1333,17 @@ class ModelBenchmarkDialog(QDialog):
         idx = self._result_sets_bar.addTab(title)
         self._result_sets.append(data)
         if bool(activate):
-            self._result_sets_bar.setCurrentIndex(idx)
+            self._select_and_apply_result_set_tab(idx)
         return idx
+
+    def _select_and_apply_result_set_tab(self, idx: int):
+        i = int(idx)
+        if i < 0 or i >= len(self._result_sets):
+            self._apply_result_set_tab(i)
+            return
+        if int(self._result_sets_bar.currentIndex()) != i:
+            self._result_sets_bar.setCurrentIndex(i)
+        self._apply_result_set_tab(i)
 
     def _update_result_set_tab(self, idx: int, payload: dict):
         if idx < 0 or idx >= len(self._result_sets):
@@ -1315,6 +1357,8 @@ class ModelBenchmarkDialog(QDialog):
         data["title"] = title
         self._result_sets[idx] = data
         self._result_sets_bar.setTabText(idx, title)
+        if int(self._result_sets_bar.currentIndex()) == int(idx):
+            self._apply_result_set_tab(idx)
 
     def _apply_result_set_tab(self, idx: int):
         if idx < 0 or idx >= len(self._result_sets):
@@ -1376,8 +1420,7 @@ class ModelBenchmarkDialog(QDialog):
             )
             return
         next_idx = min(max(0, idx), len(self._result_sets) - 1)
-        self._result_sets_bar.setCurrentIndex(next_idx)
-        self._apply_result_set_tab(next_idx)
+        self._select_and_apply_result_set_tab(next_idx)
 
     def _set_status(self, text: str, percent: int | None = None):
         msg = str(text or "").strip() or "Ready"
@@ -1633,7 +1676,6 @@ class ModelBenchmarkDialog(QDialog):
         self._tbl.clearSelection()
         self._tbl.setRowCount(0)
         self._tbl.blockSignals(False)
-        self._set_result_previews(None)
 
         for row in self._results:
             self._add_table_row(row)
@@ -1674,15 +1716,19 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_export_selected.setEnabled(bool(self._results))
         self._btn_export_all.setEnabled(bool(self._results))
 
-        if self._tbl.rowCount() > 0:
+        if self._results and self._tbl.rowCount() > 0:
             row_to_select = 0
             if selected_row is not None:
                 try:
                     row_to_select = max(0, min(int(selected_row), len(self._results) - 1))
                 except Exception:
                     row_to_select = 0
+            self._tbl.blockSignals(True)
             self._tbl.selectRow(row_to_select)
+            self._tbl.blockSignals(False)
             self._on_result_selection_changed()
+        else:
+            self._set_result_previews(None)
 
     def _compute_average_from_rows(self, rows: list[dict]) -> dict[str, float | None]:
         keys = [
@@ -1870,6 +1916,131 @@ class ModelBenchmarkDialog(QDialog):
 
         return rows, average, base_dir, meta
 
+    def _load_results_from_frame_folders(
+        self,
+        folder_path: str,
+    ) -> tuple[list[dict], dict, str | None, dict[str, object]]:
+        base_dir = os.path.normpath(str(folder_path or "").strip())
+        if not base_dir or not os.path.isdir(base_dir):
+            raise RuntimeError("Result folder does not exist.")
+
+        frame_json_paths: list[str] = []
+        target_name = str(_FRAME_RESULT_FILE).lower()
+        for root, _dirs, files in os.walk(base_dir):
+            for name in files:
+                if str(name).lower() == target_name:
+                    frame_json_paths.append(os.path.join(root, name))
+        frame_json_paths.sort()
+        if not frame_json_paths:
+            raise RuntimeError("No per-frame result metadata was found.")
+
+        rows: list[dict] = []
+        meta: dict[str, object] = {
+            "source_name": "",
+            "precision": "",
+            "resolution": "",
+            "use_hg": None,
+            "predequantize_mode": "",
+        }
+
+        for fp in frame_json_paths:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            raw_row = payload.get("row") if isinstance(payload.get("row"), dict) else payload
+            if not isinstance(raw_row, dict):
+                continue
+
+            row = dict(raw_row)
+            m = row.get("metrics")
+            row["metrics"] = dict(m) if isinstance(m, dict) else {}
+
+            sample_dir = str(row.get("sample_dir") or "").strip()
+            if not sample_dir or sample_dir in {".", "./", ".\\"}:
+                sample_dir = os.path.dirname(fp)
+            elif not os.path.isabs(sample_dir):
+                sample_dir = os.path.normpath(os.path.join(os.path.dirname(fp), sample_dir))
+            row["sample_dir"] = sample_dir
+
+            for src_key in ("source_sdr_path", "source_gt_path"):
+                src_p = str(row.get(src_key) or "").strip()
+                if src_p and not os.path.isabs(src_p):
+                    src_p = os.path.normpath(os.path.join(base_dir, src_p))
+                row[src_key] = src_p
+
+            for key, fname in (
+                ("sdr_image", "sdr.png"),
+                ("hdr_gt_image", "hdr_gt.tiff"),
+                ("hdr_convert_image", "hdr_convert.tiff"),
+            ):
+                p = str(row.get(key) or "").strip()
+                if p and not os.path.isabs(p):
+                    p = os.path.normpath(os.path.join(sample_dir, p))
+                if (not p) and sample_dir:
+                    p = os.path.join(sample_dir, fname)
+                    if not os.path.isfile(p):
+                        legacy_candidates = [
+                            os.path.splitext(p)[0] + ".tiff",
+                            os.path.splitext(p)[0] + ".png",
+                            os.path.splitext(p)[0] + ".exr",
+                        ]
+                        for legacy in legacy_candidates:
+                            if os.path.isfile(legacy):
+                                p = legacy
+                                break
+                row[key] = p
+
+            if not str(row.get("label") or "").strip():
+                row["label"] = os.path.basename(sample_dir.rstrip("\\/")) or "sample"
+
+            frame_raw = str(row.get("frame") or "").strip()
+            if frame_raw:
+                try:
+                    row["frame"] = int(float(frame_raw))
+                except Exception:
+                    row["frame"] = None
+            else:
+                row["frame"] = None
+
+            rows.append(row)
+
+            if not str(meta.get("source_name") or "").strip():
+                meta["source_name"] = str(payload.get("source_name") or "").strip()
+            if not str(meta.get("precision") or "").strip():
+                meta["precision"] = str(payload.get("precision") or "").strip()
+            if not str(meta.get("resolution") or "").strip():
+                meta["resolution"] = str(payload.get("resolution") or "").strip()
+            if meta.get("use_hg") is None and payload.get("use_hg") is not None:
+                meta["use_hg"] = bool(payload.get("use_hg"))
+            if not str(meta.get("predequantize_mode") or "").strip():
+                meta["predequantize_mode"] = str(payload.get("predequantize_mode") or "").strip()
+
+        if not rows:
+            raise RuntimeError("No valid per-frame result metadata could be loaded.")
+
+        rows.sort(
+            key=lambda r: (
+                str(r.get("source_gt_path") or "").lower(),
+                str(r.get("source_sdr_path") or "").lower(),
+                int(r.get("frame")) if r.get("frame") is not None else 10**12,
+                str(r.get("label") or "").lower(),
+            )
+        )
+
+        average = self._compute_average_from_rows(rows)
+        if not str(meta.get("source_name") or "").strip():
+            meta["source_name"] = self._infer_source_name_from_session_dir(base_dir)
+        if not str(meta.get("precision") or "").strip():
+            meta["precision"] = self._infer_precision_from_session_dir(base_dir)
+
+        return rows, average, base_dir, meta
+
     def _pick_result_folders_multi(self, start_dir: str) -> list[str]:
         dlg = QFileDialog(self, "Select Benchmark Result Folder(s)", start_dir)
         dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
@@ -1918,8 +2089,27 @@ class ModelBenchmarkDialog(QDialog):
             raise RuntimeError(f"Unsupported result file type: {p}")
         return p
 
-    def _load_result_source(self, source_path: str) -> tuple[list[dict], dict, str | None, dict[str, str]]:
-        path = self._resolve_result_summary_path(source_path)
+    def _load_result_source(self, source_path: str) -> tuple[list[dict], dict, str | None, dict[str, object]]:
+        raw = os.path.normpath(str(source_path or "").strip())
+        if not raw:
+            raise RuntimeError("Result path is empty.")
+
+        if os.path.isdir(raw):
+            try:
+                path = self._resolve_result_summary_path(raw)
+                ext = os.path.splitext(path)[1].lower()
+                if ext == ".json":
+                    return self._load_results_from_json(path)
+                if ext == ".csv":
+                    return self._load_results_from_csv(path)
+                raise RuntimeError("Unsupported result file type. Use JSON or CSV.")
+            except Exception as summary_exc:
+                try:
+                    return self._load_results_from_frame_folders(raw)
+                except Exception:
+                    raise summary_exc
+
+        path = self._resolve_result_summary_path(raw)
         ext = os.path.splitext(path)[1].lower()
         if ext == ".json":
             return self._load_results_from_json(path)
@@ -2016,7 +2206,7 @@ class ModelBenchmarkDialog(QDialog):
             return
 
         if first_loaded_idx is not None:
-            self._result_sets_bar.setCurrentIndex(first_loaded_idx)
+            self._select_and_apply_result_set_tab(first_loaded_idx)
         self._set_status(
             f"Loaded {loaded_count} result set(s) ({loaded_rows} rows)",
             percent=100,
@@ -2602,7 +2792,9 @@ class ModelBenchmarkDialog(QDialog):
         self._add_table_row(row)
         self._tbl.scrollToBottom()
         if self._tbl.rowCount() == 1:
+            self._tbl.blockSignals(True)
             self._tbl.selectRow(0)
+            self._tbl.blockSignals(False)
             self._on_result_selection_changed()
 
     def _on_worker_finished(self, payload: dict):
@@ -2651,6 +2843,39 @@ class ModelBenchmarkDialog(QDialog):
         QMessageBox.warning(self, "Benchmark Failed", str(message or "Unknown error."))
 
     def _on_worker_canceled(self, message: str):
+        avg = self._compute_average_from_rows(self._results)
+        selected_row = self._selected_result_row()
+        idx = int(self._result_sets_bar.currentIndex())
+        self._update_result_set_tab(
+            idx,
+            self._result_tab_payload(
+                title=self._result_tab_title(
+                    self._result_source_name,
+                    self._result_precision,
+                    self._session_dir,
+                ),
+                rows=self._results,
+                average=avg,
+                session_dir=self._session_dir,
+                source_name=self._result_source_name,
+                precision=self._result_precision,
+                resolution=self._result_resolution,
+                use_hg=self._result_use_hg,
+                predequantize_mode=self._result_predequantize_mode,
+                selected_row=selected_row,
+            ),
+        )
+        self._populate_results_view(
+            rows=self._results,
+            average=avg,
+            session_dir=self._session_dir,
+            source_name=self._result_source_name,
+            precision=self._result_precision,
+            resolution=self._result_resolution,
+            use_hg=self._result_use_hg,
+            predequantize_mode=self._result_predequantize_mode,
+            selected_row=selected_row,
+        )
         self._lbl_progress.setText("Benchmark canceled.")
         self._set_status("Benchmark canceled")
         if message:
