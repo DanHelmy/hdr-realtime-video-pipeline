@@ -1,6 +1,6 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v5.0-blue)
+![Version](https://img.shields.io/badge/version-v5.1-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,12 +12,16 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, compile caching, export, and live browser-window viewing.
 
-`v5.0` is the current **Grand Benchmark Update** release, adding a full in-app quality benchmarking workflow while preserving the previous playback/export/live-capture improvements.
+`v5.1` is the current release, building on the **Grand Benchmark Update** with a cleanup pass for objective metric correctness across compare and benchmark workflows.
 
 Core updates include:
 
 - new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking
 - deterministic frame/pair selection options with eager-mode quality runs for repeatable objective comparisons
+- objective metric domains are now explicit and shared across compare and benchmark:
+  - `PSNR` / `SSIM` run on linear HDR frames
+  - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
+- built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
@@ -73,7 +77,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 ---
 
-## UI Tour (v5.0)
+## UI Tour (v5.1)
 
 ### 1. Main Workspace
 
@@ -92,7 +96,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 ### 3. Compare / Objective Metrics Dialog
 
 - Side-by-side objective frame comparison workflow
-- PSNR / SSIM / DeltaEITP (+ optional HDR-VDP3)
+- PSNR / SSIM on linear HDR frames, plus DeltaEITP / HDR-VDP3 on the color-managed HDR path
 
 ![Compare Dialog](docs/images/v4-compare-dialog.png)
 
@@ -154,7 +158,7 @@ Important:
 
 ---
 
-## GUI (v5.0)
+## GUI (v5.1)
 
 ```bash
 python src/gui.py
@@ -162,7 +166,13 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles kernel compilation, model loading, HDR display, export, dedicated objective benchmarking, and live browser-window viewing.
 
-### Grand Update v5.0 Highlights
+### v5.1 Highlights
+
+- **Objective metric domains are now consistent across compare and benchmark**
+  - `PSNR` and `SSIM` are computed from true linear HDR image pairs
+  - `DeltaEITP` and `HDR-VDP3` are computed from BT.2020/PQ display-managed image pairs
+  - compare and benchmark now call the same shared metric path, so they no longer drift
+  - the built-in `HDR-VDP3` bridge now decodes PQ back to absolute photometric values before invoking `hdrvdp3`
 
 - **Model Quality Benchmark tool is now built in (Tools menu)**
   - supports two workflows: `Video (SDR + HDR GT)` and `Dataset Folders (SDR + HDR GT)`
@@ -243,7 +253,7 @@ The GUI is the primary way to use the pipeline. It handles kernel compilation, m
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
-| **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR, SSIM, DeltaEITP, normalized variants, and optional HDR-VDP3 |
+| **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
@@ -277,9 +287,13 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 ### Objective Metrics (PSNR / SSIM / DeltaEITP / HDR-VDP3)
 
 - Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
-- In `v5.0`, objective scoring remains compare-driven for playback, and the `Model Quality Benchmark` tool provides dedicated batch evaluation workflows.
+- In `v5.1`, compare and the `Model Quality Benchmark` tool use the same shared full-reference metric pipeline.
+- `PSNR` and `SSIM` are computed from the linear HDR image pair.
+- `DeltaEITP` and `HDR-VDP3` are computed from a BT.2020/PQ display-managed path derived from that linear HDR pair.
+- `DeltaEITP-N` is grade-normalized in absolute linear RGB before BT.2020/PQ conversion; it is not normalized on PQ code values and it is not re-normalized after PQ encoding.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
+  - The built-in bridge accepts BT.2100 PQ input frames and converts them to absolute display luminance / photometric values before calling `hdrvdp3`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
   - If an HDR-VDP3 toolbox is already present from an older run, it is reused and copied into the repo-local folder when possible.
   - New toolbox downloads only happen when GNU Octave is available.
@@ -289,7 +303,8 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
     - `%LOCALAPPDATA%\HDRTVNetCache\hdrvdp\`
   - Requires **GNU Octave** installed and available in `PATH`.
 - You can still override with your own command using env var `HDRTVNET_HDRVDP3_CMD`.
-  - Template placeholders: `{test}` / `{pred}` and `{reference}` / `{ref}`.
+  - Template placeholders: `{test}` / `{pred}`, `{reference}` / `{ref}`, and `{encoding}`.
+- Objective HDR peak for the managed metric path can be adjusted with `HDRTVNET_OBJECTIVE_HDR_PEAK_NITS` (default: `1000`).
 
 ### Playback Session Logs
 

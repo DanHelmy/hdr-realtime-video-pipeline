@@ -20,6 +20,20 @@ _OBJECTIVE_HDRVDP3_SAMPLE_EVERY = 24
 _OBJECTIVE_METRIC_MAX_SIDE = 512
 _OBJECTIVE_HDRVDP3_MAX_SIDE = 256
 _HDRVDP3_CMD_ENV = "HDRTVNET_HDRVDP3_CMD"
+try:
+    _OBJECTIVE_HDR_METRIC_PEAK_NITS = float(
+        os.environ.get("HDRTVNET_OBJECTIVE_HDR_PEAK_NITS", "1000.0")
+    )
+    if not np.isfinite(_OBJECTIVE_HDR_METRIC_PEAK_NITS) or _OBJECTIVE_HDR_METRIC_PEAK_NITS <= 0.0:
+        raise ValueError
+except Exception:
+    _OBJECTIVE_HDR_METRIC_PEAK_NITS = 1000.0
+
+_PQ_M1 = 2610.0 / 16384.0
+_PQ_M2 = 2523.0 / 32.0
+_PQ_C1 = 3424.0 / 4096.0
+_PQ_C2 = 2413.0 / 128.0
+_PQ_C3 = 2392.0 / 128.0
 
 
 def _frame_peak_value(frame: np.ndarray) -> float:
@@ -44,7 +58,10 @@ def _default_hdrvdp3_cmd_template() -> str:
     if not os.path.isfile(bridge):
         return ""
     py = str(sys.executable or "python")
-    return f'"{py}" "{bridge}" --test "{{test}}" --reference "{{reference}}"'
+    return (
+        f'"{py}" "{bridge}" --test "{{test}}" --reference "{{reference}}" '
+        '--input-encoding "{encoding}"'
+    )
 
 
 class _RunningAverage:
@@ -112,7 +129,7 @@ def _prepare_metric_pair(
 def _grade_normalize_pred_to_ref(
     pred_bgr: np.ndarray, ref_bgr: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Match prediction global channel statistics to reference grade."""
+    """Match prediction global channel statistics to reference grade in linear signal space."""
     pred = pred_bgr.astype(np.float32)
     ref = ref_bgr.astype(np.float32)
     out = pred.copy()
@@ -133,6 +150,32 @@ def _grade_normalize_pred_to_ref(
     dtype = np.uint16 if peak > 255.0 else np.uint8
     out = np.clip(out, 0.0, peak).astype(dtype)
     ref = np.clip(ref, 0.0, peak).astype(dtype)
+    return out, ref
+
+
+def _grade_normalize_absolute_rgb_to_ref(
+    pred_rgb_abs: np.ndarray,
+    ref_rgb_abs: np.ndarray,
+    *,
+    peak_nits: float = _OBJECTIVE_HDR_METRIC_PEAK_NITS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match prediction to reference grade in absolute linear RGB (cd/m^2)."""
+    pred = pred_rgb_abs.astype(np.float32, copy=False)
+    ref = ref_rgb_abs.astype(np.float32, copy=False)
+    out = pred.copy()
+    peak = max(1.0, float(peak_nits))
+    for c in range(3):
+        p = pred[:, :, c]
+        r = ref[:, :, c]
+        mp = float(np.mean(p))
+        mr = float(np.mean(r))
+        sp = float(np.std(p))
+        sr = float(np.std(r))
+        gain = 1.0 if sp < 1e-6 else (sr / sp)
+        bias = mr - (gain * mp)
+        out[:, :, c] = (p * gain) + bias
+    out = np.clip(out, 0.0, peak).astype(np.float32, copy=False)
+    ref = np.clip(ref, 0.0, peak).astype(np.float32, copy=False)
     return out, ref
 
 
@@ -173,30 +216,75 @@ def _ssim_bgr(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> float:
     return float(np.mean(vals))
 
 
-def _rgb_to_ictcp(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Approximate RGB -> ICtCp transform (BT.2100 matrix form)."""
+def _linear_bgr_to_absolute_rgb(
+    frame: np.ndarray,
+    *,
+    peak_nits: float = _OBJECTIVE_HDR_METRIC_PEAK_NITS,
+) -> np.ndarray:
+    rgb = _to_unit_float(frame[:, :, ::-1])
+    return np.clip(rgb, 0.0, 1.0) * float(peak_nits)
+
+
+def _pq_oetf_absolute(luminance_rgb: np.ndarray) -> np.ndarray:
+    y = np.clip(luminance_rgb.astype(np.float32, copy=False) / 10000.0, 0.0, 1.0)
+    y_m1 = np.power(y, _PQ_M1).astype(np.float32, copy=False)
+    num = _PQ_C1 + (_PQ_C2 * y_m1)
+    den = 1.0 + (_PQ_C3 * y_m1)
+    return np.power(num / np.maximum(den, 1e-12), _PQ_M2).astype(np.float32, copy=False)
+
+
+def _linear_rgb_to_itp(
+    luminance_rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """BT.2124 Annex 1 from display-referred linear RGB (cd/m^2) to ITP."""
+    rgb = luminance_rgb.astype(np.float32, copy=False)
     r = rgb[:, :, 0]
     g = rgb[:, :, 1]
     b = rgb[:, :, 2]
-    l = 0.3592 * r + 0.6976 * g - 0.0358 * b
-    m = -0.1922 * r + 1.1004 * g + 0.0755 * b
-    s = 0.0069 * r + 0.0749 * g + 0.8434 * b
-    i = 0.5 * l + 0.5 * m
-    t = 1.6137 * l - 3.3234 * m + 1.7097 * s
-    p = 4.3781 * l - 4.2455 * m - 0.1325 * s
-    return i, t, p
+
+    l = ((1688.0 * r) + (2146.0 * g) + (262.0 * b)) / 4096.0
+    m = ((683.0 * r) + (2951.0 * g) + (462.0 * b)) / 4096.0
+    s = ((99.0 * r) + (309.0 * g) + (3688.0 * b)) / 4096.0
+
+    l_p = _pq_oetf_absolute(l)
+    m_p = _pq_oetf_absolute(m)
+    s_p = _pq_oetf_absolute(s)
+
+    i = 0.5 * l_p + 0.5 * m_p
+    ct = ((6610.0 * l_p) - (13613.0 * m_p) + (7003.0 * s_p)) / 4096.0
+    cp = ((17933.0 * l_p) - (17390.0 * m_p) - (543.0 * s_p)) / 4096.0
+    t = 0.5 * ct
+    return i, t, cp
 
 
-def _delta_e_itp_bgr(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> float:
-    pr = _to_unit_float(pred_bgr[:, :, ::-1])
-    rr = _to_unit_float(ref_bgr[:, :, ::-1])
-    i1, t1, p1 = _rgb_to_ictcp(pr)
-    i2, t2, p2 = _rgb_to_ictcp(rr)
+def _delta_e_itp_absolute_rgb(
+    pred_rgb_abs: np.ndarray,
+    ref_rgb_abs: np.ndarray,
+) -> float:
+    i1, t1, p1 = _linear_rgb_to_itp(pred_rgb_abs)
+    i2, t2, p2 = _linear_rgb_to_itp(ref_rgb_abs)
     di = i1 - i2
     dt = t1 - t2
     dp = p1 - p2
-    de = 720.0 * np.sqrt(di * di + 0.25 * dt * dt + dp * dp + 1e-12)
+    de = 720.0 * np.sqrt(di * di + dt * dt + dp * dp + 1e-12)
     return float(np.mean(de, dtype=np.float64))
+
+
+def _linear_bgr_to_bt2100_pq_bgr_u16(
+    frame: np.ndarray,
+    *,
+    peak_nits: float = _OBJECTIVE_HDR_METRIC_PEAK_NITS,
+) -> np.ndarray:
+    abs_rgb = _linear_bgr_to_absolute_rgb(frame, peak_nits=peak_nits)
+    pq_rgb = _pq_oetf_absolute(abs_rgb)
+    pq_u16 = np.clip((pq_rgb * 65535.0) + 0.5, 0.0, 65535.0).astype(np.uint16)
+    return np.ascontiguousarray(pq_u16[:, :, ::-1])
+
+
+def _delta_e_itp_bgr(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> float:
+    pr = _linear_bgr_to_absolute_rgb(pred_bgr)
+    rr = _linear_bgr_to_absolute_rgb(ref_bgr)
+    return _delta_e_itp_absolute_rgb(pr, rr)
 
 
 def _hdrvdp3_cli_score(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> tuple[float | None, str]:
@@ -213,6 +301,8 @@ def _hdrvdp3_cli_score(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> tuple[float
     pred_small, ref_small = _prepare_metric_pair(
         pred_bgr, ref_bgr, max_side=_OBJECTIVE_HDRVDP3_MAX_SIDE
     )
+    pred_small = _linear_bgr_to_bt2100_pq_bgr_u16(pred_small)
+    ref_small = _linear_bgr_to_bt2100_pq_bgr_u16(ref_small)
     with tempfile.TemporaryDirectory(prefix="hdrtvnet_vdp3_") as td:
         test_path = os.path.join(td, "test.tiff")
         ref_path = os.path.join(td, "reference.tiff")
@@ -226,6 +316,7 @@ def _hdrvdp3_cli_score(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> tuple[float
                 pred=test_path,
                 reference=ref_path,
                 ref=ref_path,
+                encoding="bt2100-pq",
             )
         except Exception:
             return None, (
@@ -263,3 +354,57 @@ def _hdrvdp3_cli_score(pred_bgr: np.ndarray, ref_bgr: np.ndarray) -> tuple[float
             return float(nums[-1]), ""
         except Exception:
             return None, "HDR-VDP3 parse failed."
+
+
+def _compute_full_reference_metrics(
+    pred_bgr: np.ndarray,
+    ref_bgr: np.ndarray,
+) -> dict:
+    metrics = {
+        "psnr_db": None,
+        "sssim": None,
+        "delta_e_itp": None,
+        "psnr_norm_db": None,
+        "sssim_norm": None,
+        "delta_e_itp_norm": None,
+        "hdr_vdp3": None,
+        "obj_note": "",
+        "hdr_vdp3_note": "",
+    }
+    try:
+        eval_pred, eval_ref = _prepare_metric_pair(
+            pred_bgr,
+            ref_bgr,
+            max_side=_OBJECTIVE_METRIC_MAX_SIDE,
+        )
+        metrics["psnr_db"] = float(_psnr_bgr(eval_pred, eval_ref))
+        metrics["sssim"] = float(_ssim_bgr(eval_pred, eval_ref))
+        metrics["delta_e_itp"] = float(_delta_e_itp_bgr(eval_pred, eval_ref))
+
+        norm_pred, norm_ref = _grade_normalize_pred_to_ref(eval_pred, eval_ref)
+        metrics["psnr_norm_db"] = float(_psnr_bgr(norm_pred, norm_ref))
+        metrics["sssim_norm"] = float(_ssim_bgr(norm_pred, norm_ref))
+        norm_pred_abs, norm_ref_abs = _grade_normalize_absolute_rgb_to_ref(
+            _linear_bgr_to_absolute_rgb(eval_pred),
+            _linear_bgr_to_absolute_rgb(eval_ref),
+        )
+        metrics["delta_e_itp_norm"] = float(
+            _delta_e_itp_absolute_rgb(norm_pred_abs, norm_ref_abs)
+        )
+        metrics["obj_note"] = (
+            "Computed (raw + normalized; PSNR/SSIM linear, "
+            "DeltaEITP/HDR-VDP3 color-managed; DeltaEITP-N normalized pre-PQ)"
+        )
+    except Exception as exc:
+        metrics["obj_note"] = f"Metric error: {exc}"
+
+    try:
+        vdp_score, vdp_note = _hdrvdp3_cli_score(pred_bgr, ref_bgr)
+        if vdp_score is not None:
+            metrics["hdr_vdp3"] = float(vdp_score)
+        elif vdp_note:
+            metrics["hdr_vdp3_note"] = str(vdp_note)
+    except Exception as exc:
+        metrics["hdr_vdp3_note"] = f"HDR-VDP3 error: {exc}"
+
+    return metrics

@@ -178,7 +178,12 @@ def _octave_executable() -> str | None:
     return None
 
 
-def _run_octave(test_path: Path, ref_path: Path, toolbox: Path) -> float:
+def _run_octave(
+    test_path: Path,
+    ref_path: Path,
+    toolbox: Path,
+    input_encoding: str,
+) -> float:
     octave = _octave_executable()
     if not octave:
         raise RuntimeError(
@@ -187,8 +192,8 @@ def _run_octave(test_path: Path, ref_path: Path, toolbox: Path) -> float:
 
     m_src = (
         "args = argv();\n"
-        "if numel(args) < 3, fprintf(2, 'need test ref root\\n'); exit(2); end\n"
-        "test_path = args{1}; ref_path = args{2}; root = args{3};\n"
+        "if numel(args) < 4, fprintf(2, 'need test ref root encoding\\n'); exit(2); end\n"
+        "test_path = args{1}; ref_path = args{2}; root = args{3}; input_encoding = args{4};\n"
         "addpath(root); addpath(fullfile(root,'utils'));\n"
         "try, pkg load image; catch, end\n"
         "try, pkg load statistics; catch, end\n"
@@ -199,10 +204,25 @@ def _run_octave(test_path: Path, ref_path: Path, toolbox: Path) -> float:
         "if any(size(I_test,1:2) != size(I_ref,1:2))\n"
         "  I_test = imresize(I_test, [size(I_ref,1) size(I_ref,2)], 'bicubic');\n"
         "end\n"
-        "% Approximate display model for compare snapshots.\n"
-        "Y_peak=1000; contrast=1000; gamma=2.2; E_ambient=100; ppd=60;\n"
-        "L_test = hdrvdp_gog_display_model(I_test, Y_peak, contrast, gamma, E_ambient);\n"
-        "L_ref  = hdrvdp_gog_display_model(I_ref,  Y_peak, contrast, gamma, E_ambient);\n"
+        "ppd=60;\n"
+        "if strcmpi(input_encoding, 'bt2100-pq')\n"
+        "  m1 = 2610/16384;\n"
+        "  m2 = 2523/32;\n"
+        "  c1 = 3424/4096;\n"
+        "  c2 = 2413/128;\n"
+        "  c3 = 2392/128;\n"
+        "  pq_eotf = @(E) 10000 * ((max(E.^(1/m2) - c1, 0)) ./ (c2 - c3 * E.^(1/m2))).^(1/m1);\n"
+        "  E_ambient = 200;\n"
+        "  k_refl = 0.005;\n"
+        "  ambient_term = E_ambient * k_refl / pi;\n"
+        "  L_test = pq_eotf(I_test) + ambient_term;\n"
+        "  L_ref  = pq_eotf(I_ref) + ambient_term;\n"
+        "else\n"
+        "  % Approximate display model for standard display-referred RGB snapshots.\n"
+        "  Y_peak=1000; contrast=1000; gamma=2.2; E_ambient=100;\n"
+        "  L_test = hdrvdp_gog_display_model(I_test, Y_peak, contrast, gamma, E_ambient);\n"
+        "  L_ref  = hdrvdp_gog_display_model(I_ref,  Y_peak, contrast, gamma, E_ambient);\n"
+        "end\n"
         "res = hdrvdp3('quality', L_test, L_ref, 'rgb-native', ppd, {'quiet', true});\n"
         "score = NaN;\n"
         "if isfield(res, 'Q_JOD'), score = res.Q_JOD; elseif isfield(res, 'Q'), score = res.Q; end\n"
@@ -220,6 +240,7 @@ def _run_octave(test_path: Path, ref_path: Path, toolbox: Path) -> float:
             str(test_path),
             str(ref_path),
             str(toolbox),
+            str(input_encoding),
         ]
         cp = subprocess.run(
             cmd,
@@ -246,6 +267,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Run HDR-VDP3 via local Octave bridge.")
     ap.add_argument("--test", required=True, help="Path to test image")
     ap.add_argument("--reference", required=True, help="Path to reference image")
+    ap.add_argument(
+        "--input-encoding",
+        default="display-rgb",
+        choices=("display-rgb", "bt2100-pq"),
+        help="Interpretation of the input image pixel values.",
+    )
     args = ap.parse_args()
 
     test_path = Path(args.test).resolve()
@@ -264,7 +291,12 @@ def main() -> int:
                 "GNU Octave not found (PATH/default locations). Install Octave to enable HDR-VDP3."
             )
         toolbox = _ensure_hdrvdp_toolbox(root)
-        score = _run_octave(test_path, ref_path, toolbox)
+        score = _run_octave(
+            test_path,
+            ref_path,
+            toolbox,
+            str(args.input_encoding or "display-rgb"),
+        )
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1

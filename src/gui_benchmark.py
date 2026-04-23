@@ -63,14 +63,8 @@ from gui_media_probe import (
     _probe_video_timing_info,
 )
 from gui_objective_metrics import (
-    _OBJECTIVE_METRIC_MAX_SIDE,
-    _delta_e_itp_bgr,
-    _grade_normalize_pred_to_ref,
-    _hdrvdp3_cli_score,
-    _prepare_metric_pair,
-    _psnr_bgr,
+    _compute_full_reference_metrics,
     _read_video_frame_at,
-    _ssim_bgr,
 )
 from gui_pipeline_worker_model import _resolve_predequantize_arg
 from gui_mpv_widget import MpvHDRWidget
@@ -549,45 +543,7 @@ class _BenchmarkWorker(QObject):
         pred_eval: np.ndarray,
         gt_eval: np.ndarray,
     ) -> dict:
-        metrics = {
-            "psnr_db": None,
-            "sssim": None,
-            "delta_e_itp": None,
-            "psnr_norm_db": None,
-            "sssim_norm": None,
-            "delta_e_itp_norm": None,
-            "hdr_vdp3": None,
-            "obj_note": "",
-            "hdr_vdp3_note": "",
-        }
-        try:
-            eval_pred, eval_ref = _prepare_metric_pair(
-                pred_eval,
-                gt_eval,
-                max_side=_OBJECTIVE_METRIC_MAX_SIDE,
-            )
-            metrics["psnr_db"] = float(_psnr_bgr(eval_pred, eval_ref))
-            metrics["sssim"] = float(_ssim_bgr(eval_pred, eval_ref))
-            metrics["delta_e_itp"] = float(_delta_e_itp_bgr(eval_pred, eval_ref))
-
-            norm_pred, norm_ref = _grade_normalize_pred_to_ref(eval_pred, eval_ref)
-            metrics["psnr_norm_db"] = float(_psnr_bgr(norm_pred, norm_ref))
-            metrics["sssim_norm"] = float(_ssim_bgr(norm_pred, norm_ref))
-            metrics["delta_e_itp_norm"] = float(_delta_e_itp_bgr(norm_pred, norm_ref))
-            metrics["obj_note"] = "Computed (raw + normalized)"
-        except Exception as exc:
-            metrics["obj_note"] = f"Metric error: {exc}"
-
-        try:
-            vdp_score, vdp_note = _hdrvdp3_cli_score(pred_eval, gt_eval)
-            if vdp_score is not None:
-                metrics["hdr_vdp3"] = float(vdp_score)
-            elif vdp_note:
-                metrics["hdr_vdp3_note"] = str(vdp_note)
-        except Exception as exc:
-            metrics["hdr_vdp3_note"] = f"HDR-VDP3 error: {exc}"
-
-        return metrics
+        return _compute_full_reference_metrics(pred_eval, gt_eval)
 
     def run(self):
         processor = None

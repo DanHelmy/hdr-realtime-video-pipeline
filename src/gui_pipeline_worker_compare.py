@@ -6,14 +6,8 @@ import torch
 from gui_hdr_io import read_hdr_video_frame_rgb16, tensor_to_bgr_u16
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
-    _OBJECTIVE_METRIC_MAX_SIDE,
+    _compute_full_reference_metrics,
     _read_video_frame_at,
-    _prepare_metric_pair,
-    _grade_normalize_pred_to_ref,
-    _psnr_bgr,
-    _ssim_bgr,
-    _delta_e_itp_bgr,
-    _hdrvdp3_cli_score,
 )
 
 
@@ -318,26 +312,27 @@ class PipelineWorkerCompareMixin:
             and cmp_hdr_gt.dtype == np.uint16
         ):
             try:
-                eval_pred, eval_ref = _prepare_metric_pair(
-                    cmp_hdr_algo, cmp_hdr_gt, max_side=_OBJECTIVE_METRIC_MAX_SIDE
+                cmp_metrics.update(
+                    _compute_full_reference_metrics(cmp_hdr_algo, cmp_hdr_gt)
                 )
-                cmp_metrics["psnr_db"] = _psnr_bgr(eval_pred, eval_ref)
-                cmp_metrics["sssim"] = _ssim_bgr(eval_pred, eval_ref)
-                cmp_metrics["delta_e_itp"] = _delta_e_itp_bgr(eval_pred, eval_ref)
-                norm_pred, norm_ref = _grade_normalize_pred_to_ref(eval_pred, eval_ref)
-                cmp_metrics["psnr_norm_db"] = _psnr_bgr(norm_pred, norm_ref)
-                cmp_metrics["sssim_norm"] = _ssim_bgr(norm_pred, norm_ref)
-                cmp_metrics["delta_e_itp_norm"] = _delta_e_itp_bgr(norm_pred, norm_ref)
-                cmp_metrics["obj_note"] = (
-                    f"Computed (raw + normalized, {algo_hdr_mode_note}, {gt_hdr_mode_note})"
-                )
+                obj_note = str(cmp_metrics.get("obj_note") or "").strip()
+                if obj_note.startswith("Computed"):
+                    cmp_metrics["obj_note"] = (
+                        f"{obj_note} ({algo_hdr_mode_note}, {gt_hdr_mode_note})"
+                    )
+                elif obj_note:
+                    cmp_metrics["obj_note"] = (
+                        f"{obj_note} ({algo_hdr_mode_note}, {gt_hdr_mode_note})"
+                    )
+                else:
+                    cmp_metrics["obj_note"] = (
+                        f"{algo_hdr_mode_note}, {gt_hdr_mode_note}"
+                    )
             except Exception as exc:
                 cmp_metrics["obj_note"] = f"Error ({exc})"
-            vdp_score, vdp_note = _hdrvdp3_cli_score(cmp_hdr_algo, cmp_hdr_gt)
-            if vdp_score is not None:
-                cmp_metrics["hdr_vdp3"] = float(vdp_score)
-            elif vdp_note:
-                cmp_metrics["hdr_vdp3_note"] = str(vdp_note)
+            vdp_score = cmp_metrics.get("hdr_vdp3")
+            vdp_note = str(cmp_metrics.get("hdr_vdp3_note") or "").strip()
+            if vdp_score is None and vdp_note:
                 msg = f"HDR-VDP3 unavailable: {vdp_note}"
                 cmp_note = f"{cmp_note} {msg}".strip()
         elif not (
