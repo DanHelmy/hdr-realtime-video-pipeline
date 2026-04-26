@@ -5,13 +5,13 @@ import time
 
 class FPSTimer:
     def __init__(self):
-        self.last = time.time()
+        self.last = time.perf_counter()
         self.frames = 0
         self.fps = 0.0
 
     def update(self):
         self.frames += 1
-        now = time.time()
+        now = time.perf_counter()
         if now - self.last >= 1.0:
             self.fps = self.frames / (now - self.last)
             self.frames = 0
