@@ -1222,7 +1222,7 @@ class PlaybackRuntimeMixin:
                 film_grain,
                 force_hdr_metadata,
             ) = pending
-            self._disp_hdr_mpv.start_playback(
+            hdr_mpv_started = self._disp_hdr_mpv.start_playback(
                 pw,
                 ph,
                 fps=fps,
@@ -1233,21 +1233,33 @@ class PlaybackRuntimeMixin:
                 film_grain=film_grain,
                 force_hdr_metadata=force_hdr_metadata,
             )
-            # Anchor mpv timeline at 0 on startup to avoid initial drift.
-            self._disp_hdr_mpv.seek_seconds(0.0)
-            if not self._audio_available:
-                self._apply_selected_audio_track_mpv_async()
-            self._apply_volume_to_backends()
-            if self._startup_sync_pending:
-                self._disp_hdr_mpv.set_paused(True)
-            self._worker.set_mpv_widget(self._disp_hdr_mpv)
+            if hdr_mpv_started:
+                # Anchor mpv timeline at 0 on startup to avoid initial drift.
+                self._disp_hdr_mpv.seek_seconds(0.0)
+                if not self._audio_available:
+                    self._apply_selected_audio_track_mpv_async()
+                self._apply_volume_to_backends()
+                if self._startup_sync_pending:
+                    self._disp_hdr_mpv.set_paused(True)
+                self._worker.set_mpv_widget(self._disp_hdr_mpv)
+                if self._startup_sync_pending:
+                    QTimer.singleShot(250, self._release_startup_sync)
+            else:
+                self._active_use_mpv = False
+                self._startup_sync_pending = False
+                self._worker.set_mpv_widget(None)
+                self._worker.set_sdr_mpv_widget(None)
+                self._sdr_mpv_feed_from_worker = False
+                if self._disp_hdr_stack is not None and self._disp_hdr_cpu is not None:
+                    self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
+                if self._disp_sdr_stack is not None and self._disp_sdr_cpu is not None:
+                    self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
+                self._pending_sdr_mpv_start = None
             self._pending_mpv_start = None
-            if self._startup_sync_pending:
-                QTimer.singleShot(250, self._release_startup_sync)
         pending_sdr = getattr(self, "_pending_sdr_mpv_start", None)
-        if pending_sdr and self._disp_sdr_mpv is not None:
+        if pending_sdr and self._disp_sdr_mpv is not None and self._active_use_mpv:
             pw, ph, fps, scale_kernel = pending_sdr
-            self._disp_sdr_mpv.start_playback(
+            sdr_mpv_started = self._disp_sdr_mpv.start_playback(
                 pw,
                 ph,
                 fps=fps,
@@ -1255,10 +1267,16 @@ class PlaybackRuntimeMixin:
                 audio_path=None,
                 force_hdr_metadata=False,
             )
-            if self._startup_sync_pending:
-                self._disp_sdr_mpv.set_paused(True)
-            self._worker.set_sdr_mpv_widget(self._disp_sdr_mpv)
-            self._sdr_mpv_feed_from_worker = True
+            if sdr_mpv_started:
+                if self._startup_sync_pending:
+                    self._disp_sdr_mpv.set_paused(True)
+                self._worker.set_sdr_mpv_widget(self._disp_sdr_mpv)
+                self._sdr_mpv_feed_from_worker = True
+            else:
+                self._worker.set_sdr_mpv_widget(None)
+                self._sdr_mpv_feed_from_worker = False
+                if self._disp_sdr_stack is not None and self._disp_sdr_cpu is not None:
+                    self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
             self._pending_sdr_mpv_start = None
         self._note_live_audio_compile_ready()
         self._sync_screen_change_hooks()
@@ -2533,7 +2551,7 @@ class PlaybackRuntimeMixin:
         prec_arg = _precision_to_compile_arg(gui_prec)
 
         # Always compile via a clean subprocess - this ensures autotune
-        # benchmarks have zero GPU interference from Qt / D3D11 / mpv.
+        # benchmarks have zero GPU interference from Qt / mpv rendering.
         # If the Triton + Inductor cache is already warm from a previous
         # compile, the subprocess finishes in seconds and auto-closes.
         model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
@@ -2626,7 +2644,7 @@ class PlaybackRuntimeMixin:
         self._refresh_source_mode_ui()
 
         # Start mpv HDR display AFTER compile finishes (via signal)
-        # so that mpv's D3D11 GPU usage doesn't pollute Triton autotuning.
+        # so that mpv's GPU usage doesn't pollute Triton autotuning.
         # mpv receives frames at processing resolution; GPU scaling happens in mpv.
         self._pending_mpv_start = None
         self._pending_sdr_mpv_start = None

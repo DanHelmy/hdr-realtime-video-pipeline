@@ -53,8 +53,9 @@ class MpvHDRWidget(QWidget):
         self._seek_warned = False
         self._last_playback_cfg: dict | None = None
         self._last_scale_error: str | None = None
-        self._active_vo: str = "gpu"
+        self._active_vo: str = "gpu-next"
         self._target_colorspace_hint: str = "no"
+        self._requested_gpu_api: str = "vulkan"
 
         self._mpv_lib = mpv_lib
         self._mpv_diag = bool(mpv_diag)
@@ -98,6 +99,10 @@ class MpvHDRWidget(QWidget):
         out_lvl = _g(vop, "levels", "colorlevels")
         t_trc = _prop("target_trc")
         t_prim = _prop("target_prim")
+        gpu_api = _prop("gpu_api")
+        requested_gpu_api = str(self._requested_gpu_api or "?")
+        if gpu_api == "?":
+            gpu_api = requested_gpu_api
 
         hdr_metadata_forced = ("pq" in t_trc and "bt.2020" in t_prim)
         hdr_vo_confirmed = ("bt.2020" in out_prim and "pq" in out_trc)
@@ -110,7 +115,8 @@ class MpvHDRWidget(QWidget):
             "max_cll": _g(vop, "max-cll", "max_cll"),
             "max_fall": _g(vop, "max-fall", "max_fall"),
             "vo": _prop("current_vo"),
-            "gpu_api": "d3d11",
+            "gpu_api": gpu_api,
+            "gpu_api_requested": requested_gpu_api,
             "hdr_metadata_forced": hdr_metadata_forced,
             "hdr_vo_confirmed": hdr_vo_confirmed,
             "hdr_vo_unknown": hdr_vo_unknown,
@@ -122,20 +128,74 @@ class MpvHDRWidget(QWidget):
         props = {"t_trc": t_trc, "t_prim": t_prim}
         return hdr_info, aux, props
 
+    @staticmethod
+    def _coerce_shader_prop_list(value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "no", "[]"}:
+            return []
+        if os.pathsep in text:
+            parts = [part.strip() for part in text.split(os.pathsep) if part.strip()]
+            if len(parts) > 1:
+                return parts
+        return [text]
+
+    @staticmethod
+    def _shader_path_keys(paths: list[str]) -> list[str]:
+        return [
+            os.path.basename(str(path or "")).strip().lower()
+            for path in paths
+            if str(path or "").strip()
+        ]
+
+    def get_active_shader_paths(self) -> list[str]:
+        p = self._player
+        if p is None:
+            return []
+        try:
+            return self._coerce_shader_prop_list(getattr(p, "glsl_shaders", None))
+        except Exception:
+            return []
+
+    def _verify_glsl_shaders(self, expected_paths: list[str]) -> bool:
+        import time as _t
+
+        expected_keys = self._shader_path_keys(expected_paths)
+        last_active_paths: list[str] = []
+        last_active_keys: list[str] = []
+        for _ in range(5):
+            last_active_paths = self.get_active_shader_paths()
+            last_active_keys = self._shader_path_keys(last_active_paths)
+            if last_active_keys == expected_keys:
+                if self._diag_enabled and expected_keys:
+                    print(f"[mpv] glsl-shaders active: {last_active_paths}")
+                return True
+            _t.sleep(0.02)
+        self._last_scale_error = (
+            "glsl-shaders verification failed: "
+            f"expected={expected_keys or []}, got={last_active_keys or []}"
+        )
+        print(f"[mpv] {self._last_scale_error}")
+        return False
+
     def _set_glsl_shaders(self, shader_paths: list[str]) -> bool:
         p = self._player
         if p is None:
             return False
+        self._last_scale_error = None
         paths = self._normalize_shader_paths(shader_paths)
         try:
             try:
                 p.glsl_shaders = paths
-                return True
+                return self._verify_glsl_shaders(paths)
             except Exception:
                 pass
             joined = os.pathsep.join(paths)
             p.command("set", "glsl-shaders", joined)
-            return True
+            return self._verify_glsl_shaders(paths)
         except Exception as exc:
             self._last_scale_error = str(exc)
             print(f"[mpv] glsl-shaders set failed: {exc}")
@@ -181,7 +241,39 @@ class MpvHDRWidget(QWidget):
         threading.Thread(target=_worker, daemon=True).start()
 
     @staticmethod
-    def _pipe_feeder_fn(pipe_name: str, frame_queue: _queue.Queue, shutdown: threading.Event):
+    def _poke_named_pipe_client(pipe_name: str | None):
+        if not pipe_name:
+            return
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            GENERIC_WRITE = 0x40000000
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = wt.HANDLE(-1).value
+
+            h = kernel32.CreateFileW(
+                pipe_name,
+                GENERIC_WRITE,
+                0,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if h != INVALID_HANDLE_VALUE:
+                kernel32.CloseHandle(h)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _pipe_feeder_fn(
+        pipe_name: str,
+        frame_queue: _queue.Queue,
+        shutdown: threading.Event,
+        ready_event: threading.Event | None = None,
+    ):
         import ctypes
         import ctypes.wintypes as wt
 
@@ -204,8 +296,12 @@ class MpvHDRWidget(QWidget):
             None,
         )
         if h == INVALID_HANDLE_VALUE:
+            if ready_event is not None:
+                ready_event.set()
             return
 
+        if ready_event is not None:
+            ready_event.set()
         kernel32.ConnectNamedPipe(h, None)
 
         written = wt.DWORD(0)
@@ -247,13 +343,14 @@ class MpvHDRWidget(QWidget):
         audio_path: str | None = None,
         film_grain: bool = False,
         force_hdr_metadata: bool = True,
-    ):
+    ) -> bool:
         self.stop_playback()
         self._shutdown.clear()
         self._queue = _queue.Queue(maxsize=1)
         self._fps = float(fps) if fps and fps > 0 else 30.0
         self._force_hdr_metadata = bool(force_hdr_metadata)
         self._diag_enabled = bool(self._mpv_diag and self._force_hdr_metadata)
+        self._last_scale_error = None
         kernel_name, antiring = self._kernel_antiring(scale_kernel)
         if scale_antiring is not None:
             antiring = max(0.0, min(1.0, float(scale_antiring)))
@@ -272,13 +369,6 @@ class MpvHDRWidget(QWidget):
 
         pipe_id = id(self)
         self._pipe_name = rf"\\.\pipe\hdrtvnet_mpv_{pipe_id}"
-
-        self._feeder = threading.Thread(
-            target=self._pipe_feeder_fn,
-            args=(self._pipe_name, self._queue, self._shutdown),
-            daemon=True,
-        )
-        self._feeder.start()
 
         wid = str(int(self.winId()))
         pipe_url = f"lavf://file:{self._pipe_name}"
@@ -312,7 +402,7 @@ class MpvHDRWidget(QWidget):
         mpv_kwargs = dict(
             wid=wid,
             vo="gpu-next",
-            gpu_api="d3d11",
+            gpu_api="vulkan",
             demuxer="rawvideo",
             demuxer_rawvideo_w=str(width),
             demuxer_rawvideo_h=str(height),
@@ -364,29 +454,50 @@ class MpvHDRWidget(QWidget):
             player = self._mpv_lib.MPV(**mpv_kwargs)
             self._active_vo = "gpu-next"
         except Exception as exc:
-            # Older libmpv builds may not support gpu-next/target hint.
-            fallback_kwargs = dict(mpv_kwargs)
-            fallback_kwargs.update(
-                vo="gpu",
-                target_colorspace_hint="no",
-            )
-            self._target_colorspace_hint = "no"
-            player = self._mpv_lib.MPV(**fallback_kwargs)
-            self._active_vo = "gpu"
-            print(
-                f"[mpv] gpu-next unavailable ({exc}); "
-                "falling back to vo=gpu."
-            )
+            self._last_scale_error = f"mpv startup failed with gpu-next/vulkan: {exc}"
+            print(f"[mpv] {self._last_scale_error}")
+            try:
+                self.runtime_notice.emit(self._last_scale_error)
+            except Exception:
+                pass
+            self._queue = None
+            self._pipe_name = None
+            return False
+        self._player = player
+        pipe_ready = threading.Event()
+        self._feeder = threading.Thread(
+            target=self._pipe_feeder_fn,
+            args=(self._pipe_name, self._queue, self._shutdown, pipe_ready),
+            daemon=True,
+        )
+        self._feeder.start()
+        if not pipe_ready.wait(timeout=1.0):
+            self._last_scale_error = "mpv named-pipe feeder failed to initialize."
+            print(f"[mpv] {self._last_scale_error}")
+            try:
+                self.runtime_notice.emit(self._last_scale_error)
+            except Exception:
+                pass
+            self.stop_playback()
+            return False
+        try:
+            player.play(pipe_url)
+        except Exception as exc:
+            self._last_scale_error = f"mpv play failed: {exc}"
+            print(f"[mpv] {self._last_scale_error}")
+            try:
+                self.runtime_notice.emit(self._last_scale_error)
+            except Exception:
+                pass
+            self.stop_playback()
+            return False
+        if shader_paths and not self._set_glsl_shaders(shader_paths):
             try:
                 self.runtime_notice.emit(
-                    "mpv fallback: gpu-next unavailable, using compatibility vo=gpu."
+                    f"mpv shader load check failed: {self._last_scale_error or 'unknown error'}"
                 )
             except Exception:
                 pass
-        self._player = player
-        player.play(pipe_url)
-        if shader_paths:
-            self._set_glsl_shaders(shader_paths)
         if use_external_audio:
             self._attach_audio_async(audio_path)
 
@@ -413,7 +524,11 @@ class MpvHDRWidget(QWidget):
                         print(f"║  target-prim       : {props.get('t_prim', '?')}")
                         print(f"║  target-peak       : {getattr(p, 'target_peak', '?')}")
                         print(f"║  current-vo        : {getattr(p, 'current_vo', '?')}")
-                        print("║  gpu-api           : d3d11 (forced)")
+                        print(
+                            "║  gpu-api           : "
+                            f"{hdr_info.get('gpu_api', '?')} "
+                            f"(requested {hdr_info.get('gpu_api_requested', '?')})"
+                        )
                         hint_mode = str(self._target_colorspace_hint or "?")
                         print(f"║  colorspace-hint   : {hint_mode}")
                         print("╠════════════════════════════════════════╣")
@@ -427,6 +542,7 @@ class MpvHDRWidget(QWidget):
                     pass
 
         threading.Thread(target=_hdr_monitor, daemon=True).start()
+        return True
 
     def feed_frame(self, rgb48_bytes):
         q = self._queue
@@ -598,12 +714,18 @@ class MpvHDRWidget(QWidget):
         if enabled and not use_film:
             print("[mpv] film grain shader unavailable (download failed).")
         use_fsr = False
+        use_ssim = False
         if self._last_playback_cfg is not None:
             k = str(self._last_playback_cfg.get("scale_kernel", "")).lower()
             use_fsr = (k == "fsr" and self._ensure_fsr_shader())
+            use_ssim = (
+                k == "ssim_superres" and self._ensure_ssim_superres_shader()
+            )
         shader_paths = []
         if use_fsr:
             shader_paths.append(self._fsr_shader_path)
+        if use_ssim:
+            shader_paths.append(self._ssim_superres_shader_path)
         if use_film:
             shader_paths.append(self._filmgrain_shader_path)
         try:
@@ -618,16 +740,10 @@ class MpvHDRWidget(QWidget):
             return False
 
     def is_fsr_active(self) -> bool:
-        p = self._player
-        if p is None:
-            return False
         try:
-            val = getattr(p, "glsl_shaders", None)
-            if not val:
-                return False
-            if isinstance(val, (list, tuple)):
-                return any("fsr" in str(v).lower() for v in val)
-            return "fsr" in str(val).lower()
+            return any(
+                "fsr" in str(path).lower() for path in self.get_active_shader_paths()
+            )
         except Exception:
             return False
 
@@ -652,6 +768,8 @@ class MpvHDRWidget(QWidget):
                 q.put_nowait(None)
             except _queue.Full:
                 pass
+        if self._feeder is not None and self._feeder.is_alive():
+            self._poke_named_pipe_client(self._pipe_name)
         if self._player is not None:
             try:
                 self._player.terminate()

@@ -147,8 +147,7 @@ class _CompareVideoPane(QWidget):
         size = (int(w), int(h))
         if self._last_size == size:
             return
-        self._last_size = size
-        self._mpv.start_playback(
+        started = self._mpv.start_playback(
             width=int(w),
             height=int(h),
             fps=float(self._preview_fps),
@@ -158,6 +157,12 @@ class _CompareVideoPane(QWidget):
             force_hdr_metadata=self._force_hdr_metadata,
             film_grain=self._preview_film_grain,
         )
+        if not started:
+            raise RuntimeError(
+                getattr(self._mpv, "_last_scale_error", None)
+                or "mpv preview startup failed."
+            )
+        self._last_size = size
 
     def set_frame(self, bgr: np.ndarray | None, unavailable_text: str):
         if not isinstance(bgr, np.ndarray):

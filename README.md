@@ -291,6 +291,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - `PSNR` and `SSIM` are computed from the linear HDR image pair.
 - `DeltaEITP` and `HDR-VDP3` are computed from a BT.2020/PQ display-managed path derived from that linear HDR pair.
 - `DeltaEITP-N` is grade-normalized in absolute linear RGB before BT.2020/PQ conversion; it is not normalized on PQ code values and it is not re-normalized after PQ encoding.
+- Shared padded black borders are cropped from both images before objective metrics when a substantial common letterbox/pillarbox region is detected.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The built-in bridge accepts BT.2100 PQ input frames and converts them to absolute display luminance / photometric values before calling `hdrvdp3`.

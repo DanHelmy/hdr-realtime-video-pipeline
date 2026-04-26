@@ -108,7 +108,7 @@ def _prepare_metric_pair(
     ref_bgr: np.ndarray,
     max_side: int = _OBJECTIVE_METRIC_MAX_SIDE,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Align and optionally downscale two BGR uint8 frames for metric evaluation."""
+    """Align and optionally downscale two frames for metric evaluation."""
     if pred_bgr is None or ref_bgr is None:
         raise ValueError("Missing frame(s) for metric evaluation.")
     if pred_bgr.shape[:2] != ref_bgr.shape[:2]:
@@ -124,6 +124,47 @@ def _prepare_metric_pair(
         pred_bgr = cv2.resize(pred_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
         ref_bgr = cv2.resize(ref_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
     return pred_bgr, ref_bgr
+
+
+def _crop_shared_black_borders(
+    pred_bgr: np.ndarray,
+    ref_bgr: np.ndarray,
+    *,
+    min_border_px: int = 8,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Crop shared zero-valued letterbox/pillarbox borders when they are substantial."""
+    if pred_bgr is None or ref_bgr is None:
+        return pred_bgr, ref_bgr, False
+    if pred_bgr.shape[:2] != ref_bgr.shape[:2]:
+        return pred_bgr, ref_bgr, False
+    if pred_bgr.ndim < 2 or ref_bgr.ndim < 2:
+        return pred_bgr, ref_bgr, False
+
+    union_signal = np.any(pred_bgr != 0, axis=2) | np.any(ref_bgr != 0, axis=2)
+    if not np.any(union_signal):
+        return pred_bgr, ref_bgr, False
+
+    row_has_signal = np.any(union_signal, axis=1)
+    col_has_signal = np.any(union_signal, axis=0)
+    h, w = pred_bgr.shape[:2]
+
+    top = int(np.argmax(row_has_signal))
+    bottom = h - int(np.argmax(row_has_signal[::-1]))
+    left = int(np.argmax(col_has_signal))
+    right = w - int(np.argmax(col_has_signal[::-1]))
+
+    crop_top = max(0, top)
+    crop_bottom = max(0, h - bottom)
+    crop_left = max(0, left)
+    crop_right = max(0, w - right)
+    if max(crop_top, crop_bottom, crop_left, crop_right) < max(1, int(min_border_px)):
+        return pred_bgr, ref_bgr, False
+    if bottom - top < 2 or right - left < 2:
+        return pred_bgr, ref_bgr, False
+
+    pred_crop = np.ascontiguousarray(pred_bgr[top:bottom, left:right])
+    ref_crop = np.ascontiguousarray(ref_bgr[top:bottom, left:right])
+    return pred_crop, ref_crop, True
 
 
 def _grade_normalize_pred_to_ref(
@@ -371,10 +412,17 @@ def _compute_full_reference_metrics(
         "obj_note": "",
         "hdr_vdp3_note": "",
     }
+    eval_pred = pred_bgr
+    eval_ref = ref_bgr
+    cropped_active_picture = False
     try:
-        eval_pred, eval_ref = _prepare_metric_pair(
+        eval_pred, eval_ref, cropped_active_picture = _crop_shared_black_borders(
             pred_bgr,
             ref_bgr,
+        )
+        eval_pred, eval_ref = _prepare_metric_pair(
+            eval_pred,
+            eval_ref,
             max_side=_OBJECTIVE_METRIC_MAX_SIDE,
         )
         metrics["psnr_db"] = float(_psnr_bgr(eval_pred, eval_ref))
@@ -391,15 +439,17 @@ def _compute_full_reference_metrics(
         metrics["delta_e_itp_norm"] = float(
             _delta_e_itp_absolute_rgb(norm_pred_abs, norm_ref_abs)
         )
+        crop_note = "; shared black borders cropped" if cropped_active_picture else ""
         metrics["obj_note"] = (
             "Computed (raw + normalized; PSNR/SSIM linear, "
-            "DeltaEITP/HDR-VDP3 color-managed; DeltaEITP-N normalized pre-PQ)"
+            "DeltaEITP/HDR-VDP3 color-managed; DeltaEITP-N normalized pre-PQ"
+            f"{crop_note})"
         )
     except Exception as exc:
         metrics["obj_note"] = f"Metric error: {exc}"
 
     try:
-        vdp_score, vdp_note = _hdrvdp3_cli_score(pred_bgr, ref_bgr)
+        vdp_score, vdp_note = _hdrvdp3_cli_score(eval_pred, eval_ref)
         if vdp_score is not None:
             metrics["hdr_vdp3"] = float(vdp_score)
         elif vdp_note:
