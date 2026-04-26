@@ -347,7 +347,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 
 ### mpv Display / Color Path
 
-Both SDR and HDR panes are rendered through embedded **mpv** (D3D11):
+Both SDR and HDR panes are rendered through embedded **mpv** (vulkan):
 
 - **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
 - **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
