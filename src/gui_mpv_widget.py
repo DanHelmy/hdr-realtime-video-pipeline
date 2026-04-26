@@ -90,16 +90,51 @@ class MpvHDRWidget(QWidget):
         def _prop(name):
             try:
                 v = getattr(p, name.replace("-", "_"), None)
-                return str(v) if v is not None else "?"
+                if v is None:
+                    return "?"
+                if isinstance(v, (dict, list, tuple)):
+                    return v
+                return str(v)
             except Exception:
                 return "?"
+
+        def _fmt_prop_text(value) -> str:
+            if value is None:
+                return "?"
+            if isinstance(value, str):
+                text = value.strip()
+                return text if text else "?"
+            return str(value)
+
+        def _fmt_gpu_api(value) -> str:
+            if value in (None, "?"):
+                return "?"
+            if isinstance(value, dict):
+                name = value.get("name")
+                return str(name).strip() if name is not None else str(value)
+            if isinstance(value, (list, tuple)):
+                names: list[str] = []
+                for item in value:
+                    if isinstance(item, dict):
+                        if item.get("enabled", True):
+                            name = str(item.get("name", "")).strip()
+                            if name:
+                                names.append(name)
+                    else:
+                        text = str(item).strip()
+                        if text:
+                            names.append(text)
+                if names:
+                    return ",".join(names)
+                return str(value)
+            return _fmt_prop_text(value)
 
         out_prim = _g(vop, "primaries", "colormatrix-primaries")
         out_trc = _g(vop, "gamma", "transfer")
         out_lvl = _g(vop, "levels", "colorlevels")
-        t_trc = _prop("target_trc")
-        t_prim = _prop("target_prim")
-        gpu_api = _prop("gpu_api")
+        t_trc = _fmt_prop_text(_prop("target_trc"))
+        t_prim = _fmt_prop_text(_prop("target_prim"))
+        gpu_api = _fmt_gpu_api(_prop("gpu_api"))
         requested_gpu_api = str(self._requested_gpu_api or "?")
         if gpu_api == "?":
             gpu_api = requested_gpu_api
@@ -114,7 +149,7 @@ class MpvHDRWidget(QWidget):
             "sig_peak": _g(vop, "sig-peak", "sig_peak"),
             "max_cll": _g(vop, "max-cll", "max_cll"),
             "max_fall": _g(vop, "max-fall", "max_fall"),
-            "vo": _prop("current_vo"),
+            "vo": _fmt_prop_text(_prop("current_vo")),
             "gpu_api": gpu_api,
             "gpu_api_requested": requested_gpu_api,
             "hdr_metadata_forced": hdr_metadata_forced,
@@ -351,15 +386,20 @@ class MpvHDRWidget(QWidget):
         self._force_hdr_metadata = bool(force_hdr_metadata)
         self._diag_enabled = bool(self._mpv_diag and self._force_hdr_metadata)
         self._last_scale_error = None
+        requested_kernel = str(scale_kernel or "").strip().lower()
         kernel_name, antiring = self._kernel_antiring(scale_kernel)
         if scale_antiring is not None:
             antiring = max(0.0, min(1.0, float(scale_antiring)))
+
+        remembered_scale_kernel = (
+            "ssim_superres" if requested_kernel == "ssim_superres" else str(kernel_name)
+        )
 
         self._last_playback_cfg = {
             "width": int(width),
             "height": int(height),
             "fps": float(self._fps),
-            "scale_kernel": str(kernel_name),
+            "scale_kernel": remembered_scale_kernel,
             "scale_antiring": None if scale_antiring is None else float(scale_antiring),
             "cas_strength": None if cas_strength is None else float(cas_strength),
             "audio_path": audio_path,
@@ -376,20 +416,21 @@ class MpvHDRWidget(QWidget):
         frame_bytes = width * height * 6
         max_demux = str(frame_bytes)
 
-        use_fsr = (kernel_name == "fsr" and self._ensure_fsr_shader())
-        if kernel_name == "fsr" and not use_fsr:
+        use_fsr = (requested_kernel == "fsr" and self._ensure_fsr_shader())
+        if requested_kernel == "fsr" and not use_fsr:
             print(f"[mpv] FSR shader unavailable (download failed). Falling back to {self._best_mpv_scale}.")
             kernel_name = self._best_mpv_scale
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["scale_kernel"] = str(kernel_name)
-        use_ssim = (kernel_name == "ssim_superres" and self._ensure_ssim_superres_shader())
-        if kernel_name == "ssim_superres" and not use_ssim:
+        use_ssim = (
+            requested_kernel == "ssim_superres" and self._ensure_ssim_superres_shader()
+        )
+        if requested_kernel == "ssim_superres" and not use_ssim:
             print(f"[mpv] SSimSuperRes shader unavailable (download failed). Falling back to {self._best_mpv_scale}.")
             kernel_name = self._best_mpv_scale
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["scale_kernel"] = str(kernel_name)
-        use_fsr = (kernel_name == "fsr")
-        use_ssim = (kernel_name == "ssim_superres")
+        use_fsr = (requested_kernel == "fsr" and use_fsr)
         use_film_grain = bool(film_grain and self._ensure_filmgrain_shader())
         if film_grain and not use_film_grain:
             print("[mpv] film grain shader unavailable (download failed).")

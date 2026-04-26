@@ -282,9 +282,6 @@ class PipelineWorker(
         if use_cached_frame:
             self._paused_control_wake = True
             self._paused_control_refresh_frame = None
-        elif self._user_paused and bool(force_immediate):
-            self._paused_control_wake = True
-            self._paused_control_refresh_frame = None
         else:
             self._seek_frame = target_frame
         # Unblock the worker so compare can be emitted immediately when paused,

@@ -53,10 +53,9 @@ class PipelineWorkerCompareMixin:
         try:
             target_frame = max(0, int(compare_request.get("frame", -1)))
             cached_frame = int(cached.get("frame_idx", -2))
-            force_immediate = bool(compare_request.get("force_immediate", False))
         except Exception:
             return False
-        if target_frame != cached_frame and not force_immediate:
+        if target_frame != cached_frame:
             return False
         frame = cached.get("frame")
         if not isinstance(frame, np.ndarray):

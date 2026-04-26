@@ -131,8 +131,9 @@ def _crop_shared_black_borders(
     ref_bgr: np.ndarray,
     *,
     min_border_px: int = 8,
+    black_level_ratio: float = 0.002,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
-    """Crop shared zero-valued letterbox/pillarbox borders when they are substantial."""
+    """Crop shared black/near-black letterbox or pillarbox borders when substantial."""
     if pred_bgr is None or ref_bgr is None:
         return pred_bgr, ref_bgr, False
     if pred_bgr.shape[:2] != ref_bgr.shape[:2]:
@@ -140,18 +141,46 @@ def _crop_shared_black_borders(
     if pred_bgr.ndim < 2 or ref_bgr.ndim < 2:
         return pred_bgr, ref_bgr, False
 
-    union_signal = np.any(pred_bgr != 0, axis=2) | np.any(ref_bgr != 0, axis=2)
-    if not np.any(union_signal):
-        return pred_bgr, ref_bgr, False
-
-    row_has_signal = np.any(union_signal, axis=1)
-    col_has_signal = np.any(union_signal, axis=0)
+    peak = max(_frame_peak_value(pred_bgr), _frame_peak_value(ref_bgr))
+    black_threshold = max(2.0, float(peak) * float(black_level_ratio))
     h, w = pred_bgr.shape[:2]
+    min_row_signal_px = max(4, int(round(w * 0.01)))
+    min_col_signal_px = max(4, int(round(h * 0.01)))
 
-    top = int(np.argmax(row_has_signal))
-    bottom = h - int(np.argmax(row_has_signal[::-1]))
-    left = int(np.argmax(col_has_signal))
-    right = w - int(np.argmax(col_has_signal[::-1]))
+    def _bounds_from_frame(frame_bgr: np.ndarray) -> tuple[int, int, int, int] | None:
+        frame_max = np.max(frame_bgr.astype(np.float32, copy=False), axis=2)
+        signal_mask = frame_max > black_threshold
+        if not np.any(signal_mask):
+            return None
+
+        row_signal_counts = np.count_nonzero(signal_mask, axis=1)
+        col_signal_counts = np.count_nonzero(signal_mask, axis=0)
+        row_has_signal = row_signal_counts >= min_row_signal_px
+        col_has_signal = col_signal_counts >= min_col_signal_px
+        if not np.any(row_has_signal) or not np.any(col_has_signal):
+            return None
+
+        top = int(np.argmax(row_has_signal))
+        bottom = h - int(np.argmax(row_has_signal[::-1]))
+        left = int(np.argmax(col_has_signal))
+        right = w - int(np.argmax(col_has_signal[::-1]))
+        if bottom - top < 2 or right - left < 2:
+            return None
+        return top, bottom, left, right
+
+    pred_bounds = _bounds_from_frame(pred_bgr)
+    ref_bounds = _bounds_from_frame(ref_bgr)
+    if pred_bounds is None and ref_bounds is None:
+        return pred_bgr, ref_bgr, False
+    if pred_bounds is None:
+        top, bottom, left, right = ref_bounds
+    elif ref_bounds is None:
+        top, bottom, left, right = pred_bounds
+    else:
+        top = max(int(pred_bounds[0]), int(ref_bounds[0]))
+        bottom = min(int(pred_bounds[1]), int(ref_bounds[1]))
+        left = max(int(pred_bounds[2]), int(ref_bounds[2]))
+        right = min(int(pred_bounds[3]), int(ref_bounds[3]))
 
     crop_top = max(0, top)
     crop_bottom = max(0, h - bottom)

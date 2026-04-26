@@ -247,7 +247,7 @@ class CompareViewMixin:
                 max(0, int(anchor_frame)),
                 hdr_ground_truth_path=self._hdr_ground_truth_path,
                 precision_key=req_precision or None,
-                force_immediate=True,
+                force_immediate=False,
             )
 
     def _compare_current_frame(self):
