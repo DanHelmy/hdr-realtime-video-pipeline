@@ -202,6 +202,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
     - pre-compile kernels
     - clear kernel cache
     - export max-autotune/pre-dequantize advanced controls
+  - NVIDIA exposes a dedicated `Clear TensorRT Engine Cache` tool for cached `.engine` files
   - visible NVIDIA controls focus on model, precision/mode, resolution, and HG selection
 
 - **TensorRT replaces PyTorch max-autotune for NVIDIA**
@@ -304,6 +305,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Color handling** | SDR pane uses Rec.709 tagging; HDR pane uses BT.2020/PQ tagging; mpv auto-selects output mapping per display |
 | **Hybrid backend selection** | NVIDIA uses TensorRT engines exclusively; AMD uses the existing PyTorch runtime |
 | **TensorRT engine cache** | NVIDIA engines are built on demand per model/resolution/mode and reused from `src/models/engines/` |
+| **Clear TensorRT engine cache** | NVIDIA-only tool for deleting selected or all cached `.engine` files |
 | **PyTorch kernel compilation** | AMD can use Triton/torch.compile caches in a clean subprocess; caches are project-scoped and verified before reuse |
 | **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
 | **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
@@ -372,6 +374,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - **Runtime Execution Mode** — AMD PyTorch only; choose compiled or eager execution
 - **Pre-compile Kernels** — AMD PyTorch only; compile for any resolution(s) ahead of time
 - **Clear Kernel Cache** — AMD PyTorch only; force recompilation (e.g. after a PyTorch / driver update)
+- **Clear TensorRT Engine Cache** — NVIDIA only; delete selected or all cached `.engine` files
 
 On NVIDIA, PyTorch-specific tuning and kernel-cache tools are hidden because inference always uses TensorRT engines.
 
@@ -754,6 +757,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | Cached model/resolution/mode | Load `.engine` directly |
 | Different model/resolution/mode | Build a new `.engine` once |
 | Build/load failure | Log and inform user; no NVIDIA PyTorch fallback |
+| Manual clear | `Tools -> Clear TensorRT Engine Cache ...` |
 
 Manual prebuild:
 

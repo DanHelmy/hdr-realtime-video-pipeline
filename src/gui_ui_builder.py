@@ -119,6 +119,10 @@ class UiBuilderMixin:
         self._act_clear_kernel_cache = tools_menu.addAction(
             "Clear &Kernel Cache ...", self._clear_kernel_cache
         )
+        self._act_clear_tensorrt_engine_cache = tools_menu.addAction(
+            "Clear TensorRT &Engine Cache ...",
+            self._clear_tensorrt_engine_cache,
+        )
         if _IS_NVIDIA:
             for action in (
                 self._act_runtime_execution_mode,
@@ -128,6 +132,8 @@ class UiBuilderMixin:
                 self._act_clear_kernel_cache,
             ):
                 action.setVisible(False)
+        else:
+            self._act_clear_tensorrt_engine_cache.setVisible(False)
 
         view_menu = menu_bar.addMenu("&View")
         self._act_borderless_full_window = view_menu.addAction(

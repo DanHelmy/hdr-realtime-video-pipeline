@@ -96,6 +96,7 @@ _ROOT = os.path.dirname(_HERE)
 _HG_WEIGHTS_PATH = os.path.join(
     _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
+_TENSORRT_ENGINE_DIR = os.path.join(_ROOT, "src", "models", "engines")
 _LIBMPV_DLL_PATH = os.path.join(_ROOT, "src", "libmpv-2.dll")
 _HIP_SDK_URL = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
 
@@ -1639,6 +1640,105 @@ class PlaybackRuntimeMixin:
                 self,
                 "Kernel Cache",
                 "Failed to clear compile cache records.",
+            )
+
+    def _clear_tensorrt_engine_cache(self):
+        """Delete selected or all cached TensorRT engine files."""
+        if not _IS_NVIDIA:
+            QMessageBox.information(
+                self,
+                "TensorRT Engine Cache",
+                "TensorRT engine caches are only used on NVIDIA.",
+            )
+            return
+        if self._playing or (self._worker is not None and self._worker.isRunning()):
+            QMessageBox.information(
+                self,
+                "Clear TensorRT Engine Cache",
+                "Stop playback before clearing TensorRT engine files.\n\n"
+                "Engines are rebuilt on next playback/export/benchmark.",
+            )
+            return
+
+        import pathlib
+
+        engine_dir = pathlib.Path(_TENSORRT_ENGINE_DIR)
+        engines = sorted(
+            [p for p in engine_dir.glob("*.engine") if p.is_file()],
+            key=lambda p: p.name.lower(),
+        ) if engine_dir.is_dir() else []
+
+        if not engines:
+            QMessageBox.information(
+                self,
+                "TensorRT Engine Cache",
+                "No cached TensorRT engines were found.",
+            )
+            return
+
+        labels: list[str] = ["All TensorRT engines"]
+        label_to_path: dict[str, pathlib.Path] = {}
+        for path in engines:
+            size_mb = path.stat().st_size / (1024.0 * 1024.0)
+            label = f"{path.name} ({size_mb:.1f} MB)"
+            labels.append(label)
+            label_to_path[label] = path
+
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Clear TensorRT Engine Cache",
+            "Choose what to clear:",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        selected = str(selected or "")
+        if selected == labels[0]:
+            targets = engines
+            detail = f"all {len(targets)} cached TensorRT engine file(s)"
+        else:
+            target = label_to_path.get(selected)
+            if target is None:
+                return
+            targets = [target]
+            detail = target.name
+
+        answer = QMessageBox.question(
+            self,
+            "Clear TensorRT Engine Cache",
+            "This will delete "
+            + detail
+            + ".\n\nEngines will be rebuilt on next use. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        removed = 0
+        errors: list[str] = []
+        for path in targets:
+            try:
+                path.unlink()
+                removed += 1
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "TensorRT Engine Cache",
+                f"Removed {removed} engine file(s), but some files could not be deleted:\n\n"
+                + "\n".join(errors[:8]),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "TensorRT Engine Cache",
+                f"Removed {removed} TensorRT engine file(s).",
             )
 
     def _open_file(self):
