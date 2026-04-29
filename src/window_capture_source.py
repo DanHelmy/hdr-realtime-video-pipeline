@@ -938,6 +938,7 @@ class WindowCaptureSource:
         *,
         hwnd: int = 0,
         pid: int = 0,
+        observe_fps: float | None = None,
     ):
         self.hwnd = max(0, int(hwnd or 0))
         self.pid = max(0, int(pid or 0))
@@ -945,6 +946,7 @@ class WindowCaptureSource:
             raise RuntimeError("Window capture requires a native window handle.")
         self.title = str(title or "").strip()
         self.fps = max(1.0, float(fps))
+        self.observe_fps = max(self.fps, float(observe_fps or self.fps))
         self.prefetch = max(0, int(prefetch))
         self.capture_max_w = max(0, int(capture_max_w))
         self.capture_max_h = max(0, int(capture_max_h))
@@ -961,6 +963,7 @@ class WindowCaptureSource:
         self._payload_cond = threading.Condition()
         self._latest_payload: tuple[int, float, float, np.ndarray] | None = None
         self._delivered_seq = -1
+        self._last_delivery_perf = 0.0
         self._capture_started_perf = time.perf_counter()
 
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -990,10 +993,23 @@ class WindowCaptureSource:
         return np.ascontiguousarray(resized)
 
     def _capture_wait_timeout_s(self) -> float:
-        return min(_WINDOW_CAPTURE_DUPLICATE_WAIT_S, 1.0 / 120.0)
+        return min(_WINDOW_CAPTURE_DUPLICATE_WAIT_S, self._capture_interval_s())
+
+    def _capture_interval_s(self) -> float:
+        return 1.0 / max(1.0, min(240.0, float(self.observe_fps or self.fps or 24.0)))
+
+    def _delivery_interval_s(self) -> float:
+        return 1.0 / max(1.0, min(240.0, float(self.fps or 24.0)))
 
     def _reader_loop(self):
+        capture_interval_s = self._capture_interval_s()
+        next_capture_t = time.perf_counter()
         while not self._stopped:
+            now_t = time.perf_counter()
+            if capture_interval_s > 0.0 and now_t < next_capture_t:
+                time.sleep(min(0.010, next_capture_t - now_t))
+                continue
+
             frame, _width, _height = _capture_native_window_frame(
                 self.hwnd,
                 wait_timeout_s=self._capture_wait_timeout_s(),
@@ -1001,6 +1017,8 @@ class WindowCaptureSource:
             captured_t = time.perf_counter()
             if frame is None:
                 if _window_exists(self.hwnd):
+                    capture_interval_s = self._capture_interval_s()
+                    next_capture_t = max(next_capture_t + capture_interval_s, captured_t)
                     continue
                 break
 
@@ -1013,6 +1031,8 @@ class WindowCaptureSource:
             with self._payload_cond:
                 self._latest_payload = payload
                 self._payload_cond.notify_all()
+            capture_interval_s = self._capture_interval_s()
+            next_capture_t = max(next_capture_t + capture_interval_s, captured_t)
 
         self._stopped = True
         with self._payload_cond:
@@ -1021,11 +1041,24 @@ class WindowCaptureSource:
     def read_with_meta(self):
         while not self._stopped:
             with self._payload_cond:
+                now_t = time.perf_counter()
+                if self._last_delivery_perf > 0.0:
+                    delivery_due_t = self._last_delivery_perf + self._delivery_interval_s()
+                    if now_t < delivery_due_t:
+                        self._payload_cond.wait(
+                            timeout=min(
+                                self._capture_wait_timeout_s(),
+                                max(0.0, delivery_due_t - now_t),
+                            )
+                        )
+                        continue
+
                 payload = self._latest_payload
                 if payload is not None:
                     idx, pts_sec, captured_t, frame = payload
                     if int(idx) > self._delivered_seq:
                         self._delivered_seq = int(idx)
+                        self._last_delivery_perf = now_t
                         self.last_capture_perf_counter = float(captured_t)
                         return True, frame, int(idx), float(pts_sec)
                 if not _window_exists(self.hwnd):

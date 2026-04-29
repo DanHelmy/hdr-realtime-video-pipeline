@@ -159,6 +159,8 @@ class StateInitMixin:
         self._cursor_hidden = False
         self._cursor_idle_ms = 1500
         self._startup_sync_pending = False
+        self._startup_frame_relock_pending = False
+        self._startup_frame_relock_token = 0
         self._last_sdr_frame = None
         self._last_hdr_frame = None
         self._compare_dialog = None

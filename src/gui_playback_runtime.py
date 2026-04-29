@@ -20,7 +20,8 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
-    LIVE_CAPTURE_DISPLAY_FPS,
+    LIVE_CAPTURE_OBSERVE_FPS,
+    LIVE_CAPTURE_PROCESS_FPS,
     PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
@@ -1235,17 +1236,32 @@ class PlaybackRuntimeMixin:
 
         pending = getattr(self, "_pending_mpv_start", None)
         if pending and self._disp_hdr_mpv is not None:
-            (
-                pw,
-                ph,
-                fps,
-                scale_kernel,
-                scale_antiring,
-                cas_strength,
-                audio_path,
-                film_grain,
-                force_hdr_metadata,
-            ) = pending
+            vsync_timed = False
+            if len(pending) >= 10:
+                (
+                    pw,
+                    ph,
+                    fps,
+                    scale_kernel,
+                    scale_antiring,
+                    cas_strength,
+                    audio_path,
+                    film_grain,
+                    force_hdr_metadata,
+                    vsync_timed,
+                ) = pending[:10]
+            else:
+                (
+                    pw,
+                    ph,
+                    fps,
+                    scale_kernel,
+                    scale_antiring,
+                    cas_strength,
+                    audio_path,
+                    film_grain,
+                    force_hdr_metadata,
+                ) = pending
             hdr_mpv_started = self._disp_hdr_mpv.start_playback(
                 pw,
                 ph,
@@ -1256,6 +1272,7 @@ class PlaybackRuntimeMixin:
                 audio_path=audio_path,
                 film_grain=film_grain,
                 force_hdr_metadata=force_hdr_metadata,
+                vsync_timed=vsync_timed,
             )
             if hdr_mpv_started:
                 # Anchor mpv timeline at 0 on startup to avoid initial drift.
@@ -1282,7 +1299,11 @@ class PlaybackRuntimeMixin:
             self._pending_mpv_start = None
         pending_sdr = getattr(self, "_pending_sdr_mpv_start", None)
         if pending_sdr and self._disp_sdr_mpv is not None and self._active_use_mpv:
-            pw, ph, fps, scale_kernel = pending_sdr
+            if len(pending_sdr) >= 5:
+                pw, ph, fps, scale_kernel, vsync_timed = pending_sdr[:5]
+            else:
+                pw, ph, fps, scale_kernel = pending_sdr
+                vsync_timed = False
             sdr_mpv_started = self._disp_sdr_mpv.start_playback(
                 pw,
                 ph,
@@ -1290,6 +1311,7 @@ class PlaybackRuntimeMixin:
                 scale_kernel=scale_kernel,
                 audio_path=None,
                 force_hdr_metadata=False,
+                vsync_timed=vsync_timed,
             )
             if sdr_mpv_started:
                 if self._startup_sync_pending:
@@ -1302,6 +1324,7 @@ class PlaybackRuntimeMixin:
                 if self._disp_sdr_stack is not None and self._disp_sdr_cpu is not None:
                     self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
             self._pending_sdr_mpv_start = None
+        self._worker.resolve_display_handoff()
         self._note_live_audio_compile_ready()
         self._sync_screen_change_hooks()
 
@@ -2315,7 +2338,7 @@ class PlaybackRuntimeMixin:
 
         self._save_user_settings()
         self._set_source_resolution_options_for_dims(src_w, src_h)
-        self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
+        self._prepare_live_timeline(LIVE_CAPTURE_PROCESS_FPS)
         self._show_idle_preview_frame(preview)
         self._refresh_source_mode_ui()
         self._btn_pause.setEnabled(False)
@@ -2325,17 +2348,22 @@ class PlaybackRuntimeMixin:
         self._update_playback_log_button()
         self.setWindowTitle(f"HDRTVNet++ - {self._capture_target.label}")
         has_tab_audio_sync = bool(str(getattr(self._capture_target, "session_id", "") or "").strip())
+        cadence_text = (
+            f"Chrome is observed up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, "
+            f"video processing is capped at {LIVE_CAPTURE_PROCESS_FPS:g} fps, "
+            "and mpv repeats those frames on display vsync."
+        )
         self.statusBar().showMessage(
             (
                 f"Selected live browser window: {self._capture_target.label}. "
                 "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Press Play to start video. If Chrome Audio Sync is active, the extension will delay and play the tab audio locally while HDRTVNet++ stays silent. "
-                "Live presentation cadence is phase-locked to capture timing for smoother pacing."
+                f"{cadence_text}"
             )
             if has_tab_audio_sync
             else (
                 f"Selected live browser window: {self._capture_target.label}. "
                 "Experimental Chrome-only mode. Chrome's 'Use graphics acceleration when available' must be off. Start Chrome Audio Sync in the extension before Play if you want delayed local browser audio. Without it, Chrome keeps playing audio locally and it can lead the video. "
-                "Live presentation cadence is phase-locked to capture timing for smoother pacing."
+                f"{cadence_text}"
             )
         )
         if auto_play:
@@ -2559,10 +2587,10 @@ class PlaybackRuntimeMixin:
                 source_url=str(getattr(target, "source_url", "") or "").strip(),
             )
             self._set_source_resolution_options_for_dims(vw, vh)
-            self._prepare_live_timeline(LIVE_CAPTURE_DISPLAY_FPS)
+            self._prepare_live_timeline(LIVE_CAPTURE_PROCESS_FPS)
             self._source_hdr_info = {"is_hdr": False, "reason": "browser_window_capture"}
             total_frames = 0
-            self._vid_fps = float(LIVE_CAPTURE_DISPLAY_FPS)
+            self._vid_fps = float(LIVE_CAPTURE_PROCESS_FPS)
             if not str(getattr(self._capture_target, "session_id", "") or "").strip():
                 self.statusBar().showMessage(
                     "No matching Chrome Audio Sync session was found. "
@@ -2816,6 +2844,7 @@ class PlaybackRuntimeMixin:
                     self._chk_film_grain.blockSignals(True)
                     self._chk_film_grain.setChecked(False)
                     self._chk_film_grain.blockSignals(False)
+            live_vsync_timed = bool(is_window_source)
             self._pending_mpv_start = (
                 pw,
                 ph,
@@ -2826,9 +2855,16 @@ class PlaybackRuntimeMixin:
                 mpv_audio_path,
                 self._active_film_grain,
                 True,
+                live_vsync_timed,
             )
             if self._disp_sdr_mpv is not None:
-                self._pending_sdr_mpv_start = (ow, oh, float(display_fps), "bicubic")
+                self._pending_sdr_mpv_start = (
+                    ow,
+                    oh,
+                    float(display_fps),
+                    "bicubic",
+                    live_vsync_timed,
+                )
         else:
             self._worker.set_mpv_widget(None)
             self._worker.set_sdr_mpv_widget(None)
@@ -2860,13 +2896,15 @@ class PlaybackRuntimeMixin:
                     "source_url": str(getattr(self._capture_target, "source_url", "") or ""),
                     "process_name": str(getattr(self._capture_target, "process_name", "") or ""),
                     "pid": int(getattr(self._capture_target, "pid", 0) or 0),
-                    "fps": float(LIVE_CAPTURE_DISPLAY_FPS),
+                    "fps": float(LIVE_CAPTURE_PROCESS_FPS),
+                    "observe_fps": float(LIVE_CAPTURE_OBSERVE_FPS),
                     "capture_w": int(pw),
                     "capture_h": int(ph),
                 }
                 if is_window_source and self._capture_target is not None
                 else None
             ),
+            expect_display_handoff=bool(use_mpv_pipeline),
         )
 
         # Show loading dialog while the worker loads the runtime. On NVIDIA
@@ -2901,7 +2939,7 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage(
                 "Live browser window capture started. "
                 "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. "
-                "Capture runs dynamically from fresh Chrome window frames with phase-locked smooth cadence. HDRTVNet++ stays silent. "
+                f"Capture observes Chrome up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, and lets mpv repeat frames on display vsync. HDRTVNet++ stays silent. "
                 "If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
             )
         elif self._audio_available:

@@ -13,6 +13,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from gui_config import (
+    LIVE_CAPTURE_OBSERVE_FPS,
+    LIVE_CAPTURE_PROCESS_FPS,
+)
 from window_capture_source import (
     WindowCaptureTarget,
     attach_best_browser_tab_session,
@@ -78,7 +82,7 @@ class WindowCaptureDialog(QDialog):
         root.addLayout(row_window)
 
         self._lbl_capture_mode = QLabel(
-            "Capture rate adapts automatically to whatever Chrome is actually presenting."
+            f"Video observes Chrome up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, then mpv repeats frames on display vsync."
         )
         self._lbl_capture_mode.setWordWrap(True)
         root.addWidget(self._lbl_capture_mode)

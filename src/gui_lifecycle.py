@@ -23,6 +23,8 @@ class LifecycleMixin:
         self._active_upscale_mode = DEFAULT_UPSCALER
         self._active_film_grain = False
         self._startup_sync_pending = False
+        self._startup_frame_relock_pending = False
+        self._startup_frame_relock_token += 1
         self._auto_muted_low_fps = False
         self._scrub_muted = False
         self._live_audio_active = False

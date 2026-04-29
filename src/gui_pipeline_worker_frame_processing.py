@@ -91,8 +91,8 @@ class PipelineWorkerFrameProcessingMixin:
         mpv_w,
         use_cuda: bool,
     ) -> tuple[np.ndarray | None, np.ndarray, object, bool, float]:
-        # For live capture, present_t carries source capture timestamps so
-        # feeder threads can phase-lock smooth cadence to capture timing.
+        # File playback may carry an absolute presentation time. Live capture
+        # uses the feeder's steady low-FPS clock and mpv's display sync.
         queue_present_t = present_t
         need_display_frame = self._input_is_hdr or self._sdr_visible or mpv_w is None
         display_frame = _letterbox_bgr(frame, out_w, out_h) if need_display_frame else None

@@ -7,20 +7,15 @@ import time
 import numpy as np
 import torch
 
+from gui_config import LIVE_CAPTURE_PROCESS_FPS
 from gui_mpv_widget import MpvHDRWidget
 from timer import sleep_until
 
-_LIVE_SMOOTH_PRESENT_FPS = 60.0
-_LIVE_SMOOTH_PRESENT_INTERVAL_S = 1.0 / _LIVE_SMOOTH_PRESENT_FPS
 _LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.050
-_LIVE_PLL_DELAY_DEFAULT_S = 0.040
-_LIVE_PLL_DELAY_MIN_S = 0.018
-_LIVE_PLL_DELAY_MAX_S = 0.110
-_LIVE_PLL_SOURCE_SMOOTHING = 0.12
-_LIVE_PLL_DELAY_SMOOTHING = 0.15
-_LIVE_PLL_PHASE_CORRECTION_GAIN = 0.08
-_LIVE_PLL_PHASE_CORRECTION_CLAMP_S = 0.0025
-_LIVE_PLL_DRIFT_RESET_S = 0.350
+
+
+def _live_present_interval_s() -> float:
+    return 1.0 / max(1.0, float(LIVE_CAPTURE_PROCESS_FPS or 24.0))
 
 
 class PipelineWorkerFeedersMixin:
@@ -37,9 +32,7 @@ class PipelineWorkerFeedersMixin:
             no_item = object()
             next_present_t = 0.0
             latest_rgb48_bytes: bytes | None = None
-            last_source_t = 0.0
-            source_interval_s = _LIVE_SMOOTH_PRESENT_INTERVAL_S
-            source_to_present_delay_s = _LIVE_PLL_DELAY_DEFAULT_S
+            present_interval_s = _live_present_interval_s()
             while True:
                 now = time.perf_counter()
                 wait_timeout = 0.2
@@ -72,41 +65,12 @@ class PipelineWorkerFeedersMixin:
                         break
 
                     ready_event = None
-                    source_t = 0.0
                     if isinstance(item, tuple) and len(item) == 3:
-                        source_t, tensor, ready_event = item
+                        _source_t, tensor, ready_event = item
                     elif isinstance(item, tuple) and len(item) == 2:
-                        source_t, tensor = item
+                        _source_t, tensor = item
                     else:
                         tensor = item
-
-                    try:
-                        source_t = float(source_t or 0.0)
-                    except Exception:
-                        source_t = 0.0
-                    if source_t <= 0.0:
-                        source_t = time.perf_counter()
-
-                    if last_source_t > 0.0:
-                        raw_interval_s = max(
-                            1.0 / 240.0,
-                            min(1.0 / 10.0, source_t - last_source_t),
-                        )
-                        source_interval_s = (
-                            ((1.0 - _LIVE_PLL_SOURCE_SMOOTHING) * source_interval_s)
-                            + (_LIVE_PLL_SOURCE_SMOOTHING * raw_interval_s)
-                        )
-                    last_source_t = source_t
-
-                    desired_delay_s = max(
-                        _LIVE_PLL_DELAY_MIN_S,
-                        min(_LIVE_PLL_DELAY_MAX_S, source_interval_s * 2.0),
-                    )
-                    source_to_present_delay_s = (
-                        ((1.0 - _LIVE_PLL_DELAY_SMOOTHING) * source_to_present_delay_s)
-                        + (_LIVE_PLL_DELAY_SMOOTHING * desired_delay_s)
-                    )
-                    anchor_present_t = source_t + source_to_present_delay_s
 
                     if ready_event is not None:
                         try:
@@ -126,23 +90,8 @@ class PipelineWorkerFeedersMixin:
                     hdr_u16 = (raw_cpu.astype(np.float32).__imul__(65535)).__add__(0.5)
                     np.clip(hdr_u16, 0, 65535, out=hdr_u16)
                     latest_rgb48_bytes = hdr_u16.astype(np.uint16).tobytes()
-
-                    now = time.perf_counter()
                     if next_present_t <= 0.0:
-                        next_present_t = max(now, anchor_present_t)
-                    else:
-                        drift_s = anchor_present_t - next_present_t
-                        if abs(drift_s) > _LIVE_PLL_DRIFT_RESET_S:
-                            next_present_t = max(now, anchor_present_t)
-                        else:
-                            correction_s = max(
-                                -_LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
-                                min(
-                                    _LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
-                                    drift_s * _LIVE_PLL_PHASE_CORRECTION_GAIN,
-                                ),
-                            )
-                            next_present_t += correction_s
+                        next_present_t = time.perf_counter()
 
                 if latest_rgb48_bytes is None:
                     continue
@@ -154,9 +103,9 @@ class PipelineWorkerFeedersMixin:
                     continue
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
-                next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+                next_present_t += present_interval_s
                 while next_present_t <= now:
-                    next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+                    next_present_t += present_interval_s
             return
 
         while True:
@@ -215,9 +164,7 @@ class PipelineWorkerFeedersMixin:
             no_item = object()
             next_present_t = 0.0
             latest_rgb48_bytes: bytes | None = None
-            last_source_t = 0.0
-            source_interval_s = _LIVE_SMOOTH_PRESENT_INTERVAL_S
-            source_to_present_delay_s = _LIVE_PLL_DELAY_DEFAULT_S
+            present_interval_s = _live_present_interval_s()
             while True:
                 now = time.perf_counter()
                 wait_timeout = 0.2
@@ -249,39 +196,10 @@ class PipelineWorkerFeedersMixin:
                     if item is None:
                         break
 
-                    source_t = 0.0
                     if isinstance(item, tuple) and len(item) == 2:
-                        source_t, frame = item
+                        _source_t, frame = item
                     else:
                         frame = item
-
-                    try:
-                        source_t = float(source_t or 0.0)
-                    except Exception:
-                        source_t = 0.0
-                    if source_t <= 0.0:
-                        source_t = time.perf_counter()
-
-                    if last_source_t > 0.0:
-                        raw_interval_s = max(
-                            1.0 / 240.0,
-                            min(1.0 / 10.0, source_t - last_source_t),
-                        )
-                        source_interval_s = (
-                            ((1.0 - _LIVE_PLL_SOURCE_SMOOTHING) * source_interval_s)
-                            + (_LIVE_PLL_SOURCE_SMOOTHING * raw_interval_s)
-                        )
-                    last_source_t = source_t
-
-                    desired_delay_s = max(
-                        _LIVE_PLL_DELAY_MIN_S,
-                        min(_LIVE_PLL_DELAY_MAX_S, source_interval_s * 2.0),
-                    )
-                    source_to_present_delay_s = (
-                        ((1.0 - _LIVE_PLL_DELAY_SMOOTHING) * source_to_present_delay_s)
-                        + (_LIVE_PLL_DELAY_SMOOTHING * desired_delay_s)
-                    )
-                    anchor_present_t = source_t + source_to_present_delay_s
 
                     try:
                         latest_rgb48_bytes = np.ascontiguousarray(
@@ -290,22 +208,8 @@ class PipelineWorkerFeedersMixin:
                     except Exception:
                         latest_rgb48_bytes = None
 
-                    now = time.perf_counter()
                     if next_present_t <= 0.0:
-                        next_present_t = max(now, anchor_present_t)
-                    else:
-                        drift_s = anchor_present_t - next_present_t
-                        if abs(drift_s) > _LIVE_PLL_DRIFT_RESET_S:
-                            next_present_t = max(now, anchor_present_t)
-                        else:
-                            correction_s = max(
-                                -_LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
-                                min(
-                                    _LIVE_PLL_PHASE_CORRECTION_CLAMP_S,
-                                    drift_s * _LIVE_PLL_PHASE_CORRECTION_GAIN,
-                                ),
-                            )
-                            next_present_t += correction_s
+                        next_present_t = time.perf_counter()
 
                 if latest_rgb48_bytes is None:
                     continue
@@ -317,9 +221,9 @@ class PipelineWorkerFeedersMixin:
                     continue
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
-                next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+                next_present_t += present_interval_s
                 while next_present_t <= now:
-                    next_present_t += _LIVE_SMOOTH_PRESENT_INTERVAL_S
+                    next_present_t += present_interval_s
             return
 
         while True:

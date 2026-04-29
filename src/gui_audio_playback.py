@@ -326,8 +326,11 @@ class AudioPlaybackMixin:
         if self._user_pause_override_startup:
             # User explicitly paused during startup; do not auto-resume.
             self._startup_sync_pending = False
+            self._startup_frame_relock_pending = False
             return
         self._startup_sync_pending = False
+        self._startup_frame_relock_pending = bool(getattr(self, "_active_use_mpv", False))
+        self._startup_frame_relock_token += 1
         if self._audio_available:
             self._seek_audio_seconds(0.0)
             # Keep audio paused until startup FPS gate opens.

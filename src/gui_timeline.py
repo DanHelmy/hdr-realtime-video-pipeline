@@ -110,6 +110,36 @@ class TimelineSeekMixin:
         self._pending_playhead_relock_first_ms = int(first_delay_ms)
         self._pending_playhead_relock_settle_ms = int(settle_delay_ms)
 
+    def _maybe_dispatch_startup_frame_relock(self):
+        if not bool(getattr(self, "_startup_frame_relock_pending", False)):
+            return
+        if not self._playing or self._is_live_window_capture_active():
+            self._startup_frame_relock_pending = False
+            return
+        if not getattr(self, "_active_use_mpv", False):
+            self._startup_frame_relock_pending = False
+            return
+        if self._startup_sync_pending:
+            return
+
+        self._startup_frame_relock_pending = False
+        token = int(getattr(self, "_startup_frame_relock_token", 0)) + 1
+        self._startup_frame_relock_token = token
+
+        def _relock_if_current(delay_ms: int, drop_frames: int):
+            def _do():
+                if token != int(getattr(self, "_startup_frame_relock_token", 0)):
+                    return
+                if not self._playing or self._worker is None or self._worker.is_paused:
+                    return
+                self._relock_timeline(drop_frames=drop_frames)
+
+            QTimer.singleShot(max(0, int(delay_ms)), _do)
+
+        _relock_if_current(40, 3)
+        _relock_if_current(220, 2)
+        _relock_if_current(620, 1)
+
     def _force_audio_seek(self, sec: float):
         """Aggressive audio resync: double-seek to reduce drift after UI changes."""
         if not self._audio_available:
@@ -135,6 +165,7 @@ class TimelineSeekMixin:
         """Update seek slider + time labels from worker."""
         self._last_seek_frame = int(current_frame)
         self._audio_sync_frame_hint = int(current_frame)
+        self._maybe_dispatch_startup_frame_relock()
         if (
             total_frames > 0
             and not self._seek_slider.isSliderDown()

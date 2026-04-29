@@ -78,7 +78,27 @@ SOURCE_MODE_LABELS = {
     SOURCE_MODE_WINDOW: "Browser Window Capture (Experimental)",
 }
 
-LIVE_CAPTURE_DISPLAY_FPS = 120.0
+def _env_live_fps(name: str, default: float, *, max_value: float = 120.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = float(default)
+    if value <= 0.0:
+        value = float(default)
+    return max(1.0, min(float(max_value), float(value)))
+
+
+# Browser-window video has two separate rates:
+# - observe FPS controls how often we check Chrome/DWM for fresh compositor frames
+# - process FPS controls the steady raw-video stream fed to mpv
+# mpv then repeats frames on display vsync, so Python does not need 60 Hz writes.
+LIVE_CAPTURE_PROCESS_FPS = _env_live_fps("HDRTVNET_LIVE_CAPTURE_PROCESS_FPS", 24.0)
+LIVE_CAPTURE_OBSERVE_FPS = _env_live_fps(
+    "HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS",
+    max(30.0, LIVE_CAPTURE_PROCESS_FPS),
+)
+LIVE_CAPTURE_PRESENT_MAX_FPS = LIVE_CAPTURE_PROCESS_FPS
+LIVE_CAPTURE_DISPLAY_FPS = LIVE_CAPTURE_PROCESS_FPS
 
 
 def _normalize_source_mode(mode: str | None) -> str:

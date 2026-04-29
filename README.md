@@ -35,8 +35,9 @@ Core updates include:
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
 - Chrome Audio Sync extension kept audio-only, with manual start/stop in Chrome
-- Browser Window Capture now follows fresh Chrome window frames dynamically instead of using a manual capture-FPS cap
-- Browser Window Capture now uses adaptive paced presentation from a curated live target ladder instead of coarse divisor-only stepping
+- Browser Window Capture now observes Chrome compositor frames separately from the low-cost process-FPS budget
+- Browser Window Capture now feeds mpv a steady low-FPS stream and lets mpv repeat frames on display vsync instead of forcing 60 fps pipe writes
+- Browser Window Capture waits for the HDR mpv display handoff after cold compile, avoiding the occasional black HDR pane / inactive-HDR startup race
 - cleaner startup logging by filtering harmless Qt DPI-awareness warning spam
 - project-scoped PyTorch kernel caches on AMD so separate local clones do not reuse or delete each other's kernels
 - bounded cached-kernel verification with clear-and-recompile recovery when an incompatible cache would otherwise hang warmup
@@ -97,6 +98,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 - Direct visible-window Chrome capture for video
 - Chrome extension handles delayed local audio sync
+- Video processing stays on a low-FPS budget while mpv handles display-vsync frame repeat
 
 ![Browser Capture Flow](docs/images/v4-browser-capture-flow.png)
 
@@ -148,6 +150,19 @@ Use this flow for `Browser Window Capture`:
 12. Adjust the extension delay slider while playback is running until lip-sync looks right
 13. Stop Chrome Audio Sync later from the extension popup when you are done
 
+Browser capture pacing:
+
+- Chrome compositor observation runs at up to `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` frames per second so 24 fps processing has a fresh recent browser frame available. Default: `30`.
+- Video processing samples the latest visible Chrome window frame as a steady `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS` raw-video stream. Default: `24`.
+- mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
+- To reduce load further, set the variables before launching:
+
+```powershell
+$env:HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS="30"
+$env:HDRTVNET_LIVE_CAPTURE_PROCESS_FPS="20"
+.\run_gui.bat
+```
+
 Important:
 
 - `Browser Window Capture` is experimental.
@@ -158,8 +173,8 @@ Important:
 - The extension is audio-only and delays tab audio locally inside Chrome.
 - Chrome Audio Sync now stays active until you stop it manually in the extension.
 - HDRTVNet++ stays silent during browser-window playback.
-- Browser-window capture now follows fresh Chrome window frames dynamically; there is no manual Browser Window capture-FPS cap anymore.
-- Browser-window playback uses adaptive paced presentation internally, but the FPS metric still shows observed live output cadence rather than a rounded target rung.
+- Browser-window capture observes Chrome separately (`HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS`, default `30`), feeds mpv a steady process-FPS stream (`HDRTVNET_LIVE_CAPTURE_PROCESS_FPS`, default `24`), and lets mpv repeat frames on display vsync.
+- After a cold compile, playback waits for mpv to attach before the worker starts producing frames; this prevents the HDR pane from staying black while the worker silently falls back to CPU output.
 - Without Chrome Audio Sync, Chrome keeps playing audio locally and it can lead the video.
 - If the Chrome source window disappears unexpectedly, HDRTVNet++ now treats that as source loss and restarts cleanly instead of holding onto a dead browser feed.
 
@@ -239,9 +254,10 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - manual stop behavior stays in the extension popup
   - HDRTVNet++ stays silent while Chrome replays delayed tab audio locally
 - **Browser Window Capture is more usable as a live viewer**
-  - Browser Window Capture now follows fresh Chrome window frames dynamically instead of exposing a manual live capture-FPS cap
+  - Browser Window Capture now observes Chrome compositor frames separately, then runs HDRTVNet++ only under the low-cost process-FPS budget
   - the direct-window capture path remains the only active browser-video path
-  - live browser presentation now picks from a curated pacing ladder (`60 / 50 / 48 / 45 / 40 / 36 / 30 / 25 / 24 / 20 ...`) instead of only dropping to coarse divisor steps
+  - live browser presentation now uses mpv timed playback (`display-resample`) so frame repeat is handled by the display clock instead of a Python pacing loop
+  - HDR output waits for an explicit mpv display handoff after compile, so cold compile startup no longer races into a black HDR pane with inactive HDR metadata
   - if the Chrome source window disappears unexpectedly, the app now restarts cleanly instead of leaving a dead live source attached
 - **Startup logging is cleaner**
   - harmless Qt DPI-awareness warnings are filtered so launch logs stay focused on real problems
@@ -287,7 +303,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | Feature | Description |
 |---|---|
 | **Open any video** | Browse or drag-and-drop — playback starts automatically |
-| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with bundled Chrome Audio Sync; capture follows fresh Chrome window frames dynamically and uses adaptive paced presentation |
+| **Browser Window Capture (Experimental)** | Native visible-Chrome window capture with bundled Chrome Audio Sync; samples latest frames under a process-FPS budget and lets mpv repeat them on display vsync |
 | **Modular codebase** | GUI and worker logic split into maintainable mixins/modules for easier iteration |
 | **Tabbed views** | `SDR`, `HDR`, and `Side by Side` tabs |
 | **Pop/Dock panes** | Detach SDR/HDR into separate windows and dock back |

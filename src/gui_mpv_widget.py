@@ -378,12 +378,14 @@ class MpvHDRWidget(QWidget):
         audio_path: str | None = None,
         film_grain: bool = False,
         force_hdr_metadata: bool = True,
+        vsync_timed: bool = False,
     ) -> bool:
         self.stop_playback()
         self._shutdown.clear()
         self._queue = _queue.Queue(maxsize=1)
         self._fps = float(fps) if fps and fps > 0 else 30.0
         self._force_hdr_metadata = bool(force_hdr_metadata)
+        vsync_timed = bool(vsync_timed)
         self._diag_enabled = bool(self._mpv_diag and self._force_hdr_metadata)
         self._last_scale_error = None
         requested_kernel = str(scale_kernel or "").strip().lower()
@@ -405,6 +407,7 @@ class MpvHDRWidget(QWidget):
             "audio_path": audio_path,
             "film_grain": bool(film_grain),
             "force_hdr_metadata": self._force_hdr_metadata,
+            "vsync_timed": vsync_timed,
         }
 
         pipe_id = id(self)
@@ -449,7 +452,7 @@ class MpvHDRWidget(QWidget):
             demuxer_rawvideo_h=str(height),
             demuxer_rawvideo_mp_format="rgb48le",
             demuxer_rawvideo_fps=str(self._fps),
-            untimed=True,
+            untimed=(not vsync_timed),
             audio="auto",
             audio_file_auto="no",
             osc="no",
@@ -458,12 +461,17 @@ class MpvHDRWidget(QWidget):
             cache="no",
             demuxer_max_bytes=max_demux,
             demuxer_readahead_secs=0,
-            video_sync="desync",
+            video_sync="display-resample" if vsync_timed else "desync",
             scale="bilinear" if use_fsr else str(kernel_name),
             cscale="bilinear" if use_fsr else str(kernel_name),
             scale_antiring=str(antiring),
             cscale_antiring=str(antiring),
         )
+        if vsync_timed:
+            mpv_kwargs.update(
+                interpolation=True,
+                tscale="oversample",
+            )
         shader_paths = []
         if use_fsr:
             shader_paths.append(self._fsr_shader_path)
@@ -495,15 +503,50 @@ class MpvHDRWidget(QWidget):
             player = self._mpv_lib.MPV(**mpv_kwargs)
             self._active_vo = "gpu-next"
         except Exception as exc:
-            self._last_scale_error = f"mpv startup failed with gpu-next/vulkan: {exc}"
-            print(f"[mpv] {self._last_scale_error}")
-            try:
-                self.runtime_notice.emit(self._last_scale_error)
-            except Exception:
-                pass
-            self._queue = None
-            self._pipe_name = None
-            return False
+            if vsync_timed:
+                fallback_kwargs = dict(mpv_kwargs)
+                fallback_kwargs["untimed"] = True
+                fallback_kwargs["video_sync"] = "desync"
+                fallback_kwargs.pop("interpolation", None)
+                fallback_kwargs.pop("tscale", None)
+                try:
+                    player = self._mpv_lib.MPV(**fallback_kwargs)
+                    self._active_vo = "gpu-next"
+                    vsync_timed = False
+                    if self._last_playback_cfg is not None:
+                        self._last_playback_cfg["vsync_timed"] = False
+                    note = (
+                        "mpv vsync-timed mode unavailable; using low-latency "
+                        f"untimed fallback: {exc}"
+                    )
+                    print(f"[mpv] {note}")
+                    try:
+                        self.runtime_notice.emit(note)
+                    except Exception:
+                        pass
+                except Exception as fallback_exc:
+                    self._last_scale_error = (
+                        "mpv startup failed with gpu-next/vulkan: "
+                        f"{fallback_exc}"
+                    )
+                    print(f"[mpv] {self._last_scale_error}")
+                    try:
+                        self.runtime_notice.emit(self._last_scale_error)
+                    except Exception:
+                        pass
+                    self._queue = None
+                    self._pipe_name = None
+                    return False
+            else:
+                self._last_scale_error = f"mpv startup failed with gpu-next/vulkan: {exc}"
+                print(f"[mpv] {self._last_scale_error}")
+                try:
+                    self.runtime_notice.emit(self._last_scale_error)
+                except Exception:
+                    pass
+                self._queue = None
+                self._pipe_name = None
+                return False
         self._player = player
         pipe_ready = threading.Event()
         self._feeder = threading.Thread(
@@ -836,6 +879,7 @@ class MpvHDRWidget(QWidget):
             "audio_path",
             "force_hdr_metadata",
             "film_grain",
+            "vsync_timed",
         }
         safe_cfg = {k: v for k, v in cfg.items() if k in allowed}
         self.start_playback(**safe_cfg)

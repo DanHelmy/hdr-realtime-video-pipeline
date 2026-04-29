@@ -148,6 +148,9 @@ class PipelineWorker(
         self._session_logging_started_t = 0.0
         self._session_logging_total_model_latency_ms = 0.0
         self._session_logging_model_latency_count = 0
+        self._expect_display_handoff = False
+        self._display_handoff_event = threading.Event()
+        self._display_handoff_event.set()
 
     # ── public API (called from main thread) ──
 
@@ -158,7 +161,8 @@ class PipelineWorker(
                   runtime_execution_mode: str = "compile",
                   objective_metrics_enabled=False,
                   hdr_ground_truth_path: str | None = None,
-                  capture_target: dict | None = None):
+                  capture_target: dict | None = None,
+                  expect_display_handoff: bool = False):
         self._video_path = video_path
         self._capture_target = dict(capture_target) if isinstance(capture_target, dict) else None
         self._precision_key = precision_key
@@ -190,6 +194,11 @@ class PipelineWorker(
         self._live_latency_smoothed_ms = 0.0
         self._realtime_drop_frames = 0
         self._last_metrics_emit_t = 0.0
+        self._expect_display_handoff = bool(expect_display_handoff)
+        if self._expect_display_handoff:
+            self._display_handoff_event.clear()
+        else:
+            self._display_handoff_event.set()
         is_live_capture = bool(self._capture_target)
         # File playback benefits from a short startup settle window.
         # Live browser-window capture should render immediately.
@@ -438,6 +447,10 @@ class PipelineWorker(
         """Set the MpvHDRWidget reference for feeding HDR frames."""
         self._mpv_widget = widget
 
+    def resolve_display_handoff(self):
+        """Signal that the GUI has attached mpv or selected CPU fallback."""
+        self._display_handoff_event.set()
+
     def set_sdr_mpv_widget(self, widget):
         """Set the MpvHDRWidget reference for feeding SDR frames."""
         self._sdr_mpv_widget = widget
@@ -468,6 +481,7 @@ class PipelineWorker(
         self._user_paused = False
         self._paused_control_wake = False
         self._paused_control_refresh_frame = None
+        self._display_handoff_event.set()
         self._pause_event.set()  # unblock if paused
 
     @property
@@ -510,12 +524,17 @@ class PipelineWorker(
             self.playback_finished.emit()
             return
 
-        # Wait a moment for mpv to be started by the main thread
-        import time as _t
-        for _ in range(20):                  # up to 1 s
-            if self._mpv_widget is not None or self._stop_flag:
-                break
-            _t.sleep(0.05)
+        # Wait until the GUI has either attached mpv or intentionally selected
+        # CPU fallback. Cold compile can leave the GPU/driver busy long enough
+        # that a fixed short poll races and starts the worker with no mpv feed.
+        if self._expect_display_handoff:
+            self.status_message.emit("Preparing video output ...")
+            while not self._stop_flag:
+                if self._display_handoff_event.wait(timeout=0.05):
+                    break
+            if self._stop_flag:
+                self.playback_finished.emit()
+                return
 
         # Start async feeders if mpv is active
         mpv_w = self._mpv_widget
@@ -533,6 +552,14 @@ class PipelineWorker(
                 title=str(self._capture_target.get("title", "") or ""),
                 hwnd=int(self._capture_target.get("hwnd", 0) or 0),
                 pid=int(self._capture_target.get("pid", 0) or 0),
+                observe_fps=float(
+                    self._capture_target.get(
+                        "observe_fps",
+                        self._capture_target.get("fps", 24.0),
+                    )
+                    or self._capture_target.get("fps", 24.0)
+                    or 24.0
+                ),
                 prefetch=1,
                 capture_max_w=int(
                     self._capture_target.get("capture_w", self._proc_w) or self._proc_w
@@ -837,12 +864,11 @@ class PipelineWorker(
                 continue
 
             if is_live_capture:
-                # For live capture, pass the source capture clock downstream
-                # so feeders can phase-lock stable presentation cadence.
+                # Live capture is paced by WindowCaptureSource plus the mpv
+                # feeder. Keep source capture time only for latency metrics.
                 present_t = None
                 if capture_perf_counter > 0.0:
                     live_capture_prev_perf = float(capture_perf_counter)
-                    present_t = float(capture_perf_counter)
             else:
                 present_t = max(next_frame_t, time.perf_counter())
 
