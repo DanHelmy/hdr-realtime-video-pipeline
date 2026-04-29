@@ -12,6 +12,7 @@ from gui_mpv_widget import MpvHDRWidget
 from timer import sleep_until
 
 _LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.050
+_LIVE_SMOOTH_MAX_CATCHUP_FRAMES = 2
 
 
 def _live_present_interval_s() -> float:
@@ -104,8 +105,12 @@ class PipelineWorkerFeedersMixin:
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
                 next_present_t += present_interval_s
-                while next_present_t <= now:
-                    next_present_t += present_interval_s
+                if next_present_t < (
+                    now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
+                ):
+                    next_present_t = (
+                        now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
+                    )
             return
 
         while True:
@@ -222,8 +227,12 @@ class PipelineWorkerFeedersMixin:
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
                 next_present_t += present_interval_s
-                while next_present_t <= now:
-                    next_present_t += present_interval_s
+                if next_present_t < (
+                    now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
+                ):
+                    next_present_t = (
+                        now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
+                    )
             return
 
         while True:

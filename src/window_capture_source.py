@@ -964,6 +964,7 @@ class WindowCaptureSource:
         self._latest_payload: tuple[int, float, float, np.ndarray] | None = None
         self._delivered_seq = -1
         self._last_delivery_perf = 0.0
+        self._next_delivery_perf = 0.0
         self._capture_started_perf = time.perf_counter()
 
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -1000,6 +1001,17 @@ class WindowCaptureSource:
 
     def _delivery_interval_s(self) -> float:
         return 1.0 / max(1.0, min(240.0, float(self.fps or 24.0)))
+
+    def _advance_delivery_clock(self, now_t: float) -> None:
+        interval_s = self._delivery_interval_s()
+        if self._next_delivery_perf <= 0.0:
+            self._next_delivery_perf = float(now_t) + interval_s
+            return
+        self._next_delivery_perf += interval_s
+        # Keep normal wake-up jitter from permanently lowering the cadence, but
+        # avoid a long stall causing a burst of stale catch-up reads.
+        if self._next_delivery_perf < (float(now_t) - interval_s):
+            self._next_delivery_perf = float(now_t) + interval_s
 
     def _reader_loop(self):
         capture_interval_s = self._capture_interval_s()
@@ -1042,16 +1054,17 @@ class WindowCaptureSource:
         while not self._stopped:
             with self._payload_cond:
                 now_t = time.perf_counter()
-                if self._last_delivery_perf > 0.0:
-                    delivery_due_t = self._last_delivery_perf + self._delivery_interval_s()
-                    if now_t < delivery_due_t:
-                        self._payload_cond.wait(
-                            timeout=min(
-                                self._capture_wait_timeout_s(),
-                                max(0.0, delivery_due_t - now_t),
-                            )
+                if self._next_delivery_perf <= 0.0:
+                    self._next_delivery_perf = now_t
+                delivery_due_t = self._next_delivery_perf
+                if now_t < delivery_due_t:
+                    self._payload_cond.wait(
+                        timeout=min(
+                            self._capture_wait_timeout_s(),
+                            max(0.0, delivery_due_t - now_t),
                         )
-                        continue
+                    )
+                    continue
 
                 payload = self._latest_payload
                 if payload is not None:
@@ -1059,6 +1072,7 @@ class WindowCaptureSource:
                     if int(idx) > self._delivered_seq:
                         self._delivered_seq = int(idx)
                         self._last_delivery_perf = now_t
+                        self._advance_delivery_clock(now_t)
                         self.last_capture_perf_counter = float(captured_t)
                         return True, frame, int(idx), float(pts_sec)
                 if not _window_exists(self.hwnd):

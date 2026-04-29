@@ -155,11 +155,13 @@ Browser capture pacing:
 - Chrome compositor observation runs at up to `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` frames per second so 24 fps processing has a fresh recent browser frame available. Default: `30`.
 - Video processing samples the latest visible Chrome window frame as a steady `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS` raw-video stream. Default: `24`.
 - mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
+- mpv keeps a tiny live jitter buffer so short wake-up or pipe-write stalls repeat a frame instead of creating a visible cadence hole. Default: `HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES=3`.
 - To reduce load further, set the variables before launching:
 
 ```powershell
 $env:HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS="30"
 $env:HDRTVNET_LIVE_CAPTURE_PROCESS_FPS="20"
+$env:HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES="3"
 .\run_gui.bat
 ```
 

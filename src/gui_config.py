@@ -88,6 +88,14 @@ def _env_live_fps(name: str, default: float, *, max_value: float = 120.0) -> flo
     return max(1.0, min(float(max_value), float(value)))
 
 
+def _env_live_int(name: str, default: int, *, min_value: int = 1, max_value: int = 12) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(int(min_value), min(int(max_value), int(value)))
+
+
 # Browser-window video has two separate rates:
 # - observe FPS controls how often we check Chrome/DWM for fresh compositor frames
 # - process FPS controls the steady raw-video stream fed to mpv
@@ -96,6 +104,10 @@ LIVE_CAPTURE_PROCESS_FPS = _env_live_fps("HDRTVNET_LIVE_CAPTURE_PROCESS_FPS", 24
 LIVE_CAPTURE_OBSERVE_FPS = _env_live_fps(
     "HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS",
     max(30.0, LIVE_CAPTURE_PROCESS_FPS),
+)
+LIVE_CAPTURE_MPV_BUFFER_FRAMES = _env_live_int(
+    "HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES",
+    3,
 )
 LIVE_CAPTURE_PRESENT_MAX_FPS = LIVE_CAPTURE_PROCESS_FPS
 LIVE_CAPTURE_DISPLAY_FPS = LIVE_CAPTURE_PROCESS_FPS

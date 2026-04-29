@@ -10,6 +10,8 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
+from gui_config import LIVE_CAPTURE_MPV_BUFFER_FRAMES
+
 
 class MpvHDRWidget(QWidget):
     """QWidget that embeds an mpv player for real-time HDR frame display.
@@ -382,10 +384,15 @@ class MpvHDRWidget(QWidget):
     ) -> bool:
         self.stop_playback()
         self._shutdown.clear()
-        self._queue = _queue.Queue(maxsize=1)
         self._fps = float(fps) if fps and fps > 0 else 30.0
         self._force_hdr_metadata = bool(force_hdr_metadata)
         vsync_timed = bool(vsync_timed)
+        buffer_frames = (
+            max(1, int(LIVE_CAPTURE_MPV_BUFFER_FRAMES))
+            if vsync_timed
+            else 1
+        )
+        self._queue = _queue.Queue(maxsize=buffer_frames)
         self._diag_enabled = bool(self._mpv_diag and self._force_hdr_metadata)
         self._last_scale_error = None
         requested_kernel = str(scale_kernel or "").strip().lower()
@@ -408,6 +415,7 @@ class MpvHDRWidget(QWidget):
             "film_grain": bool(film_grain),
             "force_hdr_metadata": self._force_hdr_metadata,
             "vsync_timed": vsync_timed,
+            "buffer_frames": int(buffer_frames),
         }
 
         pipe_id = id(self)
@@ -417,7 +425,13 @@ class MpvHDRWidget(QWidget):
         pipe_url = f"lavf://file:{self._pipe_name}"
 
         frame_bytes = width * height * 6
-        max_demux = str(frame_bytes)
+        max_demux = str(frame_bytes * max(1, int(buffer_frames)))
+        readahead_secs = 0.0
+        if vsync_timed:
+            readahead_secs = min(
+                0.5,
+                max(0.0, (float(buffer_frames) - 1.0) / max(self._fps, 1.0)),
+            )
 
         use_fsr = (requested_kernel == "fsr" and self._ensure_fsr_shader())
         if requested_kernel == "fsr" and not use_fsr:
@@ -460,7 +474,7 @@ class MpvHDRWidget(QWidget):
             input_vo_keyboard="no",
             cache="no",
             demuxer_max_bytes=max_demux,
-            demuxer_readahead_secs=0,
+            demuxer_readahead_secs=str(readahead_secs),
             video_sync="display-resample" if vsync_timed else "desync",
             scale="bilinear" if use_fsr else str(kernel_name),
             cscale="bilinear" if use_fsr else str(kernel_name),
