@@ -1,5 +1,8 @@
 import math
 import os
+import pathlib
+import re
+import tempfile
 import threading
 import time
 
@@ -303,6 +306,181 @@ def _predequantize_model(model: nn.Module,
     return model
 
 
+class TRTQDQConv2d(nn.Module):
+    """Conv2d export module that emits ONNX Q/DQ nodes for TensorRT.
+
+    It reconstructs the calibrated quantized weights from W8/W8A8 runtime
+    modules, then uses PyTorch fake-quant ops because the ONNX exporter lowers
+    them to QuantizeLinear/DequantizeLinear.
+    """
+
+    def __init__(self, w8_mod, quantize_activation: bool):
+        super().__init__()
+        self.stride = w8_mod.stride
+        self.padding = w8_mod.padding
+        self.dilation = w8_mod.dilation
+        self.groups = w8_mod.groups
+        self.quantize_activation = bool(quantize_activation)
+        self.activation_asymmetric = bool(getattr(w8_mod, "is_asymmetric", False))
+
+        if hasattr(w8_mod, "w_scale"):
+            w_scale = w8_mod.w_scale.detach().float()
+        else:
+            w_scale = w8_mod.scale.detach().float()
+        weight = w8_mod.weight_int8.detach().float() * w_scale.view(-1, 1, 1, 1)
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.register_buffer("w_scale", w_scale.clamp(min=1e-8))
+        self.register_buffer(
+            "w_zero",
+            torch.zeros_like(w_scale, dtype=torch.int32),
+        )
+        if w8_mod.bias is not None:
+            self.bias = nn.Parameter(w8_mod.bias.detach().float().clone(),
+                                     requires_grad=False)
+        else:
+            self.bias = None
+
+        x_scale = getattr(w8_mod, "x_scale", None)
+        if x_scale is None:
+            x_scale = torch.tensor(1.0)
+        self.register_buffer(
+            "x_scale",
+            x_scale.detach().float().reshape(()).clamp(min=1e-8),
+        )
+        x_zero = getattr(w8_mod, "x_zero", None)
+        if x_zero is None:
+            x_zero = torch.tensor(0.0)
+        # Convert the existing asymmetric min/scale form into ONNX affine
+        # zero-point form. Clamping keeps the graph valid for uint8 Q/DQ.
+        zp = torch.round(-x_zero.detach().float() / self.x_scale).clamp(0, 255)
+        self.register_buffer("x_zero_point", zp.to(torch.int32).reshape(()))
+
+    def _quantize_input(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.quantize_activation:
+            return x
+        scale = self.x_scale.to(device=x.device)
+        if self.activation_asymmetric:
+            zp = self.x_zero_point.to(device=x.device)
+            return torch.fake_quantize_per_tensor_affine(x, scale, zp, 0, 255)
+        zp = torch.tensor(0, dtype=torch.int32, device=x.device)
+        return torch.fake_quantize_per_tensor_affine(x, scale, zp, -128, 127)
+
+    def _quantize_weight(self) -> torch.Tensor:
+        scale = self.w_scale.to(device=self.weight.device)
+        zero = self.w_zero.to(device=self.weight.device)
+        return torch.fake_quantize_per_channel_affine(
+            self.weight,
+            scale,
+            zero,
+            0,
+            -128,
+            127,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._quantize_input(x)
+        w = self._quantize_weight().to(dtype=x.dtype)
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.conv2d(x, w, bias, self.stride, self.padding,
+                        self.dilation, self.groups)
+
+
+class TRTQDQLinear(nn.Module):
+    """Linear export module that emits ONNX Q/DQ nodes for TensorRT."""
+
+    def __init__(self, w8_mod, quantize_activation: bool):
+        super().__init__()
+        self.quantize_activation = bool(quantize_activation)
+        self.activation_asymmetric = bool(getattr(w8_mod, "is_asymmetric", False))
+
+        if hasattr(w8_mod, "w_scale"):
+            w_scale = w8_mod.w_scale.detach().float()
+        else:
+            w_scale = w8_mod.scale.detach().float()
+        weight = w8_mod.weight_int8.detach().float() * w_scale.view(-1, 1)
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.register_buffer("w_scale", w_scale.clamp(min=1e-8))
+        self.register_buffer(
+            "w_zero",
+            torch.zeros_like(w_scale, dtype=torch.int32),
+        )
+        if w8_mod.bias is not None:
+            self.bias = nn.Parameter(w8_mod.bias.detach().float().clone(),
+                                     requires_grad=False)
+        else:
+            self.bias = None
+
+        x_scale = getattr(w8_mod, "x_scale", None)
+        if x_scale is None:
+            x_scale = torch.tensor(1.0)
+        self.register_buffer(
+            "x_scale",
+            x_scale.detach().float().reshape(()).clamp(min=1e-8),
+        )
+        x_zero = getattr(w8_mod, "x_zero", None)
+        if x_zero is None:
+            x_zero = torch.tensor(0.0)
+        zp = torch.round(-x_zero.detach().float() / self.x_scale).clamp(0, 255)
+        self.register_buffer("x_zero_point", zp.to(torch.int32).reshape(()))
+
+    def _quantize_input(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.quantize_activation:
+            return x
+        scale = self.x_scale.to(device=x.device)
+        if self.activation_asymmetric:
+            zp = self.x_zero_point.to(device=x.device)
+            return torch.fake_quantize_per_tensor_affine(x, scale, zp, 0, 255)
+        zp = torch.tensor(0, dtype=torch.int32, device=x.device)
+        return torch.fake_quantize_per_tensor_affine(x, scale, zp, -128, 127)
+
+    def _quantize_weight(self) -> torch.Tensor:
+        scale = self.w_scale.to(device=self.weight.device)
+        zero = self.w_zero.to(device=self.weight.device)
+        return torch.fake_quantize_per_channel_affine(
+            self.weight,
+            scale,
+            zero,
+            0,
+            -128,
+            127,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._quantize_input(x)
+        w = self._quantize_weight().to(dtype=x.dtype)
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, w, bias)
+
+
+def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
+    """Replace W8/W8A8 runtime wrappers with TensorRT-friendly Q/DQ modules."""
+    converted_w8a8 = 0
+    converted_w8 = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, (W8Conv2d, W8A8Conv2d, W8Linear, W8A8Linear)):
+            continue
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        quantize_activation = isinstance(module, (W8A8Conv2d, W8A8Linear))
+        if isinstance(module, (W8Conv2d, W8A8Conv2d)):
+            replacement = TRTQDQConv2d(module, quantize_activation)
+        else:
+            replacement = TRTQDQLinear(module, quantize_activation)
+        setattr(parent, parts[-1], replacement)
+        if quantize_activation:
+            converted_w8a8 += 1
+        else:
+            converted_w8 += 1
+    if converted_w8a8 or converted_w8:
+        print(
+            "TensorRT Q/DQ export: "
+            f"{converted_w8a8} W8A8 layers, {converted_w8} W8A16 layers"
+        )
+    return model
+
+
 def _is_memory_bound_1x1(module: nn.Conv2d, channel_threshold: int = 32) -> bool:
     """Decide if a Conv2d is a memory-bound 1-1 that benefits from INT8 IO.
 
@@ -533,12 +711,10 @@ class HDRTVNetTorch:
     Optimizations applied automatically per platform:
       * torch.inference_mode() (lower overhead than no_grad).
       * Pre-allocated GPU tensors to avoid per-frame allocation.
-      * NVIDIA: cudnn.benchmark + channels_last (auto).
-      * torch.compile with max-autotune (auto when Triton + HIP SDK present).
-      * AMD ROCm-Windows: auto-detects HIP SDK; use --force-compile to
-        override if detection fails.
+      * AMD/CUDA PyTorch path: cudnn.benchmark + channels_last.
+      * AMD PyTorch path: torch.compile with max-autotune when available.
       * Optional CUDA-graph replay for static-shape inputs.
-      * Pre-dequantize INT8 weights on GPUs without tensor cores (auto).
+      * Pre-dequantize INT8 weights on PyTorch backends without tensor cores (auto).
     """
 
     def __init__(self, model_path, device="auto", precision="auto",
@@ -568,22 +744,21 @@ class HDRTVNetTorch:
         self.model = self._load_model(model_path)
 
         # ---- Platform-specific: channels_last + cudnn.benchmark -----------
-        # Auto-enabled on NVIDIA (cuDNN benefits); skipped on ROCm where
-        # MIOpen NHWC can hurt.  --channels-last forces it on for A/B testing.
-        if self._use_cuda and (_IS_NVIDIA or force_channels_last):
-            if _IS_NVIDIA:
+        # AMD continues to use the PyTorch runtime, with channels_last applied
+        # by default as the AMD fast path requested by the GUI/runtime layer.
+        if self._use_cuda and (_IS_ROCM or _IS_NVIDIA or force_channels_last):
+            try:
                 torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
             self.model = self.model.to(memory_format=torch.channels_last)
             self._use_channels_last = True
             if _IS_ROCM:
-                print("ROCm + --channels-last: channels_last forced ON")
+                print("ROCm: cudnn.benchmark + channels_last enabled")
             else:
                 print("NVIDIA: cudnn.benchmark + channels_last enabled")
         else:
             self._use_channels_last = False
-            if self._use_cuda and _IS_ROCM:
-                print("ROCm: skipping channels_last (MIOpen works better "
-                      "without it for this model). Use --channels-last to override.")
 
         # ---- torch.compile (PyTorch 2.x) ----------------------------------
         # NVIDIA / ROCm-Linux: auto-enabled when Triton is available.
@@ -594,7 +769,7 @@ class HDRTVNetTorch:
             _IS_ROCM and os.name == "nt"
             and not force_compile and not _HAS_HIP_SDK
         )
-        if compile_model and _HAS_COMPILE and self._use_cuda:
+        if compile_model and _HAS_COMPILE and self._use_cuda and not _IS_NVIDIA:
             if _rocm_win_no_sdk:
                 print("torch.compile skipped on ROCm-Windows \u2014 HIP SDK "
                       "not detected.\n"
@@ -1196,3 +1371,316 @@ class HDRTVNetTorch:
 
     def end_profiling(self):
         return None
+
+
+def _sanitize_engine_token(text: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(text or "").strip())
+    return token.strip(".-") or "model"
+
+
+def _engine_cache_dir() -> str:
+    root = os.environ.get(
+        "HDRTVNET_TENSORRT_CACHE",
+        os.path.join(_ROOT, "src", "models", "engines"),
+    )
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def tensorrt_engine_path(
+    model_path: str,
+    width: int,
+    height: int,
+    mode: str,
+) -> str:
+    model_name = _sanitize_engine_token(pathlib.Path(model_path).stem)
+    resolution = f"{int(width)}x{int(height)}"
+    mode_name = _sanitize_engine_token(mode)
+    return os.path.join(_engine_cache_dir(), f"{model_name}_{resolution}_{mode_name}.engine")
+
+
+class _ONNXExportWrapper(nn.Module):
+    def __init__(self, model: nn.Module, flat_model: bool = False):
+        super().__init__()
+        self.model = model
+        self.flat_model = bool(flat_model)
+
+    def forward(self, tensor: torch.Tensor, cond: torch.Tensor):
+        if self.flat_model:
+            out = self.model(tensor, cond)
+        else:
+            out = self.model((tensor, cond))
+        if isinstance(out, (tuple, list)):
+            return out[0]
+        return out
+
+
+class HDRTVNetTensorRT(HDRTVNetTorch):
+    """TensorRT runtime with PyTorch preprocessing/postprocessing parity.
+
+    Engines are built lazily for the selected model/resolution/mode and then
+    reused from disk. INT8 checkpoints are loaded from the existing quantized
+    files, then their W8/W8A8 wrappers are converted to ONNX Q/DQ export
+    modules so TensorRT receives an explicit-quantization graph. No TensorRT
+    runtime calibration is performed.
+    """
+
+    def __init__(
+        self,
+        model_path,
+        device="auto",
+        precision="auto",
+        engine_width=1920,
+        engine_height=1080,
+        mode_name="fp16",
+        hg_weights=None,
+        use_hg=True,
+    ):
+        if not _IS_NVIDIA:
+            raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
+
+        self._engine_width = int(engine_width)
+        self._engine_height = int(engine_height)
+        self._engine_mode_name = str(mode_name or precision or "mode")
+        if str(precision).startswith("int8") and "qdq" not in self._engine_mode_name.lower():
+            self._engine_mode_name = f"{self._engine_mode_name}_qdqv1"
+        self.engine_path = tensorrt_engine_path(
+            model_path,
+            self._engine_width,
+            self._engine_height,
+            self._engine_mode_name,
+        )
+        self._trt_runtime = None
+        self._trt_engine = None
+        self._trt_context = None
+        self._trt_input_names = []
+        self._trt_output_names = []
+        self._trt_output = None
+        self._trt_output_shape = None
+
+        super().__init__(
+            model_path,
+            device=device,
+            precision=precision,
+            compile_model=False,
+            force_compile=False,
+            compile_mode="default",
+            use_cuda_graphs=False,
+            force_channels_last=False,
+            predequantize=False,
+            hg_weights=hg_weights,
+            use_hg=use_hg,
+        )
+
+        # TensorRT bindings use dense NCHW buffers; keep preprocessing and
+        # postprocessing identical, but make the staging tensors contiguous.
+        self._use_channels_last = False
+
+        if not os.path.isfile(self.engine_path):
+            print(f"TensorRT engine cache miss: {self.engine_path}")
+            self._build_engine_from_loaded_model()
+        else:
+            print(f"TensorRT engine cache hit: {self.engine_path}")
+
+        # Runtime must not retain the PyTorch model after the engine exists.
+        self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._load_engine()
+        self._compiled = False
+        print(f"TensorRT engine : {self.engine_path}")
+
+    def _build_engine_from_loaded_model(self) -> None:
+        try:
+            import tensorrt as trt
+        except Exception as exc:
+            raise RuntimeError(
+                "TensorRT is not installed. Install NVIDIA TensorRT Python "
+                "bindings to build cached engines."
+            ) from exc
+
+        if self.model is None:
+            raise RuntimeError("Cannot build TensorRT engine without a loaded PyTorch model.")
+
+        model = getattr(self.model, "_orig_mod", self.model).eval()
+        if str(self.precision).startswith("int8"):
+            model = _convert_model_to_tensorrt_qdq(model).eval()
+        wrapper = _ONNXExportWrapper(model, flat_model=getattr(self, "_is_flat_model", False)).eval()
+        onnx_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".onnx",
+                prefix="hdrtvnet_trt_",
+                delete=False,
+            ) as tmp:
+                onnx_path = tmp.name
+
+            h, w = self._engine_height, self._engine_width
+            cond_h, cond_w = max(1, h // 4), max(1, w // 4)
+            tensor = torch.zeros((1, 3, h, w), dtype=self._dtype, device=self.device)
+            cond = torch.zeros((1, 3, cond_h, cond_w), dtype=self._dtype, device=self.device)
+            with torch.inference_mode():
+                torch.onnx.export(
+                    wrapper,
+                    (tensor, cond),
+                    onnx_path,
+                    input_names=["input", "cond"],
+                    output_names=["output"],
+                    opset_version=18,
+                    do_constant_folding=True,
+                )
+            self._build_engine_from_onnx(onnx_path, trt)
+        finally:
+            if onnx_path:
+                try:
+                    os.remove(onnx_path)
+                except OSError:
+                    pass
+
+    def _build_engine_from_onnx(self, onnx_path: str, trt) -> None:
+        logger = trt.Logger(trt.Logger.INFO)
+        builder = trt.Builder(logger)
+        flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        network = builder.create_network(flags)
+        parser = trt.OnnxParser(network, logger)
+        with open(onnx_path, "rb") as f:
+            if not parser.parse(f.read()):
+                errors = []
+                for i in range(parser.num_errors):
+                    errors.append(str(parser.get_error(i)))
+                raise RuntimeError("ONNX parse failed:\n" + "\n".join(errors))
+
+        config = builder.create_builder_config()
+        workspace_gb = float(os.environ.get("HDRTVNET_TRT_WORKSPACE_GB", "4"))
+        workspace_bytes = int(max(1.0, workspace_gb) * (1024 ** 3))
+        if hasattr(config, "set_memory_pool_limit"):
+            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
+        else:
+            config.max_workspace_size = workspace_bytes
+
+        if self.precision != "fp32" and builder.platform_has_fast_fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
+        if str(self.precision).startswith("int8") and builder.platform_has_fast_int8:
+            config.set_flag(trt.BuilderFlag.INT8)
+
+        os.makedirs(os.path.dirname(self.engine_path), exist_ok=True)
+        if hasattr(builder, "build_serialized_network"):
+            serialized = builder.build_serialized_network(network, config)
+            if serialized is None:
+                raise RuntimeError("TensorRT engine build returned no serialized engine.")
+            pathlib.Path(self.engine_path).write_bytes(bytes(serialized))
+        else:
+            engine = builder.build_engine(network, config)
+            if engine is None:
+                raise RuntimeError("TensorRT engine build failed.")
+            pathlib.Path(self.engine_path).write_bytes(bytes(engine.serialize()))
+
+    def _load_engine(self) -> None:
+        try:
+            import tensorrt as trt
+        except Exception as exc:
+            raise RuntimeError(
+                "TensorRT is not installed. Install NVIDIA TensorRT Python bindings."
+            ) from exc
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        self._trt_runtime = trt.Runtime(logger)
+        data = pathlib.Path(self.engine_path).read_bytes()
+        self._trt_engine = self._trt_runtime.deserialize_cuda_engine(data)
+        if self._trt_engine is None:
+            raise RuntimeError(f"Failed to load TensorRT engine: {self.engine_path}")
+        self._trt_context = self._trt_engine.create_execution_context()
+        if self._trt_context is None:
+            raise RuntimeError("Failed to create TensorRT execution context.")
+        self._discover_bindings()
+
+    def _discover_bindings(self) -> None:
+        engine = self._trt_engine
+        try:
+            import tensorrt as trt
+            for i in range(engine.num_io_tensors):
+                name = engine.get_tensor_name(i)
+                mode = engine.get_tensor_mode(name)
+                if mode == trt.TensorIOMode.INPUT:
+                    self._trt_input_names.append(name)
+                else:
+                    self._trt_output_names.append(name)
+        except AttributeError:
+            for i in range(engine.num_bindings):
+                name = engine.get_binding_name(i)
+                if engine.binding_is_input(i):
+                    self._trt_input_names.append(name)
+                else:
+                    self._trt_output_names.append(name)
+        if len(self._trt_input_names) < 2 or not self._trt_output_names:
+            raise RuntimeError("Unexpected TensorRT bindings; expected input, cond, output.")
+
+    def _tensor_dtype_for_output(self, output_name: str):
+        try:
+            import tensorrt as trt
+            dtype = self._trt_engine.get_tensor_dtype(output_name)
+            if dtype == trt.float16:
+                return torch.float16
+            if dtype == trt.float32:
+                return torch.float32
+            if dtype == trt.int8:
+                return torch.int8
+        except Exception:
+            pass
+        return self._dtype
+
+    def infer(self, input_cond):
+        tensor, cond = input_cond
+        tensor = tensor.contiguous()
+        cond = cond.contiguous()
+        ctx = self._trt_context
+        engine = self._trt_engine
+        stream = torch.cuda.current_stream().cuda_stream
+
+        input_name = self._trt_input_names[0]
+        cond_name = self._trt_input_names[1]
+        output_name = self._trt_output_names[0]
+
+        if hasattr(ctx, "set_input_shape"):
+            ctx.set_input_shape(input_name, tuple(tensor.shape))
+            ctx.set_input_shape(cond_name, tuple(cond.shape))
+            out_shape = tuple(int(v) for v in ctx.get_tensor_shape(output_name))
+            for name, ptr in (
+                (input_name, tensor.data_ptr()),
+                (cond_name, cond.data_ptr()),
+            ):
+                ctx.set_tensor_address(name, int(ptr))
+            if self._trt_output is None or self._trt_output_shape != out_shape:
+                self._trt_output = torch.empty(
+                    out_shape,
+                    dtype=self._tensor_dtype_for_output(output_name),
+                    device=self.device,
+                )
+                self._trt_output_shape = out_shape
+            ctx.set_tensor_address(output_name, int(self._trt_output.data_ptr()))
+            ok = ctx.execute_async_v3(stream_handle=stream)
+        else:
+            bindings = [0] * engine.num_bindings
+            for name, value in ((input_name, tensor), (cond_name, cond)):
+                idx = engine.get_binding_index(name)
+                try:
+                    ctx.set_binding_shape(idx, tuple(value.shape))
+                except Exception:
+                    pass
+                bindings[idx] = int(value.data_ptr())
+            out_idx = engine.get_binding_index(output_name)
+            out_shape = tuple(int(v) for v in ctx.get_binding_shape(out_idx))
+            if self._trt_output is None or self._trt_output_shape != out_shape:
+                self._trt_output = torch.empty(
+                    out_shape,
+                    dtype=self._tensor_dtype_for_output(output_name),
+                    device=self.device,
+                )
+                self._trt_output_shape = out_shape
+            bindings[out_idx] = int(self._trt_output.data_ptr())
+            ok = ctx.execute_async_v2(bindings=bindings, stream_handle=stream)
+
+        if not ok:
+            raise RuntimeError("TensorRT execution failed.")
+        return self._trt_output

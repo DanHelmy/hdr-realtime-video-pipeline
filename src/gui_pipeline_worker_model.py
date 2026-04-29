@@ -5,7 +5,7 @@ import sys
 
 import torch
 
-from models.hdrtvnet_torch import HDRTVNetTorch
+from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
 from gui_config import PRECISIONS, _select_model_path
 
 
@@ -98,20 +98,44 @@ class PipelineWorkerModelMixin:
                 != "eager"
             )
 
-        self._processor = HDRTVNetTorch(
-            path,
-            device="auto",
-            precision=cfg["precision"],
-            compile_model=bool(compile_model),
-            compile_mode="max-autotune",
-            predequantize=_resolve_predequantize_arg(
-                getattr(self, "_predequantize_mode", "auto")
-            ),
-            use_hg=self._use_hg,
-        )
+        try:
+            if _IS_NVIDIA:
+                mode_name = f"{key}_{'hg' if self._use_hg else 'nohg'}"
+                self._processor = HDRTVNetTensorRT(
+                    path,
+                    device="auto",
+                    precision=cfg["precision"],
+                    engine_width=int(cw),
+                    engine_height=int(ch),
+                    mode_name=mode_name,
+                    use_hg=self._use_hg,
+                )
+            else:
+                self._processor = HDRTVNetTorch(
+                    path,
+                    device="auto",
+                    precision=cfg["precision"],
+                    compile_model=bool(compile_model),
+                    compile_mode="max-autotune",
+                    predequantize=_resolve_predequantize_arg(
+                        getattr(self, "_predequantize_mode", "auto")
+                    ),
+                    use_hg=self._use_hg,
+                )
+        except Exception as exc:
+            self._processor = None
+            self.status_message.emit(f"ERROR: model backend failed - {exc}")
+            print(f"ERROR: model backend failed: {exc}", file=sys.stderr)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return False
 
         if announce_ready:
-            if getattr(self._processor, "_compiled", False):
+            if getattr(self._processor, "_trt_engine", None) is not None:
+                self.status_message.emit(
+                    f"Loading TensorRT engine for {cw}x{ch} ({key}) ..."
+                )
+            elif getattr(self._processor, "_compiled", False):
                 self.status_message.emit(
                     f"Warming up kernels for {cw}x{ch} ({key}) ..."
                 )
@@ -123,7 +147,8 @@ class PipelineWorkerModelMixin:
 
         self._precision_key = key
         if announce_ready:
-            self.status_message.emit(f"Ready - {key}")
+            suffix = " [TensorRT]" if _IS_NVIDIA else ""
+            self.status_message.emit(f"Ready - {key}{suffix}")
         return True
 
     @staticmethod

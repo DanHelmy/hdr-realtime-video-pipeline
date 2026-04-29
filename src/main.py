@@ -30,7 +30,7 @@ import torch
 from collections import deque
 from video_source import VideoSource
 from timer import FPSTimer
-from models.hdrtvnet_torch import HDRTVNetTorch
+from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
 
 VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
 MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
@@ -132,7 +132,7 @@ def parse_args():
         "--compile-mode",
         default="auto",
         choices=["auto", "default", "reduce-overhead", "max-autotune"],
-        help="torch.compile mode (auto = 'max-autotune' on all GPUs)"
+        help="torch.compile mode for PyTorch backends (auto = 'max-autotune')"
     )
     parser.add_argument(
         "--cuda-graphs",
@@ -233,19 +233,31 @@ def main():
 
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
     try:
-        processor = HDRTVNetTorch(
-            args.model,
-            device=args.device,
-            precision=args.precision,
-            compile_model=not args.no_compile,
-            force_compile=args.force_compile,
-            compile_mode=args.compile_mode,
-            use_cuda_graphs=args.cuda_graphs,
-            force_channels_last=args.channels_last,
-            predequantize=predeq,
-            hg_weights=args.hg_weights,
-            use_hg=str(args.use_hg).strip() != "0",
-        )
+        if _IS_NVIDIA and str(args.device).lower() != "cpu":
+            processor = HDRTVNetTensorRT(
+                args.model,
+                device=args.device,
+                precision=args.precision,
+                engine_width=_proc_w,
+                engine_height=_proc_h,
+                mode_name=f"{args.precision}_{'hg' if str(args.use_hg).strip() != '0' else 'nohg'}",
+                hg_weights=args.hg_weights,
+                use_hg=str(args.use_hg).strip() != "0",
+            )
+        else:
+            processor = HDRTVNetTorch(
+                args.model,
+                device=args.device,
+                precision=args.precision,
+                compile_model=not args.no_compile,
+                force_compile=args.force_compile,
+                compile_mode=args.compile_mode,
+                use_cuda_graphs=args.cuda_graphs,
+                force_channels_last=args.channels_last,
+                predequantize=predeq,
+                hg_weights=args.hg_weights,
+                use_hg=str(args.use_hg).strip() != "0",
+            )
     except TypeError as exc:
         # Backward-compat for older HDRTVNetTorch without HG args.
         if "hg_weights" in str(exc) or "use_hg" in str(exc):

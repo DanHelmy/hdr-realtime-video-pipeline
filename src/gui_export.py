@@ -40,10 +40,12 @@ from gui_media_probe import _probe_hdr_input, _probe_video_timing_info
 from gui_pipeline_worker_model import PipelineWorkerModelMixin, _resolve_predequantize_arg
 from gui_scaling import _letterbox_bgr
 from models.hdrtvnet_torch import (
+    HDRTVNetTensorRT,
     HDRTVNetTorch,
     _HAS_COMPILE,
     _HAS_HIP_SDK,
     _HAS_TRITON,
+    _IS_NVIDIA,
     _IS_ROCM,
 )
 from video_source import VideoSource
@@ -299,6 +301,9 @@ class ExportOptionsDialog(QDialog):
         int8_form.addRow("Note:", self._lbl_predequant_note)
         advanced_layout.addWidget(int8_group)
         advanced_layout.addStretch(1)
+        if _IS_NVIDIA:
+            perf_group.hide()
+            int8_group.hide()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -803,21 +808,32 @@ class VideoExportWorker(QObject):
                 )
             else:
                 self.progress.emit(0, "Loading export model ...")
-            processor = HDRTVNetTorch(
-                model_path,
-                device="auto",
-                precision=str(cfg.get("precision") or "fp16"),
-                compile_model=bool(self._config.use_max_autotune),
-                compile_mode="max-autotune",
-                predequantize=_resolve_predequantize_arg(
-                    str(self._config.predequantize_mode)
-                ),
-                use_hg=self._config.use_hg,
-            )
+            if _IS_NVIDIA:
+                processor = HDRTVNetTensorRT(
+                    model_path,
+                    device="auto",
+                    precision=str(cfg.get("precision") or "fp16"),
+                    engine_width=int(self._config.width),
+                    engine_height=int(self._config.height),
+                    mode_name=f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}",
+                    use_hg=self._config.use_hg,
+                )
+            else:
+                processor = HDRTVNetTorch(
+                    model_path,
+                    device="auto",
+                    precision=str(cfg.get("precision") or "fp16"),
+                    compile_model=bool(self._config.use_max_autotune),
+                    compile_mode="max-autotune",
+                    predequantize=_resolve_predequantize_arg(
+                        str(self._config.predequantize_mode)
+                    ),
+                    use_hg=self._config.use_hg,
+                )
             with self._runtime_lock:
                 self._processor = processor
 
-            if self._config.use_max_autotune:
+            if self._config.use_max_autotune and not _IS_NVIDIA:
                 self.progress.emit(
                     0,
                     f"Warming up kernels for {int(self._config.width)}x{int(self._config.height)} ({self._config.precision_key}) ...",

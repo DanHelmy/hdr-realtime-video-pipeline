@@ -80,7 +80,7 @@ from gui_scaling import (
     _normalize_shader_paths,
 )
 from gui_widgets import _CompareVideoPane
-from models.hdrtvnet_torch import HDRTVNetTorch
+from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
@@ -561,17 +561,33 @@ class _BenchmarkWorker(QObject):
             precision_cfg = PRECISIONS.get(cfg.precision_key, {})
             model_precision = str(precision_cfg.get("precision") or "fp16")
 
-            self.progress.emit(0, "Loading model in eager mode ...")
-            processor = HDRTVNetTorch(
-                model_path,
-                device="auto",
-                precision=model_precision,
-                compile_model=False,
-                compile_mode="default",
-                predequantize=_resolve_predequantize_arg(str(cfg.predequantize_mode)),
-                use_hg=bool(cfg.use_hg),
-            )
             out_w, out_h = _resolution_dims(cfg.resolution_key)
+            self.progress.emit(
+                0,
+                "Loading TensorRT engine ..."
+                if _IS_NVIDIA
+                else "Loading model in eager mode ...",
+            )
+            if _IS_NVIDIA:
+                processor = HDRTVNetTensorRT(
+                    model_path,
+                    device="auto",
+                    precision=model_precision,
+                    engine_width=out_w,
+                    engine_height=out_h,
+                    mode_name=f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}",
+                    use_hg=bool(cfg.use_hg),
+                )
+            else:
+                processor = HDRTVNetTorch(
+                    model_path,
+                    device="auto",
+                    precision=model_precision,
+                    compile_model=False,
+                    compile_mode="default",
+                    predequantize=_resolve_predequantize_arg(str(cfg.predequantize_mode)),
+                    use_hg=bool(cfg.use_hg),
+                )
 
             rows: list[dict] = []
             ordered_tasks = sorted(
@@ -1193,7 +1209,11 @@ class ModelBenchmarkDialog(QDialog):
         opt_form.addRow("Precision:", self._cmb_precision)
         opt_form.addRow("", self._chk_use_hg)
         opt_form.addRow("Benchmark resolution:", self._cmb_resolution)
-        opt_form.addRow("INT8 pre-dequantize:", self._cmb_predequantize)
+        self._lbl_predequantize = QLabel("INT8 pre-dequantize:")
+        opt_form.addRow(self._lbl_predequantize, self._cmb_predequantize)
+        if _IS_NVIDIA:
+            self._lbl_predequantize.hide()
+            self._cmb_predequantize.hide()
         opt_form.addRow("Session logs root:", root_row)
         cfg_layout.addWidget(opt_group)
 
@@ -1773,15 +1793,29 @@ class ModelBenchmarkDialog(QDialog):
         precision_cfg = PRECISIONS.get(precision, {})
         model_precision = str(precision_cfg.get("precision") or "fp16")
         try:
-            processor = HDRTVNetTorch(
-                model_path,
-                device="auto",
-                precision=model_precision,
-                compile_model=False,
-                compile_mode="default",
-                predequantize=_resolve_predequantize_arg(predequantize_mode),
-                use_hg=bool(use_hg),
-            )
+            if _IS_NVIDIA:
+                out_w, out_h = _resolution_dims(
+                    str(getattr(self, "_result_resolution_key", "") or "1080p")
+                )
+                processor = HDRTVNetTensorRT(
+                    model_path,
+                    device="auto",
+                    precision=model_precision,
+                    engine_width=out_w,
+                    engine_height=out_h,
+                    mode_name=f"{precision}_{'hg' if use_hg else 'nohg'}",
+                    use_hg=bool(use_hg),
+                )
+            else:
+                processor = HDRTVNetTorch(
+                    model_path,
+                    device="auto",
+                    precision=model_precision,
+                    compile_model=False,
+                    compile_mode="default",
+                    predequantize=_resolve_predequantize_arg(predequantize_mode),
+                    use_hg=bool(use_hg),
+                )
         except Exception:
             return None
         self._preview_processor_cache[key] = processor

@@ -29,6 +29,11 @@ from gui_compare import _HAS_MPV
 from gui_scaling import UPSCALER_CHOICES, DEFAULT_UPSCALER
 from gui_widgets import VideoDisplay
 
+try:
+    from models.hdrtvnet_torch import _IS_NVIDIA
+except Exception:
+    _IS_NVIDIA = False
+
 
 class UiBuilderMixin:
     """Main-window UI construction split into smaller builders."""
@@ -100,12 +105,29 @@ class UiBuilderMixin:
         file_menu.addAction("E&xit", self.close)
 
         tools_menu = menu_bar.addMenu("&Tools")
-        tools_menu.addAction("Runtime Execution Mode ...", self._choose_runtime_execution_mode)
-        tools_menu.addAction("INT8 &Pre-dequantization ...", self._choose_predequantize_mode)
+        self._act_runtime_execution_mode = tools_menu.addAction(
+            "Runtime Execution Mode ...", self._choose_runtime_execution_mode
+        )
+        self._act_predequantize = tools_menu.addAction(
+            "INT8 &Pre-dequantization ...", self._choose_predequantize_mode
+        )
         tools_menu.addAction("Model Quality &Benchmark ...", self._open_benchmark_dialog)
-        tools_menu.addAction("&Pre-compile Kernels ...", self._precompile_kernels)
-        tools_menu.addSeparator()
-        tools_menu.addAction("Clear &Kernel Cache ...", self._clear_kernel_cache)
+        self._act_precompile_kernels = tools_menu.addAction(
+            "&Pre-compile Kernels ...", self._precompile_kernels
+        )
+        self._act_kernel_separator = tools_menu.addSeparator()
+        self._act_clear_kernel_cache = tools_menu.addAction(
+            "Clear &Kernel Cache ...", self._clear_kernel_cache
+        )
+        if _IS_NVIDIA:
+            for action in (
+                self._act_runtime_execution_mode,
+                self._act_predequantize,
+                self._act_precompile_kernels,
+                self._act_kernel_separator,
+                self._act_clear_kernel_cache,
+            ):
+                action.setVisible(False)
 
         view_menu = menu_bar.addMenu("&View")
         self._act_borderless_full_window = view_menu.addAction(

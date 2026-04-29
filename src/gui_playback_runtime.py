@@ -77,11 +77,18 @@ from window_capture_source import (
 )
 
 try:
-    from models.hdrtvnet_torch import _HAS_COMPILE, _HAS_HIP_SDK, _HAS_TRITON, _IS_ROCM
+    from models.hdrtvnet_torch import (
+        _HAS_COMPILE,
+        _HAS_HIP_SDK,
+        _HAS_TRITON,
+        _IS_NVIDIA,
+        _IS_ROCM,
+    )
 except Exception:
     _HAS_COMPILE = False
     _HAS_HIP_SDK = False
     _HAS_TRITON = False
+    _IS_NVIDIA = False
     _IS_ROCM = False
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -244,6 +251,8 @@ class PlaybackRuntimeMixin:
         return True
 
     def _runtime_execution_mode_uses_compile(self) -> bool:
+        if _IS_NVIDIA:
+            return False
         return _normalize_runtime_execution_mode(
             getattr(self, "_runtime_execution_mode", "compile")
         ) == "compile"
@@ -257,6 +266,13 @@ class PlaybackRuntimeMixin:
         return "Compile (recommended)"
 
     def _choose_runtime_execution_mode(self):
+        if _IS_NVIDIA:
+            QMessageBox.information(
+                self,
+                "TensorRT Runtime",
+                "NVIDIA inference uses TensorRT engines. PyTorch execution modes are hidden.",
+            )
+            return
         options = ["Compile (recommended)", "Eager (not recommended)"]
         current_label = self._runtime_execution_mode_label()
         try:
@@ -1021,6 +1037,13 @@ class PlaybackRuntimeMixin:
         return "Auto (recommended)"
 
     def _choose_predequantize_mode(self):
+        if _IS_NVIDIA:
+            QMessageBox.information(
+                self,
+                "TensorRT Runtime",
+                "NVIDIA inference uses TensorRT engines built from the selected model. PyTorch INT8 pre-dequantization controls are hidden.",
+            )
+            return
         options = [
             "Auto (recommended)",
             "On (force pre-dequantize)",
@@ -1284,6 +1307,13 @@ class PlaybackRuntimeMixin:
     def _precompile_kernels(self):
         """Open the pre-compile dialog - runs compile_kernels.py as a
         completely separate process with zero GPU interference."""
+        if _IS_NVIDIA:
+            QMessageBox.information(
+                self,
+                "TensorRT Runtime",
+                "NVIDIA TensorRT engines are built on demand when a mode is activated and reused from disk.",
+            )
+            return
         if self._playing or (self._worker is not None and self._worker.isRunning()):
             QMessageBox.information(
                 self,
@@ -1334,6 +1364,13 @@ class PlaybackRuntimeMixin:
 
     def _clear_kernel_cache(self):
         """Delete kernel cache folders or selected precision/resolution compile entries."""
+        if _IS_NVIDIA:
+            QMessageBox.information(
+                self,
+                "TensorRT Runtime",
+                "NVIDIA uses cached .engine files under src/models/engines instead of PyTorch kernel caches.",
+            )
+            return
         import getpass
         import pathlib
         import re
@@ -2732,9 +2769,12 @@ class PlaybackRuntimeMixin:
             ),
         )
 
-        # Show loading dialog (in-process model load + cache warmup is fast
-        # since subprocess already compiled the kernels)
+        # Show loading dialog while the worker loads the runtime. On NVIDIA
+        # this may include the one-time TensorRT engine build for this mode.
         self._compile_dlg = _CompileDialog(self)
+        if _IS_NVIDIA:
+            self._compile_dlg.setWindowTitle("Preparing TensorRT Engine")
+            self._compile_dlg.set_status("Loading or building TensorRT engine ...")
         self._compile_dlg.show()
 
         self._prepare_playback_logging_for_start()
