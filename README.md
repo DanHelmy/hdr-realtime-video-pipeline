@@ -496,6 +496,17 @@ pip install -r requirements/requirements-nvidia.txt
 ```
 NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export ONNX during first-time engine builds, but Triton is not required for NVIDIA inference.
 
+`setup.bat` / `scripts/setup_nvidia.ps1` performs a post-install NVIDIA runtime check:
+
+- NVIDIA CUDA driver DLL
+- `torch.cuda`
+- `onnx`
+- `onnxscript`
+- `tensorrt`
+- TensorRT builder creation
+
+A separate CUDA Toolkit/SDK is not required in the AMD HIP SDK sense when the pip wheels provide the needed runtime libraries. If the TensorRT check fails, update the NVIDIA driver first; if it still fails, install the matching NVIDIA CUDA Toolkit / TensorRT runtime from NVIDIA and rerun setup.
+
 **AMD ROCm-Windows (Python 3.12):**
 ```bash
 pip install -r requirements/requirements-amd.txt
