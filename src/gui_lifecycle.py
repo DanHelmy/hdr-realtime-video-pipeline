@@ -3,6 +3,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 
 from gui_scaling import BEST_MPV_SCALE, DEFAULT_UPSCALER
+from models.hdrtvnet_torch import _IS_NVIDIA
 
 
 class LifecycleMixin:
@@ -121,7 +122,7 @@ class LifecycleMixin:
                 "res": "Res: —",
                 "gpu": "VRAM: —",
                 "cpu": "CPU: —",
-                "model": "Model: —",
+                "model": ("Engine: -" if _IS_NVIDIA else "Checkpoint: -"),
                 "prec": "Prec: —",
             }
             for key, text in reset_map.items():

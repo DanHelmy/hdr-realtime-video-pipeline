@@ -303,6 +303,7 @@ class PlaybackLoggingMixin:
             "cpu_mb",
             "gpu_mb",
             "model_mb",
+            "model_size_label",
             "precision",
             "proc_res",
             "psnr_db",
@@ -435,6 +436,26 @@ class PlaybackLoggingMixin:
                 "CPU Memory", runtime_summary.get("cpu_mb"), " MB"
             ),
         ]
+        model_size_stats = runtime_summary.get("model_mb")
+        if model_size_stats:
+            size_label = str(
+                runtime_summary.get("model_size_label") or "Model Artifact"
+            ).strip()
+            for sample in reversed(runtime_samples):
+                if not isinstance(sample, dict):
+                    continue
+                label = str(sample.get("model_size_label") or "").strip()
+                if label:
+                    size_label = label
+                    break
+            lines.append(
+                "  "
+                + self._format_playback_log_stats(
+                    f"{size_label} Size",
+                    model_size_stats,
+                    " MB",
+                )
+            )
         live_latency_stats = runtime_summary.get("live_video_latency_ms")
         if live_latency_stats:
             lines.append(
@@ -545,12 +566,20 @@ class PlaybackLoggingMixin:
                 "live_video_latency_ms",
                 "gpu_mb",
                 "cpu_mb",
+                "model_mb",
                 "psnr_db",
                 "sssim",
                 "delta_e_itp",
                 "hdr_vdp3",
             )
         }
+        for sample in reversed(runtime_samples):
+            if not isinstance(sample, dict):
+                continue
+            label = str(sample.get("model_size_label") or "").strip()
+            if label:
+                runtime_summary["model_size_label"] = label
+                break
 
         self._playback_log_enabled = False
         self._playback_log_session_started = False

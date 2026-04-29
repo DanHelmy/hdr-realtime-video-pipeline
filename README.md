@@ -296,7 +296,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
-| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, model size, precision, processing resolution |
+| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, NVIDIA `Engine` size or AMD `Checkpoint` size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
@@ -758,6 +758,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | Different model/resolution/mode | Build a new `.engine` once |
 | Build/load failure | Log and inform user; no NVIDIA PyTorch fallback |
 | Manual clear | `Tools -> Clear TensorRT Engine Cache ...` |
+| Live size metric | GUI shows cached engine size as `Engine: ... MB`; AMD shows checkpoint size as `Checkpoint: ... MB` |
 
 Manual prebuild:
 

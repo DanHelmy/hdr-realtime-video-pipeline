@@ -86,7 +86,8 @@ class WorkerSlotsMixin:
         self._m["res"].setText(f"Res: {m['proc_res']}")
         self._m["gpu"].setText(f"VRAM: {m['gpu_mb']:.0f} MB")
         self._m["cpu"].setText(f"CPU: {m['cpu_mb']:.0f} MB")
-        self._m["model"].setText(f"Model: {m['model_mb']:.2f} MB")
+        size_label = str(m.get("model_size_label") or "Checkpoint")
+        self._m["model"].setText(f"{size_label}: {m['model_mb']:.2f} MB")
         self._m["prec"].setText(f"Prec: {m['precision']}")
 
         try:

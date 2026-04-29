@@ -6,6 +6,11 @@ import torch
 
 from gui_config import _select_model_path
 
+try:
+    from models.hdrtvnet_torch import _IS_NVIDIA
+except Exception:
+    _IS_NVIDIA = False
+
 
 class PipelineWorkerRuntimeMetricsMixin:
     """Live metrics emit helper for PipelineWorker."""
@@ -70,14 +75,21 @@ class PipelineWorkerRuntimeMetricsMixin:
         if self._input_is_hdr:
             model_mb = 0.0
             prec_label = "Bypass (HDR input)"
+            model_size_label = "Checkpoint"
         else:
             cache_key = (str(self._precision_key), bool(self._use_hg))
+            model_size_label = "Engine" if _IS_NVIDIA else "Checkpoint"
             if getattr(self, "_metrics_model_size_key", None) != cache_key:
-                model_path = _select_model_path(self._precision_key, self._use_hg)
-                model_mb = os.path.getsize(model_path) / (1024 * 1024)
-                if self._use_hg and self._precision_key in ("FP16", "FP32"):
-                    if os.path.isfile(hg_weights_path):
-                        model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
+                model_mb = 0.0
+                engine_path = getattr(self._processor, "engine_path", None)
+                if _IS_NVIDIA and engine_path and os.path.isfile(engine_path):
+                    model_mb = os.path.getsize(engine_path) / (1024 * 1024)
+                else:
+                    model_path = _select_model_path(self._precision_key, self._use_hg)
+                    model_mb = os.path.getsize(model_path) / (1024 * 1024)
+                    if self._use_hg and self._precision_key in ("FP16", "FP32"):
+                        if os.path.isfile(hg_weights_path):
+                            model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
                 self._metrics_model_size_key = cache_key
                 self._metrics_model_size_mb = model_mb
             model_mb = float(getattr(self, "_metrics_model_size_mb", 0.0))
@@ -93,6 +105,7 @@ class PipelineWorkerRuntimeMetricsMixin:
             "cpu_mb": cpu_mb,
             "gpu_mb": gpu_mb,
             "model_mb": model_mb,
+            "model_size_label": model_size_label,
             "precision": prec_label,
             "proc_res": f"{proc_w}x{proc_h}",
             "psnr_db": psnr_avg.value,
