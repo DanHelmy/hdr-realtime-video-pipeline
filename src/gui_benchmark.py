@@ -112,10 +112,10 @@ _BENCHMARK_AUTO_POST_VERIFY_ENABLED = str(
 try:
     _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = max(
         0,
-        int(os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS", "24")),
+        int(os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS", "0")),
     )
 except Exception:
-    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = 24
+    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = 0
 try:
     _BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE = float(
         os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE", "0.10")
@@ -128,6 +128,18 @@ try:
     )
 except Exception:
     _BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN = 0.04
+try:
+    _BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_SCORE = float(
+        os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_SCORE", "0.985")
+    )
+except Exception:
+    _BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_SCORE = 0.985
+try:
+    _BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_MEAN = float(
+        os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_MEAN", "0.0025")
+    )
+except Exception:
+    _BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_MEAN = 0.0025
 
 
 def _new_mpv_widget() -> MpvHDRWidget:
@@ -830,11 +842,66 @@ class _BenchmarkWorker(QObject):
                     if strict_score is None:
                         continue
 
+                    replace_reasons: list[str] = []
                     score_gate = max(
                         float(_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE),
                         float(fast_score) + float(_BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN),
                     )
-                    if float(strict_score) < score_gate:
+                    if float(strict_score) >= score_gate:
+                        replace_reasons.append("better alignment")
+
+                    gt_path_saved = str(row.get("hdr_gt_image") or "").strip()
+                    fast_gt_saved = read_image_any(gt_path_saved) if gt_path_saved else None
+                    if fast_gt_saved is not None:
+                        fast_gt_saved = np.ascontiguousarray(fast_gt_saved)
+                        if (fast_gt_saved.shape[1], fast_gt_saved.shape[0]) != (out_w, out_h):
+                            fast_gt_saved = np.ascontiguousarray(
+                                cv2.resize(
+                                    fast_gt_saved,
+                                    (out_w, out_h),
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                            )
+                        fast_u8 = self._to_u8_for_alignment(fast_gt_saved)
+                        if fast_u8 is not None:
+                            try:
+                                gt_diff_score = _frame_structure_similarity(
+                                    fast_u8,
+                                    strict_u8,
+                                )
+                            except Exception:
+                                gt_diff_score = None
+                            if (
+                                gt_diff_score is not None
+                                and float(gt_diff_score)
+                                < float(_BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_SCORE)
+                            ):
+                                replace_reasons.append(
+                                    f"GT frame changed (similarity {float(gt_diff_score):.4f})"
+                                )
+
+                        try:
+                            fast_f = fast_gt_saved.astype(np.float32)
+                            strict_f = strict_gt_eval.astype(np.float32)
+                            if fast_gt_saved.dtype == np.uint8:
+                                fast_f *= 257.0
+                            elif fast_gt_saved.dtype != np.uint16:
+                                peak = float(np.max(fast_f)) if fast_f.size else 1.0
+                                if peak <= 1.0:
+                                    fast_f *= 65535.0
+                            gt_mean_abs = float(
+                                np.mean(np.abs(fast_f - strict_f)) / 65535.0
+                            )
+                            if gt_mean_abs >= float(
+                                _BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_MEAN
+                            ):
+                                replace_reasons.append(
+                                    f"GT pixel delta {gt_mean_abs:.4f}"
+                                )
+                        except Exception:
+                            pass
+
+                    if not replace_reasons:
                         continue
 
                     pred_eval_saved = read_image_any(str(row.get("hdr_convert_image") or ""))
@@ -865,13 +932,12 @@ class _BenchmarkWorker(QObject):
                     )
                     if strict_metrics.get("obj_note"):
                         strict_metrics["obj_note"] = (
-                            f"{strict_metrics['obj_note']} [exact rerun]"
+                            f"{strict_metrics['obj_note']} [exact rerun: {', '.join(replace_reasons)}]"
                         )
                     row["metrics"] = strict_metrics
                     row["gt_decode_mode"] = "true_hdr_video_exact_rerun"
                     row["fast_gt_align_score"] = float(strict_score)
 
-                    gt_path_saved = str(row.get("hdr_gt_image") or "").strip()
                     if gt_path_saved:
                         write_hdr_tiff(gt_path_saved, strict_gt_eval)
                     self._write_frame_result_file(cfg, row)

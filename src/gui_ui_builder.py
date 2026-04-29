@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QStackedWidget,
@@ -70,15 +71,15 @@ class UiBuilderMixin:
         self._inspector_workspace.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self._inspector_workspace.setMinimumWidth(340)
-        self._inspector_workspace.setMaximumWidth(430)
+        self._inspector_workspace.setMinimumWidth(360)
+        self._inspector_workspace.setMaximumWidth(460)
 
         self._inspector_content = QWidget()
         self._inspector_content.setObjectName("InspectorContent")
         inspector_layout = QVBoxLayout(self._inspector_content)
         inspector_layout.setContentsMargins(0, 0, 0, 0)
         inspector_layout.setSpacing(10)
-        inspector_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
+        inspector_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
 
         self._build_top_controls_row(inspector_layout)
         self._build_video_displays(viewer_layout)
@@ -180,6 +181,11 @@ class UiBuilderMixin:
         self._lbl_file.setProperty("pill", True)
         self._lbl_file.setProperty("muted", True)
         self._lbl_file.setWordWrap(True)
+        self._lbl_file.setMinimumWidth(0)
+        self._lbl_file.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         row1.addWidget(self._btn_file, 0, 0, 1, 2)
         row1.addWidget(self._lbl_file, 1, 0, 1, 2)
 
@@ -188,7 +194,15 @@ class UiBuilderMixin:
         row1.addWidget(lbl_precision, 2, 0)
         self._cmb_prec = QComboBox()
         self._cmb_prec.addItems(_available_precision_keys())
-        self._cmb_prec.setMinimumWidth(170)
+        self._cmb_prec.setMinimumWidth(0)
+        self._cmb_prec.setMinimumContentsLength(12)
+        self._cmb_prec.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._cmb_prec.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         row1.addWidget(self._cmb_prec, 2, 1)
         self._chk_hg = QCheckBox("Use HG")
         self._chk_hg.setChecked(True)
@@ -199,7 +213,11 @@ class UiBuilderMixin:
         row1.addWidget(lbl_resolution, 3, 0)
         self._cmb_res = QComboBox()
         self._cmb_res.addItems(RESOLUTION_SCALES.keys())
-        self._cmb_res.setMinimumWidth(120)
+        self._cmb_res.setMinimumWidth(0)
+        self._cmb_res.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         row1.addWidget(self._cmb_res, 3, 1)
 
         lbl_upscale = QLabel("Upscale:")
@@ -207,11 +225,21 @@ class UiBuilderMixin:
         row1.addWidget(lbl_upscale, 4, 0)
         self._cmb_upscale = QComboBox()
         self._cmb_upscale.addItems(UPSCALER_CHOICES)
-        self._cmb_upscale.setMinimumWidth(150)
+        self._cmb_upscale.setMinimumWidth(0)
+        self._cmb_upscale.setMinimumContentsLength(12)
+        self._cmb_upscale.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._cmb_upscale.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self._cmb_upscale.setToolTip(
             "Upscale kernel for 540p/720p. 1080p stays native (no upscale)."
         )
         row1.addWidget(self._cmb_upscale, 4, 1)
+        row1.setColumnStretch(0, 0)
+        row1.setColumnStretch(1, 1)
 
         self._chk_film_grain = QCheckBox("Film Grain")
         self._chk_film_grain.setToolTip("Restore film grain using mpv shader.")
@@ -315,7 +343,11 @@ class UiBuilderMixin:
         self._lbl_hdr_gt = QLabel("HDR GT: none")
         self._lbl_hdr_gt.setProperty("pill", True)
         self._lbl_hdr_gt.setProperty("muted", True)
-        self._lbl_hdr_gt.setMinimumWidth(220)
+        self._lbl_hdr_gt.setMinimumWidth(0)
+        self._lbl_hdr_gt.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self._chk_hide_cursor = QCheckBox("Hide Cursor")
         self._chk_hide_cursor.setChecked(True)
         self._lbl_volume = QLabel("Volume:")
@@ -331,7 +363,12 @@ class UiBuilderMixin:
         self._lbl_audio_track = QLabel("Audio:")
         self._lbl_audio_track.setProperty("muted", True)
         self._cmb_audio_track = QComboBox()
-        self._cmb_audio_track.setFixedWidth(260)
+        self._cmb_audio_track.setMinimumWidth(140)
+        self._cmb_audio_track.setMaximumWidth(260)
+        self._cmb_audio_track.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self._cmb_audio_track.setEnabled(False)
         self._cmb_audio_track.setToolTip("Load a video with multiple audio tracks.")
 
@@ -482,6 +519,11 @@ class UiBuilderMixin:
             lbl = QLabel(f"{key}: —")
             lbl.setFont(mono)
             lbl.setProperty("metricChip", True)
+            lbl.setMinimumWidth(0)
+            lbl.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
             pl.addWidget(lbl, idx // 2, idx % 2)
             self._m[key] = lbl
 
@@ -507,6 +549,11 @@ class UiBuilderMixin:
             lbl = QLabel(default)
             lbl.setFont(mono)
             lbl.setProperty("metricChip", True)
+            lbl.setMinimumWidth(0)
+            lbl.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
             index = len(self._hdr_labels)
             if key == "status":
                 hl.addWidget(lbl, index, 0, 1, 2)

@@ -50,7 +50,7 @@ class VideoDisplay(QLabel):
         self._title = title
         self.setObjectName("VideoDisplay")
         self.setProperty("videoSurface", True)
-        self.setMinimumSize(320, 180)
+        self.setMinimumSize(240, 135)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setFont(QFont("Segoe UI", 10))

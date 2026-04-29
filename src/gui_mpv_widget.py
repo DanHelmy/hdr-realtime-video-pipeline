@@ -37,7 +37,7 @@ class MpvHDRWidget(QWidget):
         parent=None,
     ):
         super().__init__(parent)
-        self.setMinimumSize(320, 180)
+        self.setMinimumSize(240, 135)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setProperty("videoSurface", True)
