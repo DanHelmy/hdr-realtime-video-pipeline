@@ -296,7 +296,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
-| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, NVIDIA `Engine` size or AMD `Checkpoint` size, precision, processing resolution |
+| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint/export artifact size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
@@ -424,9 +424,9 @@ The first time you play, export, or benchmark a given model/resolution/mode comb
 
 INT8 TensorRT modes include a `qdqv1` suffix in the mode portion of the filename.
 
-If the engine is missing, the app loads the selected `.pt` / `.pth` model, exports an internal ONNX file, builds a TensorRT engine, saves it, and then runs inference through that engine. Later runs load the `.engine` directly.
+If the engine is missing, the app loads the selected `.pt` / `.pth` model, exports a cached ONNX file with the same model/resolution/mode stem when needed, builds a TensorRT engine, saves it, and then runs inference through that engine. Later runs load the `.engine` directly. If an ONNX file already exists but the engine does not, the app reuses the ONNX file to rebuild the engine.
 
-You can also pre-build NVIDIA engines manually:
+The GUI creates the TensorRT engine only when the user activates a mode whose engine is missing. You can also pre-build NVIDIA engines manually:
 
 ```bash
 python src/build_tensorrt_engines.py 1920x1080 --precision fp16
@@ -497,7 +497,7 @@ Equivalent setup scripts:
 ```bash
 pip install -r requirements/requirements-nvidia.txt
 ```
-NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export ONNX during first-time engine builds, but Triton is not required for NVIDIA inference.
+NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export cached ONNX artifacts during first-time model/resolution/mode builds, but Triton is not required for NVIDIA inference.
 
 `setup.bat` / `scripts/setup_nvidia.ps1` performs a post-install NVIDIA runtime check:
 
@@ -753,14 +753,15 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 
 | Scenario | Behavior |
 |---|---|
-| First run for model/resolution/mode | Load checkpoint, export ONNX internally, build `.engine` |
+| First run for model/resolution/mode | Load checkpoint, export cached `.onnx`, build `.engine` |
 | Cached model/resolution/mode | Load `.engine` directly |
+| Missing engine with cached ONNX | Rebuild `.engine` from cached `.onnx` |
 | Different model/resolution/mode | Build a new `.engine` once |
 | Build/load failure | Log and inform user; no NVIDIA PyTorch fallback |
 | Manual clear | `Tools -> Clear TensorRT Engine Cache ...` |
-| Live size metric | GUI shows cached engine size as `Engine: ... MB`; AMD shows checkpoint size as `Checkpoint: ... MB` |
+| Live size metric | GUI shows `Checkpoint: ... MB`; NVIDIA uses the cached ONNX export size, AMD uses the PyTorch checkpoint size |
 
-Manual prebuild:
+Manual engine prebuild:
 
 ```bash
 python src/build_tensorrt_engines.py 1920x1080 1280x720 --precision fp16

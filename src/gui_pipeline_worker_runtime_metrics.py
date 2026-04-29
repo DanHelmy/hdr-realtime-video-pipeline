@@ -78,12 +78,12 @@ class PipelineWorkerRuntimeMetricsMixin:
             model_size_label = "Checkpoint"
         else:
             cache_key = (str(self._precision_key), bool(self._use_hg))
-            model_size_label = "Engine" if _IS_NVIDIA else "Checkpoint"
+            model_size_label = "Checkpoint"
             if getattr(self, "_metrics_model_size_key", None) != cache_key:
                 model_mb = 0.0
-                engine_path = getattr(self._processor, "engine_path", None)
-                if _IS_NVIDIA and engine_path and os.path.isfile(engine_path):
-                    model_mb = os.path.getsize(engine_path) / (1024 * 1024)
+                onnx_path = getattr(self._processor, "onnx_path", None)
+                if _IS_NVIDIA and onnx_path and os.path.isfile(onnx_path):
+                    model_mb = os.path.getsize(onnx_path) / (1024 * 1024)
                 else:
                     model_path = _select_model_path(self._precision_key, self._use_hg)
                     model_mb = os.path.getsize(model_path) / (1024 * 1024)

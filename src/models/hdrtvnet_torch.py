@@ -2,7 +2,6 @@ import math
 import os
 import pathlib
 import re
-import tempfile
 import threading
 import time
 
@@ -1399,6 +1398,22 @@ def tensorrt_engine_path(
     return os.path.join(_engine_cache_dir(), f"{model_name}_{resolution}_{mode_name}.engine")
 
 
+def tensorrt_onnx_path(
+    model_path: str,
+    width: int,
+    height: int,
+    mode: str,
+) -> str:
+    return os.path.splitext(tensorrt_engine_path(model_path, width, height, mode))[0] + ".onnx"
+
+
+def tensorrt_mode_name(precision: str, mode: str) -> str:
+    mode_name = str(mode or precision or "mode")
+    if str(precision).startswith("int8") and "qdq" not in mode_name.lower():
+        mode_name = f"{mode_name}_qdqv1"
+    return mode_name
+
+
 class _ONNXExportWrapper(nn.Module):
     def __init__(self, model: nn.Module, flat_model: bool = False):
         super().__init__()
@@ -1413,6 +1428,45 @@ class _ONNXExportWrapper(nn.Module):
         if isinstance(out, (tuple, list)):
             return out[0]
         return out
+
+
+def _export_tensorrt_onnx_from_model(
+    *,
+    model: nn.Module,
+    onnx_path: str,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    precision: str,
+    flat_model: bool,
+    force: bool = False,
+) -> str:
+    if os.path.isfile(onnx_path) and not force:
+        print(f"TensorRT ONNX cache hit: {onnx_path}")
+        return onnx_path
+
+    export_model = getattr(model, "_orig_mod", model).eval()
+    if str(precision).startswith("int8"):
+        export_model = _convert_model_to_tensorrt_qdq(export_model).eval()
+    wrapper = _ONNXExportWrapper(export_model, flat_model=flat_model).eval()
+    h, w = int(height), int(width)
+    cond_h, cond_w = max(1, h // 4), max(1, w // 4)
+    tensor = torch.zeros((1, 3, h, w), dtype=dtype, device=device)
+    cond = torch.zeros((1, 3, cond_h, cond_w), dtype=dtype, device=device)
+    os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+    print(f"TensorRT ONNX export: {onnx_path}")
+    with torch.inference_mode():
+        torch.onnx.export(
+            wrapper,
+            (tensor, cond),
+            onnx_path,
+            input_names=["input", "cond"],
+            output_names=["output"],
+            opset_version=18,
+            do_constant_folding=True,
+        )
+    return onnx_path
 
 
 class HDRTVNetTensorRT(HDRTVNetTorch):
@@ -1441,10 +1495,14 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
 
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
-        self._engine_mode_name = str(mode_name or precision or "mode")
-        if str(precision).startswith("int8") and "qdq" not in self._engine_mode_name.lower():
-            self._engine_mode_name = f"{self._engine_mode_name}_qdqv1"
+        self._engine_mode_name = tensorrt_mode_name(precision, mode_name)
         self.engine_path = tensorrt_engine_path(
+            model_path,
+            self._engine_width,
+            self._engine_height,
+            self._engine_mode_name,
+        )
+        self.onnx_path = tensorrt_onnx_path(
             model_path,
             self._engine_width,
             self._engine_height,
@@ -1503,40 +1561,18 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         if self.model is None:
             raise RuntimeError("Cannot build TensorRT engine without a loaded PyTorch model.")
 
-        model = getattr(self.model, "_orig_mod", self.model).eval()
-        if str(self.precision).startswith("int8"):
-            model = _convert_model_to_tensorrt_qdq(model).eval()
-        wrapper = _ONNXExportWrapper(model, flat_model=getattr(self, "_is_flat_model", False)).eval()
-        onnx_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".onnx",
-                prefix="hdrtvnet_trt_",
-                delete=False,
-            ) as tmp:
-                onnx_path = tmp.name
-
-            h, w = self._engine_height, self._engine_width
-            cond_h, cond_w = max(1, h // 4), max(1, w // 4)
-            tensor = torch.zeros((1, 3, h, w), dtype=self._dtype, device=self.device)
-            cond = torch.zeros((1, 3, cond_h, cond_w), dtype=self._dtype, device=self.device)
-            with torch.inference_mode():
-                torch.onnx.export(
-                    wrapper,
-                    (tensor, cond),
-                    onnx_path,
-                    input_names=["input", "cond"],
-                    output_names=["output"],
-                    opset_version=18,
-                    do_constant_folding=True,
-                )
-            self._build_engine_from_onnx(onnx_path, trt)
-        finally:
-            if onnx_path:
-                try:
-                    os.remove(onnx_path)
-                except OSError:
-                    pass
+        onnx_path = _export_tensorrt_onnx_from_model(
+            model=self.model,
+            onnx_path=self.onnx_path,
+            width=self._engine_width,
+            height=self._engine_height,
+            dtype=self._dtype,
+            device=self.device,
+            precision=self.precision,
+            flat_model=getattr(self, "_is_flat_model", False),
+            force=False,
+        )
+        self._build_engine_from_onnx(onnx_path, trt)
 
     def _build_engine_from_onnx(self, onnx_path: str, trt) -> None:
         logger = trt.Logger(trt.Logger.INFO)

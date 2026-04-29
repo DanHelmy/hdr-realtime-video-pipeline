@@ -20,7 +20,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from models.hdrtvnet_torch import HDRTVNetTensorRT, tensorrt_engine_path
+from models.hdrtvnet_torch import (
+    HDRTVNetTensorRT,
+    tensorrt_engine_path,
+    tensorrt_mode_name,
+    tensorrt_onnx_path,
+)
 
 
 def _weight(name: str) -> str:
@@ -84,7 +89,10 @@ def main() -> int:
     precision, default_model = _PRECISION_MAP[args.precision]
     model_path = os.path.abspath(args.model or default_model)
     use_hg = str(args.use_hg).strip() != "0"
-    mode_name = f"{args.precision}_{'hg' if use_hg else 'nohg'}"
+    mode_name = tensorrt_mode_name(
+        precision,
+        f"{args.precision}_{'hg' if use_hg else 'nohg'}",
+    )
 
     if not os.path.isfile(model_path):
         print(f"ERROR: model weights not found: {model_path}", file=sys.stderr)
@@ -92,10 +100,13 @@ def main() -> int:
 
     for w, h in args.resolutions:
         engine_path = tensorrt_engine_path(model_path, w, h, mode_name)
+        onnx_path = tensorrt_onnx_path(model_path, w, h, mode_name)
         if args.force and os.path.isfile(engine_path):
             os.remove(engine_path)
         if os.path.isfile(engine_path):
             print(f"[tensorrt] cache hit: {engine_path}")
+            if os.path.isfile(onnx_path):
+                print(f"[tensorrt] onnx: {onnx_path}")
             continue
         print(
             f"[tensorrt] building {args.precision} "
@@ -113,6 +124,8 @@ def main() -> int:
         )
         del processor
         print(f"[tensorrt] ready: {engine_path}")
+        if os.path.isfile(onnx_path):
+            print(f"[tensorrt] onnx: {onnx_path}")
 
     return 0
 
