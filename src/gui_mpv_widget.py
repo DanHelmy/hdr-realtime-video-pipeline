@@ -13,6 +13,168 @@ from PyQt6.QtWidgets import QWidget
 from gui_config import LIVE_CAPTURE_MPV_BUFFER_FRAMES
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = float(default)
+    return max(float(min_value), min(float(max_value), float(value)))
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(int(min_value), min(int(max_value), int(value)))
+
+
+def _env_bool_any(names: tuple[str, ...], default: bool = False) -> bool:
+    for name in names:
+        if os.environ.get(name) is not None:
+            return _env_bool(name, default)
+    return bool(default)
+
+
+def _env_float_any(
+    names: tuple[str, ...],
+    default: float,
+    *,
+    min_value: float,
+    max_value: float,
+) -> float:
+    for name in names:
+        if os.environ.get(name) is not None:
+            return _env_float(name, default, min_value=min_value, max_value=max_value)
+    return max(float(min_value), min(float(max_value), float(default)))
+
+
+def _env_int_any(
+    names: tuple[str, ...],
+    default: int,
+    *,
+    min_value: int,
+    max_value: int,
+) -> int:
+    for name in names:
+        if os.environ.get(name) is not None:
+            return _env_int(name, default, min_value=min_value, max_value=max_value)
+    return max(int(min_value), min(int(max_value), int(default)))
+
+
+def _mpv_deband_options(*, live_capture: bool = False) -> dict:
+    env_prefix = "HDRTVNET_BROWSER_MPV_" if live_capture else "HDRTVNET_MPV_"
+    if not _env_bool_any((f"{env_prefix}DEBAND", "HDRTVNET_MPV_DEBAND"), True):
+        return {}
+    if live_capture:
+        default_iterations = 3
+        default_threshold = 96.0
+        default_range = 32
+        default_grain = 20.0
+    else:
+        default_iterations = 2
+        default_threshold = 28.0
+        default_range = 16
+        default_grain = 6.0
+    return {
+        "deband": "yes",
+        "deband_iterations": str(_env_int_any((f"{env_prefix}DEBAND_ITERATIONS", "HDRTVNET_MPV_DEBAND_ITERATIONS"), default_iterations, min_value=1, max_value=16)),
+        "deband_threshold": str(_env_float_any((f"{env_prefix}DEBAND_THRESHOLD", "HDRTVNET_MPV_DEBAND_THRESHOLD"), default_threshold, min_value=0.0, max_value=4096.0)),
+        "deband_range": str(_env_int_any((f"{env_prefix}DEBAND_RANGE", "HDRTVNET_MPV_DEBAND_RANGE"), default_range, min_value=1, max_value=64)),
+        "deband_grain": str(_env_float_any((f"{env_prefix}DEBAND_GRAIN", "HDRTVNET_MPV_DEBAND_GRAIN"), default_grain, min_value=0.0, max_value=4096.0)),
+    }
+
+
+def _mpv_dither_options(*, live_capture: bool = False) -> dict:
+    env_prefix = "HDRTVNET_BROWSER_MPV_" if live_capture else "HDRTVNET_MPV_"
+    if not _env_bool_any((f"{env_prefix}DITHER", "HDRTVNET_MPV_DITHER"), True):
+        return {}
+    algo = str(
+        os.environ.get(
+            f"{env_prefix}DITHER_ALGO",
+            os.environ.get("HDRTVNET_MPV_DITHER_ALGO", "fruit"),
+        )
+    ).strip().lower().replace("_", "-")
+    if algo not in {"fruit", "ordered", "error-diffusion", "no"}:
+        algo = "fruit"
+    depth = str(
+        os.environ.get(
+            f"{env_prefix}DITHER_DEPTH",
+            os.environ.get("HDRTVNET_MPV_DITHER_DEPTH", "auto"),
+        )
+    ).strip().lower()
+    if depth not in {"auto", "no"}:
+        try:
+            depth = str(max(1, min(16, int(depth))))
+        except Exception:
+            depth = "auto"
+    if algo == "no" or depth == "no":
+        return {
+            "dither": "no",
+            "dither_depth": "no",
+        }
+
+    options = {
+        "dither": algo,
+        "dither_depth": depth,
+    }
+    if algo == "fruit":
+        options["dither_size_fruit"] = str(_env_int_any((f"{env_prefix}DITHER_SIZE_FRUIT", "HDRTVNET_MPV_DITHER_SIZE_FRUIT"), 6, min_value=2, max_value=8))
+    if _env_bool_any((f"{env_prefix}TEMPORAL_DITHER", "HDRTVNET_MPV_TEMPORAL_DITHER"), True):
+        options["temporal_dither"] = "yes"
+        options["temporal_dither_period"] = str(_env_int_any((f"{env_prefix}TEMPORAL_DITHER_PERIOD", "HDRTVNET_MPV_TEMPORAL_DITHER_PERIOD"), 1, min_value=1, max_value=128))
+    return options
+
+
+def _mpv_live_interpolation_enabled() -> bool:
+    # Browser capture already arrives as a real-time, occasionally duplicated
+    # stream. mpv frame mixing can make duplicate/low-motion stretches bleed
+    # into the next few display refreshes, so keep it opt-in for live capture.
+    return _env_bool("HDRTVNET_BROWSER_MPV_INTERPOLATION", True)
+
+
+def _without_deband_options(kwargs: dict) -> dict:
+    clean = dict(kwargs)
+    for key in (
+        "deband",
+        "deband_iterations",
+        "deband_threshold",
+        "deband_range",
+        "deband_grain",
+    ):
+        clean.pop(key, None)
+    return clean
+
+
+def _without_dither_options(kwargs: dict) -> dict:
+    clean = dict(kwargs)
+    for key in (
+        "dither",
+        "dither_depth",
+        "dither_size_fruit",
+        "temporal_dither",
+        "temporal_dither_period",
+    ):
+        clean.pop(key, None)
+    return clean
+
+
+def _without_display_quality_options(kwargs: dict) -> dict:
+    return _without_dither_options(_without_deband_options(kwargs))
+
+
 class MpvHDRWidget(QWidget):
     """QWidget that embeds an mpv player for real-time HDR frame display.
 
@@ -51,6 +213,7 @@ class MpvHDRWidget(QWidget):
         self._shutdown = threading.Event()
         self._fps = 30.0
         self._force_hdr_metadata = True
+        self._sdr_transfer = "bt1886"
         self._diag_enabled = bool(mpv_diag)
         self._seek_warned = False
         self._last_playback_cfg: dict | None = None
@@ -69,6 +232,36 @@ class MpvHDRWidget(QWidget):
         self._fsr_shader_path = str(fsr_shader_path)
         self._ssim_superres_shader_path = str(ssim_superres_shader_path)
         self._filmgrain_shader_path = str(filmgrain_shader_path)
+
+    @staticmethod
+    def _normalize_sdr_transfer(value: str | None) -> str:
+        text = str(value or "").strip().lower().replace("-", "").replace("_", "")
+        if text in {"srgb", "iec6196621", "iec61966"}:
+            return "srgb"
+        return "bt1886"
+
+    def _sdr_format_filter(self, cas_strength: float | None = None) -> str:
+        gamma = "srgb" if self._sdr_transfer == "srgb" else "bt.1886"
+        vf_chain = f"format=colorlevels=full:primaries=bt.709:gamma={gamma}"
+        if cas_strength is not None and cas_strength > 0.0:
+            vf_chain += f",cas={cas_strength}"
+        return vf_chain
+
+    def _build_shader_paths(
+        self,
+        *,
+        use_fsr: bool,
+        use_ssim: bool,
+        use_film_grain: bool,
+    ) -> list[str]:
+        shader_paths = []
+        if use_fsr:
+            shader_paths.append(self._fsr_shader_path)
+        if use_ssim:
+            shader_paths.append(self._ssim_superres_shader_path)
+        if use_film_grain:
+            shader_paths.append(self._filmgrain_shader_path)
+        return shader_paths
 
     def _build_hdr_info_snapshot(self, p) -> tuple[dict, dict, dict]:
         vp = {}
@@ -238,6 +431,9 @@ class MpvHDRWidget(QWidget):
             print(f"[mpv] glsl-shaders set failed: {exc}")
             return False
 
+    def _set_shader_chain(self, shader_paths: list[str]) -> bool:
+        return self._set_glsl_shaders(self._normalize_shader_paths(shader_paths))
+
     @staticmethod
     def _kernel_antiring(scale_kernel: str) -> tuple[str, float]:
         k = str(scale_kernel or "bicubic").strip().lower()
@@ -381,12 +577,16 @@ class MpvHDRWidget(QWidget):
         film_grain: bool = False,
         force_hdr_metadata: bool = True,
         vsync_timed: bool = False,
+        sdr_transfer: str = "bt1886",
+        live_capture: bool | None = None,
     ) -> bool:
         self.stop_playback()
         self._shutdown.clear()
         self._fps = float(fps) if fps and fps > 0 else 30.0
         self._force_hdr_metadata = bool(force_hdr_metadata)
+        self._sdr_transfer = self._normalize_sdr_transfer(sdr_transfer)
         vsync_timed = bool(vsync_timed)
+        live_capture = bool(vsync_timed if live_capture is None else live_capture)
         buffer_frames = (
             max(1, int(LIVE_CAPTURE_MPV_BUFFER_FRAMES))
             if vsync_timed
@@ -416,6 +616,8 @@ class MpvHDRWidget(QWidget):
             "force_hdr_metadata": self._force_hdr_metadata,
             "vsync_timed": vsync_timed,
             "buffer_frames": int(buffer_frames),
+            "sdr_transfer": self._sdr_transfer,
+            "live_capture": live_capture,
         }
 
         pipe_id = id(self)
@@ -457,6 +659,8 @@ class MpvHDRWidget(QWidget):
         # Use gpu-next + colorspace hint so mpv can adapt target output while
         # dragging between HDR/SDR displays (with a compatibility fallback).
         self._target_colorspace_hint = "auto"
+        deband_options = _mpv_deband_options(live_capture=live_capture)
+        dither_options = _mpv_dither_options(live_capture=live_capture)
         mpv_kwargs = dict(
             wid=wid,
             vo="gpu-next",
@@ -481,18 +685,21 @@ class MpvHDRWidget(QWidget):
             scale_antiring=str(antiring),
             cscale_antiring=str(antiring),
         )
-        if vsync_timed:
+        mpv_kwargs.update(deband_options)
+        mpv_kwargs.update(dither_options)
+        deband_active = bool(deband_options)
+        dither_active = bool(dither_options)
+        use_interpolation = bool(vsync_timed and (not live_capture or _mpv_live_interpolation_enabled()))
+        if use_interpolation:
             mpv_kwargs.update(
                 interpolation=True,
                 tscale="oversample",
             )
-        shader_paths = []
-        if use_fsr:
-            shader_paths.append(self._fsr_shader_path)
-        if use_ssim:
-            shader_paths.append(self._ssim_superres_shader_path)
-        if use_film_grain:
-            shader_paths.append(self._filmgrain_shader_path)
+        shader_paths = self._build_shader_paths(
+            use_fsr=use_fsr,
+            use_ssim=use_ssim,
+            use_film_grain=use_film_grain,
+        )
         if self._force_hdr_metadata:
             vf_chain = "format=colorlevels=full:primaries=bt.2020:gamma=pq"
             if cas_strength is not None and cas_strength > 0.0:
@@ -502,9 +709,7 @@ class MpvHDRWidget(QWidget):
                 vf=vf_chain,
             )
         else:
-            vf_chain = "format=colorlevels=full:primaries=bt.709:gamma=bt.1886"
-            if cas_strength is not None and cas_strength > 0.0:
-                vf_chain += f",cas={cas_strength}"
+            vf_chain = self._sdr_format_filter(cas_strength)
             mpv_kwargs.update(
                 target_colorspace_hint=self._target_colorspace_hint,
                 vf=vf_chain,
@@ -513,54 +718,85 @@ class MpvHDRWidget(QWidget):
         if not use_external_audio:
             mpv_kwargs["audio"] = "no"
 
+        player = None
+        startup_exc = None
         try:
             player = self._mpv_lib.MPV(**mpv_kwargs)
             self._active_vo = "gpu-next"
         except Exception as exc:
-            if vsync_timed:
-                fallback_kwargs = dict(mpv_kwargs)
-                fallback_kwargs["untimed"] = True
-                fallback_kwargs["video_sync"] = "desync"
-                fallback_kwargs.pop("interpolation", None)
-                fallback_kwargs.pop("tscale", None)
+            startup_exc = exc
+
+        if player is None and dither_active:
+            try:
+                player = self._mpv_lib.MPV(**_without_dither_options(mpv_kwargs))
+                self._active_vo = "gpu-next"
+                dither_active = False
+                note = (
+                    "mpv dither unavailable; continuing without display dither: "
+                    f"{startup_exc}"
+                )
+                print(f"[mpv] {note}")
                 try:
-                    player = self._mpv_lib.MPV(**fallback_kwargs)
-                    self._active_vo = "gpu-next"
-                    vsync_timed = False
-                    if self._last_playback_cfg is not None:
-                        self._last_playback_cfg["vsync_timed"] = False
-                    note = (
-                        "mpv vsync-timed mode unavailable; using low-latency "
-                        f"untimed fallback: {exc}"
-                    )
-                    print(f"[mpv] {note}")
-                    try:
-                        self.runtime_notice.emit(note)
-                    except Exception:
-                        pass
-                except Exception as fallback_exc:
-                    self._last_scale_error = (
-                        "mpv startup failed with gpu-next/vulkan: "
-                        f"{fallback_exc}"
-                    )
-                    print(f"[mpv] {self._last_scale_error}")
-                    try:
-                        self.runtime_notice.emit(self._last_scale_error)
-                    except Exception:
-                        pass
-                    self._queue = None
-                    self._pipe_name = None
-                    return False
-            else:
-                self._last_scale_error = f"mpv startup failed with gpu-next/vulkan: {exc}"
-                print(f"[mpv] {self._last_scale_error}")
-                try:
-                    self.runtime_notice.emit(self._last_scale_error)
+                    self.runtime_notice.emit(note)
                 except Exception:
                     pass
-                self._queue = None
-                self._pipe_name = None
-                return False
+            except Exception as exc:
+                startup_exc = exc
+
+        if player is None and deband_active:
+            try:
+                player = self._mpv_lib.MPV(**_without_display_quality_options(mpv_kwargs))
+                self._active_vo = "gpu-next"
+                deband_active = False
+                dither_active = False
+                note = (
+                    "mpv deband/dither unavailable; continuing without display quality filters: "
+                    f"{startup_exc}"
+                )
+                print(f"[mpv] {note}")
+                try:
+                    self.runtime_notice.emit(note)
+                except Exception:
+                    pass
+            except Exception as exc:
+                startup_exc = exc
+
+        if player is None and vsync_timed:
+            fallback_kwargs = _without_display_quality_options(mpv_kwargs)
+            fallback_kwargs["untimed"] = True
+            fallback_kwargs["video_sync"] = "desync"
+            fallback_kwargs.pop("interpolation", None)
+            fallback_kwargs.pop("tscale", None)
+            try:
+                player = self._mpv_lib.MPV(**fallback_kwargs)
+                self._active_vo = "gpu-next"
+                vsync_timed = False
+                deband_active = False
+                dither_active = False
+                if self._last_playback_cfg is not None:
+                    self._last_playback_cfg["vsync_timed"] = False
+                note = (
+                    "mpv vsync/display-quality startup fallback active; using "
+                    f"low-latency untimed display: {startup_exc}"
+                )
+                print(f"[mpv] {note}")
+                try:
+                    self.runtime_notice.emit(note)
+                except Exception:
+                    pass
+            except Exception as exc:
+                startup_exc = exc
+
+        if player is None:
+            self._last_scale_error = f"mpv startup failed with gpu-next/vulkan: {startup_exc}"
+            print(f"[mpv] {self._last_scale_error}")
+            try:
+                self.runtime_notice.emit(self._last_scale_error)
+            except Exception:
+                pass
+            self._queue = None
+            self._pipe_name = None
+            return False
         self._player = player
         pipe_ready = threading.Event()
         self._feeder = threading.Thread(
@@ -589,7 +825,7 @@ class MpvHDRWidget(QWidget):
                 pass
             self.stop_playback()
             return False
-        if shader_paths and not self._set_glsl_shaders(shader_paths):
+        if shader_paths and not self._set_shader_chain(shader_paths):
             try:
                 self.runtime_notice.emit(
                     f"mpv shader load check failed: {self._last_scale_error or 'unknown error'}"
@@ -756,14 +992,12 @@ class MpvHDRWidget(QWidget):
             use_film_grain = bool(film_on and self._ensure_filmgrain_shader())
             if film_on and not use_film_grain:
                 print("[mpv] film grain shader unavailable (download failed).")
-            shader_paths = []
-            if use_fsr:
-                shader_paths.append(self._fsr_shader_path)
-            if use_ssim:
-                shader_paths.append(self._ssim_superres_shader_path)
-            if use_film_grain:
-                shader_paths.append(self._filmgrain_shader_path)
-            if not self._set_glsl_shaders(shader_paths):
+            shader_paths = self._build_shader_paths(
+                use_fsr=use_fsr,
+                use_ssim=use_ssim,
+                use_film_grain=use_film_grain,
+            )
+            if not self._set_shader_chain(shader_paths):
                 raise RuntimeError("Failed to set glsl-shaders.")
             p.command("set", "scale-antiring", str(antiring))
             p.command("set", "cscale-antiring", str(antiring))
@@ -791,8 +1025,8 @@ class MpvHDRWidget(QWidget):
         if self._force_hdr_metadata:
             vf_chain = "format=colorlevels=full:primaries=bt.2020:gamma=pq"
         else:
-            vf_chain = "format=colorlevels=full:primaries=bt.709:gamma=bt.1886"
-        if cas_val > 0.0:
+            vf_chain = self._sdr_format_filter(cas_val)
+        if self._force_hdr_metadata and cas_val > 0.0:
             vf_chain += f",cas={cas_val}"
         try:
             p.command("set", "vf", vf_chain)
@@ -819,15 +1053,13 @@ class MpvHDRWidget(QWidget):
             use_ssim = (
                 k == "ssim_superres" and self._ensure_ssim_superres_shader()
             )
-        shader_paths = []
-        if use_fsr:
-            shader_paths.append(self._fsr_shader_path)
-        if use_ssim:
-            shader_paths.append(self._ssim_superres_shader_path)
-        if use_film:
-            shader_paths.append(self._filmgrain_shader_path)
+        shader_paths = self._build_shader_paths(
+            use_fsr=use_fsr,
+            use_ssim=use_ssim,
+            use_film_grain=use_film,
+        )
         try:
-            if not self._set_glsl_shaders(shader_paths):
+            if not self._set_shader_chain(shader_paths):
                 raise RuntimeError("Failed to set glsl-shaders.")
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["film_grain"] = bool(use_film)
@@ -894,6 +1126,8 @@ class MpvHDRWidget(QWidget):
             "force_hdr_metadata",
             "film_grain",
             "vsync_timed",
+            "sdr_transfer",
+            "live_capture",
         }
         safe_cfg = {k: v for k, v in cfg.items() if k in allowed}
         self.start_playback(**safe_cfg)

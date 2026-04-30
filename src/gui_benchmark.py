@@ -2857,8 +2857,23 @@ class ModelBenchmarkDialog(QDialog):
 
         sdr_n = int(sdr_meta.get("frame_count") or 0)
         gt_n = int(gt_meta.get("frame_count") or 0)
+        try:
+            sync_tol_s = max(
+                0.25,
+                float(os.environ.get("HDRTVNET_GT_SYNC_TOLERANCE_S", "2.0")),
+            )
+        except Exception:
+            sync_tol_s = 2.0
+        sdr_d = float(sdr_meta.get("duration_s") or 0.0)
+        gt_d = float(gt_meta.get("duration_s") or 0.0)
+        duration_delta_s = abs(sdr_d - gt_d) if sdr_d > 0.0 and gt_d > 0.0 else 0.0
+        notes = []
         if sdr_n > 0 and gt_n > 0 and abs(sdr_n - gt_n) > 2:
-            return False, f"Frame-count mismatch: SDR {sdr_n} vs GT {gt_n}."
+            if duration_delta_s <= 0.0 or duration_delta_s > sync_tol_s:
+                return False, f"Frame-count mismatch: SDR {sdr_n} vs GT {gt_n}."
+            notes.append(
+                f"length differs by {duration_delta_s:.2f}s; using overlap sync"
+            )
 
         score, sampled = _content_similarity_score(sdr_path, gt_path, sample_count=5)
         if score is None or sampled < 3:
@@ -2866,7 +2881,10 @@ class ModelBenchmarkDialog(QDialog):
         if score < 0.34:
             return False, f"Content mismatch (similarity {score:.2f})."
 
-        return True, f"Validated (content similarity {score:.2f})."
+        suffix = ""
+        if notes:
+            suffix = "; " + "; ".join(notes)
+        return True, f"Validated (content similarity {score:.2f}{suffix})."
 
     def _validate_dataset_pair(self, sdr_path: str, gt_path: str) -> tuple[bool, str]:
         if not os.path.isfile(sdr_path):

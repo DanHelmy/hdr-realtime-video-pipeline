@@ -98,8 +98,11 @@ def _env_live_int(name: str, default: int, *, min_value: int = 1, max_value: int
 
 # Browser-window video has two separate rates:
 # - observe FPS controls how often we check Chrome/DWM for fresh compositor frames
-# - process FPS controls the steady raw-video stream fed to mpv
-# mpv then repeats frames on display vsync, so Python does not need 60 Hz writes.
+# - process FPS controls how often HDRTVNet++ runs on browser frames
+# - display FPS controls the steady raw-video stream fed to mpv
+# Keep display feed at or below process FPS. mpv/display vsync should own frame
+# repeats; oversampling the pipe can create uneven duplicate cadence on 24 fps
+# browser video.
 LIVE_CAPTURE_PROCESS_FPS = _env_live_fps("HDRTVNET_LIVE_CAPTURE_PROCESS_FPS", 24.0)
 LIVE_CAPTURE_OBSERVE_FPS = _env_live_fps(
     "HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS",
@@ -110,7 +113,13 @@ LIVE_CAPTURE_MPV_BUFFER_FRAMES = _env_live_int(
     3,
 )
 LIVE_CAPTURE_PRESENT_MAX_FPS = LIVE_CAPTURE_PROCESS_FPS
-LIVE_CAPTURE_DISPLAY_FPS = LIVE_CAPTURE_PROCESS_FPS
+LIVE_CAPTURE_DISPLAY_FPS = min(
+    LIVE_CAPTURE_PROCESS_FPS,
+    _env_live_fps(
+        "HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS",
+        LIVE_CAPTURE_PROCESS_FPS,
+    ),
+)
 
 
 def _normalize_source_mode(mode: str | None) -> str:

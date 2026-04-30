@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from gui_hdr_io import read_hdr_video_frame_rgb16, tensor_to_bgr_u16
+from gui_media_probe import _probe_video_timing_info
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _compute_full_reference_metrics,
@@ -13,6 +14,24 @@ from gui_objective_metrics import (
 
 class PipelineWorkerCompareMixin:
     """Compare-snapshot generation helpers for PipelineWorker."""
+
+    def _compare_gt_frame_index(self, gt_path: str, source_frame_idx: int) -> int:
+        gt_idx = max(0, int(source_frame_idx))
+        if not gt_path or not getattr(self, "_video_path", None):
+            return gt_idx
+        try:
+            src_meta = _probe_video_timing_info(self._video_path)
+            gt_meta = _probe_video_timing_info(gt_path)
+            if src_meta is None or gt_meta is None:
+                return gt_idx
+            return self._map_frame_index_between_rates(
+                gt_idx,
+                float(src_meta.get("fps", 0.0) or 0.0),
+                float(gt_meta.get("fps", 0.0) or 0.0),
+                int(gt_meta.get("frame_count", 0) or 0),
+            )
+        except Exception:
+            return gt_idx
 
     def _cache_compare_state(
         self,
@@ -248,9 +267,10 @@ class PipelineWorkerCompareMixin:
         cmp_hdr_gt = None
         gt_hdr_mode_note = "missing 16-bit HDR GT"
         if compare_gt_path:
-            gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, cmp_seek_idx)
-            if gt_rgb16 is None and cmp_seek_idx > 0:
-                gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, cmp_seek_idx - 1)
+            gt_seek_idx = self._compare_gt_frame_index(compare_gt_path, cmp_seek_idx)
+            gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx)
+            if gt_rgb16 is None and gt_seek_idx > 0:
+                gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx - 1)
             if gt_rgb16 is not None:
                 gt_probe = np.ascontiguousarray(gt_rgb16[:, :, ::-1])
                 gt_hdr_mode_note = "true 16-bit HDR decode"

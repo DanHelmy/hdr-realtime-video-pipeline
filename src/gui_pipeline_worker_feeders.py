@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue as _queue
 import threading
 import time
@@ -7,16 +8,123 @@ import time
 import numpy as np
 import torch
 
-from gui_config import LIVE_CAPTURE_PROCESS_FPS
+from gui_config import LIVE_CAPTURE_DISPLAY_FPS
 from gui_mpv_widget import MpvHDRWidget
 from timer import sleep_until
 
 _LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.050
 _LIVE_SMOOTH_MAX_CATCHUP_FRAMES = 2
+_FEEDER_GPU_RGB48 = str(
+    os.environ.get("HDRTVNET_FEEDER_GPU_RGB48", "1")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _live_present_interval_s() -> float:
-    return 1.0 / max(1.0, float(LIVE_CAPTURE_PROCESS_FPS or 24.0))
+    return 1.0 / max(1.0, float(LIVE_CAPTURE_DISPLAY_FPS or 30.0))
+
+
+def _next_live_present_deadline(
+    deadline_s: float,
+    now_s: float,
+    interval_s: float,
+) -> float:
+    """Advance cadence while allowing a tiny bounded refill after stalls."""
+    next_s = float(deadline_s) + float(interval_s)
+    floor_s = float(now_s) - (
+        float(interval_s) * float(_LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
+    )
+    if next_s < floor_s:
+        return floor_s
+    return next_s
+
+
+def _pinned_u16_host_buffer(state: dict, shape: tuple[int, int, int]):
+    if state.get("shape") == shape and state.get("tensor") is not None:
+        return state["tensor"], state["numpy"]
+    tensor = None
+    try:
+        if torch.cuda.is_available():
+            tensor = torch.empty(shape, dtype=torch.uint16, pin_memory=True)
+    except Exception:
+        tensor = None
+    if tensor is None:
+        tensor = torch.empty(shape, dtype=torch.uint16)
+    arr = tensor.numpy()
+    state["shape"] = shape
+    state["tensor"] = tensor
+    state["numpy"] = arr
+    return tensor, arr
+
+
+def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
+    with torch.inference_mode():
+        prepared = tensor[0] if isinstance(tensor, (tuple, list)) else tensor
+        rgb = (
+            prepared.squeeze(0)
+            .clamp(0.0, 1.0)
+            .permute(1, 2, 0)
+            .contiguous()
+        )
+
+    if (
+        _FEEDER_GPU_RGB48
+        and getattr(rgb, "device", None) is not None
+        and rgb.device.type == "cuda"
+    ):
+        rgb_u16 = (
+            rgb.to(dtype=torch.float32)
+            .mul_(65535.0)
+            .add_(0.5)
+            .to(dtype=torch.uint16)
+            .contiguous()
+        )
+        host_tensor, host_np = _pinned_u16_host_buffer(
+            host_state,
+            tuple(int(v) for v in rgb_u16.shape),
+        )
+        non_blocking = False
+        try:
+            non_blocking = bool(host_tensor.is_pinned())
+        except Exception:
+            non_blocking = False
+        host_tensor.copy_(rgb_u16, non_blocking=non_blocking)
+        torch.cuda.current_stream().synchronize()
+        return host_np.tobytes()
+
+    rgb_cpu = rgb.cpu().numpy()
+    rgb_f32 = rgb_cpu.astype(np.float32, copy=False)
+    shape = tuple(int(v) for v in rgb_f32.shape)
+    arr = host_state.get("numpy")
+    if host_state.get("shape") != shape or arr is None:
+        arr = np.empty(shape, dtype=np.uint16)
+        host_state["shape"] = shape
+        host_state["numpy"] = arr
+    np.multiply(rgb_f32, 65535.0, out=rgb_f32)
+    np.add(rgb_f32, 0.5, out=rgb_f32)
+    np.clip(rgb_f32, 0.0, 65535.0, out=rgb_f32)
+    arr[:] = rgb_f32.astype(np.uint16)
+    return arr.tobytes()
+
+
+def _bgr_to_rgb48_bytes(frame: np.ndarray, host_state: dict) -> bytes:
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("Expected HxWx3 frame.")
+    shape = (int(frame.shape[0]), int(frame.shape[1]), 3)
+    arr = host_state.get("numpy")
+    if host_state.get("shape") != shape or arr is None:
+        arr = np.empty(shape, dtype=np.uint16)
+        host_state["shape"] = shape
+        host_state["numpy"] = arr
+    if frame.dtype == np.uint8:
+        np.multiply(frame[:, :, ::-1], np.uint16(257), out=arr, casting="unsafe")
+    elif frame.dtype == np.uint16:
+        np.copyto(arr, frame[:, :, ::-1], casting="unsafe")
+    else:
+        src = frame.astype(np.float32, copy=False)
+        if src.max(initial=0.0) <= 1.0:
+            src = src * 65535.0
+        arr[:] = np.clip(src[:, :, ::-1], 0.0, 65535.0).astype(np.uint16)
+    return arr.tobytes()
 
 
 class PipelineWorkerFeedersMixin:
@@ -34,6 +142,7 @@ class PipelineWorkerFeedersMixin:
             next_present_t = 0.0
             latest_rgb48_bytes: bytes | None = None
             present_interval_s = _live_present_interval_s()
+            rgb48_host_state: dict = {}
             while True:
                 now = time.perf_counter()
                 wait_timeout = 0.2
@@ -79,18 +188,10 @@ class PipelineWorkerFeedersMixin:
                         except Exception:
                             pass
 
-                    with torch.inference_mode():
-                        raw_cpu = (
-                            tensor.squeeze(0)
-                            .clamp_(0.0, 1.0)
-                            .permute(1, 2, 0)
-                            .contiguous()
-                            .cpu()
-                            .numpy()
-                        )
-                    hdr_u16 = (raw_cpu.astype(np.float32).__imul__(65535)).__add__(0.5)
-                    np.clip(hdr_u16, 0, 65535, out=hdr_u16)
-                    latest_rgb48_bytes = hdr_u16.astype(np.uint16).tobytes()
+                    latest_rgb48_bytes = _tensor_to_rgb48_bytes(
+                        tensor,
+                        rgb48_host_state,
+                    )
                     if next_present_t <= 0.0:
                         next_present_t = time.perf_counter()
 
@@ -104,15 +205,14 @@ class PipelineWorkerFeedersMixin:
                     continue
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
-                next_present_t += present_interval_s
-                if next_present_t < (
-                    now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
-                ):
-                    next_present_t = (
-                        now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
-                    )
+                next_present_t = _next_live_present_deadline(
+                    next_present_t,
+                    now,
+                    present_interval_s,
+                )
             return
 
+        rgb48_host_state: dict = {}
         while True:
             try:
                 item = hdr_q.get(timeout=0.2)
@@ -143,20 +243,12 @@ class PipelineWorkerFeedersMixin:
                     ready_event.synchronize()
                 except Exception:
                     pass
-            with torch.inference_mode():
-                raw_cpu = (tensor.squeeze(0)
-                           .clamp_(0.0, 1.0)
-                           .permute(1, 2, 0)
-                           .contiguous()
-                           .cpu()
-                           .numpy())
-            hdr_u16 = (raw_cpu.astype(np.float32).__imul__(65535)).__add__(0.5)
-            np.clip(hdr_u16, 0, 65535, out=hdr_u16)
+            rgb48_bytes = _tensor_to_rgb48_bytes(tensor, rgb48_host_state)
             if present_t is not None:
                 now = time.perf_counter()
                 if now < present_t:
                     sleep_until(present_t)
-            mpv_widget.feed_frame(hdr_u16.astype(np.uint16).data)
+            mpv_widget.feed_frame(rgb48_bytes)
 
     def _sdr_feeder_fn(
         self,
@@ -170,6 +262,7 @@ class PipelineWorkerFeedersMixin:
             next_present_t = 0.0
             latest_rgb48_bytes: bytes | None = None
             present_interval_s = _live_present_interval_s()
+            rgb48_host_state: dict = {}
             while True:
                 now = time.perf_counter()
                 wait_timeout = 0.2
@@ -207,9 +300,10 @@ class PipelineWorkerFeedersMixin:
                         frame = item
 
                     try:
-                        latest_rgb48_bytes = np.ascontiguousarray(
-                            frame[:, :, ::-1].astype(np.uint16) * 257
-                        ).tobytes()
+                        latest_rgb48_bytes = _bgr_to_rgb48_bytes(
+                            frame,
+                            rgb48_host_state,
+                        )
                     except Exception:
                         latest_rgb48_bytes = None
 
@@ -226,15 +320,14 @@ class PipelineWorkerFeedersMixin:
                     continue
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
-                next_present_t += present_interval_s
-                if next_present_t < (
-                    now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
-                ):
-                    next_present_t = (
-                        now - (present_interval_s * _LIVE_SMOOTH_MAX_CATCHUP_FRAMES)
-                    )
+                next_present_t = _next_live_present_deadline(
+                    next_present_t,
+                    now,
+                    present_interval_s,
+                )
             return
 
+        rgb48_host_state: dict = {}
         while True:
             try:
                 item = sdr_q.get(timeout=0.2)
@@ -258,14 +351,15 @@ class PipelineWorkerFeedersMixin:
             else:
                 present_t, frame = None, item
             try:
-                rgb16 = np.ascontiguousarray(
-                    frame[:, :, ::-1].astype(np.uint16) * 257
+                rgb48_bytes = _bgr_to_rgb48_bytes(
+                    frame,
+                    rgb48_host_state,
                 )
                 if present_t is not None:
                     now = time.perf_counter()
                     if now < present_t:
                         sleep_until(present_t)
-                mpv_widget.feed_frame(rgb16.data)
+                mpv_widget.feed_frame(rgb48_bytes)
             except Exception:
                 pass
 

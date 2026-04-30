@@ -11,6 +11,45 @@ from gui_media_probe import (
 )
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+        if value > 0.0:
+            return value
+    except Exception:
+        pass
+    return float(default)
+
+
+_GT_SYNC_TOLERANCE_S = max(
+    0.25,
+    _env_float("HDRTVNET_GT_SYNC_TOLERANCE_S", 2.0),
+)
+_GT_EXACT_FRAME_TOLERANCE = 2
+
+
+def _metadata_duration_delta_s(
+    src_meta: dict,
+    gt_meta: dict,
+    src_fps: float,
+    gt_fps: float,
+) -> float:
+    src_d = float(src_meta.get("duration_s", 0.0) or 0.0)
+    gt_d = float(gt_meta.get("duration_s", 0.0) or 0.0)
+    if src_d > 0.0 and gt_d > 0.0:
+        return abs(src_d - gt_d)
+
+    src_n = int(src_meta.get("frame_count", 0) or 0)
+    gt_n = int(gt_meta.get("frame_count", 0) or 0)
+    if src_n > 0 and gt_n > 0:
+        if src_fps > 0.0 and gt_fps > 0.0:
+            return abs((float(src_n) / src_fps) - (float(gt_n) / gt_fps))
+        fps = src_fps if src_fps > 0.0 else gt_fps
+        if fps > 0.0:
+            return abs(float(src_n - gt_n)) / fps
+    return 0.0
+
+
 class GroundTruthMixin:
     """HDR ground-truth file selection and compatibility checks for MainWindow."""
 
@@ -68,15 +107,35 @@ class GroundTruthMixin:
         if src_fps > 0.0 and gt_fps > 0.0 and abs(src_fps - gt_fps) > 0.25:
             return False, f"FPS mismatch: source {src_fps:.3f} vs GT {gt_fps:.3f}."
 
+        notes: list[str] = []
+        duration_delta_s = _metadata_duration_delta_s(
+            src_meta,
+            gt_meta,
+            src_fps,
+            gt_fps,
+        )
+
         src_n = int(src_meta.get("frame_count", 0) or 0)
         gt_n = int(gt_meta.get("frame_count", 0) or 0)
-        if src_n > 0 and gt_n > 0 and abs(src_n - gt_n) > 2:
-            return False, f"Frame-count mismatch: source {src_n} vs GT {gt_n}."
+        if (
+            src_n > 0
+            and gt_n > 0
+            and abs(src_n - gt_n) > _GT_EXACT_FRAME_TOLERANCE
+        ):
+            if duration_delta_s <= 0.0 or duration_delta_s > _GT_SYNC_TOLERANCE_S:
+                return False, f"Frame-count mismatch: source {src_n} vs GT {gt_n}."
+            notes.append(
+                f"length differs by {duration_delta_s:.2f}s; using overlap sync"
+            )
 
         src_d = float(src_meta.get("duration_s", 0.0) or 0.0)
         gt_d = float(gt_meta.get("duration_s", 0.0) or 0.0)
         if src_d > 0.0 and gt_d > 0.0 and abs(src_d - gt_d) > 0.25:
-            return False, f"Duration mismatch: source {src_d:.2f}s vs GT {gt_d:.2f}s."
+            if duration_delta_s > _GT_SYNC_TOLERANCE_S:
+                return False, f"Duration mismatch: source {src_d:.2f}s vs GT {gt_d:.2f}s."
+            note = f"length differs by {duration_delta_s:.2f}s; using overlap sync"
+            if note not in notes:
+                notes.append(note)
 
         src_w = int(src_meta.get("width", 0) or 0)
         src_h = int(src_meta.get("height", 0) or 0)
@@ -103,7 +162,10 @@ class GroundTruthMixin:
                 f"(similarity {content_score:.2f}).",
             )
 
-        return True, f"Validated (same-content similarity {content_score:.2f})."
+        suffix = ""
+        if notes:
+            suffix = "; " + "; ".join(notes)
+        return True, f"Validated (same-content similarity {content_score:.2f}{suffix})."
 
     def _apply_objective_metrics_to_worker(self):
         if self._worker is None:

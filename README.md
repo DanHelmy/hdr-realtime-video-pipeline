@@ -153,17 +153,57 @@ Use this flow for `Browser Window Capture`:
 Browser capture pacing:
 
 - Chrome compositor observation runs at up to `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` frames per second so 24 fps processing has a fresh recent browser frame available. Default: `30`.
-- Video processing samples the latest visible Chrome window frame as a steady `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS` raw-video stream. Default: `24`.
+- Video processing samples the latest visible Chrome window frame at `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS`. Default: `24`.
+- The mpv live feed repeats the latest processed frame at `HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS` for steadier display cadence. Default: same as `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS`; values above process FPS are capped to avoid uneven 24 fps duplicate cadence.
 - mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
 - mpv keeps a tiny live jitter buffer so short wake-up or pipe-write stalls repeat a frame instead of creating a visible cadence hole. Default: `HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES=3`.
+- The live mpv feeder allows a tiny bounded refill after a late write so mpv's raw-video pipe does not underflow into visible pauses.
+- mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
+- Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
+- Static browser windows keep feeding by repeating the latest visible frame at process FPS. If WinRT has no compositor frame yet, a visible-window fallback captures one startup seed frame so playback can start even before the tab video is moving.
+- Browser source delivery now resets after a meaningfully late frame instead of immediately catching up with a short interval. This favors steady motion cadence over shaving a few milliseconds of live latency.
 - To reduce load further, set the variables before launching:
 
 ```powershell
 $env:HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS="30"
 $env:HDRTVNET_LIVE_CAPTURE_PROCESS_FPS="20"
+$env:HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS="20"
 $env:HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES="3"
 .\run_gui.bat
 ```
+
+Advanced testing: `HDRTVNET_FEEDER_GPU_RGB48=1` enables the experimental GPU-side HDR tensor-to-RGB48 feeder conversion and is currently the default. If it hangs or misbehaves on a GPU/driver stack, launch with `HDRTVNET_FEEDER_GPU_RGB48=0`.
+
+Display deband/dither tuning:
+
+- `HDRTVNET_MPV_DEBAND=1|0` enables/disables display debanding; default is `1`.
+- `HDRTVNET_MPV_DEBAND_ITERATIONS=2`
+- `HDRTVNET_MPV_DEBAND_THRESHOLD=28`
+- `HDRTVNET_MPV_DEBAND_RANGE=16`
+- `HDRTVNET_MPV_DEBAND_GRAIN=6`
+- `HDRTVNET_MPV_DITHER=1|0` enables/disables mpv output dithering; default is `1`.
+- `HDRTVNET_MPV_DITHER_ALGO=fruit` (`ordered` and `error-diffusion` are also accepted by mpv builds that support them)
+- `HDRTVNET_MPV_DITHER_DEPTH=auto`
+- `HDRTVNET_MPV_DITHER_SIZE_FRUIT=6`
+- `HDRTVNET_MPV_TEMPORAL_DITHER=1|0` changes the dither pattern over time; default is `1`.
+- `HDRTVNET_MPV_TEMPORAL_DITHER_PERIOD=1`
+
+Browser Window Capture uses a stronger display cleanup profile by default because Chrome/streaming video often arrives as 8-bit composited SDR with baked-in red/orange posterization:
+
+- `HDRTVNET_BROWSER_MPV_DEBAND_ITERATIONS=3`
+- `HDRTVNET_BROWSER_MPV_DEBAND_THRESHOLD=96`
+- `HDRTVNET_BROWSER_MPV_DEBAND_RANGE=32`
+- `HDRTVNET_BROWSER_MPV_DEBAND_GRAIN=20`
+- `HDRTVNET_BROWSER_MPV_TEMPORAL_DITHER=1|0` enables/disables temporal dither for Browser Window Capture; default is `1`.
+- `HDRTVNET_BROWSER_MPV_TEMPORAL_DITHER_PERIOD=1`
+
+If you see shimmer or panel-dither interference on a 6-bit/FRC display, first try `HDRTVNET_MPV_TEMPORAL_DITHER=0`.
+
+WinRT pacing tuning:
+
+- `HDRTVNET_WINRT_FRAME_POOL_BUFFERS=4` controls the Windows Graphics Capture frame-pool depth. Default: `4`.
+- `HDRTVNET_WINRT_DRAIN_TO_LATEST=0` keeps queued WinRT frames in order for steadier motion cadence. Set to `1` for the older lowest-latency behavior that always jumps to the newest queued frame.
+- `HDRTVNET_BROWSER_MPV_INTERPOLATION=0` disables mpv frame-mixing for Browser Window Capture.
 
 Important:
 

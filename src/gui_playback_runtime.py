@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
+    LIVE_CAPTURE_DISPLAY_FPS,
     LIVE_CAPTURE_OBSERVE_FPS,
     LIVE_CAPTURE_PROCESS_FPS,
     PRECISIONS,
@@ -1299,7 +1300,10 @@ class PlaybackRuntimeMixin:
             self._pending_mpv_start = None
         pending_sdr = getattr(self, "_pending_sdr_mpv_start", None)
         if pending_sdr and self._disp_sdr_mpv is not None and self._active_use_mpv:
-            if len(pending_sdr) >= 5:
+            sdr_transfer = "bt1886"
+            if len(pending_sdr) >= 6:
+                pw, ph, fps, scale_kernel, vsync_timed, sdr_transfer = pending_sdr[:6]
+            elif len(pending_sdr) >= 5:
                 pw, ph, fps, scale_kernel, vsync_timed = pending_sdr[:5]
             else:
                 pw, ph, fps, scale_kernel = pending_sdr
@@ -1312,6 +1316,7 @@ class PlaybackRuntimeMixin:
                 audio_path=None,
                 force_hdr_metadata=False,
                 vsync_timed=vsync_timed,
+                sdr_transfer=sdr_transfer,
             )
             if sdr_mpv_started:
                 if self._startup_sync_pending:
@@ -2351,6 +2356,7 @@ class PlaybackRuntimeMixin:
         cadence_text = (
             f"Chrome is observed up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, "
             f"video processing is capped at {LIVE_CAPTURE_PROCESS_FPS:g} fps, "
+            f"mpv is fed at {LIVE_CAPTURE_DISPLAY_FPS:g} fps, "
             "and mpv repeats those frames on display vsync."
         )
         self.statusBar().showMessage(
@@ -2691,7 +2697,7 @@ class PlaybackRuntimeMixin:
 
         # Set up seek slider
         display_fps = (
-            float(self._vid_fps)
+            float(LIVE_CAPTURE_DISPLAY_FPS)
             if is_window_source
             else _limited_playback_fps(self._vid_fps)
         )
@@ -2864,6 +2870,7 @@ class PlaybackRuntimeMixin:
                     float(display_fps),
                     "bicubic",
                     live_vsync_timed,
+                    "srgb" if is_window_source else "bt1886",
                 )
         else:
             self._worker.set_mpv_widget(None)
@@ -2939,7 +2946,7 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage(
                 "Live browser window capture started. "
                 "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. "
-                f"Capture observes Chrome up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, and lets mpv repeat frames on display vsync. HDRTVNet++ stays silent. "
+                f"Capture observes Chrome up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, feeds mpv at {LIVE_CAPTURE_DISPLAY_FPS:g} fps, and lets mpv repeat frames on display vsync. HDRTVNet++ stays silent. "
                 "If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
             )
         elif self._audio_available:

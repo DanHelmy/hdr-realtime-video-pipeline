@@ -728,7 +728,10 @@ class PipelineWorker(
                 source.seek(seek_to)
                 if gt_source is not None:
                     try:
-                        gt_source.seek(seek_to)
+                        gt_source.seek(
+                            self._map_gt_frame_index(source, gt_source, seek_to)
+                        )
+                        self._reset_gt_sync_state()
                     except Exception:
                         gt_source = self._close_gt_source(gt_source)
                         objective_note = "HDR ground-truth seek failed"

@@ -77,6 +77,16 @@ class PipelineWorkerFrameProcessingMixin:
                 output = cv2.resize(output, (out_w, out_h), interpolation=cv2.INTER_AREA)
         return output
 
+    def _cuda_timing_events(self):
+        events = getattr(self, "_infer_timing_events", None)
+        if events is not None:
+            return events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        events = (start_event, end_event)
+        self._infer_timing_events = events
+        return events
+
     def _process_frame(
         self,
         *,
@@ -144,8 +154,7 @@ class PipelineWorkerFrameProcessingMixin:
         infer_end_event = None
         if use_cuda:
             try:
-                infer_start_event = torch.cuda.Event(enable_timing=True)
-                infer_end_event = torch.cuda.Event(enable_timing=True)
+                infer_start_event, infer_end_event = self._cuda_timing_events()
                 infer_start_event.record(torch.cuda.current_stream())
                 cuda_timing = True
             except Exception:

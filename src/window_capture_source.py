@@ -13,6 +13,8 @@ import cv2
 import numpy as np
 import psutil
 
+from timer import sleep_until
+
 try:
     import dxcam
 except Exception:
@@ -57,6 +59,33 @@ _WINRT_WINDOW_CAPTURE_CACHE: dict[int, "_WinRTWindowCaptureSession"] = {}
 _WINRT_WINDOW_BINDINGS = None
 _WINDOW_CAPTURE_DUPLICATE_WAIT_S = 0.25
 _WINRT_CAPTURE_POLL_MAX_SLEEP_S = 0.002
+_LIVE_DELIVERY_LATE_RESET_FRACTION = 0.25
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    text = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(int(min_value), min(int(max_value), int(value)))
+
+
+_WINRT_FRAME_POOL_BUFFERS = _env_int(
+    "HDRTVNET_WINRT_FRAME_POOL_BUFFERS",
+    4,
+    min_value=2,
+    max_value=8,
+)
+_WINRT_DRAIN_TO_LATEST = _env_bool("HDRTVNET_WINRT_DRAIN_TO_LATEST", False)
 
 
 @dataclass
@@ -84,6 +113,7 @@ class WindowCaptureTarget:
 
 if os.name == "nt":
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
     try:
         _dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
     except Exception:
@@ -112,6 +142,43 @@ if os.name == "nt":
     _user32.GetWindowRect.restype = wintypes.BOOL
     _user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
     _user32.MonitorFromWindow.restype = wintypes.HMONITOR
+    _user32.GetDC.argtypes = [wintypes.HWND]
+    _user32.GetDC.restype = wintypes.HDC
+    _user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    _user32.ReleaseDC.restype = ctypes.c_int
+
+    _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    _gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    _gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    _gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    _gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    _gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    _gdi32.BitBlt.argtypes = [
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.DWORD,
+    ]
+    _gdi32.BitBlt.restype = wintypes.BOOL
+    _gdi32.GetDIBits.argtypes = [
+        wintypes.HDC,
+        wintypes.HBITMAP,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.UINT,
+    ]
+    _gdi32.GetDIBits.restype = ctypes.c_int
+    _gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    _gdi32.DeleteObject.restype = wintypes.BOOL
+    _gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    _gdi32.DeleteDC.restype = wintypes.BOOL
 
     if _dwmapi is not None:
         _dwmapi.DwmGetWindowAttribute.argtypes = [
@@ -123,6 +190,7 @@ if os.name == "nt":
         _dwmapi.DwmGetWindowAttribute.restype = getattr(ctypes, "HRESULT", ctypes.c_long)
 else:
     _user32 = None
+    _gdi32 = None
     _dwmapi = None
     _DWMWA_CLOAKED = 0
     _MONITOR_DEFAULTTONEAREST = 0
@@ -235,6 +303,127 @@ def _dxcam_output_spec_for_monitor(hmonitor: int):
     return None
 
 
+if os.name == "nt":
+    class _BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", wintypes.LONG),
+            ("biHeight", wintypes.LONG),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", wintypes.LONG),
+            ("biYPelsPerMeter", wintypes.LONG),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+
+    class _BITMAPINFO(ctypes.Structure):
+        _fields_ = [
+            ("bmiHeader", _BITMAPINFOHEADER),
+            ("bmiColors", wintypes.DWORD * 3),
+        ]
+else:
+    _BITMAPINFOHEADER = None
+    _BITMAPINFO = None
+
+
+def _capture_window_rect_via_gdi(hwnd: int) -> np.ndarray | None:
+    """Fallback capture for visible static windows when WinRT emits no frame."""
+    if _user32 is None or _gdi32 is None or _BITMAPINFO is None:
+        return None
+    hwnd_i = max(0, int(hwnd or 0))
+    if hwnd_i <= 0 or not _window_exists(hwnd_i):
+        return None
+    if _window_cloaked(hwnd_i) or bool(_user32.IsIconic(wintypes.HWND(hwnd_i))):
+        return None
+
+    left, top, width, height = _window_rect(hwnd_i)
+    if width <= 0 or height <= 0:
+        return None
+
+    screen_dc = None
+    mem_dc = None
+    bitmap = None
+    old_obj = None
+    try:
+        screen_dc = _user32.GetDC(wintypes.HWND(0))
+        if not screen_dc:
+            return None
+        mem_dc = _gdi32.CreateCompatibleDC(screen_dc)
+        if not mem_dc:
+            return None
+        bitmap = _gdi32.CreateCompatibleBitmap(screen_dc, int(width), int(height))
+        if not bitmap:
+            return None
+        old_obj = _gdi32.SelectObject(mem_dc, bitmap)
+        srccopy = 0x00CC0020
+        captureblt = 0x40000000
+        ok = bool(
+            _gdi32.BitBlt(
+                mem_dc,
+                0,
+                0,
+                int(width),
+                int(height),
+                screen_dc,
+                int(left),
+                int(top),
+                wintypes.DWORD(srccopy | captureblt),
+            )
+        )
+        if not ok:
+            return None
+
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = int(width)
+        bmi.bmiHeader.biHeight = -int(height)  # top-down DIB
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0  # BI_RGB
+        bmi.bmiHeader.biSizeImage = int(width) * int(height) * 4
+        buf = ctypes.create_string_buffer(int(width) * int(height) * 4)
+        rows = _gdi32.GetDIBits(
+            mem_dc,
+            bitmap,
+            0,
+            int(height),
+            buf,
+            ctypes.byref(bmi),
+            0,
+        )
+        if int(rows or 0) != int(height):
+            return None
+        bgra = np.frombuffer(buf, dtype=np.uint8).reshape((int(height), int(width), 4))
+        return np.ascontiguousarray(bgra[:, :, :3])
+    except Exception:
+        return None
+    finally:
+        if mem_dc and old_obj:
+            try:
+                _gdi32.SelectObject(mem_dc, old_obj)
+            except Exception:
+                pass
+        if bitmap:
+            try:
+                _gdi32.DeleteObject(bitmap)
+            except Exception:
+                pass
+        if mem_dc:
+            try:
+                _gdi32.DeleteDC(mem_dc)
+            except Exception:
+                pass
+        if screen_dc:
+            try:
+                _user32.ReleaseDC(wintypes.HWND(0), screen_dc)
+            except Exception:
+                pass
+
+
 def _load_winrt_window_capture_bindings():
     global _WINRT_WINDOW_BINDINGS
     if _WINRT_WINDOW_BINDINGS is not None:
@@ -343,7 +532,7 @@ class _WinRTWindowCaptureSession:
         frame_pool = bindings["frame_pool_cls"].create_free_threaded(
             winrt_device,
             pixel_format,
-            2,
+            _WINRT_FRAME_POOL_BUFFERS,
             capture_item.size,
         )
         session = frame_pool.create_capture_session(capture_item)
@@ -393,14 +582,14 @@ class _WinRTWindowCaptureSession:
             self._frame_pool.recreate(
                 self._winrt_device,
                 self._pixel_format,
-                2,
+                _WINRT_FRAME_POOL_BUFFERS,
                 size,
             )
             return True
         except Exception:
             return False
 
-    def _drain_to_latest_frame(self, *, wait_timeout_s: float = 0.0):
+    def _read_next_frame(self, *, wait_timeout_s: float = 0.0):
         deadline = time.perf_counter() + max(0.0, float(wait_timeout_s))
         latest = None
         while True:
@@ -415,6 +604,8 @@ class _WinRTWindowCaptureSession:
                 if frame is None:
                     break
                 saw_frame = True
+                if not _WINRT_DRAIN_TO_LATEST:
+                    return frame
                 if latest is not None:
                     _close_winrt_object(latest)
                 latest = frame
@@ -438,7 +629,7 @@ class _WinRTWindowCaptureSession:
             self._open()
         if wait_timeout_s is None:
             wait_timeout_s = 0.15 if not self._seen_frame else 0.0
-        frame = self._drain_to_latest_frame(wait_timeout_s=wait_timeout_s)
+        frame = self._read_next_frame(wait_timeout_s=wait_timeout_s)
         if frame is None:
             return None
         try:
@@ -590,6 +781,7 @@ def _capture_native_window_frame(
     hwnd: int,
     *,
     wait_timeout_s: float | None = None,
+    allow_gdi_fallback: bool = True,
 ) -> tuple[np.ndarray | None, int, int]:
     if not _window_exists(hwnd):
         _release_cached_winrt_window_capture(hwnd)
@@ -599,9 +791,21 @@ def _capture_native_window_frame(
         return None, max(0, int(width)), max(0, int(height))
     handled, frame = _capture_window_via_winrt(hwnd, wait_timeout_s=wait_timeout_s)
     if not handled:
-        return None, int(width), int(height)
+        if not allow_gdi_fallback:
+            return None, int(width), int(height)
+        fallback = _capture_window_rect_via_gdi(hwnd)
+        if fallback is None:
+            return None, int(width), int(height)
+        frame_h, frame_w = fallback.shape[:2]
+        return fallback, int(frame_w), int(frame_h)
     if frame is None:
-        return None, int(width), int(height)
+        if not allow_gdi_fallback:
+            return None, int(width), int(height)
+        fallback = _capture_window_rect_via_gdi(hwnd)
+        if fallback is None:
+            return None, int(width), int(height)
+        frame_h, frame_w = fallback.shape[:2]
+        return fallback, int(frame_w), int(frame_h)
     frame_h, frame_w = frame.shape[:2]
     return frame, int(frame_w), int(frame_h)
 
@@ -965,6 +1169,8 @@ class WindowCaptureSource:
         self._delivered_seq = -1
         self._last_delivery_perf = 0.0
         self._next_delivery_perf = 0.0
+        self._last_fallback_capture_perf = 0.0
+        self.last_delivery_repeated = False
         self._capture_started_perf = time.perf_counter()
 
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -1007,10 +1213,14 @@ class WindowCaptureSource:
         if self._next_delivery_perf <= 0.0:
             self._next_delivery_perf = float(now_t) + interval_s
             return
+        due_t = float(self._next_delivery_perf)
+        if float(now_t) > due_t + (interval_s * _LIVE_DELIVERY_LATE_RESET_FRACTION):
+            self._next_delivery_perf = float(now_t) + interval_s
+            return
         self._next_delivery_perf += interval_s
-        # Keep normal wake-up jitter from permanently lowering the cadence, but
-        # avoid a long stall causing a burst of stale catch-up reads.
-        if self._next_delivery_perf < (float(now_t) - interval_s):
+        # Keep tiny wake-up jitter from permanently lowering the cadence, but
+        # avoid short-latency catch-up bursts after a meaningful late delivery.
+        if self._next_delivery_perf < float(now_t):
             self._next_delivery_perf = float(now_t) + interval_s
 
     def _reader_loop(self):
@@ -1019,12 +1229,17 @@ class WindowCaptureSource:
         while not self._stopped:
             now_t = time.perf_counter()
             if capture_interval_s > 0.0 and now_t < next_capture_t:
-                time.sleep(min(0.010, next_capture_t - now_t))
+                sleep_until(next_capture_t, coarse_margin_s=0.0010)
                 continue
 
+            # The fallback is only a startup seed for static browser tabs. A
+            # recurring CPU BitBlt during playback can show up as a periodic
+            # hitch even though the WinRT capture thread is separate.
+            allow_gdi_fallback = self._latest_payload is None
             frame, _width, _height = _capture_native_window_frame(
                 self.hwnd,
                 wait_timeout_s=self._capture_wait_timeout_s(),
+                allow_gdi_fallback=allow_gdi_fallback,
             )
             captured_t = time.perf_counter()
             if frame is None:
@@ -1035,6 +1250,8 @@ class WindowCaptureSource:
                 break
 
             frame = self._resize_frame_if_needed(frame)
+            if allow_gdi_fallback:
+                self._last_fallback_capture_perf = float(captured_t)
 
             self._last_frame_index += 1
             idx = int(self._last_frame_index)
@@ -1069,12 +1286,21 @@ class WindowCaptureSource:
                 payload = self._latest_payload
                 if payload is not None:
                     idx, pts_sec, captured_t, frame = payload
-                    if int(idx) > self._delivered_seq:
+                    fresh_frame = int(idx) > self._delivered_seq
+                    self.last_delivery_repeated = not fresh_frame
+                    if fresh_frame:
                         self._delivered_seq = int(idx)
-                        self._last_delivery_perf = now_t
-                        self._advance_delivery_clock(now_t)
                         self.last_capture_perf_counter = float(captured_t)
-                        return True, frame, int(idx), float(pts_sec)
+                        out_pts = float(pts_sec)
+                    else:
+                        # Static browser pages often do not produce new DWM
+                        # frames. Keep the live source clock moving by
+                        # repeating the latest visible frame at process FPS.
+                        self.last_capture_perf_counter = float(now_t)
+                        out_pts = max(0.0, now_t - self._capture_started_perf)
+                    self._last_delivery_perf = now_t
+                    self._advance_delivery_clock(now_t)
+                    return True, frame, int(idx), float(out_pts)
                 if not _window_exists(self.hwnd):
                     return False, None, -1, 0.0
                 self._payload_cond.wait(timeout=self._capture_wait_timeout_s())
