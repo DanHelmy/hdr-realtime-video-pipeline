@@ -449,9 +449,22 @@ The GUI creates the TensorRT engine only when the user activates a mode whose en
 ```bash
 python src/build_tensorrt_engines.py 1920x1080 --precision fp16
 python src/build_tensorrt_engines.py 1280x720 --precision int8-mixed
+python src/build_tensorrt_engines.py 1920x1080 --precision fp16 --force --benchmark-runs 100
 ```
 
 TensorRT performs optimization during engine build time and caches the result. No PyTorch max-autotune warning is shown on NVIDIA.
+
+New TensorRT builds use the highest TensorRT builder optimization level by default and persist a shared timing cache at `src/models/engines/tensorrt_timing.cache`. Existing `.engine` files keep their current tactics until rebuilt. To compare or refresh them, clear the TensorRT cache from the GUI or run the prebuild script with `--force`.
+
+Advanced TensorRT build environment overrides:
+
+- `HDRTVNET_TRT_BUILDER_OPT_LEVEL=0..5` controls TensorRT builder search depth; default is `5`.
+- `HDRTVNET_TRT_WORKSPACE_GB=4` controls builder workspace size in GiB.
+- `HDRTVNET_TRT_TIMING_CACHE=path|none` changes or disables the shared timing cache.
+- `HDRTVNET_TRT_DEDICATED_STREAM=1|0` runs TensorRT enqueue on a non-default CUDA stream; default is `1`.
+- `HDRTVNET_TRT_AUX_STREAMS=N` optionally sets TensorRT build-time auxiliary stream count.
+
+The manual prebuild script also exposes `--opt-level`, `--workspace-gb`, `--timing-cache`, `--aux-streams`, `--force-onnx`, and `--benchmark-runs` so NVIDIA test machines can rebuild and report comparable numbers from one command.
 
 If the TensorRT engine build or load fails, the error is logged and shown to the user. The app does not silently fall back to PyTorch on NVIDIA.
 
@@ -465,6 +478,12 @@ Compiled PyTorch kernels are **cached to disk**, so:
 - export max-autotune reuses the same compile cache and only compiles cleanly on a real cache miss
 - caches are scoped to the current local project checkout instead of being shared implicitly across different local copies of the repo
 - if an old or incompatible cache looks "compiled" but would hang warmup, the app can stop early and ask to clear/recompile the current project's cache
+
+PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, `mode=max-autotune`, and two warmup passes. Advanced overrides:
+
+- `HDRTVNET_COMPILE_DYNAMIC=0|1|auto` controls shape specialization; default is `0`.
+- `HDRTVNET_COMPILE_FULLGRAPH=1` can be used for experiments, but default is `0` for compatibility.
+- `HDRTVNET_COMPILE_WARMUP_RUNS=N` controls compile warmup passes; default is `2`.
 
 ---
 

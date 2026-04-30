@@ -44,6 +44,34 @@ if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def _torch_compile_dynamic_setting():
+    value = os.environ.get("HDRTVNET_COMPILE_DYNAMIC", "0")
+    text = str(value).strip().lower()
+    if text in {"auto", "none", "default"}:
+        return None
+    return _env_bool("HDRTVNET_COMPILE_DYNAMIC", False)
+
+
+def _torch_compile_warmup_runs() -> int:
+    try:
+        value = int(os.environ.get("HDRTVNET_COMPILE_WARMUP_RUNS", "2"))
+    except Exception:
+        value = 2
+    return min(10, max(1, value))
+
+
 # ===================================================================
 # Weight-only INT8 replacement layers (gpt-fast / torchao style)
 # ===================================================================
@@ -783,13 +811,19 @@ class HDRTVNetTorch:
                 try:
                     if compile_mode == "auto":
                         compile_mode = "max-autotune"
+                    dynamic = _torch_compile_dynamic_setting()
+                    fullgraph = _env_bool("HDRTVNET_COMPILE_FULLGRAPH", False)
                     self.model = torch.compile(
                         self.model,
                         mode=compile_mode,
-                        fullgraph=False,
+                        fullgraph=fullgraph,
+                        dynamic=dynamic,
                     )
                     self._compiled = True
-                    print(f"torch.compile enabled (mode={compile_mode})")
+                    print(
+                        "torch.compile enabled "
+                        f"(mode={compile_mode}, dynamic={dynamic}, fullgraph={fullgraph})"
+                    )
                 except Exception as exc:
                     print(f"torch.compile setup failed: {exc}")
 
@@ -800,6 +834,7 @@ class HDRTVNetTorch:
         self._buf_hw = None
         self._gpu_input = None       # persistent GPU tensor (1,3,H,W)
         self._gpu_cond = None        # persistent GPU tensor (1,3,H//4,W//4)
+        self._gpu_raw = None         # persistent GPU tensor (H,W,3) uint8
         self._pin_input = None       # pinned host staging tensor (H,W,3) uint8
         self._pin_output = None      # pinned host tensor for D2H (H,W,3) uint8
         self._d2h_stream = (
@@ -1157,6 +1192,9 @@ class HDRTVNetTorch:
             self._pin_output = torch.empty(
                 (h, w, 3), dtype=torch.uint8, pin_memory=True
             )
+            self._gpu_raw = torch.empty(
+                (h, w, 3), dtype=torch.uint8, device=self.device
+            )
 
         # Invalidate any cached CUDA graph on resolution change
         self._graph = None
@@ -1173,9 +1211,11 @@ class HDRTVNetTorch:
         # Copy frame into pinned staging buffer, then async H2D
         if self._use_cuda and self._pin_input is not None:
             self._pin_input.copy_(torch.from_numpy(frame_bgr))  # CPU'pinned (memcpy)
-            raw = self._pin_input.to(
-                device=self.device, non_blocking=True            # pinned'GPU (async DMA)
+            self._gpu_raw.copy_(
+                self._pin_input,
+                non_blocking=True,                              # pinned'GPU (async DMA)
             )
+            raw = self._gpu_raw
         else:
             raw = torch.from_numpy(frame_bgr).to(
                 device=self.device, non_blocking=self._use_cuda
@@ -1355,7 +1395,16 @@ class HDRTVNetTorch:
 
         try:
             dummy = np.zeros((height, width, 3), dtype=np.uint8)
-            self.process(dummy)  # triggers full compile -> Triton disk cache
+            warmup_runs = _torch_compile_warmup_runs()
+            for i in range(warmup_runs):
+                self.process(dummy)  # triggers full compile -> Triton disk cache
+                if self._use_cuda:
+                    torch.cuda.synchronize()
+                if warmup_runs > 1:
+                    print(
+                        f"[compile] warmup pass {i + 1}/{warmup_runs} complete",
+                        flush=True,
+                    )
             if self._use_cuda:
                 torch.cuda.synchronize()
         finally:
@@ -1384,6 +1433,34 @@ def _engine_cache_dir() -> str:
     )
     os.makedirs(root, exist_ok=True)
     return root
+
+
+def _tensorrt_timing_cache_path():
+    override = os.environ.get("HDRTVNET_TRT_TIMING_CACHE")
+    if override is not None:
+        text = str(override).strip()
+        if text.lower() in {"", "0", "false", "off", "none", "disable", "disabled"}:
+            return None
+        return os.path.abspath(os.path.expanduser(text))
+    return os.path.join(_engine_cache_dir(), "tensorrt_timing.cache")
+
+
+def _tensorrt_builder_optimization_level() -> int:
+    try:
+        value = int(os.environ.get("HDRTVNET_TRT_BUILDER_OPT_LEVEL", "5"))
+    except Exception:
+        value = 5
+    return min(5, max(0, value))
+
+
+def _tensorrt_aux_stream_count():
+    value = os.environ.get("HDRTVNET_TRT_AUX_STREAMS")
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return max(0, int(value))
+    except Exception:
+        return None
 
 
 def tensorrt_engine_path(
@@ -1515,6 +1592,14 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         self._trt_output_names = []
         self._trt_output = None
         self._trt_output_shape = None
+        self._trt_shape_cache_key = None
+        self._trt_address_cache_key = None
+        self._trt_legacy_shape_cache_key = None
+        self._trt_use_dedicated_stream = _env_bool(
+            "HDRTVNET_TRT_DEDICATED_STREAM",
+            True,
+        )
+        self._trt_stream = None
 
         super().__init__(
             model_path,
@@ -1533,6 +1618,8 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         # TensorRT bindings use dense NCHW buffers; keep preprocessing and
         # postprocessing identical, but make the staging tensors contiguous.
         self._use_channels_last = False
+        if self._trt_use_dedicated_stream:
+            self._trt_stream = torch.cuda.Stream()
 
         if not os.path.isfile(self.engine_path):
             print(f"TensorRT engine cache miss: {self.engine_path}")
@@ -1595,10 +1682,28 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         else:
             config.max_workspace_size = workspace_bytes
 
+        opt_level = _tensorrt_builder_optimization_level()
+        if hasattr(config, "builder_optimization_level"):
+            try:
+                config.builder_optimization_level = opt_level
+                print(f"TensorRT builder optimization level: {opt_level}")
+            except Exception as exc:
+                print(f"TensorRT builder optimization level skipped: {exc}")
+
+        aux_streams = _tensorrt_aux_stream_count()
+        if aux_streams is not None and hasattr(config, "max_aux_streams"):
+            try:
+                config.max_aux_streams = aux_streams
+                print(f"TensorRT max auxiliary streams: {aux_streams}")
+            except Exception as exc:
+                print(f"TensorRT auxiliary streams skipped: {exc}")
+
         if self.precision != "fp32" and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
         if str(self.precision).startswith("int8") and builder.platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
+
+        timing_cache_path, timing_cache = self._attach_tensorrt_timing_cache(config)
 
         os.makedirs(os.path.dirname(self.engine_path), exist_ok=True)
         if hasattr(builder, "build_serialized_network"):
@@ -1611,6 +1716,58 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             if engine is None:
                 raise RuntimeError("TensorRT engine build failed.")
             pathlib.Path(self.engine_path).write_bytes(bytes(engine.serialize()))
+        self._save_tensorrt_timing_cache(config, timing_cache_path)
+
+        # Keep the cache object alive until after build_serialized_network has
+        # returned; TensorRT requires it to outlive the build.
+        del timing_cache
+
+    def _attach_tensorrt_timing_cache(self, config):
+        timing_cache_path = _tensorrt_timing_cache_path()
+        if not timing_cache_path:
+            return None, None
+        if not (hasattr(config, "create_timing_cache") and hasattr(config, "set_timing_cache")):
+            return timing_cache_path, None
+
+        cache_data = b""
+        try:
+            if os.path.isfile(timing_cache_path):
+                cache_data = pathlib.Path(timing_cache_path).read_bytes()
+        except Exception as exc:
+            print(f"TensorRT timing cache read skipped: {exc}")
+            cache_data = b""
+
+        try:
+            timing_cache = config.create_timing_cache(cache_data)
+            if timing_cache is None:
+                return timing_cache_path, None
+            if config.set_timing_cache(timing_cache, False):
+                if cache_data:
+                    print(f"TensorRT timing cache loaded: {timing_cache_path}")
+                return timing_cache_path, timing_cache
+
+            if cache_data:
+                print("TensorRT timing cache rejected; starting a fresh cache.")
+                timing_cache = config.create_timing_cache(b"")
+                if timing_cache is not None and config.set_timing_cache(timing_cache, False):
+                    return timing_cache_path, timing_cache
+        except Exception as exc:
+            print(f"TensorRT timing cache skipped: {exc}")
+        return timing_cache_path, None
+
+    def _save_tensorrt_timing_cache(self, config, timing_cache_path) -> None:
+        if not timing_cache_path or not hasattr(config, "get_timing_cache"):
+            return
+        try:
+            timing_cache = config.get_timing_cache()
+            if timing_cache is None:
+                return
+            serialized = timing_cache.serialize()
+            os.makedirs(os.path.dirname(timing_cache_path), exist_ok=True)
+            pathlib.Path(timing_cache_path).write_bytes(bytes(serialized))
+            print(f"TensorRT timing cache saved: {timing_cache_path}")
+        except Exception as exc:
+            print(f"TensorRT timing cache save skipped: {exc}")
 
     def _load_engine(self) -> None:
         try:
@@ -1651,6 +1808,12 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     self._trt_output_names.append(name)
         if len(self._trt_input_names) < 2 or not self._trt_output_names:
             raise RuntimeError("Unexpected TensorRT bindings; expected input, cond, output.")
+        if "input" in self._trt_input_names and "cond" in self._trt_input_names:
+            other_inputs = [
+                name for name in self._trt_input_names
+                if name not in {"input", "cond"}
+            ]
+            self._trt_input_names = ["input", "cond"] + other_inputs
 
     def _tensor_dtype_for_output(self, output_name: str):
         try:
@@ -1672,21 +1835,33 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         cond = cond.contiguous()
         ctx = self._trt_context
         engine = self._trt_engine
-        stream = torch.cuda.current_stream().cuda_stream
+        current_stream = torch.cuda.current_stream()
+        trt_stream = self._trt_stream
+        if trt_stream is not None:
+            trt_stream.wait_stream(current_stream)
+            tensor.record_stream(trt_stream)
+            cond.record_stream(trt_stream)
+            stream = trt_stream.cuda_stream
+        else:
+            stream = current_stream.cuda_stream
 
         input_name = self._trt_input_names[0]
         cond_name = self._trt_input_names[1]
         output_name = self._trt_output_names[0]
 
         if hasattr(ctx, "set_input_shape"):
-            ctx.set_input_shape(input_name, tuple(tensor.shape))
-            ctx.set_input_shape(cond_name, tuple(cond.shape))
+            tensor_shape = tuple(tensor.shape)
+            cond_shape = tuple(cond.shape)
+            shape_key = (tensor_shape, cond_shape)
+            if self._trt_shape_cache_key != shape_key:
+                if ctx.set_input_shape(input_name, tensor_shape) is False:
+                    raise RuntimeError(f"TensorRT rejected input shape: {tensor_shape}")
+                if ctx.set_input_shape(cond_name, cond_shape) is False:
+                    raise RuntimeError(f"TensorRT rejected cond shape: {cond_shape}")
+                self._trt_shape_cache_key = shape_key
+                self._trt_address_cache_key = None
+
             out_shape = tuple(int(v) for v in ctx.get_tensor_shape(output_name))
-            for name, ptr in (
-                (input_name, tensor.data_ptr()),
-                (cond_name, cond.data_ptr()),
-            ):
-                ctx.set_tensor_address(name, int(ptr))
             if self._trt_output is None or self._trt_output_shape != out_shape:
                 self._trt_output = torch.empty(
                     out_shape,
@@ -1694,17 +1869,39 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     device=self.device,
                 )
                 self._trt_output_shape = out_shape
-            ctx.set_tensor_address(output_name, int(self._trt_output.data_ptr()))
+                self._trt_address_cache_key = None
+            if trt_stream is not None:
+                self._trt_output.record_stream(trt_stream)
+
+            address_key = (
+                int(tensor.data_ptr()),
+                int(cond.data_ptr()),
+                int(self._trt_output.data_ptr()),
+            )
+            if self._trt_address_cache_key != address_key:
+                for name, ptr in (
+                    (input_name, address_key[0]),
+                    (cond_name, address_key[1]),
+                    (output_name, address_key[2]),
+                ):
+                    if ctx.set_tensor_address(name, int(ptr)) is False:
+                        raise RuntimeError(f"TensorRT rejected tensor address: {name}")
+                self._trt_address_cache_key = address_key
             ok = ctx.execute_async_v3(stream_handle=stream)
         else:
             bindings = [0] * engine.num_bindings
+            shape_key = (tuple(tensor.shape), tuple(cond.shape))
+            shape_changed = self._trt_legacy_shape_cache_key != shape_key
             for name, value in ((input_name, tensor), (cond_name, cond)):
                 idx = engine.get_binding_index(name)
-                try:
-                    ctx.set_binding_shape(idx, tuple(value.shape))
-                except Exception:
-                    pass
+                if shape_changed:
+                    try:
+                        ctx.set_binding_shape(idx, tuple(value.shape))
+                    except Exception:
+                        pass
                 bindings[idx] = int(value.data_ptr())
+            if shape_changed:
+                self._trt_legacy_shape_cache_key = shape_key
             out_idx = engine.get_binding_index(output_name)
             out_shape = tuple(int(v) for v in ctx.get_binding_shape(out_idx))
             if self._trt_output is None or self._trt_output_shape != out_shape:
@@ -1714,9 +1911,13 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     device=self.device,
                 )
                 self._trt_output_shape = out_shape
+            if trt_stream is not None:
+                self._trt_output.record_stream(trt_stream)
             bindings[out_idx] = int(self._trt_output.data_ptr())
             ok = ctx.execute_async_v2(bindings=bindings, stream_handle=stream)
 
         if not ok:
             raise RuntimeError("TensorRT execution failed.")
+        if trt_stream is not None:
+            current_stream.wait_stream(trt_stream)
         return self._trt_output

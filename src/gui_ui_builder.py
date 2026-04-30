@@ -156,7 +156,18 @@ class UiBuilderMixin:
 
         self._cmb_source_mode = QComboBox()
         self._cmb_source_mode.addItems(list(SOURCE_MODE_LABELS.values()))
-        self._cmb_source_mode.setFixedWidth(255)
+        source_mode_width = max(
+            self._cmb_source_mode.fontMetrics().horizontalAdvance(label)
+            for label in SOURCE_MODE_LABELS.values()
+        )
+        self._cmb_source_mode.setMinimumWidth(source_mode_width + 64)
+        self._cmb_source_mode.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._cmb_source_mode.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
         self._cmb_source_mode.setToolTip(
             "Choose whether HDRTVNet++ opens video files or uses the experimental Google Chrome browser-window path. Chrome's 'Use graphics acceleration when available' must be off for Browser Window Capture."
         )
