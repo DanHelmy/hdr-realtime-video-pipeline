@@ -85,6 +85,25 @@ from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
 _FRAME_RESULT_FILE = "benchmark_frame_result.json"
+_BENCHMARK_METRIC_KEYS = [
+    "psnr_db",
+    "sssim",
+    "delta_e_itp",
+    "psnr_norm_db",
+    "sssim_norm",
+    "delta_e_itp_norm",
+    "hdr_vdp3",
+]
+_BENCHMARK_OUTLIER_KEYS = [
+    "sssim_norm",
+    "sssim",
+    "psnr_norm_db",
+    "psnr_db",
+    "delta_e_itp_norm",
+    "delta_e_itp",
+    "hdr_vdp3",
+]
+_BENCHMARK_SHARED_MIN_OVERLAP_RATIO = 0.80
 
 try:
     import mpv as mpv_lib
@@ -396,17 +415,8 @@ class _BenchmarkWorker(QObject):
             n += 1
 
     def _compute_average_from_rows(self, rows: list[dict]) -> dict[str, float | None]:
-        keys = [
-            "psnr_db",
-            "sssim",
-            "delta_e_itp",
-            "psnr_norm_db",
-            "sssim_norm",
-            "delta_e_itp_norm",
-            "hdr_vdp3",
-        ]
         averages: dict[str, float | None] = {}
-        for key in keys:
+        for key in _BENCHMARK_METRIC_KEYS:
             vals = []
             for r in rows:
                 m = r.get("metrics") or {}
@@ -1076,6 +1086,7 @@ class ModelBenchmarkDialog(QDialog):
         self._result_resolution = ""
         self._result_use_hg: bool | None = None
         self._result_predequantize_mode = ""
+        self._current_outlier_indices: set[int] = set()
         self._result_sets: list[dict] = []
         self._benchmark_preview_splitter: QSplitter | None = None
         self._benchmark_results_splitter: QSplitter | None = None
@@ -1313,6 +1324,21 @@ class ModelBenchmarkDialog(QDialog):
         info_form.addRow("Precision / Resolution:", self._lbl_result_config)
         result_layout.addWidget(info_group)
 
+        preview_opts = QHBoxLayout()
+        self._cmb_average_filter = QComboBox()
+        self._cmb_average_filter.addItem("Average all rows", "all")
+        self._cmb_average_filter.addItem("Exclude outliers in this result", "per_result")
+        self._cmb_average_filter.addItem("Exclude shared outliers across open tabs", "shared")
+        self._cmb_average_filter.setToolTip(
+            "Controls only the displayed preview average. Saved benchmark results and exports are unchanged."
+        )
+        self._lbl_outlier_status = QLabel("")
+        self._lbl_outlier_status.setWordWrap(True)
+        preview_opts.addWidget(QLabel("Average filter:"))
+        preview_opts.addWidget(self._cmb_average_filter)
+        preview_opts.addWidget(self._lbl_outlier_status, 1)
+        result_layout.addLayout(preview_opts)
+
         self._tbl = QTableWidget(0, 9)
         self._tbl.setHorizontalHeaderLabels(
             [
@@ -1441,6 +1467,7 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_close.clicked.connect(self._close_dialog)
 
         self._tbl.itemSelectionChanged.connect(self._on_result_selection_changed)
+        self._cmb_average_filter.currentIndexChanged.connect(self._refresh_results_preview_options)
         self._result_sets_bar.currentChanged.connect(self._on_result_set_tab_changed)
         self._result_sets_bar.tabCloseRequested.connect(self._on_result_set_tab_close_requested)
         self._btn_open_session.clicked.connect(self._open_session_folder)
@@ -1760,6 +1787,165 @@ class ModelBenchmarkDialog(QDialog):
             cfg = "-"
         self._lbl_result_config.setText(cfg)
 
+    def _metric_value(self, row: dict, key: str) -> float | None:
+        try:
+            value = float((row.get("metrics") or {}).get(key))
+        except Exception:
+            return None
+        if not np.isfinite(value):
+            return None
+        return value
+
+    def _result_sample_key(self, row: dict) -> tuple[str, str, str, str]:
+        sdr = os.path.normcase(os.path.normpath(str(row.get("source_sdr_path") or "").strip()))
+        gt = os.path.normcase(os.path.normpath(str(row.get("source_gt_path") or "").strip()))
+        frame_raw = row.get("source_frame_idx")
+        if frame_raw is None:
+            frame_raw = row.get("frame")
+        try:
+            frame = str(int(float(frame_raw))) if frame_raw is not None and str(frame_raw).strip() else ""
+        except Exception:
+            frame = str(frame_raw or "").strip()
+        label = str(row.get("label") or row.get("task_id") or "").strip().lower()
+        if sdr or gt or frame:
+            return (sdr, gt, frame, "")
+        return ("", "", "", label)
+
+    def _detect_outlier_indices(self, rows: list[dict]) -> set[int]:
+        if len(rows) < 4:
+            return set()
+
+        votes: dict[int, int] = {}
+        usable_metric_count = 0
+        for key in _BENCHMARK_OUTLIER_KEYS:
+            indexed_values: list[tuple[int, float]] = []
+            for idx, row in enumerate(rows):
+                value = self._metric_value(row, key)
+                if value is not None:
+                    indexed_values.append((idx, value))
+            if len(indexed_values) < 4:
+                continue
+
+            values = np.asarray([v for _idx, v in indexed_values], dtype=np.float64)
+            q1, q3 = np.percentile(values, [25, 75])
+            iqr = float(q3 - q1)
+            if iqr > 1e-12:
+                lower = float(q1 - (1.5 * iqr))
+                upper = float(q3 + (1.5 * iqr))
+            else:
+                median = float(np.median(values))
+                mad = float(np.median(np.abs(values - median)))
+                if mad <= 1e-12:
+                    continue
+                span = 3.5 * 1.4826 * mad
+                lower = median - span
+                upper = median + span
+
+            usable_metric_count += 1
+            for idx, value in indexed_values:
+                if value < lower or value > upper:
+                    votes[idx] = votes.get(idx, 0) + 1
+
+        if usable_metric_count <= 0:
+            return set()
+        required_votes = 1 if usable_metric_count <= 2 else 2
+        return {idx for idx, count in votes.items() if count >= required_votes}
+
+    def _row_sample_keys(self, rows: list[dict]) -> set[tuple[str, str, str, str]]:
+        keys: set[tuple[str, str, str, str]] = set()
+        for row in rows:
+            key = self._result_sample_key(row)
+            if any(key):
+                keys.add(key)
+        return keys
+
+    def _compatible_shared_outlier_keys(
+        self,
+        active_rows: list[dict],
+        active_source_name: str | None,
+    ) -> tuple[set[tuple[str, str, str, str]], int]:
+        active_keys = self._row_sample_keys(active_rows)
+        if not active_keys:
+            return set(), 0
+        active_source = str(active_source_name or "").strip().lower()
+
+        shared_keys: set[tuple[str, str, str, str]] = set()
+        compatible_count = 0
+        for data in self._result_sets:
+            rows = list(data.get("rows") or [])
+            tab_keys = self._row_sample_keys(rows)
+            if not tab_keys:
+                continue
+            tab_source = str(data.get("source_name") or "").strip().lower()
+            if active_source and tab_source and active_source != tab_source:
+                continue
+
+            overlap = active_keys.intersection(tab_keys)
+            smaller_count = max(1, min(len(active_keys), len(tab_keys)))
+            overlap_ratio = len(overlap) / float(smaller_count)
+            if overlap_ratio < _BENCHMARK_SHARED_MIN_OVERLAP_RATIO:
+                continue
+
+            compatible_count += 1
+            for idx in self._detect_outlier_indices(rows):
+                if 0 <= idx < len(rows):
+                    key = self._result_sample_key(rows[idx])
+                    if key in active_keys:
+                        shared_keys.add(key)
+
+        return shared_keys, compatible_count
+
+    def _preview_average_and_outliers(
+        self,
+        rows: list[dict],
+        saved_average: dict | None,
+        source_name: str | None,
+    ) -> tuple[dict[str, float | None], set[int], str]:
+        filter_mode = str(self._cmb_average_filter.currentData() or "all")
+        if filter_mode == "all":
+            return dict(saved_average or self._compute_average_from_rows(rows)), set(), "all rows"
+
+        if filter_mode == "shared":
+            shared_keys, compatible_count = self._compatible_shared_outlier_keys(rows, source_name)
+            outlier_indices = {
+                idx for idx, row in enumerate(rows)
+                if self._result_sample_key(row) in shared_keys
+            }
+            if compatible_count > 1:
+                mode_label = f"shared compatible tabs ({compatible_count})"
+            else:
+                mode_label = "this result; no other compatible tab"
+        else:
+            outlier_indices = self._detect_outlier_indices(rows)
+            mode_label = "this result"
+
+        if not outlier_indices:
+            return self._compute_average_from_rows(rows), set(), mode_label
+
+        filtered_rows = [
+            row for idx, row in enumerate(rows)
+            if idx not in outlier_indices
+        ]
+        return self._compute_average_from_rows(filtered_rows), outlier_indices, mode_label
+
+    def _refresh_results_preview_options(self):
+        self._remember_current_result_selection()
+        idx = int(self._result_sets_bar.currentIndex())
+        if 0 <= idx < len(self._result_sets):
+            self._apply_result_set_tab(idx)
+            return
+        self._populate_results_view(
+            rows=self._results,
+            average=self._compute_average_from_rows(self._results),
+            session_dir=self._session_dir,
+            source_name=self._result_source_name,
+            precision=self._result_precision,
+            resolution=self._result_resolution,
+            use_hg=self._result_use_hg,
+            predequantize_mode=self._result_predequantize_mode,
+            selected_row=self._selected_result_row(),
+        )
+
     def _selected_result_row(self) -> int | None:
         rows = self._tbl.selectionModel().selectedRows() if self._tbl.selectionModel() else []
         if not rows:
@@ -1971,14 +2157,28 @@ class ModelBenchmarkDialog(QDialog):
         self._tbl.setRowCount(0)
         self._tbl.blockSignals(False)
 
-        for row in self._results:
-            self._add_table_row(row)
+        avg, outlier_indices, filter_label = self._preview_average_and_outliers(
+            self._results,
+            average,
+            source_name,
+        )
+        self._current_outlier_indices = set(outlier_indices)
 
-        avg = average or {}
+        for idx, row in enumerate(self._results):
+            self._add_table_row(row, outlier=idx in outlier_indices)
+
         if self._results:
             r = self._tbl.rowCount()
             self._tbl.insertRow(r)
-            avg_label = QTableWidgetItem(f"AVERAGE (N={len(self._results)})")
+            included_count = max(0, len(self._results) - len(outlier_indices))
+            if outlier_indices:
+                avg_text = (
+                    f"AVERAGE (N={included_count}, "
+                    f"excluded={len(outlier_indices)})"
+                )
+            else:
+                avg_text = f"AVERAGE (N={len(self._results)})"
+            avg_label = QTableWidgetItem(avg_text)
             bold = QFont()
             bold.setBold(True)
             avg_label.setFont(bold)
@@ -1997,6 +2197,19 @@ class ModelBenchmarkDialog(QDialog):
                 it = QTableWidgetItem(text)
                 it.setFont(bold)
                 self._tbl.setItem(r, col, it)
+
+        filter_mode = str(self._cmb_average_filter.currentData() or "all")
+        if self._results and filter_mode != "all":
+            if outlier_indices:
+                self._lbl_outlier_status.setText(
+                    f"Preview average excludes {len(outlier_indices)} outlier row(s) from {filter_label}."
+                )
+            else:
+                self._lbl_outlier_status.setText(
+                    f"No outliers detected for preview average from {filter_label}."
+                )
+        else:
+            self._lbl_outlier_status.setText("")
 
         self._session_dir = session_dir if session_dir and os.path.isdir(session_dir) else None
         if self._session_dir:
@@ -2025,17 +2238,8 @@ class ModelBenchmarkDialog(QDialog):
             self._set_result_previews(None)
 
     def _compute_average_from_rows(self, rows: list[dict]) -> dict[str, float | None]:
-        keys = [
-            "psnr_db",
-            "sssim",
-            "delta_e_itp",
-            "psnr_norm_db",
-            "sssim_norm",
-            "delta_e_itp_norm",
-            "hdr_vdp3",
-        ]
         avg: dict[str, float | None] = {}
-        for key in keys:
+        for key in _BENCHMARK_METRIC_KEYS:
             vals = []
             for row in rows:
                 v = (row.get("metrics") or {}).get(key)
@@ -2950,6 +3154,7 @@ class ModelBenchmarkDialog(QDialog):
             self._btn_select_all_pairs,
             self._btn_clear_pairs,
             self._btn_load_existing,
+            self._cmb_average_filter,
             self._result_sets_bar,
         ):
             w.setEnabled(not running)
@@ -3061,10 +3266,14 @@ class ModelBenchmarkDialog(QDialog):
         self._lbl_progress.setText(str(message or ""))
         self._set_status(str(message or "Running"), percent=percent)
 
-    def _add_table_row(self, row: dict):
+    def _add_table_row(self, row: dict, outlier: bool = False):
         metrics = row.get("metrics") or {}
         r = self._tbl.rowCount()
         self._tbl.insertRow(r)
+        note = str(metrics.get("obj_note") or metrics.get("hdr_vdp3_note") or "")
+        if outlier:
+            outlier_note = "Outlier (excluded from preview average)"
+            note = f"{note}; {outlier_note}" if note else outlier_note
 
         values = [
             str(row.get("label") or "-"),
@@ -3075,7 +3284,7 @@ class ModelBenchmarkDialog(QDialog):
             _fmt_metric(metrics.get("sssim_norm"), ".4f"),
             _fmt_metric(metrics.get("delta_e_itp_norm"), ".2f"),
             _fmt_metric(metrics.get("hdr_vdp3"), ".3f"),
-            str(metrics.get("obj_note") or metrics.get("hdr_vdp3_note") or ""),
+            note,
         ]
         for c, value in enumerate(values):
             item = QTableWidgetItem(value)
@@ -3221,16 +3430,7 @@ class ModelBenchmarkDialog(QDialog):
         summary_json = os.path.join(folder, "benchmark_export_summary.json")
 
         avg = {}
-        keys = [
-            "psnr_db",
-            "sssim",
-            "delta_e_itp",
-            "psnr_norm_db",
-            "sssim_norm",
-            "delta_e_itp_norm",
-            "hdr_vdp3",
-        ]
-        for key in keys:
+        for key in _BENCHMARK_METRIC_KEYS:
             vals = []
             for r in rows:
                 v = (r.get("metrics") or {}).get(key)
