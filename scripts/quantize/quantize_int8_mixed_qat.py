@@ -51,6 +51,17 @@ from models.hdrtvnet_torch import (
     _predequantize_conv, _predequantize_linear,
     _quantize_model_mixed, _quantize_model_mixed_v2, calibrate_w8a8,
 )
+from gui_objective_metrics import (
+    _crop_shared_black_borders,
+    _delta_e_itp_absolute_rgb,
+    _delta_e_itp_bgr,
+    _grade_normalize_absolute_rgb_to_ref,
+    _grade_normalize_pred_to_ref,
+    _linear_bgr_to_absolute_rgb,
+    _prepare_metric_pair,
+    _psnr_bgr,
+    _ssim_bgr,
+)
 
 
 def configure_reproducibility(args):
@@ -606,13 +617,16 @@ def sample_training_crop_pair(sdr_t, hdr_t, args):
 
 def select_highlight_monitor_pairs(pairs, num_pairs, args):
     """Pick full-image monitor pairs with the strongest highlight coverage."""
-    if num_pairs <= 0 or not pairs:
+    if not pairs:
         return [], {
             "positive_candidates": 0,
             "avg_highlight_cov": 0.0,
             "min_highlight_cov": 0.0,
             "max_highlight_cov": 0.0,
         }
+
+    if num_pairs <= 0:
+        num_pairs = len(pairs)
 
     scored = []
     for idx, pair in enumerate(pairs):
@@ -633,6 +647,36 @@ def select_highlight_monitor_pairs(pairs, num_pairs, args):
         "max_highlight_cov": float(np.max(coverages)) if coverages else 0.0,
     }
     return [pair for _, _, pair in selected], stats
+
+
+def load_image_pairs_from_dirs(sdr_dir, hdr_dir, max_long_edge, max_images=0):
+    sdr_paths = sorted(glob.glob(os.path.join(sdr_dir, "*.png")))
+    hdr_paths = sorted(glob.glob(os.path.join(hdr_dir, "*.png")))
+
+    if not sdr_paths or not hdr_paths:
+        raise FileNotFoundError("No PNG images found in SDR/HDR directories")
+
+    sdr_map = {os.path.basename(p): p for p in sdr_paths}
+    hdr_map = {os.path.basename(p): p for p in hdr_paths}
+    common = sorted(set(sdr_map.keys()) & set(hdr_map.keys()))
+    if not common:
+        raise FileNotFoundError("No matching filenames between SDR and HDR dirs")
+
+    if max_images > 0:
+        common = common[:max_images]
+
+    pairs = []
+    for name in common:
+        sdr_t, hdr_t = load_image_pair(
+            sdr_map[name], hdr_map[name], max_long_edge
+        )
+        if sdr_t is not None:
+            pairs.append((sdr_t, hdr_t))
+    if len(pairs) == 0:
+        raise RuntimeError(
+            "Matched filenames found, but no valid SDR/HDR pairs could be loaded"
+        )
+    return pairs
 
 
 def compute_loss_terms(output, target, args, teacher_output=None):
@@ -697,6 +741,82 @@ def average_metrics(metric_sums, count):
     return {key: value / count for key, value in metric_sums.items()}
 
 
+def tensor_to_bgr_u16(tensor):
+    arr = (
+        tensor.detach()
+        .float()
+        .clamp(0.0, 1.0)[0]
+        .permute(1, 2, 0)
+        .cpu()
+        .numpy()
+    )
+    bgr = arr[:, :, ::-1]
+    return np.ascontiguousarray(
+        np.clip((bgr * 65535.0) + 0.5, 0.0, 65535.0).astype(np.uint16)
+    )
+
+
+def compute_objective_monitor_metrics(output, target, args):
+    pred_bgr = tensor_to_bgr_u16(output)
+    ref_bgr = tensor_to_bgr_u16(target)
+    pred_bgr, ref_bgr, _ = _crop_shared_black_borders(pred_bgr, ref_bgr)
+    pred_bgr, ref_bgr = _prepare_metric_pair(
+        pred_bgr, ref_bgr,
+        max_side=max(64, int(args.monitor_metric_max_side)),
+    )
+
+    metrics = {
+        "objective_psnr_db": float(_psnr_bgr(pred_bgr, ref_bgr)),
+        "objective_sssim": float(_ssim_bgr(pred_bgr, ref_bgr)),
+        "objective_delta_e_itp": float(_delta_e_itp_bgr(pred_bgr, ref_bgr)),
+    }
+
+    norm_pred, norm_ref = _grade_normalize_pred_to_ref(pred_bgr, ref_bgr)
+    metrics["objective_psnr_norm_db"] = float(_psnr_bgr(norm_pred, norm_ref))
+    metrics["objective_sssim_norm"] = float(_ssim_bgr(norm_pred, norm_ref))
+    norm_pred_abs, norm_ref_abs = _grade_normalize_absolute_rgb_to_ref(
+        _linear_bgr_to_absolute_rgb(pred_bgr),
+        _linear_bgr_to_absolute_rgb(ref_bgr),
+    )
+    metrics["objective_delta_e_itp_norm"] = float(
+        _delta_e_itp_absolute_rgb(norm_pred_abs, norm_ref_abs)
+    )
+    return metrics
+
+
+def monitor_score_from_metrics(metrics, args):
+    mode = str(args.monitor_score).strip().lower()
+    if mode == "loss":
+        return float(metrics.get("total", float("inf")))
+
+    required = (
+        "objective_delta_e_itp_norm",
+        "objective_delta_e_itp",
+        "objective_sssim_norm",
+        "objective_sssim",
+        "objective_psnr_norm_db",
+    )
+    if any(key not in metrics for key in required):
+        return float(metrics.get("total", float("inf")))
+
+    de_norm = float(metrics["objective_delta_e_itp_norm"])
+    de_raw = float(metrics["objective_delta_e_itp"])
+    ssim_norm = float(metrics["objective_sssim_norm"])
+    ssim_raw = float(metrics["objective_sssim"])
+    psnr_norm = float(metrics["objective_psnr_norm_db"])
+
+    score = (
+        0.45 * (de_norm / 10.0)
+        + 0.20 * (de_raw / 25.0)
+        + 0.20 * max(0.0, (1.0 - ssim_norm) * 100.0)
+        + 0.10 * max(0.0, (1.0 - ssim_raw) * 100.0)
+        + 0.05 * (10.0 ** (-psnr_norm / 20.0))
+    )
+    if mode == "hybrid":
+        score += 0.25 * float(metrics.get("total", 0.0))
+    return float(score)
+
+
 def format_metrics(metrics):
     parts = [
         f"total={metrics.get('total', 0.0):.6f}",
@@ -714,6 +834,14 @@ def format_metrics(metrics):
         parts.append(f"hi_balance={metrics['highlight_balance']:.6f}")
     if "highlight_cov" in metrics:
         parts.append(f"hi_cov={metrics['highlight_cov']:.3f}")
+    if "objective_psnr_norm_db" in metrics:
+        parts.append(f"psnrN={metrics['objective_psnr_norm_db']:.2f}")
+    if "objective_sssim_norm" in metrics:
+        parts.append(f"ssimN={metrics['objective_sssim_norm']:.4f}")
+    if "objective_delta_e_itp_norm" in metrics:
+        parts.append(f"deN={metrics['objective_delta_e_itp_norm']:.3f}")
+    if "objective_delta_e_itp" in metrics:
+        parts.append(f"de={metrics['objective_delta_e_itp']:.3f}")
     return ", ".join(parts)
 
 
@@ -906,13 +1034,16 @@ def train_qat(model, pairs, device, compute_dtype, args,
     if monitor_pairs is None:
         monitor_count = min(max(args.num_validate, 0), len(pairs))
         monitor_pairs = pairs[:monitor_count]
-    score_name = "monitor total" if (
-        args.teacher_loss_weight > 0
-        or args.highlight_loss_weight > 0
-        or args.highlight_teacher_weight > 0
-        or args.highlight_chroma_weight > 0
-        or args.highlight_balance_weight > 0
-    ) else "monitor L1"
+    if str(args.monitor_score).strip().lower() == "loss":
+        score_name = "monitor total" if (
+            args.teacher_loss_weight > 0
+            or args.highlight_loss_weight > 0
+            or args.highlight_teacher_weight > 0
+            or args.highlight_chroma_weight > 0
+            or args.highlight_balance_weight > 0
+        ) else "monitor L1"
+    else:
+        score_name = f"monitor {args.monitor_score}"
 
     monitor_teacher_outputs = None
     if monitor_pairs and teacher_model is not None:
@@ -943,6 +1074,9 @@ def train_qat(model, pairs, device, compute_dtype, args,
     if monitor_pairs:
         print(f"  Model selection: best {score_name} on {len(monitor_pairs)} "
               f"fixed full-image pairs")
+        if str(args.monitor_score).strip().lower() != "loss":
+            print("  Objective monitor: PSNR/SSIM/DeltaEITP without HDR-VDP3 "
+                  f"(max_side={max(64, int(args.monitor_metric_max_side))})")
     else:
         print("  Model selection: best training total")
 
@@ -990,6 +1124,17 @@ def train_qat(model, pairs, device, compute_dtype, args,
                         output, target, args, teacher_output=teacher_output
                     )
                     if torch.isfinite(loss):
+                        if str(args.monitor_score).strip().lower() != "loss":
+                            try:
+                                metrics.update(
+                                    compute_objective_monitor_metrics(
+                                        output, target, args
+                                    )
+                                )
+                            except Exception as exc:
+                                print(f"  [warn] Objective monitor failed: {exc}")
+                                monitor_enabled = False
+                                return None
                         accumulate_metrics(metric_sums, metrics)
                         num_items += 1
         except RuntimeError as exc:
@@ -1087,7 +1232,7 @@ def train_qat(model, pairs, device, compute_dtype, args,
         best_train_loss = min(best_train_loss, avg_total)
         monitor_metrics = compute_monitor_metrics()
         score = (
-            monitor_metrics.get("total", avg_total)
+            monitor_score_from_metrics(monitor_metrics, args)
             if monitor_metrics is not None else avg_total
         )
 
@@ -1167,6 +1312,12 @@ def main():
         "--hdr-dir",
         default=os.path.join(_REPO_ROOT, "dataset", "train_hdr"),
                         help="HDR ground-truth directory")
+    parser.add_argument("--val-sdr-dir", default="",
+                        help="Optional held-out SDR validation directory for QAT model selection")
+    parser.add_argument("--val-hdr-dir", default="",
+                        help="Optional held-out HDR validation directory for QAT model selection")
+    parser.add_argument("--max-val-images", type=int, default=0,
+                        help="Max held-out validation images (0 = all)")
     parser.add_argument("--from-scratch", action="store_true",
                         help="Start from FP32 model (PTQ + calibrate + QAT)")
     parser.add_argument("--precision", default="fp16", choices=["fp16", "fp32"],
@@ -1227,9 +1378,14 @@ def main():
 
     # Validation
     parser.add_argument("--num-validate", type=int, default=8,
-                        help="Number of images for quality validation")
+                        help="Number of images for quality validation (0 = all monitor pairs)")
     parser.add_argument("--num-calibrate", type=int, default=0,
                         help="Calibration images when --from-scratch (0 = all)")
+    parser.add_argument("--monitor-score", default="loss",
+                        choices=["loss", "objective", "hybrid"],
+                        help="Epoch selection score for monitor pairs")
+    parser.add_argument("--monitor-metric-max-side", type=int, default=720,
+                        help="Max side for objective monitor metrics")
 
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     args = parser.parse_args()
@@ -1426,42 +1582,34 @@ def main():
     # 2. Load SDR/HDR pairs for training
     # ------------------------------------------------------------------
     print(f"\nLoading SDR/HDR pairs from {args.sdr_dir} + {args.hdr_dir} ...")
-    sdr_paths = sorted(glob.glob(os.path.join(args.sdr_dir, "*.png")))
-    hdr_paths = sorted(glob.glob(os.path.join(args.hdr_dir, "*.png")))
-
-    if not sdr_paths or not hdr_paths:
-        raise FileNotFoundError("No PNG images found in SDR/HDR directories")
-
-    # Match by filename
-    sdr_map = {os.path.basename(p): p for p in sdr_paths}
-    hdr_map = {os.path.basename(p): p for p in hdr_paths}
-    common = sorted(set(sdr_map.keys()) & set(hdr_map.keys()))
-    if not common:
-        raise FileNotFoundError("No matching filenames between SDR and HDR dirs")
-
-    if args.max_images > 0:
-        common = common[:args.max_images]
-
-    pairs = []
-    for name in common:
-        sdr_t, hdr_t = load_image_pair(
-            sdr_map[name], hdr_map[name], args.max_long_edge
-        )
-        if sdr_t is not None:
-            pairs.append((sdr_t, hdr_t))
-    if len(pairs) == 0:
-        raise RuntimeError(
-            "Matched filenames found, but no valid SDR/HDR pairs could be loaded"
-        )
+    pairs = load_image_pairs_from_dirs(
+        args.sdr_dir, args.hdr_dir, args.max_long_edge, args.max_images
+    )
 
     print(f"  {len(pairs)} pairs loaded")
 
+    monitor_source = "train"
+    monitor_candidate_pairs = pairs
+    if args.val_sdr_dir and args.val_hdr_dir:
+        print(f"\nLoading held-out monitor pairs from {args.val_sdr_dir} + {args.val_hdr_dir} ...")
+        monitor_candidate_pairs = load_image_pairs_from_dirs(
+            args.val_sdr_dir,
+            args.val_hdr_dir,
+            args.max_long_edge,
+            args.max_val_images,
+        )
+        monitor_source = "validation"
+        print(f"  {len(monitor_candidate_pairs)} held-out pairs loaded")
+    elif args.val_sdr_dir or args.val_hdr_dir:
+        raise ValueError("Provide both --val-sdr-dir and --val-hdr-dir, or neither")
+
     monitor_pairs, monitor_stats = select_highlight_monitor_pairs(
-        pairs, args.num_validate, args
+        monitor_candidate_pairs, args.num_validate, args
     )
     if monitor_pairs:
         print("  Highlight-aware monitor selection:")
         print(f"    using {len(monitor_pairs)} full-image pairs "
+              f"from {monitor_source} "
               f"(avg hi_cov={monitor_stats['avg_highlight_cov']:.4f}, "
               f"max={monitor_stats['max_highlight_cov']:.4f}, "
               f"positive candidates={monitor_stats['positive_candidates']})")
@@ -1536,6 +1684,11 @@ def main():
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
             "monitor_selection": "highlight_coverage_topk",
+            "monitor_source": monitor_source,
+            "monitor_score": args.monitor_score,
+            "monitor_metric_max_side": args.monitor_metric_max_side,
+            "val_sdr_dir": args.val_sdr_dir,
+            "val_hdr_dir": args.val_hdr_dir,
             "monitor_avg_highlight_cov": monitor_stats["avg_highlight_cov"],
             "monitor_max_highlight_cov": monitor_stats["max_highlight_cov"],
             "monitor_positive_candidates": monitor_stats["positive_candidates"],
