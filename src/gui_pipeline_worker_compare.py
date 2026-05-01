@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from gui_hdr_io import read_hdr_video_frame_rgb16, tensor_to_bgr_u16
-from gui_media_probe import _crop_frame_to_active_area, _map_video_pair_frame_index
+from gui_media_probe import _crop_gt_frame_to_pair_active_area, _map_video_pair_frame_index
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _compute_full_reference_metrics,
@@ -264,8 +264,10 @@ class PipelineWorkerCompareMixin:
             if gt_rgb16 is None and gt_seek_idx > 0:
                 gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx - 1)
             if gt_rgb16 is not None:
-                gt_probe = _crop_frame_to_active_area(
-                    np.ascontiguousarray(gt_rgb16[:, :, ::-1])
+                gt_probe = _crop_gt_frame_to_pair_active_area(
+                    np.ascontiguousarray(gt_rgb16[:, :, ::-1]),
+                    str(self._video_path or ""),
+                    compare_gt_path,
                 )
                 gt_hdr_mode_note = "true 16-bit HDR decode"
                 cmp_hdr_gt = np.ascontiguousarray(
@@ -280,9 +282,14 @@ class PipelineWorkerCompareMixin:
         elif gt_frame is not None:
             if isinstance(gt_frame, np.ndarray) and gt_frame.dtype == np.uint16:
                 gt_hdr_mode_note = "true 16-bit HDR decode"
+                gt_probe = _crop_gt_frame_to_pair_active_area(
+                    gt_frame,
+                    str(self._video_path or ""),
+                    str(compare_gt_path or ""),
+                )
                 cmp_hdr_gt = np.ascontiguousarray(
                     _letterbox_bgr(
-                        _crop_frame_to_active_area(gt_frame),
+                        gt_probe,
                         compare_out_w,
                         compare_out_h,
                     )

@@ -22,6 +22,7 @@ Core updates include:
 - no NVIDIA PyTorch fallback: TensorRT build/load errors are logged and shown to the user without crashing the app
 - PyTorch-specific tuning controls are hidden on NVIDIA
 - AMD keeps the PyTorch runtime, with channels-last tensors and benchmark mode enabled
+- AMD benchmark runs use cached `max-autotune` PyTorch kernels when the exact compile cache is already present, otherwise they stay eager to avoid surprise compile stalls
 - AMD INT8 `Auto` pre-dequantization behavior is preserved
 - new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking
 - deterministic frame/pair selection options with eager-mode quality runs for repeatable objective comparisons
@@ -32,8 +33,10 @@ Core updates include:
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
-- HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and cached constant frame offsets
+- first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
+- HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and conservative cached constant frame offsets
 - compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
+- benchmark video runs now post-verify GT frames by exact decode and local frame alignment before final metrics are reported
 - compare preparation now uses a cancelable application-modal progress dialog so pending compare seeks can be canceled cleanly
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
@@ -126,7 +129,10 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 - Open from `Tools -> Model Quality Benchmark ...`
 - Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
 - Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
+- On AMD, benchmark uses cached `torch.compile` / `max-autotune` kernels on an exact cache hit and falls back to eager mode on a miss
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
+- Video benchmark metrics are finalized by an exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
+- Dataset image pairs stay on the image decoder path; video sync/crop probes are only used for actual video files
 
 ![Benchmark Tab](docs/images/v5-benchmark-tab.png)
 
@@ -275,14 +281,20 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 
 - **HDR GT pairing is more practical for real movie files**
   - GT validation allows short duration/frame-count mismatches by default
-  - encoded black bars are detected so cropped and letterboxed versions of the same movie can still be paired
-  - a cached sync scan estimates constant SDR/HDR lead-lag offsets and reports the detected frame offset
+  - encoded black bars are handled with one stable pair-level crop rectangle, so cropped and letterboxed versions of the same movie can still be paired without per-frame aspect shifts
+  - a cached sync scan estimates constant SDR/HDR lead-lag offsets and reports the detected frame offset, but keeps offset `0` unless a nonzero offset is clearly better
+  - benchmark video runs add a per-sample local GT-frame search during post-verify, so final metrics are based on the best nearby exact-decoded GT frame instead of a stale fast seek
   - compare, objective metrics, and benchmark use the same mapped GT-frame lookup
+  - same-canvas GT files are no longer cropped per frame, avoiding accidental zoomed GT previews/metrics
 
 - **Compare preparation is cancelable**
   - clicking `Compare` opens a modal progress dialog while the exact frame is prepared
   - canceling clears the pending compare request and temporary seek instead of leaving playback pinned to the compare frame
   - stale compare results are ignored after cancel
+
+- **Safer default quality preset**
+  - clean first launches default to `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
+  - existing `.gui_prefs.json` settings still win, so local user choices are preserved
 
 ### Previous v5.1 Highlights
 
@@ -294,7 +306,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 
 - **Model Quality Benchmark tool is now built in (Tools menu)**
   - supports two workflows: `Video (SDR + HDR GT)` and `Dataset Folders (SDR + HDR GT)`
-  - runs quality benchmarking in eager mode for deterministic/repeatable metric evaluation
+  - runs quality benchmarking through TensorRT on NVIDIA, cached max-autotune on AMD when available, or eager fallback when no safe compile cache exists
   - video workflow includes deterministic distinct-frame detection and manual frame checkboxes
   - dataset workflow includes paired-file scanning with averaging modes (`selected`, `all`, deterministic subset)
   - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
@@ -396,7 +408,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Pre-compile kernels** | AMD-only PyTorch kernel precompile for any resolution/precision ahead of time |
 | **Clear kernel cache** | AMD-only PyTorch kernel cache clearing for the current project checkout |
 | **Dark theme** | Modern dark UI, auto-applied |
-| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, view/tab, upscale, film grain, metrics visibility, HG toggle, AMD pre-dequantization/runtime mode, volume, audio track, cursor hide, last-open directory) |
+| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, view/tab, upscale, film grain, metrics visibility, HG toggle, AMD pre-dequantization/runtime mode, volume, audio track, cursor hide, last-open directory). On a clean first launch the default preset is `INT8 Mixed (QAT)` / `720p` / `SSimSuperRes` / HG off |
 
 ### GUI Launch Flags
 
@@ -417,10 +429,17 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - GT pairing accepts small practical differences between real encodes:
   - `HDRTVNET_GT_SYNC_TOLERANCE_S` controls allowed duration/frame-count mismatch in seconds. Default: `2.0`.
-  - active-picture detection allows one file to be letterboxed while the other is cropped, then crops GT active content before preview/metrics.
+  - active-picture detection allows one file to be letterboxed while the other is cropped, then applies a stable pair-level geometric crop before preview/metrics only when the encoded pair genuinely needs it.
   - `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` controls the constant-offset search window. Default: `2.0`.
+  - `HDRTVNET_GT_SYNC_OFFSET_MIN_GAIN` controls how much better a nonzero global offset must be before it replaces frame offset `0`. Default: `0.06`; tiny offsets require a stronger gain to avoid false `+/-1` to `+/-5` frame shifts.
   - the detected offset is cached per file signature and used by Compare, objective logging, and benchmark frame reads.
   - if a movie starts more than two seconds apart between SDR and HDR GT files, raise `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` before launch.
+- Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames before final metrics:
+  - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY` enables/disables this pass. Default: `1`.
+  - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS` limits verified rows, or `all` verifies every video row. Default: `all`.
+  - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES` controls the per-sample local GT search radius around the mapped frame. Default: `8`.
+  - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN` controls how much better a nearby GT frame must be before it replaces the mapped frame. Default: `0.035`.
+  - benchmark summaries and CSV exports include `gt_frame`, `gt_alignment_offset_frames`, and `gt_alignment_score` for auditability.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The built-in bridge accepts BT.2100 PQ input frames and converts them to absolute display luminance / photometric values before calling `hdrvdp3`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
@@ -539,6 +558,7 @@ Compiled PyTorch kernels are **cached to disk**, so:
 
 - subsequent playback on an exact cache hit skips the clean precompile subprocess
 - export max-autotune reuses the same compile cache and only compiles cleanly on a real cache miss
+- benchmark reuses the same cache when available but does not launch a new compile on a miss; it falls back to eager for that run
 - caches are scoped to the current local project checkout instead of being shared implicitly across different local copies of the repo
 - if an old or incompatible cache looks "compiled" but would hang warmup, the app can stop early and ask to clear/recompile the current project's cache
 
@@ -547,6 +567,7 @@ PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, 
 - `HDRTVNET_COMPILE_DYNAMIC=0|1|auto` controls shape specialization; default is `0`.
 - `HDRTVNET_COMPILE_FULLGRAPH=1` can be used for experiments, but default is `0` for compatibility.
 - `HDRTVNET_COMPILE_WARMUP_RUNS=N` controls compile warmup passes; default is `2`.
+- `HDRTVNET_BENCHMARK_USE_COMPILE_CACHE=1|0` controls whether the benchmark may use an already-present max-autotune cache; default is `1`. Cache misses still run eager.
 
 ---
 

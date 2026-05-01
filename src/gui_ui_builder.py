@@ -22,6 +22,9 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
+    DEFAULT_PRECISION_KEY,
+    DEFAULT_RESOLUTION_KEY,
+    DEFAULT_USE_HG,
     _available_precision_keys,
     RESOLUTION_SCALES,
     SOURCE_MODE_LABELS,
@@ -204,7 +207,10 @@ class UiBuilderMixin:
         lbl_precision.setProperty("muted", True)
         row1.addWidget(lbl_precision, 2, 0)
         self._cmb_prec = QComboBox()
-        self._cmb_prec.addItems(_available_precision_keys())
+        available_precisions = _available_precision_keys()
+        self._cmb_prec.addItems(available_precisions)
+        if DEFAULT_PRECISION_KEY in available_precisions:
+            self._cmb_prec.setCurrentText(DEFAULT_PRECISION_KEY)
         self._cmb_prec.setMinimumWidth(0)
         self._cmb_prec.setMinimumContentsLength(12)
         self._cmb_prec.setSizeAdjustPolicy(
@@ -216,7 +222,7 @@ class UiBuilderMixin:
         )
         row1.addWidget(self._cmb_prec, 2, 1)
         self._chk_hg = QCheckBox("Use HG")
-        self._chk_hg.setChecked(True)
+        self._chk_hg.setChecked(bool(DEFAULT_USE_HG))
         self._chk_hg.setToolTip("Enable highlight refinement (HG) (very heavy).")
 
         lbl_resolution = QLabel("Resolution:")
@@ -224,6 +230,8 @@ class UiBuilderMixin:
         row1.addWidget(lbl_resolution, 3, 0)
         self._cmb_res = QComboBox()
         self._cmb_res.addItems(RESOLUTION_SCALES.keys())
+        if DEFAULT_RESOLUTION_KEY in RESOLUTION_SCALES:
+            self._cmb_res.setCurrentText(DEFAULT_RESOLUTION_KEY)
         self._cmb_res.setMinimumWidth(0)
         self._cmb_res.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -236,6 +244,8 @@ class UiBuilderMixin:
         row1.addWidget(lbl_upscale, 4, 0)
         self._cmb_upscale = QComboBox()
         self._cmb_upscale.addItems(UPSCALER_CHOICES)
+        if DEFAULT_UPSCALER in UPSCALER_CHOICES:
+            self._cmb_upscale.setCurrentText(DEFAULT_UPSCALER)
         self._cmb_upscale.setMinimumWidth(0)
         self._cmb_upscale.setMinimumContentsLength(12)
         self._cmb_upscale.setSizeAdjustPolicy(

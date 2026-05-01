@@ -10,6 +10,7 @@ from PyQt6.QtCore import QEvent
 from PyQt6.QtWidgets import QInputDialog
 
 from gui_config import (
+    DEFAULT_USE_HG,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
     _available_precision_keys,
@@ -178,7 +179,7 @@ class SettingsPreviewMixin:
                     if self._video_tabs.tabText(i) == saved_tab:
                         self._video_tabs.setCurrentIndex(i)
                         break
-        self._chk_hg.setChecked(bool(data.get("use_hg", True)))
+        self._chk_hg.setChecked(bool(data.get("use_hg", DEFAULT_USE_HG)))
         if initial_use_hg is not None:
             self._chk_hg.setChecked(str(initial_use_hg).strip() == "1")
 

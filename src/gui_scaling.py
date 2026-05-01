@@ -34,7 +34,7 @@ SSIM_SUPERRES_SHADER_URL = (
     "15d93440d0a24fc4b8770070be6a9fa2af6f200b/SSimSuperRes.glsl"
 )
 UPSCALER_CHOICES = ["EWA LanczosSharp", "FSR", "SSimSuperRes"]
-DEFAULT_UPSCALER = "EWA LanczosSharp"
+DEFAULT_UPSCALER = "SSimSuperRes"
 
 
 def _fit_with_aspect(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
@@ -224,4 +224,3 @@ def _apply_upscale_sharpen(
         return img
     blur = cv2.GaussianBlur(img, (0, 0), sigma)
     return cv2.addWeighted(img, 1.0 + strength, blur, -strength, 0)
-

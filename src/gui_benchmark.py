@@ -47,7 +47,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gui_config import PRECISIONS, RESOLUTION_SCALES, _available_precision_keys, _select_model_path
+from gui_config import (
+    DEFAULT_RESOLUTION_KEY,
+    PRECISIONS,
+    RESOLUTION_SCALES,
+    _available_precision_keys,
+    _select_model_path,
+)
 from gui_hdr_io import (
     FFMPEG_WINDOWS_DOWNLOAD_URL,
     hdr_ffmpeg_ready,
@@ -57,7 +63,7 @@ from gui_hdr_io import (
     tensor_to_bgr_u16,
 )
 from gui_media_probe import (
-    _crop_frame_to_active_area,
+    _crop_gt_frame_to_pair_active_area,
     _frame_structure_similarity,
     _map_video_pair_frame_index,
     _probe_video_active_area_info,
@@ -69,6 +75,7 @@ from gui_objective_metrics import (
     _compute_full_reference_metrics,
     _read_video_frame_at,
 )
+from gui_compile_cache import _is_compiled, _precision_to_compile_arg
 from gui_pipeline_worker_model import _resolve_predequantize_arg
 from gui_mpv_widget import MpvHDRWidget
 from gui_scaling import (
@@ -83,10 +90,33 @@ from gui_scaling import (
     _normalize_shader_paths,
 )
 from gui_widgets import _CompareVideoPane
-from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
+from models.hdrtvnet_torch import (
+    HDRTVNetTensorRT,
+    HDRTVNetTorch,
+    _HAS_COMPILE,
+    _HAS_TRITON,
+    _IS_NVIDIA,
+    _IS_ROCM,
+)
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
-_VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".m4v"}
+_VIDEO_EXTS = {
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".flv",
+    ".m4v",
+    ".wmv",
+    ".mpg",
+    ".mpeg",
+    ".ts",
+    ".m2ts",
+    ".mts",
+    ".ogv",
+    ".3gp",
+}
 _FRAME_RESULT_FILE = "benchmark_frame_result.json"
 _BENCHMARK_METRIC_KEYS = [
     "psnr_db",
@@ -127,17 +157,25 @@ _BENCHMARK_HDR_GT_MODE = str(
 ).strip().lower()
 if _BENCHMARK_HDR_GT_MODE not in {"auto", "fast", "exact"}:
     _BENCHMARK_HDR_GT_MODE = "auto"
-# Auto mode policy: fast first pass, then exact recheck only for suspicious rows.
+# Auto mode policy: fast first pass, then exact/local-aligned post verification.
 _BENCHMARK_AUTO_POST_VERIFY_ENABLED = str(
     os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY", "1")
 ).strip().lower() in {"1", "true", "yes", "on"}
-try:
-    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = max(
-        0,
-        int(os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS", "0")),
-    )
-except Exception:
-    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = 0
+
+
+def _parse_post_verify_max_items() -> int | None:
+    raw = str(
+        os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS", "all")
+    ).strip().lower()
+    if raw in {"", "all", "full", "unlimited"}:
+        return None
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return None
+
+
+_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS = _parse_post_verify_max_items()
 try:
     _BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE = float(
         os.environ.get("HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE", "0.10")
@@ -162,6 +200,26 @@ try:
     )
 except Exception:
     _BENCHMARK_AUTO_POST_VERIFY_GT_DIFF_MEAN = 0.0025
+try:
+    _BENCHMARK_GT_LOCAL_SEARCH_FRAMES = max(
+        0,
+        min(
+            120,
+            int(os.environ.get("HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES", "8")),
+        ),
+    )
+except Exception:
+    _BENCHMARK_GT_LOCAL_SEARCH_FRAMES = 8
+try:
+    _BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN = max(
+        0.0,
+        float(os.environ.get("HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN", "0.035")),
+    )
+except Exception:
+    _BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN = 0.035
+_BENCHMARK_USE_COMPILE_CACHE = str(
+    os.environ.get("HDRTVNET_BENCHMARK_USE_COMPILE_CACHE", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _new_mpv_widget() -> MpvHDRWidget:
@@ -198,6 +256,98 @@ def _resolution_dims(res_key: str) -> tuple[int, int]:
     if dims is None:
         return 1920, 1080
     return int(dims[0]), int(dims[1])
+
+
+def _normalize_benchmark_predequantize_mode(mode: str | None) -> str:
+    m = str(mode or "auto").strip().lower()
+    if m in {"on", "off"}:
+        return m
+    return "auto"
+
+
+def _effective_benchmark_predequantize_mode(
+    precision_arg: str,
+    selected_mode: str | None,
+) -> str:
+    mode = _normalize_benchmark_predequantize_mode(selected_mode)
+    if not str(precision_arg or "").startswith("int8"):
+        return mode
+    if mode in {"on", "off"}:
+        return mode
+    if _IS_ROCM:
+        return "on"
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(0)
+            has_int8_tc = (
+                props.major > 7
+                or (props.major == 7 and props.minor >= 5)
+            )
+            return "off" if has_int8_tc else "on"
+        except Exception:
+            return "auto"
+    return "auto"
+
+
+def _benchmark_compile_cache_ready(
+    *,
+    w: int,
+    h: int,
+    precision_key: str,
+    model_path: str,
+    use_hg: bool,
+    predequantize_mode: str,
+) -> tuple[bool, str, str]:
+    """Return whether benchmark can safely use cached max-autotune kernels."""
+    if _IS_NVIDIA or not _BENCHMARK_USE_COMPILE_CACHE:
+        return False, "disabled", "auto"
+    if not (_HAS_COMPILE and _HAS_TRITON and torch.cuda.is_available()):
+        return False, "unavailable", "auto"
+
+    precision_arg = _precision_to_compile_arg(precision_key)
+    selected_pdq = _normalize_benchmark_predequantize_mode(predequantize_mode)
+    effective_pdq = _effective_benchmark_predequantize_mode(
+        precision_arg,
+        selected_pdq,
+    )
+    if _is_compiled(
+        int(w),
+        int(h),
+        precision_arg,
+        model_path=model_path,
+        use_hg=bool(use_hg),
+        predequantize_mode=effective_pdq,
+    ):
+        return True, precision_arg, effective_pdq
+
+    if (
+        str(precision_arg).startswith("int8")
+        and selected_pdq == "auto"
+        and effective_pdq != "auto"
+        and _is_compiled(
+            int(w),
+            int(h),
+            precision_arg,
+            model_path=model_path,
+            use_hg=bool(use_hg),
+            predequantize_mode="auto",
+        )
+    ):
+        return True, precision_arg, "auto"
+
+    if str(precision_arg).startswith("int8") and effective_pdq == "on":
+        fp16_model = _select_model_path("FP16", bool(use_hg))
+        if _is_compiled(
+            int(w),
+            int(h),
+            "fp16",
+            model_path=fp16_model,
+            use_hg=bool(use_hg),
+            predequantize_mode="auto",
+        ):
+            return True, precision_arg, effective_pdq
+
+    return False, precision_arg, effective_pdq
 
 
 def _fmt_metric(v, fmt: str = ".4f", suffix: str = "") -> str:
@@ -297,6 +447,142 @@ def _map_gt_frame_for_sdr(
     if _is_video_path(sdr_path) and _is_video_path(gt_path):
         return _map_video_pair_frame_index(sdr_path, gt_path, int(frame_idx))
     return max(0, int(frame_idx))
+
+
+def _to_u8_for_alignment_frame(frame: np.ndarray | None) -> np.ndarray | None:
+    if not isinstance(frame, np.ndarray):
+        return None
+    arr = np.ascontiguousarray(frame)
+    if arr.dtype == np.uint8:
+        return arr
+    if arr.dtype == np.uint16:
+        return np.ascontiguousarray(
+            ((arr.astype(np.float32) / 65535.0) * 255.0)
+            .clip(0.0, 255.0)
+            .astype(np.uint8)
+        )
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        peak = max(1.0, float(info.max))
+        return np.ascontiguousarray(
+            (arr.astype(np.float32) * (255.0 / peak))
+            .clip(0.0, 255.0)
+            .astype(np.uint8)
+        )
+    arr_f = arr.astype(np.float32)
+    peak = float(np.max(arr_f)) if arr_f.size else 1.0
+    if peak <= 1.0:
+        arr_f = arr_f * 255.0
+    return np.ascontiguousarray(arr_f.clip(0.0, 255.0).astype(np.uint8))
+
+
+def _local_align_gt_frame_for_benchmark(
+    *,
+    sdr_path: str,
+    gt_path: str,
+    mapped_gt_frame_idx: int,
+    sdr_eval_u8: np.ndarray | None,
+    out_w: int,
+    out_h: int,
+) -> dict:
+    """Find the best nearby GT frame for one benchmark sample."""
+    base_idx = max(0, int(mapped_gt_frame_idx or 0))
+    info = {
+        "frame_idx": int(base_idx),
+        "base_frame_idx": int(base_idx),
+        "best_frame_idx": int(base_idx),
+        "offset_frames": 0,
+        "score": None,
+        "base_score": None,
+        "best_score": None,
+        "search_radius_frames": int(_BENCHMARK_GT_LOCAL_SEARCH_FRAMES),
+    }
+    radius = int(_BENCHMARK_GT_LOCAL_SEARCH_FRAMES)
+    if (
+        radius <= 0
+        or not isinstance(sdr_eval_u8, np.ndarray)
+        or not _is_video_path(gt_path)
+    ):
+        return info
+
+    gt_meta = _probe_video_timing_info(gt_path)
+    gt_n = int(gt_meta.get("frame_count", 0) or 0) if isinstance(gt_meta, dict) else 0
+    start_idx = max(0, base_idx - radius)
+    end_idx = base_idx + radius
+    if gt_n > 0:
+        end_idx = min(end_idx, gt_n - 1)
+    if end_idx < start_idx:
+        return info
+
+    cap = cv2.VideoCapture(gt_path)
+    if not cap.isOpened():
+        cap.release()
+        return info
+
+    best_idx = int(base_idx)
+    best_score = None
+    base_score = None
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+        for gt_idx in range(start_idx, end_idx + 1):
+            ok, gt_frame = cap.read()
+            if not ok or gt_frame is None:
+                break
+            try:
+                gt_eval = np.ascontiguousarray(
+                    _letterbox_bgr(
+                        _crop_gt_frame_to_pair_active_area(
+                            gt_frame,
+                            sdr_path,
+                            gt_path,
+                        ),
+                        out_w,
+                        out_h,
+                    )
+                )
+                gt_u8 = _to_u8_for_alignment_frame(gt_eval)
+                if gt_u8 is None:
+                    continue
+                score = _frame_structure_similarity(sdr_eval_u8, gt_u8)
+            except Exception:
+                score = None
+            if score is None or not np.isfinite(float(score)):
+                continue
+            score_f = float(score)
+            if gt_idx == base_idx:
+                base_score = score_f
+            if best_score is None or score_f > float(best_score):
+                best_score = score_f
+                best_idx = int(gt_idx)
+    finally:
+        cap.release()
+
+    selected_idx = int(base_idx)
+    selected_score = base_score
+    if best_score is not None:
+        if best_idx == base_idx:
+            selected_idx = int(best_idx)
+            selected_score = float(best_score)
+        elif base_score is None:
+            selected_idx = int(best_idx)
+            selected_score = float(best_score)
+        elif float(best_score) >= (
+            float(base_score) + float(_BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN)
+        ):
+            selected_idx = int(best_idx)
+            selected_score = float(best_score)
+
+    info.update(
+        {
+            "frame_idx": int(selected_idx),
+            "best_frame_idx": int(best_idx),
+            "offset_frames": int(selected_idx) - int(base_idx),
+            "score": None if selected_score is None else float(selected_score),
+            "base_score": None if base_score is None else float(base_score),
+            "best_score": None if best_score is None else float(best_score),
+        }
+    )
+    return info
 
 
 def _detect_distinct_video_frames(
@@ -399,6 +685,7 @@ class BenchmarkRunConfig:
     predequantize_mode: str
     tasks: list[BenchmarkTask]
     session_dir: str
+    runtime_mode: str = "auto"
 
 
 class _BenchmarkWorker(QObject):
@@ -468,6 +755,9 @@ class _BenchmarkWorker(QObject):
                         "hdr_vdp3",
                         "obj_note",
                         "hdr_vdp3_note",
+                        "gt_frame",
+                        "gt_alignment_offset_frames",
+                        "gt_alignment_score",
                         "sample_dir",
                     ]
                 )
@@ -486,6 +776,9 @@ class _BenchmarkWorker(QObject):
                             m.get("hdr_vdp3"),
                             m.get("obj_note"),
                             m.get("hdr_vdp3_note"),
+                            r.get("gt_frame_idx"),
+                            r.get("gt_alignment_offset_frames"),
+                            r.get("gt_alignment_score"),
                             r.get("sample_dir"),
                         ]
                     )
@@ -504,6 +797,9 @@ class _BenchmarkWorker(QObject):
                         averages.get("hdr_vdp3"),
                         "",
                         "",
+                        "",
+                        "",
+                        "",
                         cfg.session_dir,
                     ]
                 )
@@ -520,6 +816,7 @@ class _BenchmarkWorker(QObject):
                         "use_hg": bool(cfg.use_hg),
                         "resolution": cfg.resolution_key,
                         "predequantize_mode": cfg.predequantize_mode,
+                        "benchmark_runtime": cfg.runtime_mode,
                         "session_dir": cfg.session_dir,
                         "average": averages,
                         "results": rows,
@@ -544,6 +841,7 @@ class _BenchmarkWorker(QObject):
                 "resolution": cfg.resolution_key,
                 "use_hg": bool(cfg.use_hg),
                 "predequantize_mode": cfg.predequantize_mode,
+                "benchmark_runtime": cfg.runtime_mode,
                 "session_dir": cfg.session_dir,
                 "row": dict(row),
             }
@@ -554,26 +852,7 @@ class _BenchmarkWorker(QObject):
 
     @staticmethod
     def _to_u8_for_alignment(frame: np.ndarray | None) -> np.ndarray | None:
-        if not isinstance(frame, np.ndarray):
-            return None
-        arr = np.ascontiguousarray(frame)
-        if arr.dtype == np.uint8:
-            return arr
-        if arr.dtype == np.uint16:
-            return np.ascontiguousarray(
-                ((arr.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
-            )
-        if np.issubdtype(arr.dtype, np.integer):
-            info = np.iinfo(arr.dtype)
-            peak = max(1.0, float(info.max))
-            return np.ascontiguousarray(
-                (arr.astype(np.float32) * (255.0 / peak)).clip(0.0, 255.0).astype(np.uint8)
-            )
-        arr_f = arr.astype(np.float32)
-        peak = float(np.max(arr_f)) if arr_f.size else 1.0
-        if peak <= 1.0:
-            arr_f = arr_f * 255.0
-        return np.ascontiguousarray(arr_f.clip(0.0, 255.0).astype(np.uint8))
+        return _to_u8_for_alignment_frame(frame)
 
     def _compute_metrics_for_pair(
         self,
@@ -599,11 +878,31 @@ class _BenchmarkWorker(QObject):
             model_precision = str(precision_cfg.get("precision") or "fp16")
 
             out_w, out_h = _resolution_dims(cfg.resolution_key)
+            compile_cache_ready = False
+            compile_precision_arg = "auto"
+            compile_pdq_mode = "auto"
+            if not _IS_NVIDIA:
+                (
+                    compile_cache_ready,
+                    compile_precision_arg,
+                    compile_pdq_mode,
+                ) = _benchmark_compile_cache_ready(
+                    w=out_w,
+                    h=out_h,
+                    precision_key=cfg.precision_key,
+                    model_path=model_path,
+                    use_hg=bool(cfg.use_hg),
+                    predequantize_mode=str(cfg.predequantize_mode),
+                )
             self.progress.emit(
                 0,
                 "Loading TensorRT engine ..."
                 if _IS_NVIDIA
-                else "Loading model in eager mode ...",
+                else (
+                    "Loading cached max-autotune model ..."
+                    if compile_cache_ready
+                    else "Loading model in eager mode ..."
+                ),
             )
             if _IS_NVIDIA:
                 processor = HDRTVNetTensorRT(
@@ -615,16 +914,27 @@ class _BenchmarkWorker(QObject):
                     mode_name=f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}",
                     use_hg=bool(cfg.use_hg),
                 )
+                cfg.runtime_mode = "TensorRT"
             else:
                 processor = HDRTVNetTorch(
                     model_path,
                     device="auto",
                     precision=model_precision,
-                    compile_model=False,
-                    compile_mode="default",
+                    compile_model=bool(compile_cache_ready),
+                    force_compile=bool(compile_cache_ready),
+                    compile_mode="max-autotune" if compile_cache_ready else "default",
                     predequantize=_resolve_predequantize_arg(str(cfg.predequantize_mode)),
                     use_hg=bool(cfg.use_hg),
                 )
+                if getattr(processor, "_compiled", False):
+                    cfg.runtime_mode = (
+                        f"cached max-autotune ({compile_precision_arg}, "
+                        f"predequantize={compile_pdq_mode})"
+                    )
+                elif compile_cache_ready:
+                    cfg.runtime_mode = "eager (compile cache unavailable at load)"
+                else:
+                    cfg.runtime_mode = "eager"
 
             rows: list[dict] = []
             ordered_tasks = sorted(
@@ -640,7 +950,10 @@ class _BenchmarkWorker(QObject):
             allow_post_verify = (
                 str(_BENCHMARK_HDR_GT_MODE) != "exact"
                 and _BENCHMARK_AUTO_POST_VERIFY_ENABLED
-                and _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS > 0
+                and (
+                    _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS is None
+                    or int(_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS) > 0
+                )
             )
             post_verify_candidates: list[tuple[int, BenchmarkTask, float]] = []
 
@@ -724,13 +1037,17 @@ class _BenchmarkWorker(QObject):
                 sdr_eval = np.ascontiguousarray(_letterbox_bgr(sdr_raw, out_w, out_h))
                 gt_eval = np.ascontiguousarray(
                     _letterbox_bgr(
-                        _crop_frame_to_active_area(gt_hdr_raw),
+                        _crop_gt_frame_to_pair_active_area(
+                            gt_hdr_raw,
+                            task.sdr_path,
+                            task.gt_path,
+                        ),
                         out_w,
                         out_h,
                     )
                 )
                 fast_gt_align_score = None
-                if allow_post_verify and str(gt_hdr_mode).startswith("true_hdr_video_fast"):
+                if str(gt_hdr_mode).startswith("true_hdr_video_fast"):
                     sdr_u8 = self._to_u8_for_alignment(sdr_eval)
                     gt_u8 = self._to_u8_for_alignment(gt_eval)
                     if sdr_u8 is not None and gt_u8 is not None:
@@ -810,8 +1127,14 @@ class _BenchmarkWorker(QObject):
                     "source_sdr_path": task.sdr_path,
                     "source_gt_path": task.gt_path,
                     "source_frame_idx": int(task.frame_idx) if task.frame_idx is not None else None,
+                    "gt_frame_idx": int(gt_frame_idx) if gt_frame_idx is not None else None,
+                    "gt_alignment_base_frame_idx": int(gt_frame_idx) if gt_frame_idx is not None else None,
+                    "gt_alignment_offset_frames": 0,
+                    "gt_alignment_score": fast_gt_align_score,
+                    "gt_alignment_search_radius_frames": 0,
                     "gt_decode_mode": str(gt_hdr_mode or ""),
                     "fast_gt_align_score": fast_gt_align_score,
+                    "benchmark_runtime": cfg.runtime_mode,
                     "metrics": metrics,
                 }
                 rows.append(row)
@@ -829,9 +1152,13 @@ class _BenchmarkWorker(QObject):
 
             if allow_post_verify and post_verify_candidates:
                 suspects = sorted(post_verify_candidates, key=lambda x: x[2])
-                max_verify = int(_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS)
-                if max_verify > 0 and len(suspects) > max_verify:
-                    suspects = suspects[:max_verify]
+                max_verify = _BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS
+                if (
+                    max_verify is not None
+                    and int(max_verify) > 0
+                    and len(suspects) > int(max_verify)
+                ):
+                    suspects = suspects[: int(max_verify)]
                 total_verify = max(1, len(suspects))
                 for j, (row_idx, task, fast_score) in enumerate(suspects):
                     if self._is_canceled():
@@ -845,53 +1172,85 @@ class _BenchmarkWorker(QObject):
                         f"Post-verify {j + 1}/{total_verify}: {task.label}",
                     )
 
-                    strict_gt_frame_idx = _map_gt_frame_for_sdr(
+                    row = rows[row_idx]
+                    strict_base_gt_frame_idx = _map_gt_frame_for_sdr(
                         task.sdr_path,
                         task.gt_path,
                         task.frame_idx,
+                    )
+                    sdr_eval_saved = self._to_u8_for_alignment(
+                        read_image_any(str(row.get("sdr_image") or ""))
+                    )
+                    align_info = _local_align_gt_frame_for_benchmark(
+                        sdr_path=task.sdr_path,
+                        gt_path=task.gt_path,
+                        mapped_gt_frame_idx=max(0, int(strict_base_gt_frame_idx or 0)),
+                        sdr_eval_u8=sdr_eval_saved,
+                        out_w=out_w,
+                        out_h=out_h,
+                    )
+                    strict_gt_frame_idx = int(
+                        align_info.get("frame_idx", strict_base_gt_frame_idx or 0) or 0
                     )
                     strict_rgb16 = read_hdr_video_frame_rgb16(
                         task.gt_path,
                         max(0, int(strict_gt_frame_idx or 0)),
                         prefer_fast_seek=False,
                     )
+                    if strict_rgb16 is None and strict_gt_frame_idx != int(
+                        strict_base_gt_frame_idx or 0
+                    ):
+                        strict_gt_frame_idx = max(0, int(strict_base_gt_frame_idx or 0))
+                        strict_rgb16 = read_hdr_video_frame_rgb16(
+                            task.gt_path,
+                            strict_gt_frame_idx,
+                            prefer_fast_seek=False,
+                        )
                     if strict_rgb16 is None:
                         continue
 
-                    row = rows[row_idx]
                     strict_gt_eval = np.ascontiguousarray(
                         _letterbox_bgr(
-                            _crop_frame_to_active_area(
-                                np.ascontiguousarray(strict_rgb16[:, :, ::-1])
+                            _crop_gt_frame_to_pair_active_area(
+                                np.ascontiguousarray(strict_rgb16[:, :, ::-1]),
+                                task.sdr_path,
+                                task.gt_path,
                             ),
                             out_w,
                             out_h,
                         )
                     )
 
-                    sdr_eval_saved = self._to_u8_for_alignment(
-                        read_image_any(str(row.get("sdr_image") or ""))
-                    )
                     strict_u8 = self._to_u8_for_alignment(strict_gt_eval)
-                    if sdr_eval_saved is None or strict_u8 is None:
-                        continue
-                    try:
-                        strict_score = _frame_structure_similarity(
-                            sdr_eval_saved,
-                            strict_u8,
-                        )
-                    except Exception:
-                        strict_score = None
-                    if strict_score is None:
-                        continue
+                    strict_score = None
+                    if sdr_eval_saved is not None and strict_u8 is not None:
+                        try:
+                            strict_score = _frame_structure_similarity(
+                                sdr_eval_saved,
+                                strict_u8,
+                            )
+                        except Exception:
+                            strict_score = None
 
                     replace_reasons: list[str] = []
-                    score_gate = max(
-                        float(_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE),
-                        float(fast_score) + float(_BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN),
-                    )
-                    if float(strict_score) >= score_gate:
-                        replace_reasons.append("better alignment")
+                    try:
+                        align_offset = int(strict_gt_frame_idx) - int(
+                            strict_base_gt_frame_idx or 0
+                        )
+                    except Exception:
+                        align_offset = 0
+                    if align_offset:
+                        replace_reasons.append(
+                            f"local GT alignment {align_offset:+d} frame(s)"
+                        )
+                    if strict_score is not None:
+                        score_gate = max(
+                            float(_BENCHMARK_AUTO_POST_VERIFY_SUSPECT_SCORE),
+                            float(fast_score)
+                            + float(_BENCHMARK_AUTO_POST_VERIFY_IMPROVE_MARGIN),
+                        )
+                        if float(strict_score) >= score_gate:
+                            replace_reasons.append("better alignment")
 
                     gt_path_saved = str(row.get("hdr_gt_image") or "").strip()
                     fast_gt_saved = read_image_any(gt_path_saved) if gt_path_saved else None
@@ -944,9 +1303,6 @@ class _BenchmarkWorker(QObject):
                         except Exception:
                             pass
 
-                    if not replace_reasons:
-                        continue
-
                     pred_eval_saved = read_image_any(str(row.get("hdr_convert_image") or ""))
                     if pred_eval_saved is None:
                         continue
@@ -973,13 +1329,36 @@ class _BenchmarkWorker(QObject):
                         pred_eval_saved,
                         strict_gt_eval,
                     )
+                    verify_reasons = replace_reasons or ["exact verified"]
                     if strict_metrics.get("obj_note"):
                         strict_metrics["obj_note"] = (
-                            f"{strict_metrics['obj_note']} [exact rerun: {', '.join(replace_reasons)}]"
+                            f"{strict_metrics['obj_note']} [post-verify: {', '.join(verify_reasons)}]"
                         )
                     row["metrics"] = strict_metrics
-                    row["gt_decode_mode"] = "true_hdr_video_exact_rerun"
-                    row["fast_gt_align_score"] = float(strict_score)
+                    row["gt_decode_mode"] = (
+                        "true_hdr_video_exact_aligned"
+                        if align_offset
+                        else "true_hdr_video_exact_verified"
+                    )
+                    if strict_score is not None:
+                        row["fast_gt_align_score"] = float(strict_score)
+                    row["gt_frame_idx"] = int(strict_gt_frame_idx)
+                    row["gt_alignment_base_frame_idx"] = int(
+                        strict_base_gt_frame_idx or 0
+                    )
+                    row["gt_alignment_best_frame_idx"] = int(
+                        align_info.get("best_frame_idx", strict_gt_frame_idx) or strict_gt_frame_idx
+                    )
+                    row["gt_alignment_offset_frames"] = int(align_offset)
+                    row["gt_alignment_score"] = (
+                        None if strict_score is None else float(strict_score)
+                    )
+                    row["gt_alignment_base_score"] = align_info.get("base_score")
+                    row["gt_alignment_best_score"] = align_info.get("best_score")
+                    row["gt_alignment_search_radius_frames"] = int(
+                        align_info.get("search_radius_frames", _BENCHMARK_GT_LOCAL_SEARCH_FRAMES)
+                        or 0
+                    )
 
                     if gt_path_saved:
                         write_hdr_tiff(gt_path_saved, strict_gt_eval)
@@ -996,6 +1375,7 @@ class _BenchmarkWorker(QObject):
                     "use_hg": bool(cfg.use_hg),
                     "resolution": cfg.resolution_key,
                     "predequantize_mode": cfg.predequantize_mode,
+                    "benchmark_runtime": cfg.runtime_mode,
                     "session_dir": cfg.session_dir,
                     "summary_csv": summary_csv,
                     "summary_json": summary_json,
@@ -1126,7 +1506,7 @@ class ModelBenchmarkDialog(QDialog):
         self._expanded_preview_pane: int | None = None
         self._reset_preview_splitter_on_show = True
         self._ffmpeg_hdr_warning_shown = False
-        self._preview_processor_cache: dict[tuple[str, bool, str], HDRTVNetTorch] = {}
+        self._preview_processor_cache: dict[tuple[str, bool, str, str], HDRTVNetTorch] = {}
         self._frame_detect_cache_path = os.path.join(self._logs_root, "benchmark_frame_cache.json")
         self._frame_detect_cache = self._load_frame_detect_cache()
 
@@ -1135,7 +1515,7 @@ class ModelBenchmarkDialog(QDialog):
         root.setSpacing(10)
 
         intro = QLabel(
-            "Benchmark model quality in eager mode only. "
+            "Benchmark model quality with TensorRT on NVIDIA, cached max-autotune on AMD when available, or eager fallback. "
             "You can benchmark a single SDR/HDR-GT video pair or a paired SDR/HDR-GT dataset, "
             "review images (SDR, HDR GT, HDR Convert), and export metrics with images."
         )
@@ -1296,7 +1676,10 @@ class ModelBenchmarkDialog(QDialog):
 
         self._cmb_resolution = QComboBox()
         self._cmb_resolution.addItems(list(RESOLUTION_SCALES.keys()))
-        self._cmb_resolution.setCurrentText("1080p")
+        if DEFAULT_RESOLUTION_KEY in RESOLUTION_SCALES:
+            self._cmb_resolution.setCurrentText(DEFAULT_RESOLUTION_KEY)
+        else:
+            self._cmb_resolution.setCurrentText("1080p")
 
         self._cmb_predequantize = QComboBox()
         self._cmb_predequantize.addItem("Auto", "auto")
@@ -2066,9 +2449,10 @@ class ModelBenchmarkDialog(QDialog):
         precision = str(self._result_precision or "").strip()
         use_hg = self._result_use_hg
         predequantize_mode = str(self._result_predequantize_mode or "auto").strip() or "auto"
+        resolution_key = str(self._result_resolution or "1080p").strip() or "1080p"
         if not precision or use_hg is None:
             return None
-        key = (precision, bool(use_hg), predequantize_mode)
+        key = (precision, bool(use_hg), predequantize_mode, resolution_key)
         cached = self._preview_processor_cache.get(key)
         if cached is not None:
             return cached
@@ -2079,9 +2463,7 @@ class ModelBenchmarkDialog(QDialog):
         model_precision = str(precision_cfg.get("precision") or "fp16")
         try:
             if _IS_NVIDIA:
-                out_w, out_h = _resolution_dims(
-                    str(getattr(self, "_result_resolution_key", "") or "1080p")
-                )
+                out_w, out_h = _resolution_dims(resolution_key)
                 processor = HDRTVNetTensorRT(
                     model_path,
                     device="auto",
@@ -2092,12 +2474,22 @@ class ModelBenchmarkDialog(QDialog):
                     use_hg=bool(use_hg),
                 )
             else:
+                out_w, out_h = _resolution_dims(resolution_key)
+                compile_ready, _compile_arg, _compile_pdq = _benchmark_compile_cache_ready(
+                    w=out_w,
+                    h=out_h,
+                    precision_key=precision,
+                    model_path=model_path,
+                    use_hg=bool(use_hg),
+                    predequantize_mode=predequantize_mode,
+                )
                 processor = HDRTVNetTorch(
                     model_path,
                     device="auto",
                     precision=model_precision,
-                    compile_model=False,
-                    compile_mode="default",
+                    compile_model=bool(compile_ready),
+                    force_compile=bool(compile_ready),
+                    compile_mode="max-autotune" if compile_ready else "default",
                     predequantize=_resolve_predequantize_arg(predequantize_mode),
                     use_hg=bool(use_hg),
                 )
@@ -2131,7 +2523,11 @@ class ModelBenchmarkDialog(QDialog):
         if isinstance(gt_hdr_src, np.ndarray):
             gt_preview = np.ascontiguousarray(
                 _letterbox_bgr(
-                    _crop_frame_to_active_area(gt_hdr_src),
+                    _crop_gt_frame_to_pair_active_area(
+                        gt_hdr_src,
+                        sdr_path,
+                        gt_path,
+                    ),
                     out_w,
                     out_h,
                 )

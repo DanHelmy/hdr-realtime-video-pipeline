@@ -42,6 +42,10 @@ PRECISIONS = {
     },
 }
 
+DEFAULT_PRECISION_KEY = "INT8 Mixed (QAT)"
+DEFAULT_RESOLUTION_KEY = "720p"
+DEFAULT_USE_HG = False
+
 
 def _select_model_path(precision_key: str, use_hg: bool) -> str:
     cfg = PRECISIONS.get(precision_key, {})

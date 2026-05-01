@@ -99,6 +99,9 @@ class _CompareVideoPane(QWidget):
         self._title = str(title)
         self._force_hdr_metadata = bool(force_hdr_metadata)
         self._last_size: tuple[int, int] | None = None
+        self._last_frame: np.ndarray | None = None
+        self._last_unavailable_text = self._title
+        self._last_mpv_error: str | None = None
         self._mpv = None
         self._stack: QStackedWidget | None = None
         self._mpv_widget_factory = mpv_widget_factory
@@ -165,6 +168,11 @@ class _CompareVideoPane(QWidget):
         self._last_size = size
 
     def set_frame(self, bgr: np.ndarray | None, unavailable_text: str):
+        self._last_unavailable_text = str(unavailable_text or self._title)
+        self._last_frame = (
+            np.ascontiguousarray(bgr) if isinstance(bgr, np.ndarray) else None
+        )
+        self._last_mpv_error = None
         if not isinstance(bgr, np.ndarray):
             if self._mpv is not None:
                 try:
@@ -173,28 +181,55 @@ class _CompareVideoPane(QWidget):
                     pass
                 self._last_size = None
             self._cpu.clear_display()
-            self._cpu.setText(unavailable_text)
+            self._cpu.setText(self._last_unavailable_text)
             if self._stack is not None:
                 self._stack.setCurrentWidget(self._cpu)
             return
 
-        h, w = bgr.shape[:2]
+        frame = self._last_frame
+        h, w = frame.shape[:2]
         if self._mpv is not None and self._stack is not None:
             try:
                 self._ensure_mpv(w, h)
-                self._mpv.feed_frame(frame_to_rgb48_bytes(bgr))
+                self._mpv.feed_frame(frame_to_rgb48_bytes(frame))
                 self._stack.setCurrentWidget(self._mpv)
                 return
-            except Exception:
+            except Exception as exc:
                 # Graceful fallback to CPU preview when mpv path fails.
+                self._last_mpv_error = str(exc)
                 pass
 
-        cpu_frame = np.ascontiguousarray(bgr)
+        cpu_frame = np.ascontiguousarray(frame)
         if cpu_frame.dtype == np.uint16:
             cpu_frame = ((cpu_frame.astype(np.float32) / 65535.0) * 255.0).astype(np.uint8)
         self._cpu.update_frame(cpu_frame)
         if self._stack is not None:
             self._stack.setCurrentWidget(self._cpu)
+
+    def refresh_surface(self) -> bool:
+        frame = self._last_frame
+        if self._mpv is None or self._stack is None or not isinstance(frame, np.ndarray):
+            return False
+        try:
+            h, w = frame.shape[:2]
+            # Recreate the rawvideo surface on the current monitor so HDR
+            # metadata is re-evaluated after show/move/screen changes.
+            self._last_size = None
+            self._ensure_mpv(w, h)
+            self._mpv.feed_frame(frame_to_rgb48_bytes(frame))
+            self._stack.setCurrentWidget(self._mpv)
+            self._last_mpv_error = None
+            return True
+        except Exception as exc:
+            self._last_mpv_error = str(exc)
+            cpu_frame = np.ascontiguousarray(frame)
+            if cpu_frame.dtype == np.uint16:
+                cpu_frame = (
+                    (cpu_frame.astype(np.float32) / 65535.0) * 255.0
+                ).astype(np.uint8)
+            self._cpu.update_frame(cpu_frame)
+            self._stack.setCurrentWidget(self._cpu)
+            return False
 
     def stop(self):
         if self._mpv is not None:
@@ -230,6 +265,8 @@ class CompareFrameDialog(QDialog):
         self.setSizeGripEnabled(True)
         self.setWindowTitle("Frame Compare")
         self.resize(1500, 760)
+        self._screen_hook_handle = None
+        self._compare_surface_refresh_queued = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -375,8 +412,51 @@ class CompareFrameDialog(QDialog):
         one = max(1, total // 3)
         self._split_compare.setSizes([one, one, max(1, total - (2 * one))])
 
+    def _compare_panes(self):
+        return (self._disp_sdr, self._disp_gt, self._disp_algo)
+
+    def _attach_screen_change_hook(self):
+        try:
+            handle = self.windowHandle()
+        except Exception:
+            handle = None
+        if handle is None or handle is self._screen_hook_handle:
+            return
+        if self._screen_hook_handle is not None:
+            try:
+                self._screen_hook_handle.screenChanged.disconnect(
+                    self._on_screen_changed
+                )
+            except Exception:
+                pass
+        try:
+            handle.screenChanged.connect(self._on_screen_changed)
+        except Exception:
+            return
+        self._screen_hook_handle = handle
+
+    def _schedule_compare_surface_refresh(self, delay_ms: int = 0):
+        if self._compare_surface_refresh_queued:
+            return
+        self._compare_surface_refresh_queued = True
+
+        def _refresh():
+            self._compare_surface_refresh_queued = False
+            if not self.isVisible():
+                return
+            self._attach_screen_change_hook()
+            for pane in self._compare_panes():
+                pane.refresh_surface()
+
+        QTimer.singleShot(max(0, int(delay_ms)), _refresh)
+
+    def _on_screen_changed(self, _screen=None):
+        self._schedule_compare_surface_refresh(40)
+
     def showEvent(self, event):
         super().showEvent(event)
+        self._attach_screen_change_hook()
+        self._schedule_compare_surface_refresh(0)
         if bool(getattr(self, "_reset_splitter_on_show", False)):
             self._reset_splitter_on_show = False
             QTimer.singleShot(0, self._reset_compare_splitter_sizes)
@@ -522,6 +602,15 @@ class CompareFrameDialog(QDialog):
 
     def closeEvent(self, event):
         self._reset_splitter_on_show = True
+        self._compare_surface_refresh_queued = False
+        if self._screen_hook_handle is not None:
+            try:
+                self._screen_hook_handle.screenChanged.disconnect(
+                    self._on_screen_changed
+                )
+            except Exception:
+                pass
+            self._screen_hook_handle = None
         self._disp_sdr.stop()
         self._disp_gt.stop()
         self._disp_algo.stop()

@@ -11,6 +11,46 @@ import subprocess
 import cv2
 import numpy as np
 
+_IMAGE_FILE_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
+    ".exr",
+    ".hdr",
+    ".dpx",
+    ".ppm",
+    ".pgm",
+    ".pfm",
+}
+_VIDEO_FILE_EXTS = {
+    ".mp4",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".avi",
+    ".webm",
+    ".flv",
+    ".wmv",
+    ".mpg",
+    ".mpeg",
+    ".ts",
+    ".m2ts",
+    ".mts",
+    ".ogv",
+    ".3gp",
+}
+
+
+def _looks_like_video_path(path: str | None) -> bool:
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in _IMAGE_FILE_EXTS:
+        return False
+    return ext in _VIDEO_FILE_EXTS
+
 
 def _probe_hdr_input(video_path: str) -> dict:
     """Detect whether the input stream appears to be HDR."""
@@ -139,6 +179,8 @@ def _norm_path(path: str | None) -> str | None:
 def _probe_video_timing_info(video_path: str) -> dict | None:
     """Read basic video timing/geometry info via OpenCV."""
     if not video_path or not os.path.isfile(video_path):
+        return None
+    if not _looks_like_video_path(video_path):
         return None
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -280,6 +322,192 @@ def _crop_frame_to_active_area(frame_bgr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(frame_bgr[top:bottom, left:right])
 
 
+_PAIR_GT_ACTIVE_CROP_CACHE: dict[tuple, dict | None] = {}
+
+
+def _center_crop_bounds_for_aspect(
+    width: int,
+    height: int,
+    target_aspect: float,
+) -> tuple[int, int, int, int] | None:
+    """Return a stable centered crop matching target_aspect."""
+    w = int(width)
+    h = int(height)
+    ar = float(target_aspect or 0.0)
+    if w <= 1 or h <= 1 or ar <= 0.0:
+        return None
+    current_ar = float(w) / float(h)
+    if abs(current_ar - ar) <= 0.01:
+        return None
+
+    if ar > current_ar:
+        new_h = int(round(float(w) / ar))
+        if new_h <= 0 or new_h >= h:
+            return None
+        if new_h < int(round(h * 0.45)):
+            return None
+        top = max(0, (h - new_h) // 2)
+        bottom = min(h, top + new_h)
+        return top, bottom, 0, w
+
+    new_w = int(round(float(h) * ar))
+    if new_w <= 0 or new_w >= w:
+        return None
+    if new_w < int(round(w * 0.45)):
+        return None
+    left = max(0, (w - new_w) // 2)
+    right = min(w, left + new_w)
+    return 0, h, left, right
+
+
+def _stable_active_aspect_from_info(
+    info: dict | None,
+    *,
+    width: int,
+    height: int,
+) -> float:
+    if not isinstance(info, dict):
+        return 0.0
+    if not bool(info.get("cropped_bars", False)):
+        return 0.0
+    try:
+        active_w = int(info.get("active_width") or 0)
+        active_h = int(info.get("active_height") or 0)
+        active_ar = float(info.get("active_aspect") or 0.0)
+    except Exception:
+        return 0.0
+    if active_w <= 0 or active_h <= 0 or active_ar <= 0.0:
+        return 0.0
+    # Accept real letterbox/pillarbox estimates, but reject tiny object crops
+    # from dark or low-detail samples. The actual crop rectangle stays geometric.
+    if active_w < int(round(float(width) * 0.72)):
+        return 0.0
+    if active_h < int(round(float(height) * 0.42)):
+        return 0.0
+    return float(active_ar)
+
+
+def _scale_crop_info_to_frame(
+    crop_info: dict,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int] | None:
+    try:
+        src_w = int(crop_info.get("width") or 0)
+        src_h = int(crop_info.get("height") or 0)
+        top, bottom, left, right = crop_info.get("bounds") or (0, 0, 0, 0)
+        top = int(top)
+        bottom = int(bottom)
+        left = int(left)
+        right = int(right)
+    except Exception:
+        return None
+    if src_w <= 0 or src_h <= 0 or frame_w <= 0 or frame_h <= 0:
+        return None
+    if src_w != int(frame_w):
+        left = int(round(float(left) * float(frame_w) / float(src_w)))
+        right = int(round(float(right) * float(frame_w) / float(src_w)))
+    if src_h != int(frame_h):
+        top = int(round(float(top) * float(frame_h) / float(src_h)))
+        bottom = int(round(float(bottom) * float(frame_h) / float(src_h)))
+    top = max(0, min(int(frame_h) - 1, top))
+    bottom = max(top + 1, min(int(frame_h), bottom))
+    left = max(0, min(int(frame_w) - 1, left))
+    right = max(left + 1, min(int(frame_w), right))
+    if top <= 0 and left <= 0 and bottom >= frame_h and right >= frame_w:
+        return None
+    return top, bottom, left, right
+
+
+def _video_pair_gt_active_crop_info(
+    source_path: str,
+    candidate_path: str,
+) -> dict | None:
+    """Compute one stable GT crop rectangle for the whole video pair."""
+    if not (
+        _looks_like_video_path(source_path)
+        and _looks_like_video_path(candidate_path)
+    ):
+        return None
+    cache_key = _video_sync_cache_key(source_path, candidate_path, 0)
+    if cache_key in _PAIR_GT_ACTIVE_CROP_CACHE:
+        cached = _PAIR_GT_ACTIVE_CROP_CACHE.get(cache_key)
+        return dict(cached) if isinstance(cached, dict) else None
+
+    crop_info = None
+    try:
+        src_meta = _probe_video_timing_info(source_path)
+        gt_meta = _probe_video_timing_info(candidate_path)
+        if not isinstance(src_meta, dict) or not isinstance(gt_meta, dict):
+            raise ValueError("missing media metadata")
+        src_w = int(src_meta.get("width") or 0)
+        src_h = int(src_meta.get("height") or 0)
+        gt_w = int(gt_meta.get("width") or 0)
+        gt_h = int(gt_meta.get("height") or 0)
+        if src_w <= 0 or src_h <= 0 or gt_w <= 0 or gt_h <= 0:
+            raise ValueError("invalid media dimensions")
+
+        src_ar = float(src_w) / float(src_h)
+        gt_ar = float(gt_w) / float(gt_h)
+        if abs(src_ar - gt_ar) > 0.01:
+            src_active = _probe_video_active_area_info(source_path, sample_count=5)
+            src_active_ar = _stable_active_aspect_from_info(
+                src_active,
+                width=src_w,
+                height=src_h,
+            )
+            target_ar = src_active_ar if src_active_ar > 0.0 else src_ar
+            bounds = _center_crop_bounds_for_aspect(gt_w, gt_h, target_ar)
+            if bounds is not None:
+                top, bottom, left, right = bounds
+                crop_info = {
+                    "width": int(gt_w),
+                    "height": int(gt_h),
+                    "bounds": (
+                        int(top),
+                        int(bottom),
+                        int(left),
+                        int(right),
+                    ),
+                    "target_aspect": float(target_ar),
+                    "source_aspect": float(src_ar),
+                    "gt_aspect": float(gt_ar),
+                }
+    except Exception:
+        crop_info = None
+
+    _PAIR_GT_ACTIVE_CROP_CACHE[cache_key] = dict(crop_info) if crop_info else None
+    return dict(crop_info) if crop_info else None
+
+
+def _video_pair_should_crop_gt_active_area(
+    source_path: str,
+    candidate_path: str,
+) -> bool:
+    """Only crop GT bars when the encoded pair genuinely has different canvas AR."""
+    return _video_pair_gt_active_crop_info(source_path, candidate_path) is not None
+
+
+def _crop_gt_frame_to_pair_active_area(
+    frame_bgr: np.ndarray,
+    source_path: str,
+    candidate_path: str,
+) -> np.ndarray:
+    if frame_bgr is None or frame_bgr.ndim < 2:
+        return frame_bgr
+    crop_info = _video_pair_gt_active_crop_info(source_path, candidate_path)
+    if not isinstance(crop_info, dict):
+        return frame_bgr
+    h, w = frame_bgr.shape[:2]
+    bounds = _scale_crop_info_to_frame(crop_info, w, h)
+    if bounds is None:
+        return frame_bgr
+    top, bottom, left, right = bounds
+    if bottom <= top or right <= left:
+        return frame_bgr
+    return np.ascontiguousarray(frame_bgr[top:bottom, left:right])
+
+
 def _probe_video_active_area_info(
     video_path: str,
     sample_count: int = 7,
@@ -413,6 +641,16 @@ def _video_sync_search_seconds() -> float:
     return 2.0
 
 
+def _video_sync_offset_min_gain() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("HDRTVNET_GT_SYNC_OFFSET_MIN_GAIN", "0.06")),
+        )
+    except Exception:
+        return 0.06
+
+
 def _video_sync_cache_key(
     source_path: str,
     candidate_path: str,
@@ -437,15 +675,16 @@ def _video_sync_cache_key(
     )
 
 
-def _video_sync_offset_candidates(gt_fps: float) -> list[int]:
+def _video_sync_offset_candidates(
+    gt_fps: float,
+    duration_delta_s: float = 0.0,
+) -> list[int]:
     fps = float(gt_fps or 0.0)
     if fps <= 0.0:
         fps = 24.0
-    max_frames = max(2, int(round(fps * _video_sync_search_seconds())))
-    offsets = {0, -1, 1, -2, 2}
-    near = min(max_frames, int(round(fps)))
-    for off in range(-near, near + 1):
-        offsets.add(off)
+    max_frames = max(6, int(round(fps * _video_sync_search_seconds())))
+    small_near = min(max_frames, 6)
+    offsets = set(range(-small_near, small_near + 1))
     coarse_step = max(3, int(round(fps * 0.25)))
     for off in range(-max_frames, max_frames + 1, coarse_step):
         offsets.add(off)
@@ -458,6 +697,17 @@ def _probe_video_sync_info(
     sample_count: int = 5,
 ) -> dict:
     """Estimate same-content score and a constant GT frame offset."""
+    if not (
+        _looks_like_video_path(source_path)
+        and _looks_like_video_path(candidate_path)
+    ):
+        return {
+            "score": None,
+            "offset_score": None,
+            "sampled": 0,
+            "offset_frames": 0,
+            "offset_s": 0.0,
+        }
     if sample_count < 1:
         sample_count = 1
     cache_key = _video_sync_cache_key(source_path, candidate_path, sample_count)
@@ -491,9 +741,13 @@ def _probe_video_sync_info(
         src_fps = float(cap_src.get(cv2.CAP_PROP_FPS) or 0.0)
         gt_fps = float(cap_gt.get(cv2.CAP_PROP_FPS) or 0.0)
         if src_fps > 0.0 and gt_fps > 0.0:
-            max_duration_s = min(float(src_n) / src_fps, float(gt_n) / gt_fps)
+            src_duration_s = float(src_n) / src_fps
+            gt_duration_s = float(gt_n) / gt_fps
+            max_duration_s = min(src_duration_s, gt_duration_s)
+            duration_delta_s = abs(src_duration_s - gt_duration_s)
         else:
             max_duration_s = 0.0
+            duration_delta_s = 0.0
         probe_count = max(int(sample_count), 3)
         if max_duration_s > 2.0 and src_fps > 0.0 and gt_fps > 0.0:
             # Avoid leader/trailer/fade samples. They are common in movie
@@ -557,30 +811,45 @@ def _probe_video_sync_info(
                     idx_to_offsets.setdefault(int(gt_idx), []).append(int(offset))
                 if not idx_to_offsets:
                     continue
-                start_idx = min(idx_to_offsets)
-                end_idx = max(idx_to_offsets)
-                cap_gt.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
-                for gt_idx in range(start_idx, end_idx + 1):
-                    ok, gt_frame = cap_gt.read()
-                    if not ok or gt_frame is None:
-                        break
+                target_idxs = sorted(idx_to_offsets)
+
+                def _score_gt_frame(gt_idx: int, gt_frame: np.ndarray) -> None:
+                    nonlocal best_for_sample
                     offsets_for_idx = idx_to_offsets.get(int(gt_idx))
                     if not offsets_for_idx:
-                        continue
+                        return
                     gt_texture = _frame_texture_score(gt_frame)
                     if max(src_texture, gt_texture) < 4.0:
-                        continue
+                        return
                     s = _frame_structure_similarity(src_frame, gt_frame)
                     if s is None:
-                        continue
+                        return
                     for offset in offsets_for_idx:
                         offset_scores.setdefault(offset, []).append(float(s))
                     if best_for_sample is None or float(s) > best_for_sample:
                         best_for_sample = float(s)
+
+                start_idx = target_idxs[0]
+                end_idx = target_idxs[-1]
+                span = max(1, int(end_idx - start_idx + 1))
+                if len(target_idxs) * 2 < span:
+                    for gt_idx in target_idxs:
+                        cap_gt.set(cv2.CAP_PROP_POS_FRAMES, int(gt_idx))
+                        ok, gt_frame = cap_gt.read()
+                        if not ok or gt_frame is None:
+                            continue
+                        _score_gt_frame(int(gt_idx), gt_frame)
+                else:
+                    cap_gt.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+                    for gt_idx in range(start_idx, end_idx + 1):
+                        ok, gt_frame = cap_gt.read()
+                        if not ok or gt_frame is None:
+                            break
+                        _score_gt_frame(int(gt_idx), gt_frame)
                 if best_for_sample is not None:
                     per_sample_best.append(float(best_for_sample))
 
-        initial_offsets = _video_sync_offset_candidates(gt_fps)
+        initial_offsets = _video_sync_offset_candidates(gt_fps, duration_delta_s)
         _score_offsets(initial_offsets)
 
         summaries: dict[int, tuple[float, int]] = {}
@@ -626,6 +895,23 @@ def _probe_video_sync_info(
                 summaries.items(),
                 key=lambda item: (item[1][0], item[1][1], -abs(item[0])),
             )
+            zero_summary = summaries.get(0)
+            zero_score_out = None
+            offset_gain = None
+            if best_offset != 0 and zero_summary is not None:
+                zero_score, zero_count = zero_summary
+                zero_score_out = float(zero_score)
+                offset_gain = float(best_score) - float(zero_score)
+                required_gain = _video_sync_offset_min_gain()
+                if abs(int(best_offset)) <= 5:
+                    required_gain = max(required_gain, 0.08)
+                if float(best_score) < (float(zero_score) + float(required_gain)):
+                    best_offset = 0
+                    best_score = float(zero_score)
+                    best_count = int(zero_count)
+            elif zero_summary is not None:
+                zero_score_out = float(zero_summary[0])
+                offset_gain = float(best_score) - float(zero_summary[0])
             flexible_score = _content_similarity_summary(per_sample_best)
             final_score = best_score
             if flexible_score is not None:
@@ -643,6 +929,8 @@ def _probe_video_sync_info(
                 "offset_s": float(offset_s),
                 "source_fps": float(src_fps),
                 "gt_fps": float(gt_fps),
+                "zero_offset_score": zero_score_out,
+                "offset_gain": offset_gain,
             }
         _VIDEO_SYNC_INFO_CACHE[cache_key] = dict(info)
         return info
@@ -675,6 +963,11 @@ def _map_video_pair_frame_index(
 ) -> int:
     """Map a source frame index onto the synced GT timeline."""
     idx = max(0, int(source_frame_idx))
+    if not (
+        _looks_like_video_path(source_path)
+        and _looks_like_video_path(candidate_path)
+    ):
+        return idx
     src_meta = _probe_video_timing_info(source_path)
     gt_meta = _probe_video_timing_info(candidate_path)
     if gt_meta is None:

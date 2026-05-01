@@ -5,6 +5,7 @@ import os
 from PyQt6.QtCore import QTimer, Qt
 
 from gui_config import (
+    DEFAULT_USE_HG,
     PRECISIONS,
     RESOLUTION_SCALES,
     SOURCE_MODE_VIDEO,
@@ -31,7 +32,7 @@ class StateInitMixin:
         self._active_resolution = None
         self._active_use_mpv = False
         self._sdr_mpv_feed_from_worker = False
-        self._active_use_hg = True
+        self._active_use_hg = bool(DEFAULT_USE_HG)
         self._active_film_grain = False
         self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
         self._last_seek_frame = 0
