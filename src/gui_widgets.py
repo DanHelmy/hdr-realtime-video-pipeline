@@ -266,7 +266,6 @@ class CompareFrameDialog(QDialog):
         self.setWindowTitle("Frame Compare")
         self.resize(1500, 760)
         self._screen_hook_handle = None
-        self._compare_surface_refresh_queued = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -435,28 +434,12 @@ class CompareFrameDialog(QDialog):
             return
         self._screen_hook_handle = handle
 
-    def _schedule_compare_surface_refresh(self, delay_ms: int = 0):
-        if self._compare_surface_refresh_queued:
-            return
-        self._compare_surface_refresh_queued = True
-
-        def _refresh():
-            self._compare_surface_refresh_queued = False
-            if not self.isVisible():
-                return
-            self._attach_screen_change_hook()
-            for pane in self._compare_panes():
-                pane.refresh_surface()
-
-        QTimer.singleShot(max(0, int(delay_ms)), _refresh)
-
     def _on_screen_changed(self, _screen=None):
-        self._schedule_compare_surface_refresh(40)
+        return
 
     def showEvent(self, event):
         super().showEvent(event)
         self._attach_screen_change_hook()
-        self._schedule_compare_surface_refresh(0)
         if bool(getattr(self, "_reset_splitter_on_show", False)):
             self._reset_splitter_on_show = False
             QTimer.singleShot(0, self._reset_compare_splitter_sizes)
@@ -602,7 +585,6 @@ class CompareFrameDialog(QDialog):
 
     def closeEvent(self, event):
         self._reset_splitter_on_show = True
-        self._compare_surface_refresh_queued = False
         if self._screen_hook_handle is not None:
             try:
                 self._screen_hook_handle.screenChanged.disconnect(

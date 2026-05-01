@@ -847,6 +847,7 @@ class VideoExportWorker(QObject):
             self.progress.emit(0, "Preparing export pipeline ...")
 
             vf_filters: list[str] = []
+            vf_filters.append("deband")
             vf_filters.append(
                 "zscale="
                 "matrixin=gbr:"
@@ -857,7 +858,7 @@ class VideoExportWorker(QObject):
                 "transfer=smpte2084:"
                 "primaries=bt2020:"
                 "range=limited:"
-                f"dither=none:npl={EXPORT_HDR_TARGET_PEAK_NITS:.0f}"
+                f"dither=error_diffusion:npl={EXPORT_HDR_TARGET_PEAK_NITS:.0f}"
             )
             vf_filters.append("format=yuv422p10le")
             if abs(float(self._config.fps) - src_fps) > 1e-3:

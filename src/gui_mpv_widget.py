@@ -78,22 +78,32 @@ def _mpv_deband_options(*, live_capture: bool = False) -> dict:
     env_prefix = "HDRTVNET_BROWSER_MPV_" if live_capture else "HDRTVNET_MPV_"
     if not _env_bool_any((f"{env_prefix}DEBAND", "HDRTVNET_MPV_DEBAND"), True):
         return {}
-    if live_capture:
-        default_iterations = 3
-        default_threshold = 96.0
-        default_range = 32
-        default_grain = 20.0
-    else:
-        default_iterations = 2
-        default_threshold = 28.0
-        default_range = 16
-        default_grain = 6.0
+
+    # Keep video-player defaults aligned with browser-window capture so
+    # quality characteristics match between both source modes.
+    default_iterations = 3
+    default_threshold = 96.0
+    default_range = 32
+    default_grain = 20.0
+
     return {
         "deband": "yes",
-        "deband_iterations": str(_env_int_any((f"{env_prefix}DEBAND_ITERATIONS", "HDRTVNET_MPV_DEBAND_ITERATIONS"), default_iterations, min_value=1, max_value=16)),
-        "deband_threshold": str(_env_float_any((f"{env_prefix}DEBAND_THRESHOLD", "HDRTVNET_MPV_DEBAND_THRESHOLD"), default_threshold, min_value=0.0, max_value=4096.0)),
-        "deband_range": str(_env_int_any((f"{env_prefix}DEBAND_RANGE", "HDRTVNET_MPV_DEBAND_RANGE"), default_range, min_value=1, max_value=64)),
-        "deband_grain": str(_env_float_any((f"{env_prefix}DEBAND_GRAIN", "HDRTVNET_MPV_DEBAND_GRAIN"), default_grain, min_value=0.0, max_value=4096.0)),
+        "deband_iterations": str(_env_int_any(
+            (f"{env_prefix}DEBAND_ITERATIONS", "HDRTVNET_BROWSER_MPV_DEBAND_ITERATIONS", "HDRTVNET_MPV_DEBAND_ITERATIONS"),
+            default_iterations, min_value=1, max_value=16
+        )),
+        "deband_threshold": str(_env_float_any(
+            (f"{env_prefix}DEBAND_THRESHOLD", "HDRTVNET_BROWSER_MPV_DEBAND_THRESHOLD", "HDRTVNET_MPV_DEBAND_THRESHOLD"),
+            default_threshold, min_value=0.0, max_value=4096.0
+        )),
+        "deband_range": str(_env_int_any(
+            (f"{env_prefix}DEBAND_RANGE", "HDRTVNET_BROWSER_MPV_DEBAND_RANGE", "HDRTVNET_MPV_DEBAND_RANGE"),
+            default_range, min_value=1, max_value=64
+        )),
+        "deband_grain": str(_env_float_any(
+            (f"{env_prefix}DEBAND_GRAIN", "HDRTVNET_BROWSER_MPV_DEBAND_GRAIN", "HDRTVNET_MPV_DEBAND_GRAIN"),
+            default_grain, min_value=0.0, max_value=4096.0
+        )),
     }
 
 
@@ -112,7 +122,10 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
     depth = str(
         os.environ.get(
             f"{env_prefix}DITHER_DEPTH",
-            os.environ.get("HDRTVNET_MPV_DITHER_DEPTH", "auto"),
+            os.environ.get(
+                "HDRTVNET_BROWSER_MPV_DITHER_DEPTH",
+                os.environ.get("HDRTVNET_MPV_DITHER_DEPTH", "auto"),
+            )
         )
     ).strip().lower()
     if depth not in {"auto", "no"}:
@@ -137,6 +150,17 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
         options["temporal_dither_period"] = str(_env_int_any((f"{env_prefix}TEMPORAL_DITHER_PERIOD", "HDRTVNET_MPV_TEMPORAL_DITHER_PERIOD"), 1, min_value=1, max_value=128))
     return options
 
+def _env_hdr_target_peak_nits() -> str:
+    raw = str(os.environ.get("HDRTVNET_MPV_HDR_TARGET_PEAK_NITS", "auto") or "auto").strip().lower()
+    if raw == "auto":
+        return "auto"
+    try:
+        val = float(raw)
+    except Exception:
+        return "auto"
+    if not np.isfinite(val) or val <= 0.0:
+        return "auto"
+    return f"{val:.0f}"
 
 def _mpv_live_interpolation_enabled() -> bool:
     # Browser capture already arrives as a real-time, occasionally duplicated
@@ -659,6 +683,7 @@ class MpvHDRWidget(QWidget):
         # Use gpu-next + colorspace hint so mpv can adapt target output while
         # dragging between HDR/SDR displays (with a compatibility fallback).
         self._target_colorspace_hint = "auto"
+        hdr_target_peak = _env_hdr_target_peak_nits()
         deband_options = _mpv_deband_options(live_capture=live_capture)
         dither_options = _mpv_dither_options(live_capture=live_capture)
         mpv_kwargs = dict(
@@ -706,6 +731,8 @@ class MpvHDRWidget(QWidget):
                 vf_chain += f",cas={cas_strength}"
             mpv_kwargs.update(
                 target_colorspace_hint=self._target_colorspace_hint,
+                hdr_compute_peak="yes",
+                target_peak=hdr_target_peak,
                 vf=vf_chain,
             )
         else:
