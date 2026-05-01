@@ -5,7 +5,8 @@ import os
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from gui_media_probe import (
-    _content_similarity_score,
+    _probe_video_sync_info,
+    _probe_video_active_area_info,
     _probe_hdr_input,
     _probe_video_timing_info,
 )
@@ -145,21 +146,58 @@ class GroundTruthMixin:
             src_ar = float(src_w) / float(src_h)
             gt_ar = float(gt_w) / float(gt_h)
             if abs(src_ar - gt_ar) > 0.01:
-                return (
-                    False,
-                    f"Aspect-ratio mismatch: source {src_w}x{src_h} vs GT {gt_w}x{gt_h}.",
+                src_active = _probe_video_active_area_info(src_path, sample_count=5)
+                gt_active = _probe_video_active_area_info(gt_path, sample_count=5)
+                src_active_ar = (
+                    float(src_active.get("active_aspect", 0.0) or 0.0)
+                    if isinstance(src_active, dict)
+                    else 0.0
                 )
+                gt_active_ar = (
+                    float(gt_active.get("active_aspect", 0.0) or 0.0)
+                    if isinstance(gt_active, dict)
+                    else 0.0
+                )
+                if (
+                    src_active_ar > 0.0
+                    and gt_active_ar > 0.0
+                    and abs(src_active_ar - gt_active_ar) <= 0.04
+                ):
+                    src_aw = int(src_active.get("active_width", src_w))
+                    src_ah = int(src_active.get("active_height", src_h))
+                    gt_aw = int(gt_active.get("active_width", gt_w))
+                    gt_ah = int(gt_active.get("active_height", gt_h))
+                    notes.append(
+                        "active picture aspect matches after black-bar crop "
+                        f"({src_aw}x{src_ah} vs {gt_aw}x{gt_ah})"
+                    )
+                else:
+                    return (
+                        False,
+                        f"Aspect-ratio mismatch: source {src_w}x{src_h} vs GT {gt_w}x{gt_h}.",
+                    )
 
-        content_score, sampled = _content_similarity_score(
-            src_path, gt_path, sample_count=5
-        )
+        sync_info = _probe_video_sync_info(src_path, gt_path, sample_count=3)
+        content_score = sync_info.get("score")
+        sampled = int(sync_info.get("sampled", 0) or 0)
         if content_score is None or sampled < 3:
             return False, "Could not verify content match from sampled frames."
+        content_score = float(content_score)
         if content_score < 0.38:
             return (
                 False,
                 "Content mismatch: GT does not look like the same video "
                 f"(similarity {content_score:.2f}).",
+            )
+        try:
+            sync_offset_frames = int(sync_info.get("offset_frames", 0) or 0)
+            sync_offset_s = float(sync_info.get("offset_s", 0.0) or 0.0)
+        except Exception:
+            sync_offset_frames = 0
+            sync_offset_s = 0.0
+        if sync_offset_frames:
+            notes.append(
+                f"GT sync offset {sync_offset_frames:+d} frames ({sync_offset_s:+.3f}s)"
             )
 
         suffix = ""

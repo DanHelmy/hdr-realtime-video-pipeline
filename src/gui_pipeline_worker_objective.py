@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from gui_media_probe import _crop_frame_to_active_area
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _OBJECTIVE_METRIC_SAMPLE_EVERY,
@@ -57,7 +58,11 @@ class PipelineWorkerObjectiveMixin:
                         metric_pred = None
 
                 if metric_pred is not None:
-                    metric_ref = _letterbox_bgr(gt_frame, out_w, out_h)
+                    metric_ref = _letterbox_bgr(
+                        _crop_frame_to_active_area(gt_frame),
+                        out_w,
+                        out_h,
+                    )
                     try:
                         eval_pred, eval_ref = _prepare_metric_pair(
                             metric_pred, metric_ref, max_side=_OBJECTIVE_METRIC_MAX_SIDE

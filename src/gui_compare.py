@@ -6,8 +6,8 @@ import shutil
 import webbrowser
 
 import numpy as np
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QCheckBox, QMessageBox
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QCheckBox, QMessageBox, QProgressDialog
 
 from gui_hdr_io import FFMPEG_WINDOWS_DOWNLOAD_URL, hdr_ffmpeg_ready
 from gui_mpv_widget import MpvHDRWidget
@@ -172,6 +172,69 @@ class CompareViewMixin:
         min_frame = 1 if max_frame > 0 else 0
         return min_frame, max_frame
 
+    def _create_compare_progress_dialog(self, frame_number: int | None = None):
+        if self._compare_progress_dlg is not None:
+            return self._compare_progress_dlg
+        label = "Preparing frame compare ..."
+        if frame_number is not None:
+            label = f"Preparing frame compare at frame {int(frame_number)} ..."
+        progress = QProgressDialog(label, "Cancel", 0, 0, self)
+        progress.setWindowTitle("Frame Compare")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.canceled.connect(self._request_cancel_compare_snapshot)
+        progress.show()
+        self._compare_progress_dlg = progress
+        return progress
+
+    def _close_compare_progress_dialog(self):
+        progress = self._compare_progress_dlg
+        self._compare_progress_dlg = None
+        if progress is None:
+            return
+        try:
+            progress.blockSignals(True)
+            progress.close()
+            progress.deleteLater()
+        except Exception:
+            pass
+
+    def _request_cancel_compare_snapshot(self):
+        if not self._compare_snapshot_pending:
+            self._compare_resume_after_cancel = False
+            self._close_compare_progress_dialog()
+            return
+        self._compare_snapshot_pending = False
+        if self._compare_progress_dlg is not None:
+            try:
+                self._compare_progress_dlg.setLabelText("Canceling frame compare ...")
+                self._compare_progress_dlg.setCancelButton(None)
+            except Exception:
+                pass
+        if self._worker is not None:
+            try:
+                self._worker.cancel_compare_snapshot()
+            except Exception:
+                pass
+        dlg = self._compare_dialog
+        if dlg is not None:
+            dlg.set_recompare_busy(False)
+        self._close_compare_progress_dialog()
+        self.statusBar().showMessage("Frame compare canceled.")
+
+        should_resume = bool(getattr(self, "_compare_resume_after_cancel", False))
+        self._compare_resume_after_cancel = False
+        if should_resume and self._playing and self._worker is not None:
+            self._pending_seek_on_resume = None
+
+            def _resume_after_cancel():
+                if self._playing and self._worker is not None and self._worker.is_paused:
+                    self._toggle_pause()
+
+            QTimer.singleShot(0, _resume_after_cancel)
+
     def _request_compare_snapshot(
         self,
         precision_key: str | None = None,
@@ -197,8 +260,10 @@ class CompareViewMixin:
         self._warn_if_octave_missing_for_compare()
 
         # Pause first to freeze playback context for deterministic compare.
+        was_paused = bool(self._worker.is_paused)
         if not self._worker.is_paused:
             self._toggle_pause()
+        self._compare_resume_after_cancel = not was_paused
 
         anchor_frame = frame_number
         preserve_resume_seek = False
@@ -222,6 +287,7 @@ class CompareViewMixin:
         dlg = self._compare_dialog
         if dlg is not None:
             dlg.set_recompare_busy(True)
+        self._create_compare_progress_dialog(anchor_frame)
 
         self.statusBar().showMessage(
             "Preparing compare snapshot (SDR, HDR GT, HDR Convert) ..."
@@ -268,7 +334,11 @@ class CompareViewMixin:
         self._request_compare_snapshot(precision_key=key, frame_number=anchor)
 
     def _on_compare_snapshot_ready(self, payload: dict):
+        if not self._compare_snapshot_pending:
+            return
         self._compare_snapshot_pending = False
+        self._compare_resume_after_cancel = False
+        self._close_compare_progress_dialog()
         frame_idx = int(payload.get("frame", self._last_seek_frame))
         self._compare_anchor_frame = int(frame_idx)
         sdr = payload.get("sdr")

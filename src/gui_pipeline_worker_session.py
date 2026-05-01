@@ -5,6 +5,7 @@ import numpy as np
 
 from video_source import VideoSource
 from gui_objective_metrics import _RunningAverage
+from gui_media_probe import _probe_video_sync_info
 
 
 class PipelineWorkerSessionMixin:
@@ -54,12 +55,17 @@ class PipelineWorkerSessionMixin:
         gt_source: VideoSource,
         source_frame_idx: int,
     ) -> int:
-        return self._map_frame_index_between_rates(
+        idx = self._map_frame_index_between_rates(
             int(source_frame_idx),
             float(getattr(source, "fps", 0.0) or 0.0),
             float(getattr(gt_source, "fps", 0.0) or 0.0),
             int(getattr(gt_source, "frame_count", 0) or 0),
         )
+        idx += int(getattr(self, "_gt_sync_offset_frames", 0) or 0)
+        gt_frame_count = int(getattr(gt_source, "frame_count", 0) or 0)
+        if gt_frame_count > 0:
+            idx = min(idx, gt_frame_count - 1)
+        return max(0, int(idx))
 
     def _read_synced_gt_frame(
         self,
@@ -129,6 +135,22 @@ class PipelineWorkerSessionMixin:
                 f"Failed to open HDR ground-truth video: {exc}"
             )
             return None, "HDR ground-truth open failed", objective_warned_gt_eof
+
+        self._gt_sync_offset_frames = 0
+        source_path = str(getattr(self, "_video_path", "") or "")
+        if source_path and os.path.isfile(source_path):
+            try:
+                sync_info = _probe_video_sync_info(source_path, gt_path, sample_count=3)
+                self._gt_sync_offset_frames = int(
+                    sync_info.get("offset_frames", 0) or 0
+                )
+                if self._gt_sync_offset_frames:
+                    sync_s = float(sync_info.get("offset_s", 0.0) or 0.0)
+                    self.status_message.emit(
+                        f"HDR GT sync offset {self._gt_sync_offset_frames:+d} frames ({sync_s:+.3f}s)."
+                    )
+            except Exception:
+                self._gt_sync_offset_frames = 0
 
         self._reset_gt_sync_state()
         if cur_frame_idx > 0:

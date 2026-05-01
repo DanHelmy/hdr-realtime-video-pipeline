@@ -57,9 +57,12 @@ from gui_hdr_io import (
     tensor_to_bgr_u16,
 )
 from gui_media_probe import (
-    _content_similarity_score,
+    _crop_frame_to_active_area,
     _frame_structure_similarity,
+    _map_video_pair_frame_index,
+    _probe_video_active_area_info,
     _probe_hdr_input,
+    _probe_video_sync_info,
     _probe_video_timing_info,
 )
 from gui_objective_metrics import (
@@ -282,6 +285,18 @@ def _read_media_frame_hdr_with_mode(
             return gt_bgr16, f"true_hdr_video_{decode_mode}"
         return None, "hdr_video_decode_failed"
     return None, "missing"
+
+
+def _map_gt_frame_for_sdr(
+    sdr_path: str,
+    gt_path: str,
+    frame_idx: int | None,
+) -> int | None:
+    if frame_idx is None:
+        return None
+    if _is_video_path(sdr_path) and _is_video_path(gt_path):
+        return _map_video_pair_frame_index(sdr_path, gt_path, int(frame_idx))
+    return max(0, int(frame_idx))
 
 
 def _detect_distinct_video_frames(
@@ -641,9 +656,14 @@ class _BenchmarkWorker(QObject):
                 )
 
                 sdr_raw = _read_media_frame(task.sdr_path, frame_idx=task.frame_idx)
+                gt_frame_idx = _map_gt_frame_for_sdr(
+                    task.sdr_path,
+                    task.gt_path,
+                    task.frame_idx,
+                )
                 gt_hdr_raw, gt_hdr_mode = _read_media_frame_hdr_with_mode(
                     task.gt_path,
-                    frame_idx=task.frame_idx,
+                    frame_idx=gt_frame_idx,
                     sdr_reference=sdr_raw,
                 )
                 if sdr_raw is None:
@@ -702,7 +722,13 @@ class _BenchmarkWorker(QObject):
                     continue
 
                 sdr_eval = np.ascontiguousarray(_letterbox_bgr(sdr_raw, out_w, out_h))
-                gt_eval = np.ascontiguousarray(_letterbox_bgr(gt_hdr_raw, out_w, out_h))
+                gt_eval = np.ascontiguousarray(
+                    _letterbox_bgr(
+                        _crop_frame_to_active_area(gt_hdr_raw),
+                        out_w,
+                        out_h,
+                    )
+                )
                 fast_gt_align_score = None
                 if allow_post_verify and str(gt_hdr_mode).startswith("true_hdr_video_fast"):
                     sdr_u8 = self._to_u8_for_alignment(sdr_eval)
@@ -819,9 +845,14 @@ class _BenchmarkWorker(QObject):
                         f"Post-verify {j + 1}/{total_verify}: {task.label}",
                     )
 
+                    strict_gt_frame_idx = _map_gt_frame_for_sdr(
+                        task.sdr_path,
+                        task.gt_path,
+                        task.frame_idx,
+                    )
                     strict_rgb16 = read_hdr_video_frame_rgb16(
                         task.gt_path,
-                        max(0, int(task.frame_idx or 0)),
+                        max(0, int(strict_gt_frame_idx or 0)),
                         prefer_fast_seek=False,
                     )
                     if strict_rgb16 is None:
@@ -830,7 +861,9 @@ class _BenchmarkWorker(QObject):
                     row = rows[row_idx]
                     strict_gt_eval = np.ascontiguousarray(
                         _letterbox_bgr(
-                            np.ascontiguousarray(strict_rgb16[:, :, ::-1]),
+                            _crop_frame_to_active_area(
+                                np.ascontiguousarray(strict_rgb16[:, :, ::-1])
+                            ),
                             out_w,
                             out_h,
                         )
@@ -2087,7 +2120,7 @@ class ModelBenchmarkDialog(QDialog):
         sdr_src = _read_media_frame(sdr_path, frame_idx=frame_idx)
         gt_hdr_src, _gt_mode = _read_media_frame_hdr_with_mode(
             gt_path,
-            frame_idx=frame_idx,
+            frame_idx=_map_gt_frame_for_sdr(sdr_path, gt_path, frame_idx),
             sdr_reference=sdr_src,
         )
         if sdr_src is None:
@@ -2096,7 +2129,13 @@ class ModelBenchmarkDialog(QDialog):
         sdr_preview = np.ascontiguousarray(_letterbox_bgr(sdr_src, out_w, out_h))
         gt_preview = None
         if isinstance(gt_hdr_src, np.ndarray):
-            gt_preview = np.ascontiguousarray(_letterbox_bgr(gt_hdr_src, out_w, out_h))
+            gt_preview = np.ascontiguousarray(
+                _letterbox_bgr(
+                    _crop_frame_to_active_area(gt_hdr_src),
+                    out_w,
+                    out_h,
+                )
+            )
 
         processor = self._preview_processor_for_current_result()
         pred_preview = None
@@ -2875,11 +2914,60 @@ class ModelBenchmarkDialog(QDialog):
                 f"length differs by {duration_delta_s:.2f}s; using overlap sync"
             )
 
-        score, sampled = _content_similarity_score(sdr_path, gt_path, sample_count=5)
+        sdr_w = int(sdr_meta.get("width") or 0)
+        sdr_h = int(sdr_meta.get("height") or 0)
+        gt_w = int(gt_meta.get("width") or 0)
+        gt_h = int(gt_meta.get("height") or 0)
+        if sdr_w > 0 and sdr_h > 0 and gt_w > 0 and gt_h > 0:
+            sdr_ar = float(sdr_w) / float(sdr_h)
+            gt_ar = float(gt_w) / float(gt_h)
+            if abs(sdr_ar - gt_ar) > 0.01:
+                sdr_active = _probe_video_active_area_info(sdr_path, sample_count=5)
+                gt_active = _probe_video_active_area_info(gt_path, sample_count=5)
+                sdr_active_ar = (
+                    float(sdr_active.get("active_aspect", 0.0) or 0.0)
+                    if isinstance(sdr_active, dict)
+                    else 0.0
+                )
+                gt_active_ar = (
+                    float(gt_active.get("active_aspect", 0.0) or 0.0)
+                    if isinstance(gt_active, dict)
+                    else 0.0
+                )
+                if (
+                    sdr_active_ar > 0.0
+                    and gt_active_ar > 0.0
+                    and abs(sdr_active_ar - gt_active_ar) <= 0.04
+                ):
+                    sdr_aw = int(sdr_active.get("active_width", sdr_w))
+                    sdr_ah = int(sdr_active.get("active_height", sdr_h))
+                    gt_aw = int(gt_active.get("active_width", gt_w))
+                    gt_ah = int(gt_active.get("active_height", gt_h))
+                    notes.append(
+                        "active picture aspect matches after black-bar crop "
+                        f"({sdr_aw}x{sdr_ah} vs {gt_aw}x{gt_ah})"
+                    )
+                else:
+                    return False, f"Aspect-ratio mismatch: SDR {sdr_w}x{sdr_h} vs GT {gt_w}x{gt_h}."
+
+        sync_info = _probe_video_sync_info(sdr_path, gt_path, sample_count=3)
+        score = sync_info.get("score")
+        sampled = int(sync_info.get("sampled", 0) or 0)
         if score is None or sampled < 3:
             return False, "Could not verify content alignment from sampled frames."
+        score = float(score)
         if score < 0.34:
             return False, f"Content mismatch (similarity {score:.2f})."
+        try:
+            sync_offset_frames = int(sync_info.get("offset_frames", 0) or 0)
+            sync_offset_s = float(sync_info.get("offset_s", 0.0) or 0.0)
+        except Exception:
+            sync_offset_frames = 0
+            sync_offset_s = 0.0
+        if sync_offset_frames:
+            notes.append(
+                f"GT sync offset {sync_offset_frames:+d} frames ({sync_offset_s:+.3f}s)"
+            )
 
         suffix = ""
         if notes:

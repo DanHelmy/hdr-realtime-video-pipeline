@@ -32,6 +32,9 @@ Core updates include:
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
+- HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and cached constant frame offsets
+- compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
+- compare preparation now uses a cancelable application-modal progress dialog so pending compare seeks can be canceled cleanly
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
 - Chrome Audio Sync extension kept audio-only, with manual start/stop in Chrome
@@ -106,6 +109,8 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 - Side-by-side objective frame comparison workflow
 - PSNR / SSIM on linear HDR frames, plus DeltaEITP / HDR-VDP3 on the color-managed HDR path
+- Compare pauses playback while preparing the exact requested frame and shows a cancelable modal progress dialog
+- Cancel clears the pending compare seek/request; playback resumes automatically when Compare was the thing that paused it
 
 ![Compare Dialog](docs/images/v4-compare-dialog.png)
 
@@ -121,6 +126,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 - Open from `Tools -> Model Quality Benchmark ...`
 - Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
 - Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
+- Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
 
 ![Benchmark Tab](docs/images/v5-benchmark-tab.png)
 
@@ -267,6 +273,17 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - optimized engines are cached and reused
   - no max-autotune background-load warning is shown on NVIDIA
 
+- **HDR GT pairing is more practical for real movie files**
+  - GT validation allows short duration/frame-count mismatches by default
+  - encoded black bars are detected so cropped and letterboxed versions of the same movie can still be paired
+  - a cached sync scan estimates constant SDR/HDR lead-lag offsets and reports the detected frame offset
+  - compare, objective metrics, and benchmark use the same mapped GT-frame lookup
+
+- **Compare preparation is cancelable**
+  - clicking `Compare` opens a modal progress dialog while the exact frame is prepared
+  - canceling clears the pending compare request and temporary seek instead of leaving playback pinned to the compare frame
+  - stale compare results are ignored after cancel
+
 ### Previous v5.1 Highlights
 
 - **Objective metric domains are now consistent across compare and benchmark**
@@ -356,7 +373,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint/export artifact size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
-| **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, run metadata display, preview images, and summary export/load |
+| **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
@@ -398,6 +415,12 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - `DeltaEITP-N` is grade-normalized in absolute linear RGB before BT.2020/PQ conversion; it is not normalized on PQ code values and it is not re-normalized after PQ encoding.
 - Shared padded black or near-black borders are cropped from both images before objective metrics when a substantial common letterbox/pillarbox region is detected.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
+- GT pairing accepts small practical differences between real encodes:
+  - `HDRTVNET_GT_SYNC_TOLERANCE_S` controls allowed duration/frame-count mismatch in seconds. Default: `2.0`.
+  - active-picture detection allows one file to be letterboxed while the other is cropped, then crops GT active content before preview/metrics.
+  - `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` controls the constant-offset search window. Default: `2.0`.
+  - the detected offset is cached per file signature and used by Compare, objective logging, and benchmark frame reads.
+  - if a movie starts more than two seconds apart between SDR and HDR GT files, raise `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` before launch.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The built-in bridge accepts BT.2100 PQ input frames and converts them to absolute display luminance / photometric values before calling `hdrvdp3`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.

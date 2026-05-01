@@ -297,6 +297,14 @@ class PipelineWorker(
         # or after a single explicit seek when an anchored frame is requested.
         self._pause_event.set()
 
+    def cancel_compare_snapshot(self):
+        """Cancel a queued compare request and its temporary seek."""
+        self._pending_compare_snapshot = None
+        self._seek_frame = None
+        self._paused_control_wake = False
+        self._paused_control_refresh_frame = None
+        self._pause_event.set()
+
     def request_precision_change(self, key):
         self._pending_precision = key
         self._wake_for_paused_control_change()

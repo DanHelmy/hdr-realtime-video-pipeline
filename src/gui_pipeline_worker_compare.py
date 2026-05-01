@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from gui_hdr_io import read_hdr_video_frame_rgb16, tensor_to_bgr_u16
-from gui_media_probe import _probe_video_timing_info
+from gui_media_probe import _crop_frame_to_active_area, _map_video_pair_frame_index
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _compute_full_reference_metrics,
@@ -20,16 +20,7 @@ class PipelineWorkerCompareMixin:
         if not gt_path or not getattr(self, "_video_path", None):
             return gt_idx
         try:
-            src_meta = _probe_video_timing_info(self._video_path)
-            gt_meta = _probe_video_timing_info(gt_path)
-            if src_meta is None or gt_meta is None:
-                return gt_idx
-            return self._map_frame_index_between_rates(
-                gt_idx,
-                float(src_meta.get("fps", 0.0) or 0.0),
-                float(gt_meta.get("fps", 0.0) or 0.0),
-                int(gt_meta.get("frame_count", 0) or 0),
-            )
+            return _map_video_pair_frame_index(self._video_path, gt_path, gt_idx)
         except Exception:
             return gt_idx
 
@@ -132,6 +123,7 @@ class PipelineWorkerCompareMixin:
             (not force_immediate) and frame_idx < int(compare_target)
         ):
             return
+        active_compare_request = compare_request
 
         cmp_idx = int(compare_target)
         cmp_seek_idx = max(0, int(cmp_idx) - 1)
@@ -272,7 +264,9 @@ class PipelineWorkerCompareMixin:
             if gt_rgb16 is None and gt_seek_idx > 0:
                 gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx - 1)
             if gt_rgb16 is not None:
-                gt_probe = np.ascontiguousarray(gt_rgb16[:, :, ::-1])
+                gt_probe = _crop_frame_to_active_area(
+                    np.ascontiguousarray(gt_rgb16[:, :, ::-1])
+                )
                 gt_hdr_mode_note = "true 16-bit HDR decode"
                 cmp_hdr_gt = np.ascontiguousarray(
                     _letterbox_bgr(gt_probe, compare_out_w, compare_out_h)
@@ -287,7 +281,11 @@ class PipelineWorkerCompareMixin:
             if isinstance(gt_frame, np.ndarray) and gt_frame.dtype == np.uint16:
                 gt_hdr_mode_note = "true 16-bit HDR decode"
                 cmp_hdr_gt = np.ascontiguousarray(
-                    _letterbox_bgr(gt_frame, compare_out_w, compare_out_h)
+                    _letterbox_bgr(
+                        _crop_frame_to_active_area(gt_frame),
+                        compare_out_w,
+                        compare_out_h,
+                    )
                 )
             else:
                 msg = (
@@ -380,6 +378,11 @@ class PipelineWorkerCompareMixin:
                 cmp_note = f"{cmp_note} {msg}".strip()
             else:
                 self._reset_enhance_history()
+
+        if self._pending_compare_snapshot is not active_compare_request:
+            if self._user_paused:
+                self._pause_event.clear()
+            return
 
         self.compare_snapshot_ready.emit({
             "frame": int(cmp_idx),

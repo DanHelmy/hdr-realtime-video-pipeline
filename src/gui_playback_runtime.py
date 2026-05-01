@@ -3086,6 +3086,13 @@ class PlaybackRuntimeMixin:
 
     def _stop(self):
         self._suppress_eof_restart_once = True
+        if getattr(self, "_compare_snapshot_pending", False):
+            self._compare_snapshot_pending = False
+            self._compare_resume_after_cancel = False
+            if hasattr(self, "_close_compare_progress_dialog"):
+                self._close_compare_progress_dialog()
+            if self._compare_dialog is not None:
+                self._compare_dialog.set_recompare_busy(False)
         self._worker.stop()
         self._worker.wait(10000)
         self._finalize_playback_logging("playback stopped")

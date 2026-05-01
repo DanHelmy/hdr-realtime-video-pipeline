@@ -165,6 +165,8 @@ class StateInitMixin:
         self._last_hdr_frame = None
         self._compare_dialog = None
         self._compare_snapshot_pending = False
+        self._compare_progress_dlg = None
+        self._compare_resume_after_cancel = False
         self._compare_anchor_frame = None
         self._source_proc_dims = None
         self._source_video_dims = None
