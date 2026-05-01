@@ -189,10 +189,10 @@ Advanced testing: `HDRTVNET_FEEDER_GPU_RGB48=1` enables the experimental GPU-sid
 Display deband/dither tuning:
 
 - `HDRTVNET_MPV_DEBAND=1|0` enables/disables display debanding; default is `1`.
-- `HDRTVNET_MPV_DEBAND_ITERATIONS=2`
-- `HDRTVNET_MPV_DEBAND_THRESHOLD=28`
-- `HDRTVNET_MPV_DEBAND_RANGE=16`
-- `HDRTVNET_MPV_DEBAND_GRAIN=6`
+- `HDRTVNET_MPV_DEBAND_ITERATIONS=3`
+- `HDRTVNET_MPV_DEBAND_THRESHOLD=96`
+- `HDRTVNET_MPV_DEBAND_RANGE=32`
+- `HDRTVNET_MPV_DEBAND_GRAIN=20`
 - `HDRTVNET_MPV_DITHER=1|0` enables/disables mpv output dithering; default is `1`.
 - `HDRTVNET_MPV_DITHER_ALGO=fruit` (`ordered` and `error-diffusion` are also accepted by mpv builds that support them)
 - `HDRTVNET_MPV_DITHER_DEPTH=auto`
@@ -200,7 +200,7 @@ Display deband/dither tuning:
 - `HDRTVNET_MPV_TEMPORAL_DITHER=1|0` changes the dither pattern over time; default is `1`.
 - `HDRTVNET_MPV_TEMPORAL_DITHER_PERIOD=1`
 
-Browser Window Capture uses a stronger display cleanup profile by default because Chrome/streaming video often arrives as 8-bit composited SDR with baked-in red/orange posterization:
+Browser Window Capture uses the same default cleanup profile as normal video playback so visual behavior is consistent across source modes:
 
 - `HDRTVNET_BROWSER_MPV_DEBAND_ITERATIONS=3`
 - `HDRTVNET_BROWSER_MPV_DEBAND_THRESHOLD=96`
@@ -210,6 +210,11 @@ Browser Window Capture uses a stronger display cleanup profile by default becaus
 - `HDRTVNET_BROWSER_MPV_TEMPORAL_DITHER_PERIOD=1`
 
 If you see shimmer or panel-dither interference on a 6-bit/FRC display, first try `HDRTVNET_MPV_TEMPORAL_DITHER=0`.
+
+Export defaults now follow the same direction:
+
+- HDR export adds `deband` before colorspace conversion.
+- HDR export uses `zscale` dithering (`error_diffusion`) instead of disabling dithering.
 
 WinRT pacing tuning:
 
@@ -351,6 +356,9 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **HDR metadata/tagging improved**
   - ProRes exports now use a more reliable BT.2020 / PQ tagging path
   - export conversion path now targets a `1001 nit` HDR peak expectation
+  - export now applies `deband` + `error_diffusion` dithering by default to better match interactive playback cleanup
+- **Compare pane display transitions are smoother**
+  - compare no longer force-recreates mpv surfaces on show/screen-change, reducing visible color-space flashing
 - **Playback and export now use a simpler single-frame path**
   - temporal stabilization has been removed globally to reduce GPU cost and keep latency/FPS behavior more predictable
   - browser-window playback, video playback, and export now all follow the same no-temporal-stabilization policy
