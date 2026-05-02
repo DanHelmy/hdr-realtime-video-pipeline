@@ -668,12 +668,17 @@ class WindowingMixin:
         self._ui_pause_timer.start(delay)
 
     def _stabilize_window_capture_surface_after_startup(self):
-        if (
-            _normalize_source_mode(getattr(self, "_source_mode", None))
-            != SOURCE_MODE_WINDOW
-        ):
-            return
         if not self._playing or not self._active_use_mpv:
+            return
+        source_mode = _normalize_source_mode(getattr(self, "_source_mode", None))
+        if source_mode != SOURCE_MODE_WINDOW:
+            # Non-window playback can also start in a sluggish present state
+            # when launched directly into fullscreen. Trigger the same
+            # pause/relock/refresh path once after startup to avoid needing a
+            # manual fullscreen toggle.
+            self._pause_for_ui_transition(duration_ms=120, wait_for_stable=True)
+            self._with_layout_freeze(lambda: None, refresh_delay=40)
+            self._relock_timeline(delay_ms=140, drop_frames=3)
             return
         tabs = getattr(self, "_video_tabs", None)
         if tabs is None or tabs.count() < 2:

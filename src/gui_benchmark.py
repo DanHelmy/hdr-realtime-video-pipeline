@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import queue
 import threading
 import webbrowser
 from dataclasses import dataclass
@@ -206,7 +207,7 @@ try:
         0,
         min(
             120,
-            int(os.environ.get("HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES", "8")),
+            int(os.environ.get("HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES", "0")),
         ),
     )
 except Exception:
@@ -718,6 +719,36 @@ class _BenchmarkWorker(QObject):
     def _is_canceled(self) -> bool:
         return bool(self._cancel.is_set())
 
+    def _run_blocking_with_cancel(
+        self,
+        fn,
+        *args,
+        canceled_fallback=None,
+        poll_interval_s: float = 0.03,
+        **kwargs,
+    ):
+        done_evt = threading.Event()
+        out_q: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+        def _target() -> None:
+            try:
+                out_q.put((True, fn(*args, **kwargs)))
+            except Exception as exc:
+                out_q.put((False, exc))
+            finally:
+                done_evt.set()
+
+        threading.Thread(target=_target, daemon=True).start()
+
+        while not done_evt.wait(timeout=max(0.005, float(poll_interval_s))):
+            if self._is_canceled():
+                return canceled_fallback, True
+
+        ok, payload = out_q.get_nowait()
+        if not ok:
+            raise payload
+        return payload, False
+
     def _choose_unique_dir(self, base_dir: str) -> str:
         if not os.path.exists(base_dir):
             return base_dir
@@ -971,7 +1002,6 @@ class _BenchmarkWorker(QObject):
 
             for i, task in enumerate(ordered_tasks):
                 if self._is_canceled():
-                    self._write_session_summaries(cfg, rows)
                     self.canceled.emit("Benchmark canceled.")
                     return
 
@@ -1174,7 +1204,6 @@ class _BenchmarkWorker(QObject):
                 total_verify = max(1, len(suspects))
                 for j, (row_idx, task, fast_score) in enumerate(suspects):
                     if self._is_canceled():
-                        self._write_session_summaries(cfg, rows)
                         self.canceled.emit("Benchmark canceled during post verification.")
                         return
 
@@ -1193,7 +1222,9 @@ class _BenchmarkWorker(QObject):
                     sdr_eval_saved = self._to_u8_for_alignment(
                         read_image_any(str(row.get("sdr_image") or ""))
                     )
-                    align_info = _local_align_gt_frame_for_benchmark(
+                    
+                    align_info, canceled_now = self._run_blocking_with_cancel(
+                        _local_align_gt_frame_for_benchmark,
                         cancel_check=self._is_canceled,
                         sdr_path=task.sdr_path,
                         gt_path=task.gt_path,
@@ -1201,31 +1232,46 @@ class _BenchmarkWorker(QObject):
                         sdr_eval_u8=sdr_eval_saved,
                         out_w=out_w,
                         out_h=out_h,
+                        canceled_fallback={"canceled": True},
                     )
 
-                    if self._is_canceled() or bool(align_info.get("canceled", False)):
+                    if canceled_now or self._is_canceled() or bool(align_info.get("canceled", False)):
                         self.canceled.emit("Benchmark canceled during post verification.")
                         return
+                    
                     strict_gt_frame_idx = int(
                         align_info.get("frame_idx", strict_base_gt_frame_idx or 0) or 0
                     )
-                    strict_rgb16 = read_hdr_video_frame_rgb16(
+
+                    strict_rgb16, canceled_now = self._run_blocking_with_cancel(
+                        read_hdr_video_frame_rgb16,
                         task.gt_path,
                         max(0, int(strict_gt_frame_idx or 0)),
                         prefer_fast_seek=False,
+                        canceled_fallback=None,
                     )
-                    if self._is_canceled():
+
+                    if canceled_now or self._is_canceled():
                         self.canceled.emit("Benchmark canceled during post verification.")
                         return
+                    
                     if strict_rgb16 is None and strict_gt_frame_idx != int(
                         strict_base_gt_frame_idx or 0
                     ):
                         strict_gt_frame_idx = max(0, int(strict_base_gt_frame_idx or 0))
-                        strict_rgb16 = read_hdr_video_frame_rgb16(
-                            task.gt_path,
-                            strict_gt_frame_idx,
-                            prefer_fast_seek=False,
-                        )
+
+                    strict_rgb16, canceled_now = self._run_blocking_with_cancel(
+                        read_hdr_video_frame_rgb16,
+                        task.gt_path,
+                        strict_gt_frame_idx,
+                        prefer_fast_seek=False,
+                        canceled_fallback=None,
+                    )
+
+                    if canceled_now or self._is_canceled():
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
+
                     if strict_rgb16 is None:
                         continue
 
@@ -1351,10 +1397,15 @@ class _BenchmarkWorker(QObject):
                             cv2.resize(pred_eval_saved, (out_w, out_h), interpolation=cv2.INTER_AREA)
                         )
 
-                    strict_metrics = self._compute_metrics_for_pair(
+                    strict_metrics, canceled_now = self._run_blocking_with_cancel(
+                        self._compute_metrics_for_pair,
                         pred_eval_saved,
                         strict_gt_eval,
+                        canceled_fallback=None,
                     )
+                    if canceled_now or self._is_canceled():
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
                     verify_reasons = replace_reasons or ["exact verified"]
                     if strict_metrics.get("obj_note"):
                         strict_metrics["obj_note"] = (
@@ -1813,6 +1864,9 @@ class ModelBenchmarkDialog(QDialog):
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
             preview_scale_kernel="bicubic",
+            preview_cas_strength=0.0,
+            preview_film_grain=False,
+
         )
         self._img_gt = _CompareVideoPane(
             "HDR GT",
@@ -1821,6 +1875,8 @@ class ModelBenchmarkDialog(QDialog):
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
             preview_scale_kernel="bicubic",
+            preview_cas_strength=0.0,
+            preview_film_grain=False,
         )
         self._img_pred = _CompareVideoPane(
             "HDR Convert",
@@ -1829,6 +1885,8 @@ class ModelBenchmarkDialog(QDialog):
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
             preview_scale_kernel="bicubic",
+            preview_cas_strength=0.0,
+            preview_film_grain=False,
         )
         previews.addWidget(self._img_sdr)
         previews.addWidget(self._img_gt)

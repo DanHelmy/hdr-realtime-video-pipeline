@@ -312,15 +312,19 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
-            preview_scale_kernel=best_mpv_scale,
+            preview_scale_kernel="bicubic",
+            preview_cas_strength=0.0,
+            preview_film_grain=False,
         )
         self._disp_gt = _CompareVideoPane(
             "HDR GT",
-            force_hdr_metadata=True,
+            force_hdr_metadata=True, 
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
-            preview_scale_kernel=best_mpv_scale,
+            preview_scale_kernel="bicubic",
+            preview_cas_strength=0.0,
+            preview_film_grain=False,
         )
         self._disp_algo = _CompareVideoPane(
             "HDR Convert",
@@ -328,7 +332,9 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
-            preview_scale_kernel=best_mpv_scale,
+            preview_scale_kernel="bicubic",
+            preview_cas_strength=0.0,
+            preview_film_grain=False,
         )
         self._split_compare = QSplitter(Qt.Orientation.Horizontal)
         self._split_compare.setChildrenCollapsible(False)

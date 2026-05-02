@@ -110,11 +110,11 @@ def _env_live_int(name: str, default: int, *, min_value: int = 1, max_value: int
 LIVE_CAPTURE_PROCESS_FPS = _env_live_fps("HDRTVNET_LIVE_CAPTURE_PROCESS_FPS", 24.0)
 LIVE_CAPTURE_OBSERVE_FPS = _env_live_fps(
     "HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS",
-    max(30.0, LIVE_CAPTURE_PROCESS_FPS),
+    max(36.0, LIVE_CAPTURE_PROCESS_FPS),  # Higher observe rate for smoother 24fps capture
 )
 LIVE_CAPTURE_MPV_BUFFER_FRAMES = _env_live_int(
     "HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES",
-    3,
+    8,  # Extra buffer for smoother live playback
 )
 LIVE_CAPTURE_PRESENT_MAX_FPS = LIVE_CAPTURE_PROCESS_FPS
 LIVE_CAPTURE_DISPLAY_FPS = min(

@@ -15,7 +15,7 @@ function clampAudioDelayMs(value) {
   if (!Number.isFinite(delayMs)) {
     return DEFAULT_AUDIO_DELAY_MS;
   }
-  return Math.max(0, Math.min(500, Math.round(delayMs)));
+  return Math.max(0, Math.min(2000, Math.round(delayMs)));
 }
 
 function renderDelayValue(value) {

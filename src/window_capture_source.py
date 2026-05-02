@@ -546,10 +546,10 @@ class _WinRTWindowCaptureSession:
             pass
         session.start_capture()
 
-        frame_w = max(1, int(capture_item.size.width))
-        frame_h = max(1, int(capture_item.size.height))
         stage_surface = bindings["StageSurface"](output=output, device=device)
         stage_surface.release()
+        frame_w = max(1, int(capture_item.size.width))
+        frame_h = max(1, int(capture_item.size.height))
         stage_surface.rebuild(output=output, device=device, dim=(frame_w, frame_h))
 
         self._monitor = max(0, int(monitor))

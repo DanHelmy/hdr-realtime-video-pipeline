@@ -12,8 +12,8 @@ from gui_config import LIVE_CAPTURE_DISPLAY_FPS
 from gui_mpv_widget import MpvHDRWidget
 from timer import sleep_until
 
-_LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.050
-_LIVE_SMOOTH_MAX_CATCHUP_FRAMES = 2
+_LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.042  # ~1/24 second for better 24fps cadence
+_LIVE_SMOOTH_MAX_CATCHUP_FRAMES = 3  # Allow more catchup for smoother playback
 _FEEDER_GPU_RGB48 = str(
     os.environ.get("HDRTVNET_FEEDER_GPU_RGB48", "1")
 ).strip().lower() in {"1", "true", "yes", "on"}

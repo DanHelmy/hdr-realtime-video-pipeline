@@ -82,9 +82,9 @@ def _mpv_deband_options(*, live_capture: bool = False) -> dict:
     # Keep video-player defaults aligned with browser-window capture so
     # quality characteristics match between both source modes.
     default_iterations = 3
-    default_threshold = 96.0
+    default_threshold = 100
     default_range = 32
-    default_grain = 20.0
+    default_grain = 8
 
     return {
         "deband": "yes",
@@ -114,11 +114,11 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
     algo = str(
         os.environ.get(
             f"{env_prefix}DITHER_ALGO",
-            os.environ.get("HDRTVNET_MPV_DITHER_ALGO", "fruit"),
+            os.environ.get("HDRTVNET_MPV_DITHER_ALGO", "error-diffusion"),
         )
     ).strip().lower().replace("_", "-")
     if algo not in {"fruit", "ordered", "error-diffusion", "no"}:
-        algo = "fruit"
+        algo = "error-diffusion"
     depth = str(
         os.environ.get(
             f"{env_prefix}DITHER_DEPTH",
@@ -163,10 +163,8 @@ def _env_hdr_target_peak_nits() -> str:
     return f"{val:.0f}"
 
 def _mpv_live_interpolation_enabled() -> bool:
-    # Browser capture already arrives as a real-time, occasionally duplicated
-    # stream. mpv frame mixing can make duplicate/low-motion stretches bleed
-    # into the next few display refreshes, so keep it opt-in for live capture.
-    return _env_bool("HDRTVNET_BROWSER_MPV_INTERPOLATION", True)
+    # Favor lower latency for live capture; interpolation can add delay.
+    return False
 
 
 def _without_deband_options(kwargs: dict) -> dict:
@@ -710,6 +708,7 @@ class MpvHDRWidget(QWidget):
             scale_antiring=str(antiring),
             cscale_antiring=str(antiring),
         )
+
         mpv_kwargs.update(deband_options)
         mpv_kwargs.update(dither_options)
         deband_active = bool(deband_options)
@@ -726,16 +725,21 @@ class MpvHDRWidget(QWidget):
             use_film_grain=use_film_grain,
         )
         if self._force_hdr_metadata:
+            # ✅ Both GT and Convert use same HDR visualization pipeline
             vf_chain = "format=colorlevels=full:primaries=bt.2020:gamma=pq"
             if cas_strength is not None and cas_strength > 0.0:
                 vf_chain += f",cas={cas_strength}"
+
             mpv_kwargs.update(
                 target_colorspace_hint=self._target_colorspace_hint,
                 hdr_compute_peak="yes",
-                target_peak=hdr_target_peak,
+                tone_mapping="bt.2390",
+                tone_mapping_param=0.8,
                 vf=vf_chain,
             )
+
         else:
+            # ✅ SDR
             vf_chain = self._sdr_format_filter(cas_strength)
             mpv_kwargs.update(
                 target_colorspace_hint=self._target_colorspace_hint,
@@ -1057,6 +1061,8 @@ class MpvHDRWidget(QWidget):
             vf_chain += f",cas={cas_val}"
         try:
             p.command("set", "vf", vf_chain)
+            if self._force_hdr_metadata:
+                p.command("set", "tone-mapping", "bt.2390")
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["cas_strength"] = float(cas_val)
             return True

@@ -29,15 +29,16 @@ Core updates include:
 - objective metric domains are now explicit and shared across compare and benchmark:
   - `PSNR` / `SSIM` run on linear HDR frames
   - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
+- display-side HDR tone mapping (BT.2390) for improved visual presentation, applied consistently across HDR panes when enabled; does not affect objective metrics or exported HDR content
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
-- **HDR GT fast path processing** for significantly faster ground-truth video alignment and frame mapping
-- **optimized GT sync algorithm** with improved frame scanning and alignment detection
-- **HDR GT status indicator** in the GUI status line showing when fast path is active
-- **cached GT alignment results** to avoid redundant processing for the same video pairs
+- HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
+- optimized GT sync algorithm with improved frame scanning and alignment detection
+- HDR GT status indicator in the GUI status line showing when fast path is active
+- cached GT alignment results to avoid redundant processing for the same video pairs
 - HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and conservative cached constant frame offsets
 - compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
 - benchmark video runs now post-verify GT frames by exact decode and local frame alignment before final metrics are reported
@@ -166,15 +167,17 @@ Use this flow for `Browser Window Capture`:
 12. Adjust the extension delay slider while playback is running until lip-sync looks right
 13. Stop Chrome Audio Sync later from the extension popup when you are done
 
+Audio delay slider range: 0-2000 ms.
+
 Browser capture pacing:
 
 - Chrome compositor observation runs at up to `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` frames per second so 24 fps processing has a fresh recent browser frame available. Default: `30`.
 - Video processing samples the latest visible Chrome window frame at `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS`. Default: `24`.
 - The mpv live feed repeats the latest processed frame at `HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS` for steadier display cadence. Default: same as `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS`; values above process FPS are capped to avoid uneven 24 fps duplicate cadence.
 - mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
-- mpv keeps a tiny live jitter buffer so short wake-up or pipe-write stalls repeat a frame instead of creating a visible cadence hole. Default: `HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES=3`.
+- mpv keeps a tiny live jitter buffer so short wake-up or pipe-write stalls repeat a frame instead of creating a visible cadence hole. Default: `HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES=8`.
 - The live mpv feeder allows a tiny bounded refill after a late write so mpv's raw-video pipe does not underflow into visible pauses.
-- mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
+- mpv display debanding and built-in `error-diffusion` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
 - Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
 - Static browser windows keep feeding by repeating the latest visible frame at process FPS. If WinRT has no compositor frame yet, a visible-window fallback captures one startup seed frame so playback can start even before the tab video is moving.
 - Browser source delivery now resets after a meaningfully late frame instead of immediately catching up with a short interval. This favors steady motion cadence over shaving a few milliseconds of live latency.
@@ -193,12 +196,12 @@ Advanced testing: `HDRTVNET_FEEDER_GPU_RGB48=1` enables the experimental GPU-sid
 Display deband/dither tuning:
 
 - `HDRTVNET_MPV_DEBAND=1|0` enables/disables display debanding; default is `1`.
-- `HDRTVNET_MPV_DEBAND_ITERATIONS=3`
-- `HDRTVNET_MPV_DEBAND_THRESHOLD=96`
-- `HDRTVNET_MPV_DEBAND_RANGE=32`
-- `HDRTVNET_MPV_DEBAND_GRAIN=20`
+- HDRTVNET_MPV_DEBAND_ITERATIONS=4
+- HDRTVNET_MPV_DEBAND_THRESHOLD=100
+- HDRTVNET_MPV_DEBAND_RANGE=32
+- HDRTVNET_MPV_DEBAND_GRAIN=8
 - `HDRTVNET_MPV_DITHER=1|0` enables/disables mpv output dithering; default is `1`.
-- `HDRTVNET_MPV_DITHER_ALGO=fruit` (`ordered` and `error-diffusion` are also accepted by mpv builds that support them)
+- `HDRTVNET_MPV_DITHER_ALGO=error-diffusion` (`ordered` and `fruit` are also accepted by mpv builds that support them)
 - `HDRTVNET_MPV_DITHER_DEPTH=auto`
 - `HDRTVNET_MPV_DITHER_SIZE_FRUIT=6`
 - `HDRTVNET_MPV_TEMPORAL_DITHER=1|0` changes the dither pattern over time; default is `1`.
@@ -224,7 +227,7 @@ WinRT pacing tuning:
 
 - `HDRTVNET_WINRT_FRAME_POOL_BUFFERS=4` controls the Windows Graphics Capture frame-pool depth. Default: `4`.
 - `HDRTVNET_WINRT_DRAIN_TO_LATEST=0` keeps queued WinRT frames in order for steadier motion cadence. Set to `1` for the older lowest-latency behavior that always jumps to the newest queued frame.
-- `HDRTVNET_BROWSER_MPV_INTERPOLATION=0` disables mpv frame-mixing for Browser Window Capture.
+- Live capture interpolation is currently disabled by default to reduce latency.
 
 Important:
 
@@ -458,7 +461,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames before final metrics:
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY` enables/disables this pass. Default: `1`.
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS` limits verified rows, or `all` verifies every video row. Default: `all`.
-  - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES` controls the per-sample local GT search radius around the mapped frame. Default: `8`.
+  - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES` controls the per-sample local GT search radius around the mapped frame. Default: `0`.
   - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN` controls how much better a nearby GT frame must be before it replaces the mapped frame. Default: `0.035`.
   - benchmark summaries and CSV exports include `gt_frame`, `gt_alignment_offset_frames`, and `gt_alignment_score` for auditability.
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
@@ -525,6 +528,32 @@ Both SDR and HDR panes are rendered through embedded **mpv** (vulkan):
 - **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
 - **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
+
+### Tone Mapping Behavior
+
+HDR playback in the GUI uses mpv's display pipeline. When `force_hdr_metadata` is enabled, frames are interpreted as **BT.2020 / PQ HDR** within the playback pipeline, as raw frame data does not retain original container metadata
+
+Tone mapping behavior is **display-side only**:
+
+- By default, mpv (or the OS/display) performs automatic HDR tone mapping based on the connected display.
+- Using `tone_mapping=bt.2390`, a standardized HDR display tone-mapping curve **for visualization purposes only**.
+
+Key distinctions:
+
+- **Metrics (PSNR, SSIM, DeltaEITP, HDR-VDP3)** are computed **before display** and operate on the signal domain; they are **not affected by tone mapping**.
+- **Exported videos** are encoded as **BT.2020/PQ HDR signals without display-side tone mapping**, preserving the intended HDR luminance range
+- **BT.2390 is only used to improve visual appearance** (e.g., smoother highlight rolloff, reduced perceived banding) during playback.
+
+For fair comparison:
+
+- When enabled, tone mapping should be applied **equally to both HDR GT and HDR Convert**.
+- For benchmarking and thesis results, it is recommended to **disable tone mapping overrides** to avoid altering perceived contrast.
+
+In summary:
+
+- **Metrics → no tone mapping**
+- **Export → no tone mapping**
+- **Playback → tone mapping (display-only, for visualization)**
 
 > **Requires** `libmpv-2.dll` in the `src/` folder.
 > `setup.bat` and first GUI launch now try to download it automatically.
