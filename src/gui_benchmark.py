@@ -485,10 +485,12 @@ def _local_align_gt_frame_for_benchmark(
     sdr_eval_u8: np.ndarray | None,
     out_w: int,
     out_h: int,
+    cancel_check=None,
 ) -> dict:
     """Find the best nearby GT frame for one benchmark sample."""
     base_idx = max(0, int(mapped_gt_frame_idx or 0))
     info = {
+        "canceled": False,
         "frame_idx": int(base_idx),
         "base_frame_idx": int(base_idx),
         "best_frame_idx": int(base_idx),
@@ -526,6 +528,15 @@ def _local_align_gt_frame_for_benchmark(
     try:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
         for gt_idx in range(start_idx, end_idx + 1):
+
+            if callable(cancel_check):
+                try:
+                    if bool(cancel_check()):
+                        info["canceled"] = True
+                        break
+                except Exception:
+                    pass
+            
             ok, gt_frame = cap.read()
             if not ok or gt_frame is None:
                 break
@@ -1183,6 +1194,7 @@ class _BenchmarkWorker(QObject):
                         read_image_any(str(row.get("sdr_image") or ""))
                     )
                     align_info = _local_align_gt_frame_for_benchmark(
+                        cancel_check=self._is_canceled,
                         sdr_path=task.sdr_path,
                         gt_path=task.gt_path,
                         mapped_gt_frame_idx=max(0, int(strict_base_gt_frame_idx or 0)),
@@ -1190,6 +1202,11 @@ class _BenchmarkWorker(QObject):
                         out_w=out_w,
                         out_h=out_h,
                     )
+
+                    if self._is_canceled() or bool(align_info.get("canceled", False)):
+                        self._write_session_summaries(cfg, rows)
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
                     strict_gt_frame_idx = int(
                         align_info.get("frame_idx", strict_base_gt_frame_idx or 0) or 0
                     )
@@ -1198,6 +1215,10 @@ class _BenchmarkWorker(QObject):
                         max(0, int(strict_gt_frame_idx or 0)),
                         prefer_fast_seek=False,
                     )
+                    if self._is_canceled():
+                        self._write_session_summaries(cfg, rows)
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
                     if strict_rgb16 is None and strict_gt_frame_idx != int(
                         strict_base_gt_frame_idx or 0
                     ):
@@ -1305,8 +1326,15 @@ class _BenchmarkWorker(QObject):
                             pass
 
                     pred_eval_saved = read_image_any(str(row.get("hdr_convert_image") or ""))
+
+                    if self._is_canceled():
+                        self._write_session_summaries(cfg, rows)
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
+
                     if pred_eval_saved is None:
                         continue
+
                     pred_eval_saved = np.ascontiguousarray(pred_eval_saved)
                     if pred_eval_saved.dtype != np.uint16:
                         if pred_eval_saved.dtype == np.uint8:
@@ -1364,6 +1392,7 @@ class _BenchmarkWorker(QObject):
                     if gt_path_saved:
                         write_hdr_tiff(gt_path_saved, strict_gt_eval)
                     self._write_frame_result_file(cfg, row)
+                    self.sample_ready.emit(dict(row))
 
             summary_csv, summary_json, averages = self._write_session_summaries(cfg, rows)
 
