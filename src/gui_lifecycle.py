@@ -13,6 +13,8 @@ class LifecycleMixin:
             self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
         except Exception:
             pass
+        if hasattr(self, "_cancel_hdr_ground_truth_validation"):
+            self._cancel_hdr_ground_truth_validation(invalidate=True)
         self._playing = False
         self._compare_snapshot_pending = False
         self._active_use_mpv = False
@@ -152,6 +154,8 @@ class LifecycleMixin:
 
         self._ui_closing = True
         self._save_user_settings()
+        if hasattr(self, "_cancel_hdr_ground_truth_validation"):
+            self._cancel_hdr_ground_truth_validation(wait=True, invalidate=True)
         if self._export_worker is not None:
             try:
                 self._export_worker.cancel()

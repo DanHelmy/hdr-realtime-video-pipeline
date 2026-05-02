@@ -436,7 +436,7 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - Shared padded black or near-black borders are cropped from both images before objective metrics when a substantial common letterbox/pillarbox region is detected.
 - Ground-truth should be the same content/timing as the input clip for valid measurements.
 - GT pairing accepts small practical differences between real encodes:
-  - `HDRTVNET_GT_SYNC_TOLERANCE_S` controls allowed duration/frame-count mismatch in seconds. Default: `2.0`.
+  - `HDRTVNET_GT_SYNC_TOLERANCE_S` controls when GT pairing can stay on simple overlap-sync before it falls back to content-sync notes. Default: `2.0`.
   - active-picture detection allows one file to be letterboxed while the other is cropped, then applies a stable pair-level geometric crop before preview/metrics only when the encoded pair genuinely needs it.
   - `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` controls the constant-offset search window. Default: `2.0`.
   - `HDRTVNET_GT_SYNC_OFFSET_MIN_GAIN` controls how much better a nonzero global offset must be before it replaces frame offset `0`. Default: `0.06`; tiny offsets require a stronger gain to avoid false `+/-1` to `+/-5` frame shifts.

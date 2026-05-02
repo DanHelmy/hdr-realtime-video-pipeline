@@ -70,6 +70,7 @@ from gui_media_probe import (
     _probe_hdr_input,
     _probe_video_sync_info,
     _probe_video_timing_info,
+    _validate_video_timing_compatibility,
 )
 from gui_objective_metrics import (
     _compute_full_reference_metrics,
@@ -3282,33 +3283,16 @@ class ModelBenchmarkDialog(QDialog):
 
         sdr_meta = _probe_video_timing_info(sdr_path)
         gt_meta = _probe_video_timing_info(gt_path)
-        if sdr_meta is None or gt_meta is None:
-            return False, "Could not read video metadata."
-
-        sdr_fps = float(sdr_meta.get("fps") or 0.0)
-        gt_fps = float(gt_meta.get("fps") or 0.0)
-        if sdr_fps > 0.0 and gt_fps > 0.0 and abs(sdr_fps - gt_fps) > 0.25:
-            return False, f"FPS mismatch: SDR {sdr_fps:.3f} vs GT {gt_fps:.3f}."
-
-        sdr_n = int(sdr_meta.get("frame_count") or 0)
-        gt_n = int(gt_meta.get("frame_count") or 0)
-        try:
-            sync_tol_s = max(
-                0.25,
-                float(os.environ.get("HDRTVNET_GT_SYNC_TOLERANCE_S", "2.0")),
-            )
-        except Exception:
-            sync_tol_s = 2.0
-        sdr_d = float(sdr_meta.get("duration_s") or 0.0)
-        gt_d = float(gt_meta.get("duration_s") or 0.0)
-        duration_delta_s = abs(sdr_d - gt_d) if sdr_d > 0.0 and gt_d > 0.0 else 0.0
-        notes = []
-        if sdr_n > 0 and gt_n > 0 and abs(sdr_n - gt_n) > 2:
-            if duration_delta_s <= 0.0 or duration_delta_s > sync_tol_s:
-                return False, f"Frame-count mismatch: SDR {sdr_n} vs GT {gt_n}."
-            notes.append(
-                f"length differs by {duration_delta_s:.2f}s; using overlap sync"
-            )
+        ok, timing_error, notes = _validate_video_timing_compatibility(
+            sdr_meta,
+            gt_meta,
+            source_label="SDR",
+            gt_label="GT",
+            metadata_error_message="Could not read video metadata.",
+            enforce_sync_tolerance=False,
+        )
+        if not ok:
+            return False, str(timing_error or "Could not read video metadata.")
 
         sdr_w = int(sdr_meta.get("width") or 0)
         sdr_h = int(sdr_meta.get("height") or 0)

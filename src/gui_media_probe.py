@@ -45,11 +45,134 @@ _VIDEO_FILE_EXTS = {
 }
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+        if value > 0.0:
+            return value
+    except Exception:
+        pass
+    return float(default)
+
+
+_GT_SYNC_TOLERANCE_S = max(
+    0.25,
+    _env_float("HDRTVNET_GT_SYNC_TOLERANCE_S", 2.0),
+)
+_GT_EXACT_FRAME_TOLERANCE = 2
+
+
 def _looks_like_video_path(path: str | None) -> bool:
     ext = os.path.splitext(str(path or ""))[1].lower()
     if ext in _IMAGE_FILE_EXTS:
         return False
     return ext in _VIDEO_FILE_EXTS
+
+
+def _cancel_check_requested(cancel_check) -> bool:
+    if not callable(cancel_check):
+        return False
+    try:
+        return bool(cancel_check())
+    except Exception:
+        return False
+
+
+def _metadata_duration_delta_s(
+    src_meta: dict,
+    gt_meta: dict,
+    src_fps: float,
+    gt_fps: float,
+) -> float:
+    src_d = float(src_meta.get("duration_s", 0.0) or 0.0)
+    gt_d = float(gt_meta.get("duration_s", 0.0) or 0.0)
+    if src_d > 0.0 and gt_d > 0.0:
+        return abs(src_d - gt_d)
+
+    src_n = int(src_meta.get("frame_count", 0) or 0)
+    gt_n = int(gt_meta.get("frame_count", 0) or 0)
+    if src_n > 0 and gt_n > 0:
+        if src_fps > 0.0 and gt_fps > 0.0:
+            return abs((float(src_n) / src_fps) - (float(gt_n) / gt_fps))
+        fps = src_fps if src_fps > 0.0 else gt_fps
+        if fps > 0.0:
+            return abs(float(src_n - gt_n)) / fps
+    return 0.0
+
+
+def _validate_video_timing_compatibility(
+    src_meta: dict | None,
+    gt_meta: dict | None,
+    *,
+    source_label: str = "source",
+    gt_label: str = "GT",
+    metadata_error_message: str = "Could not read video metadata.",
+    enforce_sync_tolerance: bool = True,
+) -> tuple[bool, str | None, list[str]]:
+    if not isinstance(src_meta, dict) or not isinstance(gt_meta, dict):
+        return False, str(metadata_error_message), []
+
+    src_fps = float(src_meta.get("fps", 0.0) or 0.0)
+    gt_fps = float(gt_meta.get("fps", 0.0) or 0.0)
+    if src_fps > 0.0 and gt_fps > 0.0 and abs(src_fps - gt_fps) > 0.25:
+        return (
+            False,
+            f"FPS mismatch: {source_label} {src_fps:.3f} vs {gt_label} {gt_fps:.3f}.",
+            [],
+        )
+
+    notes: list[str] = []
+    duration_delta_s = _metadata_duration_delta_s(
+        src_meta,
+        gt_meta,
+        src_fps,
+        gt_fps,
+    )
+
+    src_n = int(src_meta.get("frame_count", 0) or 0)
+    gt_n = int(gt_meta.get("frame_count", 0) or 0)
+    if (
+        src_n > 0
+        and gt_n > 0
+        and abs(src_n - gt_n) > _GT_EXACT_FRAME_TOLERANCE
+    ):
+        if duration_delta_s <= 0.0 or duration_delta_s > _GT_SYNC_TOLERANCE_S:
+            if not enforce_sync_tolerance and duration_delta_s > 0.0:
+                notes.append(
+                    f"length differs by {duration_delta_s:.2f}s; using content sync"
+                )
+            elif not enforce_sync_tolerance:
+                notes.append(
+                    f"frame count differs ({source_label} {src_n} vs {gt_label} {gt_n}); using content sync"
+                )
+            else:
+                return (
+                    False,
+                    f"Frame-count mismatch: {source_label} {src_n} vs {gt_label} {gt_n}.",
+                    [],
+                )
+        else:
+            notes.append(
+                f"length differs by {duration_delta_s:.2f}s; using overlap sync"
+            )
+
+    src_d = float(src_meta.get("duration_s", 0.0) or 0.0)
+    gt_d = float(gt_meta.get("duration_s", 0.0) or 0.0)
+    if src_d > 0.0 and gt_d > 0.0 and abs(src_d - gt_d) > 0.25:
+        if duration_delta_s > _GT_SYNC_TOLERANCE_S:
+            if enforce_sync_tolerance:
+                return (
+                    False,
+                    f"Duration mismatch: {source_label} {src_d:.2f}s vs {gt_label} {gt_d:.2f}s.",
+                    [],
+                )
+            note = f"length differs by {duration_delta_s:.2f}s; using content sync"
+        else:
+            note = f"length differs by {duration_delta_s:.2f}s; using overlap sync"
+        if note not in notes:
+            notes.append(note)
+
+    return True, None, notes
 
 
 def _probe_hdr_input(video_path: str) -> dict:
@@ -511,8 +634,11 @@ def _crop_gt_frame_to_pair_active_area(
 def _probe_video_active_area_info(
     video_path: str,
     sample_count: int = 7,
+    cancel_check=None,
 ) -> dict | None:
     """Estimate the active picture area after encoded black-bar cropping."""
+    if _cancel_check_requested(cancel_check):
+        return None
     meta = _probe_video_timing_info(video_path)
     if meta is None:
         return None
@@ -550,6 +676,8 @@ def _probe_video_active_area_info(
 
         bounds = []
         for idx in idxs:
+            if _cancel_check_requested(cancel_check):
+                return None
             cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(idx)))
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -695,19 +823,26 @@ def _probe_video_sync_info(
     source_path: str,
     candidate_path: str,
     sample_count: int = 5,
+    cancel_check=None,
 ) -> dict:
     """Estimate same-content score and a constant GT frame offset."""
-    if not (
-        _looks_like_video_path(source_path)
-        and _looks_like_video_path(candidate_path)
-    ):
+    def _empty_info(*, canceled: bool = False) -> dict:
         return {
             "score": None,
             "offset_score": None,
             "sampled": 0,
             "offset_frames": 0,
             "offset_s": 0.0,
+            "canceled": bool(canceled),
         }
+
+    if _cancel_check_requested(cancel_check):
+        return _empty_info(canceled=True)
+    if not (
+        _looks_like_video_path(source_path)
+        and _looks_like_video_path(candidate_path)
+    ):
+        return _empty_info()
     if sample_count < 1:
         sample_count = 1
     cache_key = _video_sync_cache_key(source_path, candidate_path, sample_count)
@@ -720,24 +855,14 @@ def _probe_video_sync_info(
     if not cap_src.isOpened() or not cap_gt.isOpened():
         cap_src.release()
         cap_gt.release()
-        return {
-            "score": None,
-            "offset_score": None,
-            "sampled": 0,
-            "offset_frames": 0,
-            "offset_s": 0.0,
-        }
+        return _empty_info()
     try:
+        if _cancel_check_requested(cancel_check):
+            return _empty_info(canceled=True)
         src_n = int(cap_src.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         gt_n = int(cap_gt.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if src_n <= 1 or gt_n <= 1:
-            return {
-                "score": None,
-                "offset_score": None,
-                "sampled": 0,
-                "offset_frames": 0,
-                "offset_s": 0.0,
-            }
+            return _empty_info()
         src_fps = float(cap_src.get(cv2.CAP_PROP_FPS) or 0.0)
         gt_fps = float(cap_gt.get(cv2.CAP_PROP_FPS) or 0.0)
         if src_fps > 0.0 and gt_fps > 0.0:
@@ -779,6 +904,8 @@ def _probe_video_sync_info(
 
         src_samples = []
         for src_idx, gt_base_idx in zip(src_idxs, gt_base_idxs):
+            if _cancel_check_requested(cancel_check):
+                return _empty_info(canceled=True)
             src_frame = _read_at(cap_src, int(src_idx))
             if src_frame is None:
                 continue
@@ -804,6 +931,8 @@ def _probe_video_sync_info(
             if not new_offsets:
                 return
             for _src_idx, gt_base_idx, src_frame, src_texture in src_samples:
+                if _cancel_check_requested(cancel_check):
+                    return
                 best_for_sample = None
                 idx_to_offsets: dict[int, list[int]] = {}
                 for offset in new_offsets:
@@ -834,6 +963,8 @@ def _probe_video_sync_info(
                 span = max(1, int(end_idx - start_idx + 1))
                 if len(target_idxs) * 2 < span:
                     for gt_idx in target_idxs:
+                        if _cancel_check_requested(cancel_check):
+                            return
                         cap_gt.set(cv2.CAP_PROP_POS_FRAMES, int(gt_idx))
                         ok, gt_frame = cap_gt.read()
                         if not ok or gt_frame is None:
@@ -842,6 +973,8 @@ def _probe_video_sync_info(
                 else:
                     cap_gt.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
                     for gt_idx in range(start_idx, end_idx + 1):
+                        if _cancel_check_requested(cancel_check):
+                            return
                         ok, gt_frame = cap_gt.read()
                         if not ok or gt_frame is None:
                             break
@@ -851,6 +984,8 @@ def _probe_video_sync_info(
 
         initial_offsets = _video_sync_offset_candidates(gt_fps, duration_delta_s)
         _score_offsets(initial_offsets)
+        if _cancel_check_requested(cancel_check):
+            return _empty_info(canceled=True)
 
         summaries: dict[int, tuple[float, int]] = {}
         for offset, scores in offset_scores.items():
@@ -874,6 +1009,8 @@ def _probe_video_sync_info(
                 int(v) for v in refine_offsets if abs(int(v)) <= int(max_offset)
             }
             _score_offsets(sorted(refine_offsets))
+            if _cancel_check_requested(cancel_check):
+                return _empty_info(canceled=True)
 
         summaries = {}
         for offset, scores in offset_scores.items():
@@ -883,13 +1020,7 @@ def _probe_video_sync_info(
             summaries[int(offset)] = (float(summary), int(len(scores)))
 
         if not summaries:
-            info = {
-                "score": None,
-                "offset_score": None,
-                "sampled": 0,
-                "offset_frames": 0,
-                "offset_s": 0.0,
-            }
+            info = _empty_info()
         else:
             best_offset, (best_score, best_count) = max(
                 summaries.items(),
@@ -932,6 +1063,8 @@ def _probe_video_sync_info(
                 "zero_offset_score": zero_score_out,
                 "offset_gain": offset_gain,
             }
+        if bool(info.get("canceled", False)):
+            return info
         _VIDEO_SYNC_INFO_CACHE[cache_key] = dict(info)
         return info
     finally:

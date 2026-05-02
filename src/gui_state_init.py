@@ -169,6 +169,11 @@ class StateInitMixin:
         self._compare_progress_dlg = None
         self._compare_resume_after_cancel = False
         self._compare_anchor_frame = None
+        self._hdr_gt_validation_thread = None
+        self._hdr_gt_validation_worker = None
+        self._hdr_gt_progress_dlg = None
+        self._hdr_gt_resume_after_validation = False
+        self._hdr_gt_validation_generation = 0
         self._source_proc_dims = None
         self._source_video_dims = None
         self._source_max_resolution_key = "1080p"

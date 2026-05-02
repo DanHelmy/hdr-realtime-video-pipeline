@@ -3086,6 +3086,8 @@ class PlaybackRuntimeMixin:
 
     def _stop(self):
         self._suppress_eof_restart_once = True
+        if hasattr(self, "_cancel_hdr_ground_truth_validation"):
+            self._cancel_hdr_ground_truth_validation(invalidate=True)
         if getattr(self, "_compare_snapshot_pending", False):
             self._compare_snapshot_pending = False
             self._compare_resume_after_cancel = False
