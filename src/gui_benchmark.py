@@ -1204,7 +1204,6 @@ class _BenchmarkWorker(QObject):
                     )
 
                     if self._is_canceled() or bool(align_info.get("canceled", False)):
-                        self._write_session_summaries(cfg, rows)
                         self.canceled.emit("Benchmark canceled during post verification.")
                         return
                     strict_gt_frame_idx = int(
@@ -1216,7 +1215,6 @@ class _BenchmarkWorker(QObject):
                         prefer_fast_seek=False,
                     )
                     if self._is_canceled():
-                        self._write_session_summaries(cfg, rows)
                         self.canceled.emit("Benchmark canceled during post verification.")
                         return
                     if strict_rgb16 is None and strict_gt_frame_idx != int(
@@ -1328,7 +1326,6 @@ class _BenchmarkWorker(QObject):
                     pred_eval_saved = read_image_any(str(row.get("hdr_convert_image") or ""))
 
                     if self._is_canceled():
-                        self._write_session_summaries(cfg, rows)
                         self.canceled.emit("Benchmark canceled during post verification.")
                         return
 
