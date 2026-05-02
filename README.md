@@ -34,6 +34,10 @@ Core updates include:
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
+- **HDR GT fast path processing** for significantly faster ground-truth video alignment and frame mapping
+- **optimized GT sync algorithm** with improved frame scanning and alignment detection
+- **HDR GT status indicator** in the GUI status line showing when fast path is active
+- **cached GT alignment results** to avoid redundant processing for the same video pairs
 - HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and conservative cached constant frame offsets
 - compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
 - benchmark video runs now post-verify GT frames by exact decode and local frame alignment before final metrics are reported
@@ -287,6 +291,10 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **HDR GT pairing is more practical for real movie files**
   - GT validation allows short duration/frame-count mismatches by default
   - encoded black bars are handled with one stable pair-level crop rectangle, so cropped and letterboxed versions of the same movie can still be paired without per-frame aspect shifts
+  - **fast path processing** significantly accelerates HDR GT alignment with optimized frame scanning
+  - **improved sync algorithm** with better constant offset detection and frame mapping
+  - **cached alignment results** prevent redundant processing for repeated video pairs
+  - **GUI status indicator** shows "HDR GT: fast path active" when using optimized processing
   - a cached sync scan estimates constant SDR/HDR lead-lag offsets and reports the detected frame offset, but keeps offset `0` unless a nonzero offset is clearly better
   - benchmark video runs add a per-sample local GT-frame search during post-verify, so final metrics are based on the best nearby exact-decoded GT frame instead of a stale fast seek
   - compare, objective metrics, and benchmark use the same mapped GT-frame lookup
@@ -357,6 +365,11 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - ProRes exports now use a more reliable BT.2020 / PQ tagging path
   - export conversion path now targets a `1001 nit` HDR peak expectation
   - export now applies `deband` + `error_diffusion` dithering by default to better match interactive playback cleanup
+- **HDR GT fast path utilities**
+  - dedicated `gui_hdr_gt_fast_path.py` module for optimized ground-truth video processing
+  - `true_hdr_video_fast` mode indicator for improved HDR GT handling
+  - faster frame alignment with reduced computational overhead
+  - better memory management for large HDR GT video files
 - **Compare pane display transitions are smoother**
   - compare no longer force-recreates mpv surfaces on show/screen-change, reducing visible color-space flashing
 - **Playback and export now use a simpler single-frame path**

@@ -655,19 +655,66 @@ def _probe_video_active_area_info(
         fps = float(meta.get("fps", 0.0) or 0.0)
         frame_count = int(meta.get("frame_count", 0) or 0)
         duration_s = float(meta.get("duration_s", 0.0) or 0.0)
-        probe_count = max(3, int(sample_count))
+        # Adaptive probe count based on video length
+        if duration_s < 5.0:
+            probe_count = max(2, min(5, int(sample_count)))
+        elif duration_s < 10.0:
+            probe_count = max(3, min(8, int(sample_count)))
+        else:
+            probe_count = max(3, int(sample_count))
         if duration_s > 2.0 and fps > 0.0:
-            times_s = np.linspace(
-                duration_s * 0.12,
-                duration_s * 0.88,
-                num=probe_count,
-                dtype=np.float64,
-            )
+            # Adaptive margins based on video length
+            if duration_s < 10.0:
+                # For very short videos, sample all frames
+                start_time = 0.0
+                end_time = duration_s
+            elif duration_s < 30.0:
+                # For short videos, use smaller margins (5%)
+                start_time = duration_s * 0.05
+                end_time = duration_s * 0.95
+            else:
+                # For longer videos, use original margins (12%)
+                start_time = duration_s * 0.12
+                end_time = duration_s * 0.88
+
+            # Adjust probe count for very short videos
+            if duration_s < 5.0:
+                probe_count = max(2, min(10, int(frame_count)))
+
+            if start_time < end_time:
+                times_s = np.linspace(
+                    start_time,
+                    end_time,
+                    num=probe_count,
+                    dtype=np.float64,
+                )
+            else:
+                # Fallback if margins would overlap
+                times_s = np.array([0.0], dtype=np.float64)
             idxs = np.rint(times_s * fps).astype(np.int64)
         elif frame_count > 1:
+            # Adaptive margins based on frame count
+            if frame_count < 10:
+                # For very few frames, sample all frames
+                start_idx = 0
+                end_idx = frame_count - 1
+            elif frame_count < 50:
+                # For few frames, use smaller margins (5%)
+                start_idx = max(0, int(round(frame_count * 0.05)))
+                end_idx = max(1, int(round((frame_count - 1) * 0.95)))
+            else:
+                # For more frames, use original margins (12%)
+                start_idx = max(0, int(round(frame_count * 0.12)))
+                end_idx = max(1, int(round((frame_count - 1) * 0.88)))
+
+            # Ensure end_idx > start_idx
+            if start_idx >= end_idx:
+                start_idx = 0
+                end_idx = max(1, frame_count - 1)
+
             idxs = np.linspace(
-                max(0, int(round(frame_count * 0.12))),
-                max(1, int(round((frame_count - 1) * 0.88))),
+                start_idx,
+                end_idx,
                 num=probe_count,
                 dtype=np.int64,
             )

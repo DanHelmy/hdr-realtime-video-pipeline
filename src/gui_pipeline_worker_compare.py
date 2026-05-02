@@ -258,45 +258,56 @@ class PipelineWorkerCompareMixin:
 
         cmp_hdr_gt = None
         gt_hdr_mode_note = "missing 16-bit HDR GT"
+        gt_u8_frame = None  # For fast alignment
+
+        # Import fast path utilities
+        from gui_hdr_gt_fast_path import _process_hdr_gt_with_fast_path
+
         if compare_gt_path:
             gt_seek_idx = self._compare_gt_frame_index(compare_gt_path, cmp_seek_idx)
             gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx)
             if gt_rgb16 is None and gt_seek_idx > 0:
                 gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx - 1)
             if gt_rgb16 is not None:
-                gt_probe = _crop_gt_frame_to_pair_active_area(
-                    np.ascontiguousarray(gt_rgb16[:, :, ::-1]),
-                    str(self._video_path or ""),
-                    compare_gt_path,
+                # Use fast path for HDR GT processing
+                cmp_hdr_gt, gt_u8_frame, gt_hdr_mode_note, _ = _process_hdr_gt_with_fast_path(
+                    gt_rgb16,
+                    cmp_sdr,  # Pass SDR frame for alignment
+                    output_width=compare_out_w,
+                    output_height=compare_out_h,
+                    crop_active_area=True,
+                    sdr_video_path=str(self._video_path or ""),
+                    gt_video_path=compare_gt_path,
                 )
-                gt_hdr_mode_note = "true 16-bit HDR decode"
-                cmp_hdr_gt = np.ascontiguousarray(
-                    _letterbox_bgr(gt_probe, compare_out_w, compare_out_h)
-                )
+                # Fast path is required - no fallback
+                if cmp_hdr_gt is None:
+                    msg = "HDR GT fast path failed - no fallback available"
+                    cmp_note = f"{cmp_note} {msg}".strip()
             else:
                 msg = (
                     "HDR GT frame unavailable as true 16-bit linear decode at "
-                    "this position; fallback is disabled."
+                    "this position."
                 )
                 cmp_note = f"{cmp_note} {msg}".strip()
         elif gt_frame is not None:
             if isinstance(gt_frame, np.ndarray) and gt_frame.dtype == np.uint16:
-                gt_hdr_mode_note = "true 16-bit HDR decode"
-                gt_probe = _crop_gt_frame_to_pair_active_area(
+                # Use fast path for runtime HDR GT frame
+                cmp_hdr_gt, gt_u8_frame, gt_hdr_mode_note, _ = _process_hdr_gt_with_fast_path(
                     gt_frame,
-                    str(self._video_path or ""),
-                    str(compare_gt_path or ""),
+                    cmp_sdr,  # Pass SDR frame for alignment
+                    output_width=compare_out_w,
+                    output_height=compare_out_h,
+                    crop_active_area=True,
+                    sdr_video_path=str(self._video_path or ""),
+                    gt_video_path=str(compare_gt_path or ""),
                 )
-                cmp_hdr_gt = np.ascontiguousarray(
-                    _letterbox_bgr(
-                        gt_probe,
-                        compare_out_w,
-                        compare_out_h,
-                    )
-                )
+                # Fast path is required - no fallback
+                if cmp_hdr_gt is None:
+                    msg = "HDR GT fast path failed for runtime frame - no fallback available"
+                    cmp_note = f"{cmp_note} {msg}".strip()
             else:
                 msg = (
-                    "Runtime HDR GT frame is not uint16 linear; fallback is disabled."
+                    "Runtime HDR GT frame is not uint16 linear."
                 )
                 cmp_note = f"{cmp_note} {msg}".strip()
         else:

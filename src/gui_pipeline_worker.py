@@ -151,6 +151,7 @@ class PipelineWorker(
         self._expect_display_handoff = False
         self._display_handoff_event = threading.Event()
         self._display_handoff_event.set()
+        self._use_hdr_gt_fast_path = True
 
     # ── public API (called from main thread) ──
 
@@ -162,7 +163,8 @@ class PipelineWorker(
                   objective_metrics_enabled=False,
                   hdr_ground_truth_path: str | None = None,
                   capture_target: dict | None = None,
-                  expect_display_handoff: bool = False):
+                  expect_display_handoff: bool = False,
+                  use_hdr_gt_fast_path: bool = True):
         self._video_path = video_path
         self._capture_target = dict(capture_target) if isinstance(capture_target, dict) else None
         self._precision_key = precision_key
@@ -195,6 +197,7 @@ class PipelineWorker(
         self._realtime_drop_frames = 0
         self._last_metrics_emit_t = 0.0
         self._expect_display_handoff = bool(expect_display_handoff)
+        self._use_hdr_gt_fast_path = bool(use_hdr_gt_fast_path)
         if self._expect_display_handoff:
             self._display_handoff_event.clear()
         else:
