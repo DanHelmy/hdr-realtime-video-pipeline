@@ -701,6 +701,12 @@ class BenchmarkRunConfig:
     runtime_mode: str = "auto"
 
 
+@dataclass
+class _QueuedBenchmarkRun:
+    config: BenchmarkRunConfig
+    title: str
+
+
 class _BenchmarkWorker(QObject):
     progress = pyqtSignal(int, str)
     sample_ready = pyqtSignal(dict)
@@ -1584,6 +1590,10 @@ class ModelBenchmarkDialog(QDialog):
         self._expanded_preview_pane: int | None = None
         self._reset_preview_splitter_on_show = True
         self._ffmpeg_hdr_warning_shown = False
+        self._benchmark_queue: list[_QueuedBenchmarkRun] = []
+        self._queue_running = False
+        self._active_queue_total = 0
+        self._active_queue_index = 0
         self._preview_processor_cache: dict[tuple[str, bool, str, str], HDRTVNetTorch] = {}
         self._frame_detect_cache_path = os.path.join(self._logs_root, "benchmark_frame_cache.json")
         self._frame_detect_cache = self._load_frame_detect_cache()
@@ -1788,6 +1798,28 @@ class ModelBenchmarkDialog(QDialog):
         opt_form.addRow("Session logs root:", root_row)
         cfg_layout.addWidget(opt_group)
 
+        queue_group = QGroupBox("Benchmark Queue")
+        queue_layout = QGridLayout(queue_group)
+        self._lst_benchmark_queue = QListWidget()
+        self._lst_benchmark_queue.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._lbl_queue_status = QLabel("Queue: empty")
+        self._lbl_queue_preview = QLabel("Select a queued run to preview its captured settings.")
+        self._lbl_queue_preview.setWordWrap(True)
+        self._btn_queue_add = QPushButton("Add Current to Queue")
+        self._btn_queue_run = QPushButton("Run Queue")
+        self._btn_queue_clear = QPushButton("Clear Queue")
+        self._btn_queue_run.setProperty("role", "primary")
+        self._lst_benchmark_queue.setToolTip(
+            "Queued runs use the mode, source/tasks, precision, resolution, HG, and pre-dequantize settings captured when added."
+        )
+        queue_layout.addWidget(self._lbl_queue_status, 0, 0, 1, 3)
+        queue_layout.addWidget(self._lst_benchmark_queue, 1, 0, 1, 3)
+        queue_layout.addWidget(self._lbl_queue_preview, 2, 0, 1, 3)
+        queue_layout.addWidget(self._btn_queue_add, 3, 0)
+        queue_layout.addWidget(self._btn_queue_run, 3, 1)
+        queue_layout.addWidget(self._btn_queue_clear, 3, 2)
+        cfg_layout.addWidget(queue_group)
+
         result_tab = QWidget()
         result_layout = QVBoxLayout(result_tab)
         result_layout.setContentsMargins(0, 6, 0, 0)
@@ -1964,6 +1996,10 @@ class ModelBenchmarkDialog(QDialog):
 
         self._btn_session_root.clicked.connect(self._pick_session_root)
         self._btn_run.clicked.connect(self._start_benchmark)
+        self._btn_queue_add.clicked.connect(self._add_current_benchmark_to_queue)
+        self._btn_queue_run.clicked.connect(self._start_benchmark_queue)
+        self._btn_queue_clear.clicked.connect(self._clear_benchmark_queue)
+        self._lst_benchmark_queue.currentRowChanged.connect(self._update_queue_preview)
         self._btn_cancel.clicked.connect(self._cancel_benchmark)
         self._btn_close.clicked.connect(self._close_dialog)
 
@@ -1983,6 +2019,7 @@ class ModelBenchmarkDialog(QDialog):
 
         self._sync_mode_ui()
         self._sync_subset_enabled()
+        self._sync_queue_ui()
         self._add_result_set_tab(
             {
                 "title": "Current Run",
@@ -3695,9 +3732,151 @@ class ModelBenchmarkDialog(QDialog):
         if rkey:
             session_name = f"{session_name}__{rkey}"
         session_name = f"{session_name}__n{max(0, int(task_count))}"
-        session = os.path.join(root_dir, source_key, session_name)
+        session_root = os.path.join(root_dir, source_key)
+        session = os.path.join(session_root, session_name)
+        suffix = 2
+        while os.path.exists(session):
+            session = os.path.join(session_root, f"{session_name}_{suffix}")
+            suffix += 1
         os.makedirs(session, exist_ok=True)
         return session
+
+    def _build_current_run_config(self) -> BenchmarkRunConfig:
+        mode = str(self._cmb_mode.currentData() or "video")
+        if mode == "video":
+            tasks = self._build_video_tasks()
+        else:
+            tasks = self._build_dataset_tasks()
+        source_name = self._derive_source_name(mode, tasks)
+        session_dir = self._new_session_dir(source_name, len(tasks))
+        return BenchmarkRunConfig(
+            mode=mode,
+            source_name=source_name,
+            precision_key=self._cmb_precision.currentText(),
+            use_hg=bool(self._chk_use_hg.isChecked()),
+            resolution_key=self._cmb_resolution.currentText(),
+            predequantize_mode=str(self._cmb_predequantize.currentData() or "auto"),
+            tasks=tasks,
+            session_dir=session_dir,
+        )
+
+    def _queue_title_for_config(self, cfg: BenchmarkRunConfig) -> str:
+        hg_label = "HG" if bool(cfg.use_hg) else "no-HG"
+        pdq = _normalize_benchmark_predequantize_mode(cfg.predequantize_mode)
+        mode_label = "video" if cfg.mode == "video" else "dataset"
+        return (
+            f"{cfg.source_name} | {cfg.precision_key} | {cfg.resolution_key} | "
+            f"{hg_label} | predeq={pdq} | {mode_label} n={len(cfg.tasks)}"
+        )
+
+    def _queue_detail_for_config(self, cfg: BenchmarkRunConfig) -> str:
+        hg_label = "on" if bool(cfg.use_hg) else "off"
+        pdq = _normalize_benchmark_predequantize_mode(cfg.predequantize_mode)
+        mode_label = "Video" if cfg.mode == "video" else "Dataset"
+        first_task = cfg.tasks[0] if cfg.tasks else None
+        first_label = str(first_task.label) if first_task is not None else "-"
+        if len(cfg.tasks) > 1:
+            first_label = f"{first_label} (+{len(cfg.tasks) - 1} more)"
+        return (
+            f"{mode_label} benchmark: {cfg.source_name} | "
+            f"precision={cfg.precision_key}, resolution={cfg.resolution_key}, "
+            f"HG={hg_label}, predequantize={pdq}, items={len(cfg.tasks)} | "
+            f"first item={first_label} | session={cfg.session_dir}"
+        )
+
+    def _sync_queue_ui(self):
+        if not hasattr(self, "_lbl_queue_status"):
+            return
+        running = self._worker_thread is not None
+        queued = len(self._benchmark_queue)
+        if self._queue_running:
+            remaining = queued
+            total = max(1, int(self._active_queue_total))
+            current = max(1, int(self._active_queue_index))
+            self._lbl_queue_status.setText(
+                f"Queue: running {current}/{total} ({remaining} remaining)"
+            )
+        else:
+            self._lbl_queue_status.setText(
+                f"Queue: {queued} run{'s' if queued != 1 else ''}"
+            )
+        self._btn_queue_add.setEnabled(not running)
+        self._btn_queue_run.setEnabled((not running) and queued > 0)
+        self._btn_queue_clear.setEnabled((not running) and queued > 0)
+
+    def _refresh_queue_list(self):
+        previous_row = self._lst_benchmark_queue.currentRow()
+        self._lst_benchmark_queue.clear()
+        for idx, queued in enumerate(self._benchmark_queue, start=1):
+            item = QListWidgetItem(f"{idx}. {queued.title}")
+            item.setToolTip(self._queue_detail_for_config(queued.config))
+            self._lst_benchmark_queue.addItem(item)
+        if self._benchmark_queue:
+            next_row = min(max(previous_row, 0), len(self._benchmark_queue) - 1)
+            self._lst_benchmark_queue.setCurrentRow(next_row)
+        else:
+            self._update_queue_preview(-1)
+        self._sync_queue_ui()
+
+    def _update_queue_preview(self, row: int):
+        if not hasattr(self, "_lbl_queue_preview"):
+            return
+        if row < 0 or row >= len(self._benchmark_queue):
+            self._lbl_queue_preview.setText(
+                "Select a queued run to preview its captured settings."
+            )
+            return
+        queued = self._benchmark_queue[row]
+        self._lbl_queue_preview.setText(self._queue_detail_for_config(queued.config))
+
+    def _add_current_benchmark_to_queue(self):
+        if self._worker_thread is not None:
+            return
+        try:
+            cfg = self._build_current_run_config()
+        except Exception as exc:
+            QMessageBox.warning(self, "Benchmark Queue", str(exc))
+            return
+        title = self._queue_title_for_config(cfg)
+        self._benchmark_queue.append(_QueuedBenchmarkRun(config=cfg, title=title))
+        self._refresh_queue_list()
+        self._set_status(f"Queued benchmark: {title}")
+
+    def _clear_benchmark_queue(self):
+        if self._worker_thread is not None:
+            return
+        self._benchmark_queue.clear()
+        self._queue_running = False
+        self._active_queue_total = 0
+        self._active_queue_index = 0
+        self._refresh_queue_list()
+        self._set_status("Benchmark queue cleared")
+
+    def _start_benchmark_queue(self):
+        if self._worker_thread is not None or not self._benchmark_queue:
+            return
+        if not self._warn_if_ffmpeg_missing_for_hdr_benchmark():
+            return
+        self._queue_running = True
+        self._active_queue_total = len(self._benchmark_queue)
+        self._active_queue_index = 0
+        self._start_next_queued_benchmark()
+
+    def _start_next_queued_benchmark(self):
+        if self._worker_thread is not None:
+            return
+        if not self._benchmark_queue:
+            self._queue_running = False
+            self._active_queue_total = 0
+            self._active_queue_index = 0
+            self._lbl_progress.setText("Benchmark queue completed.")
+            self._set_status("Benchmark queue completed", percent=100)
+            self._sync_queue_ui()
+            return
+        queued = self._benchmark_queue.pop(0)
+        self._active_queue_index += 1
+        self._refresh_queue_list()
+        self._start_benchmark_config(queued.config, queue_title=queued.title)
 
     def _set_running_state(self, running: bool):
         self._btn_run.setEnabled(not running)
@@ -3728,28 +3907,38 @@ class ModelBenchmarkDialog(QDialog):
             self._result_sets_bar,
         ):
             w.setEnabled(not running)
+        if hasattr(self, "_lst_benchmark_queue"):
+            self._lst_benchmark_queue.setEnabled(not running)
+        self._sync_queue_ui()
 
     def _start_benchmark(self):
         if self._worker_thread is not None:
             return
 
-        mode = str(self._cmb_mode.currentData() or "video")
         try:
-            if mode == "video":
-                tasks = self._build_video_tasks()
-            else:
-                tasks = self._build_dataset_tasks()
+            run_cfg = self._build_current_run_config()
         except Exception as exc:
             QMessageBox.warning(self, "Benchmark", str(exc))
             return
 
-        source_name = self._derive_source_name(mode, tasks)
         if not self._warn_if_ffmpeg_missing_for_hdr_benchmark():
             return
-        session_dir = self._new_session_dir(source_name, len(tasks))
+        self._queue_running = False
+        self._active_queue_total = 0
+        self._active_queue_index = 0
+        self._start_benchmark_config(run_cfg)
+
+    def _start_benchmark_config(
+        self,
+        run_cfg: BenchmarkRunConfig,
+        *,
+        queue_title: str | None = None,
+    ):
+        source_name = run_cfg.source_name
+        session_dir = run_cfg.session_dir
         run_title = self._result_tab_title(
             source_name,
-            self._cmb_precision.currentText(),
+            run_cfg.precision_key,
             session_dir,
         )
         run_payload = self._result_tab_payload(
@@ -3758,40 +3947,39 @@ class ModelBenchmarkDialog(QDialog):
             average={},
             session_dir=session_dir,
             source_name=source_name,
-            precision=self._cmb_precision.currentText(),
-            resolution=self._cmb_resolution.currentText(),
-            use_hg=bool(self._chk_use_hg.isChecked()),
-            predequantize_mode=str(self._cmb_predequantize.currentData() or "auto"),
+            precision=run_cfg.precision_key,
+            resolution=run_cfg.resolution_key,
+            use_hg=bool(run_cfg.use_hg),
+            predequantize_mode=str(run_cfg.predequantize_mode),
             selected_row=0,
         )
         self._add_result_set_tab(run_payload, activate=True)
 
         self._session_dir = session_dir
         self._lbl_session_dir.setText(f"Session: {session_dir}")
-        self._lbl_progress.setText("Benchmark started ...")
+        if self._queue_running:
+            self._lbl_progress.setText(
+                f"Benchmark queue {self._active_queue_index}/{self._active_queue_total}: "
+                f"{queue_title or run_title}"
+            )
+        else:
+            self._lbl_progress.setText("Benchmark started ...")
         self._progress.setValue(0)
-        self._set_status("Benchmark started", percent=0)
+        status_message = (
+            f"Benchmark queue {self._active_queue_index}/{self._active_queue_total} started"
+            if self._queue_running else "Benchmark started"
+        )
+        self._set_status(status_message, percent=0)
         self._set_result_run_info(
             source_name,
-            self._cmb_precision.currentText(),
-            self._cmb_resolution.currentText(),
+            run_cfg.precision_key,
+            run_cfg.resolution_key,
         )
         self._tabs.setCurrentIndex(1)
 
         self._results = []
         self._tbl.setRowCount(0)
         self._set_result_previews(None)
-
-        run_cfg = BenchmarkRunConfig(
-            mode=mode,
-            source_name=source_name,
-            precision_key=self._cmb_precision.currentText(),
-            use_hg=bool(self._chk_use_hg.isChecked()),
-            resolution_key=self._cmb_resolution.currentText(),
-            predequantize_mode=str(self._cmb_predequantize.currentData() or "auto"),
-            tasks=tasks,
-            session_dir=session_dir,
-        )
 
         thread = QThread(self)
         worker = _BenchmarkWorker(run_cfg)
@@ -3819,8 +4007,12 @@ class ModelBenchmarkDialog(QDialog):
     def _cancel_benchmark(self):
         if self._worker is not None:
             self._worker.cancel()
-            self._lbl_progress.setText("Canceling benchmark ...")
-            self._set_status("Canceling benchmark ...")
+            if self._queue_running:
+                self._lbl_progress.setText("Canceling benchmark queue ...")
+                self._set_status("Canceling benchmark queue ...")
+            else:
+                self._lbl_progress.setText("Canceling benchmark ...")
+                self._set_status("Canceling benchmark ...")
 
     def _cleanup_worker(self):
         if self._worker is not None:
@@ -3830,6 +4022,8 @@ class ModelBenchmarkDialog(QDialog):
             self._worker_thread.deleteLater()
             self._worker_thread = None
         self._set_running_state(False)
+        if self._queue_running:
+            self._start_next_queued_benchmark()
 
     def _on_worker_progress(self, percent: int, message: str):
         self._progress.setValue(max(0, min(100, int(percent))))
@@ -3914,11 +4108,20 @@ class ModelBenchmarkDialog(QDialog):
         )
 
     def _on_worker_failed(self, message: str):
+        self._queue_running = False
+        self._active_queue_total = 0
+        self._active_queue_index = 0
+        self._sync_queue_ui()
         self._lbl_progress.setText("Benchmark failed.")
         self._set_status("Benchmark failed")
         QMessageBox.warning(self, "Benchmark Failed", str(message or "Unknown error."))
 
     def _on_worker_canceled(self, message: str):
+        was_queue_running = bool(self._queue_running)
+        self._queue_running = False
+        self._active_queue_total = 0
+        self._active_queue_index = 0
+        self._sync_queue_ui()
         avg = self._compute_average_from_rows(self._results)
         selected_row = self._selected_result_row()
         idx = int(self._result_sets_bar.currentIndex())
@@ -3952,8 +4155,12 @@ class ModelBenchmarkDialog(QDialog):
             predequantize_mode=self._result_predequantize_mode,
             selected_row=selected_row,
         )
-        self._lbl_progress.setText("Benchmark canceled.")
-        self._set_status("Benchmark canceled")
+        if was_queue_running:
+            self._lbl_progress.setText("Benchmark queue canceled.")
+            self._set_status("Benchmark queue canceled")
+        else:
+            self._lbl_progress.setText("Benchmark canceled.")
+            self._set_status("Benchmark canceled")
         if message:
             QMessageBox.information(self, "Benchmark", message)
 

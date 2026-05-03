@@ -24,7 +24,7 @@ Core updates include:
 - AMD keeps the PyTorch runtime, with channels-last tensors and benchmark mode enabled
 - AMD benchmark runs use cached `max-autotune` PyTorch kernels when the exact compile cache is already present, otherwise they stay eager to avoid surprise compile stalls
 - AMD INT8 `Auto` pre-dequantization behavior is preserved
-- new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking
+- new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking, including queued multi-run benchmark batches
 - deterministic frame/pair selection options with eager-mode quality runs for repeatable objective comparisons
 - objective metric domains are now explicit and shared across compare and benchmark:
   - `PSNR` / `SSIM` run on linear HDR frames
@@ -134,6 +134,7 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 - Open from `Tools -> Model Quality Benchmark ...`
 - Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
+- Queue multiple benchmark configurations and run them back-to-back without manually restarting each run
 - Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
 - On AMD, benchmark uses cached `torch.compile` / `max-autotune` kernels on an exact cache hit and falls back to eager mode on a miss
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
@@ -410,7 +411,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint/export artifact size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
-| **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
+| **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, queued multi-run batches, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
