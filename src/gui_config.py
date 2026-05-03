@@ -30,6 +30,11 @@ PRECISIONS = {
         "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
     },
+    "INT8 Mixed (QAT) (Film)": {
+        "precision": "int8-mixed",
+        "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt"),
+    },
     "INT8 Full (PTQ)": {
         "precision": "int8-full",
         "model": _weight("Ensemble_AGCM_LE_int8_full.pt"),
@@ -39,6 +44,11 @@ PRECISIONS = {
         "precision": "int8-full",
         "model": _weight("Ensemble_AGCM_LE_int8_full_qat.pt"),
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_nohg.pt"),
+    },
+    "INT8 Full (QAT) (Film)": {
+        "precision": "int8-full",
+        "model": _weight("Ensemble_AGCM_LE_int8_full_qat_film.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt"),
     },
 }
 

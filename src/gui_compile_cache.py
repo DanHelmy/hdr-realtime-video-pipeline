@@ -216,6 +216,8 @@ def _precision_to_compile_arg(gui_precision: str) -> str:
         "FP32": "fp32",
         "INT8 Mixed (PTQ)": "int8-mixed",
         "INT8 Mixed (QAT)": "int8-mixed",
+        "INT8 Mixed (QAT) (Film)": "int8-mixed",
         "INT8 Full (PTQ)": "int8-full",
         "INT8 Full (QAT)": "int8-full",
+        "INT8 Full (QAT) (Film)": "int8-full",
     }.get(str(gui_precision), "fp16")
