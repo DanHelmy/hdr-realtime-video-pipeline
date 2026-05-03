@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from gui_config import PRECISIONS, _available_precision_keys, _select_model_path
 from gui_media_probe import _probe_hdr_input, _probe_video_timing_info
+from gui_pipeline_worker_frame_processing import PipelineWorkerFrameProcessingMixin
 from gui_pipeline_worker_model import PipelineWorkerModelMixin, _resolve_predequantize_arg
 from gui_scaling import _letterbox_bgr
 from models.hdrtvnet_torch import (
@@ -625,7 +626,7 @@ class ExportOptionsDialog(QDialog):
         return getattr(self, "_accepted_config", None)
 
 
-class VideoExportWorker(QObject):
+class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
     compile_ready = pyqtSignal()
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(str)
@@ -643,6 +644,7 @@ class VideoExportWorker(QObject):
         self._rgb48_host_tensor = None
         self._rgb48_host_np = None
         self._rgb48_host_shape = None
+        self._reset_enhance_history()
 
     def cancel(self):
         self._cancel_requested.set()
@@ -986,7 +988,16 @@ class VideoExportWorker(QObject):
                 with torch.inference_mode():
                     tensor, cond = processor.preprocess(model_inp)
                     raw_out = processor.infer((tensor, cond))
-                output_rgb48 = self._tensor_to_rgb48_bytes(raw_out)
+                    prepared_out = self._prepare_hdr_output_tensor(
+                        raw_out,
+                        lower_res_processing=False,
+                    )
+                    export_out = self._apply_hdr_flat_surface_cleanup(
+                        prepared_out,
+                        model_inp,
+                        quality=os.environ.get("HDRTVNET_EXPORT_HDR_CLEANUP", "highlight-high"),
+                    )
+                output_rgb48 = self._tensor_to_rgb48_bytes(export_out)
                 if self._canceled():
                     raise InterruptedError("Export canceled by user.")
                 while not self._canceled():

@@ -357,18 +357,6 @@ class PipelineWorker(
         self._sdr_drop_until_frame = max(self._sdr_drop_until_frame,
                                          self._frame_idx + max(0, int(drop_frames)))
 
-    def _reset_enhance_history(self):
-        self._enh_prev_luma = None
-        self._enh_temporal_detail = None
-        self._flat_temporal_prev_rgb = None
-        self._flat_temporal_prev_luma = None
-        self._flat_temporal_prev_scene = None
-
-    @staticmethod
-    def _box_blur(x: torch.Tensor, k: int = 3) -> torch.Tensor:
-        p = k // 2
-        return F.avg_pool2d(x, kernel_size=k, stride=1, padding=p)
-
     def _ensure_sobel_kernels(self, device: torch.device, dtype: torch.dtype):
         if self._sobel_x is not None and self._sobel_x.device == device and self._sobel_x.dtype == dtype:
             return

@@ -30,7 +30,7 @@ Core updates include:
   - `PSNR` / `SSIM` run on linear HDR frames
   - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
 - display-side HDR tone mapping (BT.2390) for improved visual presentation, applied consistently across HDR panes when enabled; does not affect objective metrics or exported HDR content
-- display-side temporal stabilization reduces flicker on static flat highlight regions in the mpv viewer without changing objective metrics, compare snapshots, benchmark results, or exports
+- lightweight high-highlight debanding is enabled for live HDR playback, while heavier sky deblocking/temporal cleanup remains opt-in and does not affect objective metrics, compare snapshots, or benchmark results
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
@@ -198,8 +198,8 @@ Advanced testing: `HDRTVNET_FEEDER_GPU_RGB48=1` enables the experimental GPU-sid
 
 Display deband/dither tuning:
 
-- `HDRTVNET_MPV_DEBAND=1|0` enables/disables display debanding; default is `1`.
-- HDRTVNET_MPV_DEBAND_ITERATIONS=4
+- `HDRTVNET_MPV_DEBAND=1|0` enables/disables normal video display debanding; default is `1`.
+- HDRTVNET_MPV_DEBAND_ITERATIONS=3
 - HDRTVNET_MPV_DEBAND_THRESHOLD=100
 - HDRTVNET_MPV_DEBAND_RANGE=32
 - HDRTVNET_MPV_DEBAND_GRAIN=8
@@ -210,12 +210,13 @@ Display deband/dither tuning:
 - `HDRTVNET_MPV_TEMPORAL_DITHER=1|0` changes the dither pattern over time; default is `1`.
 - `HDRTVNET_MPV_TEMPORAL_DITHER_PERIOD=1`
 
-Browser Window Capture uses the same default cleanup profile as normal video playback so visual behavior is consistent across source modes:
+Browser Window Capture uses the same display cleanup defaults as normal video playback:
 
+- `HDRTVNET_BROWSER_MPV_DEBAND=1|0`; default is `1`.
 - `HDRTVNET_BROWSER_MPV_DEBAND_ITERATIONS=3`
-- `HDRTVNET_BROWSER_MPV_DEBAND_THRESHOLD=96`
+- `HDRTVNET_BROWSER_MPV_DEBAND_THRESHOLD=100`
 - `HDRTVNET_BROWSER_MPV_DEBAND_RANGE=32`
-- `HDRTVNET_BROWSER_MPV_DEBAND_GRAIN=20`
+- `HDRTVNET_BROWSER_MPV_DEBAND_GRAIN=8`
 - `HDRTVNET_BROWSER_MPV_TEMPORAL_DITHER=1|0` enables/disables temporal dither for Browser Window Capture; default is `1`.
 - `HDRTVNET_BROWSER_MPV_TEMPORAL_DITHER_PERIOD=1`
 
@@ -355,7 +356,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - AMD PyTorch compile caches are scoped per local project checkout, so multiple local copies no longer reuse or wipe each other's kernels
   - FP16 and predequantized mixed INT8 cache markers now line up consistently in both directions when they share the same effective compiled graph
   - cached-kernel verification now detects incompatible "compiled" caches before playback/export enters a stuck warmup path
-  - when a cache is incompatible, the app can prompt to clear only the current project's cache and recompile
+  - when verification stops, the dialog prioritizes retrying verification or clean recompilation instead of immediately suggesting cache deletion
 - **Export workflow remains production-oriented**
   - separate `File > Export Video...` flow with independent precision/model/HG selection
   - source-native resolution/FPS defaults
@@ -378,9 +379,10 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - better memory management for large HDR GT video files
 - **Compare pane display transitions are smoother**
   - compare no longer force-recreates mpv surfaces on show/screen-change, reducing visible color-space flashing
-- **Playback and export now use a simpler single-frame path**
-  - temporal stabilization has been removed globally to reduce GPU cost and keep latency/FPS behavior more predictable
-  - browser-window playback, video playback, and export now all follow the same no-temporal-stabilization policy
+- **HDR playback cleanup is split into cheap default and heavier opt-in modes**
+  - lightweight high-highlight debanding is enabled by default for live mpv playback
+  - optional low-resolution sky deblocking can be enabled for square pop-in testing with much lower cost than the full cleaner
+  - optional full sky/temporal cleanup remains available for static flat-surface flicker testing while backing off around moving subjects and edges
 - **Live metrics are more thesis-friendly**
   - the `Latency` field now reflects model-stage latency instead of mixing in more source-path timing differences
   - app `VRAM` / `CPU` memory remain whole-app runtime metrics, which is more honest than pretending they are model-only allocations
@@ -519,7 +521,7 @@ On NVIDIA, PyTorch-specific tuning and kernel-cache tools are hidden because inf
   - experimental max-autotune compile reuse
   - INT8 pre-dequantize override (`Auto` / `Force On` / `Force Off`)
 - On NVIDIA, export uses TensorRT engines and hides PyTorch-specific export tuning controls.
-- Export follows the same single-frame processing path as playback; temporal stabilization is disabled globally
+- Export uses the same lightweight `highlight-high` HDR cleanup profile as playback by default; use `HDRTVNET_EXPORT_HDR_CLEANUP=off|highlight|highlight-high|lite|export` to override it
 - Starting a normal export keeps playback paused/locked for the export run
 - Starting an AMD export with **experimental max-autotune** may trigger the same full **Stop** behavior first so compile/warmup can run cleanly
 - Canceling an export tears down the export model/runtime and releases GPU resources without requiring an app close
@@ -531,6 +533,19 @@ Both SDR and HDR panes are rendered through embedded **mpv** (vulkan):
 - **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
 - **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
+
+### HDR Playback Cleanup
+
+Live HDR playback applies a lightweight high-highlight deband pass by default. It uses a cached static dither pattern only in very bright regions, so it avoids the expensive sky blur and temporal blending path that can reduce FPS when the viewer is large.
+
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=highlight-high` is the default live playback profile: stronger highlight deband only, no sky deblock, no temporal blend.
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=highlight` uses the same fast path with a slightly lighter deband strength.
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=lite` enables a low-resolution sky deblock plus highlight deband for square pop-in testing.
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=high` enables the full masked sky deblock and temporal cleaner for quality experiments.
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=off` disables all tensor-side playback cleanup.
+- Optional tuning: `HDRTVNET_HIGHLIGHT_DEBAND_STRENGTH`, `HDRTVNET_HIGHLIGHT_DEBAND_START`, `HDRTVNET_HIGHLIGHT_DEBAND_RANGE`, and `HDRTVNET_SKY_LITE_DEBLOCK_STRENGTH`.
+- Compare snapshots, HDR GT, benchmark images, and objective metrics do not use this cleanup path, so thesis accuracy numbers remain measured on the raw model output.
+- ProRes export defaults to the same `highlight-high` profile as browser capture and video playback; set `HDRTVNET_EXPORT_HDR_CLEANUP=off` only when you want raw model output.
 
 ### Tone Mapping Behavior
 
@@ -555,7 +570,7 @@ For fair comparison:
 In summary:
 
 - **Metrics → no tone mapping**
-- **Export → no tone mapping**
+- **Export → no tone mapping; lightweight `highlight-high` HDR cleanup is on by default**
 - **Playback → tone mapping (display-only, for visualization)**
 
 > **Requires** `libmpv-2.dll` in the `src/` folder.
