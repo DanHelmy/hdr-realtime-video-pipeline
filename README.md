@@ -135,10 +135,11 @@ Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side ta
 
 - Open from `Tools -> Model Quality Benchmark ...`
 - Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
-- Queue multiple benchmark configurations and run them back-to-back without manually restarting each run
+- Queue multiple benchmark configurations, preview/remove individual queued runs, and run the remaining queue back-to-back without manually restarting each run
 - Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
 - On AMD, benchmark uses cached `torch.compile` / `max-autotune` kernels on an exact cache hit and falls back to eager mode on a miss
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
+- Video frame selection can detect a larger deterministic candidate pool, then use the same average-mode workflow as datasets (`selected`, `all`, or deterministic subset) for final scoring
 - Video benchmark metrics are finalized by an exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
 - Dataset image pairs stay on the image decoder path; video sync/crop probes are only used for actual video files
 
@@ -327,8 +328,8 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **Model Quality Benchmark tool is now built in (Tools menu)**
   - supports two workflows: `Video (SDR + HDR GT)` and `Dataset Folders (SDR + HDR GT)`
   - runs quality benchmarking through TensorRT on NVIDIA, cached max-autotune on AMD when available, or eager fallback when no safe compile cache exists
-  - video workflow includes deterministic distinct-frame detection and manual frame checkboxes
-  - dataset workflow includes paired-file scanning with averaging modes (`selected`, `all`, deterministic subset)
+  - video workflow includes deterministic distinct-frame candidate pools, average modes (`selected`, `all`, deterministic subset), and manual frame checkboxes
+  - dataset workflow includes paired-file scanning with the same averaging modes (`selected`, `all`, deterministic subset)
   - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
   - result previews now use the same compare-style color-managed display path for `SDR`, `HDR GT`, and `HDR Convert`
   - session outputs are structured under `logs/benchmark_sessions/<source>/<timestamp>__<precision>__<resolution>__n<count>/...`

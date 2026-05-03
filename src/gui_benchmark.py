@@ -1668,12 +1668,12 @@ class ModelBenchmarkDialog(QDialog):
         video_layout.addLayout(video_form)
 
         frames_bar = QHBoxLayout()
-        self._lbl_detect_frame_count = QLabel("Count:")
+        self._lbl_detect_frame_count = QLabel("Pool:")
         self._spn_detect_frame_count = QSpinBox()
         self._spn_detect_frame_count.setRange(1, 240)
-        self._spn_detect_frame_count.setValue(10)
+        self._spn_detect_frame_count.setValue(50)
         self._spn_detect_frame_count.setToolTip(
-            "Number of distinct frames to detect. For the same video and count, detection is deterministic."
+            "Number of distinct candidate frames to detect. For the same video and pool size, detection is deterministic."
         )
         self._btn_detect_frames = QPushButton("Detect Distinct Frames")
         self._btn_select_all_frames = QPushButton("Check All Frames")
@@ -1694,9 +1694,31 @@ class ModelBenchmarkDialog(QDialog):
 
         self._lst_video_frames = QListWidget()
         self._lst_video_frames.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._lbl_video_note = QLabel("Detect frames, then keep the frames you want to benchmark.")
+        self._lbl_video_note = QLabel(
+            "Detect a candidate pool, then use Average mode to benchmark checked frames or a deterministic subset."
+        )
         self._lbl_video_note.setWordWrap(True)
         video_layout.addWidget(self._lst_video_frames, 1)
+
+        video_avg_form = QFormLayout()
+        self._cmb_video_avg_mode = QComboBox()
+        self._cmb_video_avg_mode.addItem("Average selected frames", "selected")
+        self._cmb_video_avg_mode.addItem("Average all detected frames", "all")
+        self._cmb_video_avg_mode.addItem("Average deterministic subset", "subset")
+        self._cmb_video_avg_mode.setCurrentIndex(2)
+        self._spn_video_subset = QSpinBox()
+        self._spn_video_subset.setRange(1, 240)
+        self._spn_video_subset.setValue(10)
+        self._cmb_video_avg_mode.setToolTip(
+            "Matches the dataset average-mode workflow. Deterministic subset samples evenly from the checked candidate frames."
+        )
+        self._spn_video_subset.setToolTip(
+            "Number of checked candidate frames to evaluate when Average deterministic subset is selected."
+        )
+        video_avg_form.addRow("Average mode:", self._cmb_video_avg_mode)
+        video_avg_form.addRow("Subset size:", self._spn_video_subset)
+        video_layout.addLayout(video_avg_form)
+
         video_layout.addWidget(self._lbl_video_note)
         self._img_video_setup_preview = _ImagePreviewLabel("Selected SDR Frame Preview")
         self._img_video_setup_preview.setMinimumHeight(120)
@@ -1817,6 +1839,7 @@ class ModelBenchmarkDialog(QDialog):
         self._lbl_queue_preview = QLabel("Select a queued run to preview its captured settings.")
         self._lbl_queue_preview.setWordWrap(True)
         self._btn_queue_add = QPushButton("Add Current to Queue")
+        self._btn_queue_remove = QPushButton("Remove Selected")
         self._btn_queue_run = QPushButton("Run Queue")
         self._btn_queue_clear = QPushButton("Clear Queue")
         self._btn_queue_run.setProperty("role", "primary")
@@ -1826,9 +1849,14 @@ class ModelBenchmarkDialog(QDialog):
         queue_layout.addWidget(self._lbl_queue_status, 0, 0, 1, 3)
         queue_layout.addWidget(self._lst_benchmark_queue, 1, 0, 1, 3)
         queue_layout.addWidget(self._lbl_queue_preview, 2, 0, 1, 3)
-        queue_layout.addWidget(self._btn_queue_add, 3, 0)
-        queue_layout.addWidget(self._btn_queue_run, 3, 1)
-        queue_layout.addWidget(self._btn_queue_clear, 3, 2)
+        queue_buttons = QHBoxLayout()
+        queue_buttons.setContentsMargins(0, 0, 0, 0)
+        queue_buttons.setSpacing(6)
+        queue_buttons.addWidget(self._btn_queue_add)
+        queue_buttons.addWidget(self._btn_queue_remove)
+        queue_buttons.addWidget(self._btn_queue_run)
+        queue_buttons.addWidget(self._btn_queue_clear)
+        queue_layout.addLayout(queue_buttons, 3, 0, 1, 3)
         cfg_layout.addWidget(queue_group)
 
         result_tab = QWidget()
@@ -1997,6 +2025,7 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_select_all_frames.clicked.connect(lambda: self._set_all_checked(self._lst_video_frames, True))
         self._btn_clear_frames.clicked.connect(lambda: self._set_all_checked(self._lst_video_frames, False))
         self._lst_video_frames.currentItemChanged.connect(lambda _cur, _prev: self._refresh_video_frame_preview())
+        self._cmb_video_avg_mode.currentIndexChanged.connect(self._sync_subset_enabled)
 
         self._btn_dataset_sdr.clicked.connect(self._pick_dataset_sdr)
         self._btn_dataset_gt.clicked.connect(self._pick_dataset_gt)
@@ -2008,6 +2037,7 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_session_root.clicked.connect(self._pick_session_root)
         self._btn_run.clicked.connect(self._start_benchmark)
         self._btn_queue_add.clicked.connect(self._add_current_benchmark_to_queue)
+        self._btn_queue_remove.clicked.connect(self._remove_selected_benchmark_from_queue)
         self._btn_queue_run.clicked.connect(self._start_benchmark_queue)
         self._btn_queue_clear.clicked.connect(self._clear_benchmark_queue)
         self._lst_benchmark_queue.currentRowChanged.connect(self._update_queue_preview)
@@ -3325,8 +3355,10 @@ class ModelBenchmarkDialog(QDialog):
         )
 
     def _sync_subset_enabled(self):
-        mode = str(self._cmb_avg_mode.currentData() or "selected")
-        self._spn_subset.setEnabled(mode == "subset")
+        video_mode = str(self._cmb_video_avg_mode.currentData() or "selected")
+        self._spn_video_subset.setEnabled(video_mode == "subset")
+        dataset_mode = str(self._cmb_avg_mode.currentData() or "selected")
+        self._spn_subset.setEnabled(dataset_mode == "subset")
 
     def _pick_video_sdr(self):
         start = self._last_source_dir or self._suggested_dir
@@ -3519,17 +3551,17 @@ class ModelBenchmarkDialog(QDialog):
             QMessageBox.warning(self, "Video Benchmark", note)
             return
 
-        desired_count = max(1, int(self._spn_detect_frame_count.value()))
-        cache_key = self._frame_detect_cache_key(sdr_path, desired_count)
+        pool_count = max(1, int(self._spn_detect_frame_count.value()))
+        cache_key = self._frame_detect_cache_key(sdr_path, pool_count)
         frames = list(self._frame_detect_cache.get(cache_key) or [])
         used_cache = bool(frames)
         if not frames:
             # Increase scan budget with requested count to keep higher-count runs useful,
             # while keeping deterministic behavior for the same source+count.
-            scan_cap = min(4000, max(260, desired_count * 24))
+            scan_cap = min(4000, max(260, pool_count * 24))
             frames = _detect_distinct_video_frames(
                 sdr_path,
-                desired_count=desired_count,
+                desired_count=pool_count,
                 max_scan_points=scan_cap,
             )
             if frames:
@@ -3558,8 +3590,10 @@ class ModelBenchmarkDialog(QDialog):
         self._refresh_video_frame_preview()
 
         self._lbl_video_note.setText(
-            f"{len(frames)} deterministic scene-diverse frames detected (requested {desired_count}, "
-            f"{'cache hit' if used_cache else 'fresh scan'}). {note}"
+            f"{len(frames)} deterministic candidate frames detected "
+            f"(pool {pool_count}, {'cache hit' if used_cache else 'fresh scan'}). "
+            "Average mode controls how many checked candidates are benchmarked. "
+            f"{note}"
         )
 
     def _pair_dataset_files(self, sdr_root: str, gt_root: str) -> list[BenchmarkTask]:
@@ -3654,15 +3688,42 @@ class ModelBenchmarkDialog(QDialog):
         if not ok:
             raise RuntimeError(note)
 
-        frames: list[int] = []
+        checked_frames: list[int] = []
+        all_frames: list[int] = []
         for i in range(self._lst_video_frames.count()):
             item = self._lst_video_frames.item(i)
-            if item.checkState() != Qt.CheckState.Checked:
-                continue
             try:
-                frames.append(int(item.data(Qt.ItemDataRole.UserRole)))
+                frame_1b = int(item.data(Qt.ItemDataRole.UserRole))
             except Exception:
                 continue
+            all_frames.append(frame_1b)
+            if item.checkState() == Qt.CheckState.Checked:
+                checked_frames.append(frame_1b)
+        if not all_frames:
+            raise RuntimeError("Detect distinct frames first.")
+
+        avg_mode = str(self._cmb_video_avg_mode.currentData() or "selected")
+        if avg_mode == "all":
+            frames = list(all_frames)
+        elif avg_mode == "subset":
+            if not checked_frames:
+                raise RuntimeError(
+                    "Check at least one candidate frame before using deterministic subset mode."
+                )
+            subset_n = max(1, int(self._spn_video_subset.value()))
+            frame_tasks = [
+                BenchmarkTask(
+                    task_id=f"frame_{int(frame_1b)}",
+                    label=f"Frame {int(frame_1b)}",
+                    sdr_path=sdr_path,
+                    gt_path=gt_path,
+                    frame_idx=max(0, int(frame_1b) - 1),
+                )
+                for frame_1b in sorted(set(checked_frames))
+            ]
+            return self._deterministic_subset(frame_tasks, subset_n)
+        else:
+            frames = list(checked_frames)
         if not frames:
             raise RuntimeError("Select at least one frame for video benchmarking.")
 
@@ -3811,8 +3872,13 @@ class ModelBenchmarkDialog(QDialog):
             self._lbl_queue_status.setText(
                 f"Queue: {queued} run{'s' if queued != 1 else ''}"
             )
+        selected_row = -1
+        if hasattr(self, "_lst_benchmark_queue"):
+            selected_row = int(self._lst_benchmark_queue.currentRow())
+        can_remove = (not running) and 0 <= selected_row < queued
         self._btn_queue_add.setEnabled(not running)
         self._btn_queue_run.setEnabled((not running) and queued > 0)
+        self._btn_queue_remove.setEnabled(can_remove)
         self._btn_queue_clear.setEnabled((not running) and queued > 0)
 
     def _refresh_queue_list(self):
@@ -3852,6 +3918,16 @@ class ModelBenchmarkDialog(QDialog):
         self._benchmark_queue.append(_QueuedBenchmarkRun(config=cfg, title=title))
         self._refresh_queue_list()
         self._set_status(f"Queued benchmark: {title}")
+
+    def _remove_selected_benchmark_from_queue(self):
+        if self._worker_thread is not None:
+            return
+        row = int(self._lst_benchmark_queue.currentRow())
+        if row < 0 or row >= len(self._benchmark_queue):
+            return
+        removed = self._benchmark_queue.pop(row)
+        self._refresh_queue_list()
+        self._set_status(f"Removed queued benchmark: {removed.title}")
 
     def _clear_benchmark_queue(self):
         if self._worker_thread is not None:
@@ -3899,6 +3975,8 @@ class ModelBenchmarkDialog(QDialog):
             self._btn_video_gt,
             self._spn_detect_frame_count,
             self._btn_detect_frames,
+            self._cmb_video_avg_mode,
+            self._spn_video_subset,
             self._btn_dataset_sdr,
             self._btn_dataset_gt,
             self._btn_scan_dataset,
