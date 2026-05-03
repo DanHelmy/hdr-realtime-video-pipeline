@@ -17,7 +17,7 @@ This project converts standard dynamic range (SDR) video to high dynamic range (
 
 Latest stable tagged release: **v5.1**.
 
-For normal use, download a tagged version from the version list below instead of cloning `main`. Clone `main` only if you intentionally want the newest unreleased development state.
+For normal use, download the latest stable build from GitHub **Releases** instead of cloning `main`. Clone `main` only if you intentionally want the newest unreleased development state.
 
 Core updates include:
 
@@ -65,14 +65,15 @@ Windows-only project with **NVIDIA CUDA/TensorRT**, **AMD ROCm-Windows/PyTorch**
 
 ---
 
-## How To Run (Recommended Download Workflow)
+## How To Run (Recommended Release Workflow)
 
 No manual asset download is required before setup.
 
-1. Download a tagged version from **Version Downloads** below.
-2. Extract the ZIP.
-3. Run `setup.bat` (double-click or terminal).
-4. Run `run_gui.bat` to start the app.
+1. Open the [GitHub Releases page](https://github.com/DanHelmy/hdr-realtime-video-pipeline/releases).
+2. Download the latest stable release ZIP.
+3. Extract the ZIP.
+4. Run `setup.bat` (double-click or terminal).
+5. Run `run_gui.bat` to start the app.
 
 Do not clone `main` for normal use. `main` may contain unreleased changes, experimental features, or in-progress thesis work.
 
@@ -87,27 +88,22 @@ Manual fallback assets link:
 
 ---
 
-## Version Downloads
+## Releases
 
-Use the latest stable tagged version unless you are testing unreleased development work.
+Use the latest stable release unless you are testing unreleased development work:
 
-| Version | Status | Download |
-|---|---|---|
-| `v5.1` | Latest stable release | [Download ZIP](https://github.com/DanHelmy/hdr-realtime-video-pipeline/archive/refs/tags/v5.1.zip) |
-| `v5.0` | Previous stable release | [Download ZIP](https://github.com/DanHelmy/hdr-realtime-video-pipeline/archive/refs/tags/v5.0.zip) |
-| `v4.0.1` | Older stable release | [Download ZIP](https://github.com/DanHelmy/hdr-realtime-video-pipeline/archive/refs/tags/v4.0.1.zip) |
-| `main` / `v6.0-in-progress` | Unreleased development branch | For developers only |
+- Latest stable release: **v5.1**
+- Releases page: [github.com/DanHelmy/hdr-realtime-video-pipeline/releases](https://github.com/DanHelmy/hdr-realtime-video-pipeline/releases)
+- `main` / `v6.0-in-progress`: unreleased development branch for developers only
 
-Full tag list:
-
-`https://github.com/DanHelmy/hdr-realtime-video-pipeline/tags`
+Do not use the green `Code -> Download ZIP` button for normal installs, because that downloads the current `main` branch rather than a stable release.
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Download a tagged ZIP from Version Downloads above
+# 1. Download the latest stable ZIP from GitHub Releases
 # 2. Extract it and open a terminal in the extracted folder
 
 # 3. Double-click setup.bat
