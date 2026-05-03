@@ -1,6 +1,7 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v6.0-blue)
+![Version](https://img.shields.io/badge/version-v6.0--in--progress-blue)
+![Stable](https://img.shields.io/badge/stable-v5.1-brightgreen)
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -12,7 +13,11 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, backend-specific inference, export, and live browser-window viewing.
 
-`v6.0` is the current release, introducing a hybrid inference runtime: NVIDIA devices use TensorRT engines exclusively, while AMD devices keep the existing PyTorch pipeline with channels-last optimization.
+`main` currently tracks **v6.0-in-progress**. It contains unreleased development work for the next release, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with channels-last optimization.
+
+Latest stable tagged release: **v5.1**.
+
+For normal use, download a tagged version from the version list below instead of cloning `main`. Clone `main` only if you intentionally want the newest unreleased development state.
 
 Core updates include:
 
@@ -60,13 +65,16 @@ Windows-only project with **NVIDIA CUDA/TensorRT**, **AMD ROCm-Windows/PyTorch**
 
 ---
 
-## How To Run (Clone Workflow)
+## How To Run (Recommended Download Workflow)
 
 No manual asset download is required before setup.
 
-1. Clone the repo.
-2. Run `setup.bat` (double-click or terminal).
-3. Run `run_gui.bat` to start the app.
+1. Download a tagged version from **Version Downloads** below.
+2. Extract the ZIP.
+3. Run `setup.bat` (double-click or terminal).
+4. Run `run_gui.bat` to start the app.
+
+Do not clone `main` for normal use. `main` may contain unreleased changes, experimental features, or in-progress thesis work.
 
 What now happens automatically:
 - `setup.bat` tries to download `libmpv-2.dll` and `HG_weights.pth` into the repo.
@@ -79,22 +87,47 @@ Manual fallback assets link:
 
 ---
 
+## Version Downloads
+
+Use the latest stable tagged version unless you are testing unreleased development work.
+
+| Version | Status | Download |
+|---|---|---|
+| `v5.1` | Latest stable release | [Download ZIP](https://github.com/DanHelmy/hdr-realtime-video-pipeline/archive/refs/tags/v5.1.zip) |
+| `v5.0` | Previous stable release | [Download ZIP](https://github.com/DanHelmy/hdr-realtime-video-pipeline/archive/refs/tags/v5.0.zip) |
+| `v4.0.1` | Older stable release | [Download ZIP](https://github.com/DanHelmy/hdr-realtime-video-pipeline/archive/refs/tags/v4.0.1.zip) |
+| `main` / `v6.0-in-progress` | Unreleased development branch | For developers only |
+
+Full tag list:
+
+`https://github.com/DanHelmy/hdr-realtime-video-pipeline/tags`
+
+---
+
 ## Quick Start
 
 ```bash
-# 1. Clone and set up
-git clone https://github.com/DanHelmy/hdr-realtime-video-pipeline.git
-cd hdr-realtime-video-pipeline
+# 1. Download a tagged ZIP from Version Downloads above
+# 2. Extract it and open a terminal in the extracted folder
 
-# 2. Double-click setup.bat
+# 3. Double-click setup.bat
 # (or run it in terminal)
 .\setup.bat
 
-# 3. Launch the GUI
+# 4. Launch the GUI
 .\run_gui.bat
 ```
 
 Open a video and it plays in tabbed SDR/HDR views (with optional side-by-side tab).
+
+Developer-only clone workflow:
+
+```bash
+git clone https://github.com/DanHelmy/hdr-realtime-video-pipeline.git
+cd hdr-realtime-video-pipeline
+.\setup.bat
+.\run_gui.bat
+```
 
 ---
 
