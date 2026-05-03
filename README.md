@@ -177,7 +177,7 @@ Browser capture pacing:
 - mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
 - mpv keeps a tiny live jitter buffer so short wake-up or pipe-write stalls repeat a frame instead of creating a visible cadence hole. Default: `HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES=8`.
 - The live mpv feeder allows a tiny bounded refill after a late write so mpv's raw-video pipe does not underflow into visible pauses.
-- mpv display debanding and built-in `error-diffusion` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
+- mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
 - Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
 - Static browser windows keep feeding by repeating the latest visible frame at process FPS. If WinRT has no compositor frame yet, a visible-window fallback captures one startup seed frame so playback can start even before the tab video is moving.
 - Browser source delivery now resets after a meaningfully late frame instead of immediately catching up with a short interval. This favors steady motion cadence over shaving a few milliseconds of live latency.
@@ -201,7 +201,7 @@ Display deband/dither tuning:
 - HDRTVNET_MPV_DEBAND_RANGE=32
 - HDRTVNET_MPV_DEBAND_GRAIN=8
 - `HDRTVNET_MPV_DITHER=1|0` enables/disables mpv output dithering; default is `1`.
-- `HDRTVNET_MPV_DITHER_ALGO=error-diffusion` (`ordered` and `fruit` are also accepted by mpv builds that support them)
+- `HDRTVNET_MPV_DITHER_ALGO=fruit` (`ordered` and `error-diffusion` are also accepted by mpv builds that support them)
 - `HDRTVNET_MPV_DITHER_DEPTH=auto`
 - `HDRTVNET_MPV_DITHER_SIZE_FRUIT=6`
 - `HDRTVNET_MPV_TEMPORAL_DITHER=1|0` changes the dither pattern over time; default is `1`.

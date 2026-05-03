@@ -114,7 +114,7 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
     algo = str(
         os.environ.get(
             f"{env_prefix}DITHER_ALGO",
-            os.environ.get("HDRTVNET_MPV_DITHER_ALGO", "error-diffusion"),
+            os.environ.get("HDRTVNET_MPV_DITHER_ALGO", "fruit"),
         )
     ).strip().lower().replace("_", "-")
     if algo not in {"fruit", "ordered", "error-diffusion", "no"}:
