@@ -565,45 +565,58 @@ class PlaybackRuntimeMixin:
             else "Cached-kernel verification failed before warmup completed."
         )
         details = str(process_output or "").strip()
-        detail_tail = ""
+        last_lines = []
         if details:
-            lines = [ln.strip() for ln in details.splitlines() if ln.strip()]
-            if lines:
-                detail_tail = "\n\nLast log lines:\n" + "\n".join(lines[-6:])
+            last_lines = [ln.strip() for ln in details.splitlines() if ln.strip()][-8:]
 
-        answer = QMessageBox.warning(
-            self,
-            "Kernel Cache Looks Incompatible",
-            f"{workflow_name} detected a cached-kernel problem for {w}x{h} / {precision}.\n\n"
-            f"{reason}\n\n"
-            "Clear this local project's kernel cache and recompile now?"
-            f"{detail_tail}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Kernel Verification Stopped")
+        box.setText(
+            f"{workflow_name} could not verify cached kernels for {w}x{h} / {precision}."
         )
-        if answer != QMessageBox.StandardButton.Yes:
-            self.statusBar().showMessage(
-                "Cached-kernel verification failed. Playback/export was canceled."
-            )
-            return False
+        info = (
+            f"{reason}\n\n"
+            "This can be transient if the GPU, driver, or compile cache was busy. "
+            "Try verification again first; retry does not delete or rebuild kernels.\n\n"
+            "If retry keeps failing, recompile the same kernels in a clean process."
+        )
+        if last_lines:
+            info += "\n\nLast log lines:\n" + "\n".join(last_lines)
+        box.setInformativeText(info)
+        if details:
+            box.setDetailedText(details)
+        retry_btn = box.addButton(
+            "Retry Verification",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        recompile_btn = box.addButton(
+            "Recompile Kernels",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        box.addButton(
+            "Cancel",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(retry_btn)
+        box.exec()
+        clicked = box.clickedButton()
 
-        progress = QProgressDialog("Clearing this project's kernel cache ...", None, 0, 0, self)
-        progress.setWindowTitle("Clear Kernel Cache")
-        progress.setMinimumDuration(0)
-        progress.setCancelButton(None)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.show()
-        QApplication.processEvents()
-        try:
-            cleared_ok = self._clear_current_project_kernel_cache_now()
-        finally:
-            progress.close()
-            QApplication.processEvents()
-        if not cleared_ok:
-            QMessageBox.warning(
-                self,
-                "Kernel Cache",
-                "Failed to fully clear this project's kernel cache.",
+        if clicked is retry_btn:
+            self.statusBar().showMessage("Retrying cached-kernel verification ...")
+            return self._ensure_runtime_compile_cache_usable(
+                w=w,
+                h=h,
+                precision=precision,
+                model_path=model_path,
+                use_hg=use_hg,
+                selected_predequantize_mode=selected_predequantize_mode,
+                workflow_name=workflow_name,
+            )
+
+        if clicked is not recompile_btn:
+            self.statusBar().showMessage(
+                "Cached-kernel verification stopped. Playback/export was canceled."
             )
             return False
 
@@ -622,7 +635,7 @@ class PlaybackRuntimeMixin:
         dlg.exec()
         if not dlg.succeeded:
             self.statusBar().showMessage(
-                "Kernel recompile was canceled after clearing the cache."
+                "Kernel recompile failed or was canceled. Cache was not deleted."
             )
             return False
 

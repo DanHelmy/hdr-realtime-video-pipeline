@@ -20,6 +20,7 @@ from PyQt6.QtCore import QObject, QThread, Qt, QDir, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -36,6 +37,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -1568,7 +1571,7 @@ class ModelBenchmarkDialog(QDialog):
         self.setSizeGripEnabled(True)
         self.setWindowTitle("Model Quality Benchmark")
         self.setModal(True)
-        self.resize(1320, 860)
+        self.resize(1240, 740)
 
         self._suggested_dir = suggested_dir if os.path.isdir(suggested_dir) else os.getcwd()
         self._last_source_dir = self._suggested_dir
@@ -1614,8 +1617,14 @@ class ModelBenchmarkDialog(QDialog):
         self._tabs = tabs
         root.addWidget(tabs, 1)
 
-        config_tab = QWidget()
-        cfg_layout = QVBoxLayout(config_tab)
+        config_tab = QScrollArea()
+        config_tab.setWidgetResizable(True)
+        config_tab.setFrameShape(QScrollArea.Shape.NoFrame)
+        config_tab.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        config_tab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        config_body = QWidget()
+        config_tab.setWidget(config_body)
+        cfg_layout = QVBoxLayout(config_body)
         cfg_layout.setContentsMargins(0, 6, 0, 0)
         cfg_layout.setSpacing(10)
         tabs.addTab(config_tab, "Setup")
@@ -1690,7 +1699,8 @@ class ModelBenchmarkDialog(QDialog):
         video_layout.addWidget(self._lst_video_frames, 1)
         video_layout.addWidget(self._lbl_video_note)
         self._img_video_setup_preview = _ImagePreviewLabel("Selected SDR Frame Preview")
-        self._img_video_setup_preview.setMinimumHeight(220)
+        self._img_video_setup_preview.setMinimumHeight(120)
+        self._img_video_setup_preview.setMaximumHeight(180)
         video_layout.addWidget(self._img_video_setup_preview)
 
         dataset_page = QWidget()
@@ -1802,6 +1812,7 @@ class ModelBenchmarkDialog(QDialog):
         queue_layout = QGridLayout(queue_group)
         self._lst_benchmark_queue = QListWidget()
         self._lst_benchmark_queue.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._lst_benchmark_queue.setMaximumHeight(96)
         self._lbl_queue_status = QLabel("Queue: empty")
         self._lbl_queue_preview = QLabel("Select a queued run to preview its captured settings.")
         self._lbl_queue_preview.setWordWrap(True)

@@ -14,6 +14,19 @@ class PipelineWorkerFrameProcessingMixin:
     """Per-frame HDR bypass / SDR infer processing for PipelineWorker."""
 
     @staticmethod
+    def _scene_signature_bgr(frame: np.ndarray | None) -> np.ndarray | None:
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+            return None
+        try:
+            small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+            b = small[:, :, 0].astype(np.float32)
+            g = small[:, :, 1].astype(np.float32)
+            r = small[:, :, 2].astype(np.float32)
+            return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        except Exception:
+            return None
+
+    @staticmethod
     def _queue_latest(q: _queue.Queue | None, item) -> None:
         if q is None:
             return
@@ -76,6 +89,88 @@ class PipelineWorkerFrameProcessingMixin:
             else:
                 output = cv2.resize(output, (out_w, out_h), interpolation=cv2.INTER_AREA)
         return output
+
+    def _apply_mpv_highlight_temporal_stabilizer(
+        self,
+        prepared_out,
+        model_inp: np.ndarray | None,
+    ):
+        """Viewer-only smoothing for static flat highlights before mpv display."""
+        if not isinstance(prepared_out, torch.Tensor):
+            return prepared_out
+        if prepared_out.ndim not in (3, 4):
+            return prepared_out
+
+        with torch.inference_mode():
+            squeeze_batch = prepared_out.ndim == 3
+            current = prepared_out.unsqueeze(0) if squeeze_batch else prepared_out
+            if current.ndim != 4 or current.shape[1] != 3:
+                return prepared_out
+
+            scene = self._scene_signature_bgr(model_inp)
+            scene_factor = 1.0
+            prev_scene = getattr(self, "_flat_temporal_prev_scene", None)
+            if scene is not None and isinstance(prev_scene, np.ndarray) and prev_scene.shape == scene.shape:
+                scene_delta = float(np.mean(np.abs(scene - prev_scene)))
+                if scene_delta > 0.12:
+                    self._reset_enhance_history()
+                    self._flat_temporal_prev_scene = scene
+                    return prepared_out
+                scene_factor = float(np.clip((0.075 - scene_delta) / 0.045, 0.0, 1.0))
+            if scene is not None:
+                self._flat_temporal_prev_scene = scene
+
+            prev_rgb = getattr(self, "_flat_temporal_prev_rgb", None)
+            prev_luma = getattr(self, "_flat_temporal_prev_luma", None)
+            if (
+                not isinstance(prev_rgb, torch.Tensor)
+                or not isinstance(prev_luma, torch.Tensor)
+                or tuple(prev_rgb.shape) != tuple(current.shape)
+                or tuple(prev_luma.shape[-2:]) != tuple(current.shape[-2:])
+            ):
+                self._flat_temporal_prev_rgb = current.detach().clone()
+                cur_luma = (
+                    0.2126 * current[:, 0:1].float()
+                    + 0.7152 * current[:, 1:2].float()
+                    + 0.0722 * current[:, 2:3].float()
+                )
+                self._flat_temporal_prev_luma = cur_luma.detach().clone()
+                return prepared_out
+
+            cur_f = current.float().clamp(0.0, 1.0)
+            prev_f = prev_rgb.to(device=current.device, dtype=torch.float32).clamp(0.0, 1.0)
+            cur_luma = (
+                0.2126 * cur_f[:, 0:1]
+                + 0.7152 * cur_f[:, 1:2]
+                + 0.0722 * cur_f[:, 2:3]
+            )
+            prev_luma_f = prev_luma.to(device=current.device, dtype=torch.float32)
+
+            local_mean = self._box_blur(cur_luma, 5)
+            local_var = self._box_blur((cur_luma - local_mean) ** 2, 5)
+            flat_mask = torch.clamp((0.0025 - local_var) / 0.0025, 0.0, 1.0)
+            highlight_mask = torch.clamp((cur_luma - 0.62) / 0.24, 0.0, 1.0)
+            temporal_delta = (cur_luma - prev_luma_f).abs()
+            stable_mask = torch.clamp((0.045 - temporal_delta) / 0.045, 0.0, 1.0)
+
+            mask = highlight_mask * flat_mask * stable_mask
+            if scene_factor <= 0.0:
+                self._flat_temporal_prev_rgb = current.detach().clone()
+                self._flat_temporal_prev_luma = cur_luma.detach().clone()
+                return prepared_out
+
+            # Avoid mask.max().item() here; a CPU readback would sync the GPU every frame.
+            strength = (0.22 * scene_factor * mask).expand_as(cur_f)
+            stabilized = cur_f * (1.0 - strength) + prev_f * strength
+            stabilized = stabilized.clamp(0.0, 1.0).to(dtype=current.dtype)
+            stable_luma = (
+                0.2126 * stabilized[:, 0:1].float()
+                + 0.7152 * stabilized[:, 1:2].float()
+                + 0.0722 * stabilized[:, 2:3].float()
+            )
+            self._flat_temporal_prev_rgb = stabilized.detach().clone()
+            self._flat_temporal_prev_luma = stable_luma.detach().clone()
+            return stabilized.squeeze(0) if squeeze_batch else stabilized
 
     def _cuda_timing_events(self):
         events = getattr(self, "_infer_timing_events", None)
@@ -191,7 +286,11 @@ class PipelineWorkerFrameProcessingMixin:
             else:
                 self._hdr_drop_until_frame = 0
             if self._hdr_drop_until_frame == 0:
-                queued_tensor = prepared_out.clone()
+                display_out = self._apply_mpv_highlight_temporal_stabilizer(
+                    prepared_out,
+                    model_inp,
+                )
+                queued_tensor = display_out.clone()
                 if use_cuda:
                     ready_event = torch.cuda.Event(enable_timing=False)
                     ready_event.record(torch.cuda.current_stream())

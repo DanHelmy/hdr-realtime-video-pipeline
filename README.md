@@ -30,6 +30,7 @@ Core updates include:
   - `PSNR` / `SSIM` run on linear HDR frames
   - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
 - display-side HDR tone mapping (BT.2390) for improved visual presentation, applied consistently across HDR panes when enabled; does not affect objective metrics or exported HDR content
+- display-side temporal stabilization reduces flicker on static flat highlight regions in the mpv viewer without changing objective metrics, compare snapshots, benchmark results, or exports
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
