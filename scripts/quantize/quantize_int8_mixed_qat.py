@@ -578,6 +578,38 @@ def build_highlight_neutral_mask(target, highlight_threshold, neutral_threshold)
     return highlight_weight * neutral_weight
 
 
+def build_rgb_luma(tensor):
+    """BT.709 luma used for shadow-sensitive QAT masks and losses."""
+    weights = tensor.new_tensor((0.2126, 0.7152, 0.0722)).view(1, 3, 1, 1)
+    return (tensor * weights).sum(dim=1, keepdim=True)
+
+
+def build_dark_area_mask(target, dark_threshold, dark_floor):
+    """Weight shadow detail while avoiding pure black borders/letterbox pixels."""
+    dark_threshold = float(np.clip(dark_threshold, 1e-6, 1.0))
+    dark_floor = float(np.clip(dark_floor, 0.0, max(dark_threshold - 1e-6, 0.0)))
+    luma = build_rgb_luma(target)
+    dark_weight = ((dark_threshold - luma) /
+                   max(dark_threshold - dark_floor, 1e-6)).clamp(0.0, 1.0)
+    if dark_floor > 0.0:
+        signal_weight = (luma / max(dark_floor, 1e-6)).clamp(0.0, 1.0)
+        dark_weight = dark_weight * signal_weight
+    return dark_weight
+
+
+def compute_tone_protection_coverages(target, args):
+    highlight_mask = build_highlight_neutral_mask(
+        target, args.highlight_threshold, args.neutral_threshold
+    )
+    dark_mask = build_dark_area_mask(
+        target, args.dark_threshold, args.dark_floor
+    )
+    highlight_cov = float(highlight_mask.mean().item())
+    dark_cov = float(dark_mask.mean().item())
+    tone_score = highlight_cov + float(args.dark_monitor_weight) * dark_cov
+    return highlight_cov, dark_cov, tone_score
+
+
 def build_channel_balance_deltas(tensor):
     """Per-pixel RGB channel deltas; zero means perfectly neutral."""
     red = tensor[:, 0:1]
@@ -587,7 +619,7 @@ def build_channel_balance_deltas(tensor):
 
 
 def sample_training_crop_pair(sdr_t, hdr_t, args):
-    """Pick a crop, biased toward bright neutral highlights when present."""
+    """Pick a crop, biased toward highlight and shadow-protection coverage."""
     crop_size = int(args.crop_size)
     _, _, h, w = sdr_t.shape
     if h <= crop_size and w <= crop_size:
@@ -602,10 +634,10 @@ def sample_training_crop_pair(sdr_t, hdr_t, args):
         left = random.randint(0, max(0, w - crop_size))
         sdr_c = sdr_t[:, :, top:top + crop_size, left:left + crop_size]
         hdr_c = hdr_t[:, :, top:top + crop_size, left:left + crop_size]
-        mask = build_highlight_neutral_mask(
-            hdr_c.float(), args.highlight_threshold, args.neutral_threshold
+        highlight_cov, dark_cov, _ = compute_tone_protection_coverages(
+            hdr_c.float(), args
         )
-        score = float(mask.mean().item())
+        score = highlight_cov + float(args.dark_crop_weight) * dark_cov
         if score > best_score:
             best_score = score
             best_crop = (sdr_c, hdr_c)
@@ -615,14 +647,22 @@ def sample_training_crop_pair(sdr_t, hdr_t, args):
     )
 
 
-def select_highlight_monitor_pairs(pairs, num_pairs, args):
-    """Pick full-image monitor pairs with the strongest highlight coverage."""
+def select_tone_protected_monitor_pairs(pairs, num_pairs, args):
+    """Pick monitor pairs with strong highlight or shadow-detail coverage."""
     if not pairs:
         return [], {
             "positive_candidates": 0,
+            "highlight_positive_candidates": 0,
+            "dark_positive_candidates": 0,
+            "avg_tone_cov": 0.0,
+            "min_tone_cov": 0.0,
+            "max_tone_cov": 0.0,
             "avg_highlight_cov": 0.0,
             "min_highlight_cov": 0.0,
             "max_highlight_cov": 0.0,
+            "avg_dark_cov": 0.0,
+            "min_dark_cov": 0.0,
+            "max_dark_cov": 0.0,
         }
 
     if num_pairs <= 0:
@@ -631,22 +671,31 @@ def select_highlight_monitor_pairs(pairs, num_pairs, args):
     scored = []
     for idx, pair in enumerate(pairs):
         _, hdr_t = pair
-        mask = build_highlight_neutral_mask(
-            hdr_t.float(), args.highlight_threshold, args.neutral_threshold
+        highlight_cov, dark_cov, tone_cov = compute_tone_protection_coverages(
+            hdr_t.float(), args
         )
-        scored.append((float(mask.mean().item()), idx, pair))
+        scored.append((tone_cov, highlight_cov, dark_cov, idx, pair))
 
-    scored.sort(key=lambda item: (-item[0], item[1]))
+    scored.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
     selected = scored[:min(num_pairs, len(scored))]
-    coverages = [cov for cov, _, _ in selected]
-    positive_candidates = sum(cov > 0.0 for cov, _, _ in scored)
+    tone_coverages = [tone_cov for tone_cov, _, _, _, _ in selected]
+    highlight_coverages = [hi_cov for _, hi_cov, _, _, _ in selected]
+    dark_coverages = [dark_cov for _, _, dark_cov, _, _ in selected]
     stats = {
-        "positive_candidates": positive_candidates,
-        "avg_highlight_cov": float(np.mean(coverages)) if coverages else 0.0,
-        "min_highlight_cov": float(np.min(coverages)) if coverages else 0.0,
-        "max_highlight_cov": float(np.max(coverages)) if coverages else 0.0,
+        "positive_candidates": sum(tone_cov > 0.0 for tone_cov, _, _, _, _ in scored),
+        "highlight_positive_candidates": sum(hi_cov > 0.0 for _, hi_cov, _, _, _ in scored),
+        "dark_positive_candidates": sum(dark_cov > 0.0 for _, _, dark_cov, _, _ in scored),
+        "avg_tone_cov": float(np.mean(tone_coverages)) if tone_coverages else 0.0,
+        "min_tone_cov": float(np.min(tone_coverages)) if tone_coverages else 0.0,
+        "max_tone_cov": float(np.max(tone_coverages)) if tone_coverages else 0.0,
+        "avg_highlight_cov": float(np.mean(highlight_coverages)) if highlight_coverages else 0.0,
+        "min_highlight_cov": float(np.min(highlight_coverages)) if highlight_coverages else 0.0,
+        "max_highlight_cov": float(np.max(highlight_coverages)) if highlight_coverages else 0.0,
+        "avg_dark_cov": float(np.mean(dark_coverages)) if dark_coverages else 0.0,
+        "min_dark_cov": float(np.min(dark_coverages)) if dark_coverages else 0.0,
+        "max_dark_cov": float(np.max(dark_coverages)) if dark_coverages else 0.0,
     }
-    return [pair for _, _, pair in selected], stats
+    return [pair for _, _, _, _, pair in selected], stats
 
 
 def load_image_pairs_from_dirs(sdr_dir, hdr_dir, max_long_edge, max_images=0):
@@ -680,7 +729,7 @@ def load_image_pairs_from_dirs(sdr_dir, hdr_dir, max_long_edge, max_images=0):
 
 
 def compute_loss_terms(output, target, args, teacher_output=None):
-    """Composite QAT loss tuned to preserve bright highlight color."""
+    """Composite QAT loss tuned to preserve highlights and shadow detail."""
     base_l1 = F.l1_loss(output, target)
     total = base_l1
     metrics = {
@@ -697,34 +746,67 @@ def compute_loss_terms(output, target, args, teacher_output=None):
         total = total + args.teacher_loss_weight * teacher_l1
         metrics["teacher_l1"] = float(teacher_l1.detach().item())
 
-    mask = build_highlight_neutral_mask(
+    highlight_mask = build_highlight_neutral_mask(
         target, args.highlight_threshold, args.neutral_threshold
     )
-    metrics["highlight_cov"] = float(mask.mean().detach().item())
+    dark_mask = build_dark_area_mask(target, args.dark_threshold, args.dark_floor)
+    metrics["highlight_cov"] = float(highlight_mask.mean().detach().item())
+    metrics["dark_cov"] = float(dark_mask.mean().detach().item())
 
     if args.highlight_loss_weight > 0:
-        highlight_l1 = masked_mean_abs(output - target, mask)
+        highlight_l1 = masked_mean_abs(output - target, highlight_mask)
         total = total + args.highlight_loss_weight * highlight_l1
         metrics["highlight_l1"] = float(highlight_l1.detach().item())
 
     if teacher_ref is not None and args.highlight_teacher_weight > 0:
-        highlight_teacher = masked_mean_abs(output - teacher_ref, mask)
+        highlight_teacher = masked_mean_abs(output - teacher_ref, highlight_mask)
         total = total + args.highlight_teacher_weight * highlight_teacher
         metrics["highlight_teacher"] = float(highlight_teacher.detach().item())
 
+    output_chroma = None
+    target_chroma = None
     if args.highlight_chroma_weight > 0:
         output_chroma = output - output.mean(dim=1, keepdim=True)
         target_chroma = target - target.mean(dim=1, keepdim=True)
-        highlight_chroma = masked_mean_abs(output_chroma - target_chroma, mask)
+        highlight_chroma = masked_mean_abs(
+            output_chroma - target_chroma, highlight_mask
+        )
         total = total + args.highlight_chroma_weight * highlight_chroma
         metrics["highlight_chroma"] = float(highlight_chroma.detach().item())
 
     if args.highlight_balance_weight > 0:
         output_balance = build_channel_balance_deltas(output)
         target_balance = build_channel_balance_deltas(target)
-        highlight_balance = masked_mean_abs(output_balance - target_balance, mask)
+        highlight_balance = masked_mean_abs(
+            output_balance - target_balance, highlight_mask
+        )
         total = total + args.highlight_balance_weight * highlight_balance
         metrics["highlight_balance"] = float(highlight_balance.detach().item())
+
+    if args.dark_loss_weight > 0:
+        dark_l1 = masked_mean_abs(output - target, dark_mask)
+        total = total + args.dark_loss_weight * dark_l1
+        metrics["dark_l1"] = float(dark_l1.detach().item())
+
+    if teacher_ref is not None and args.dark_teacher_weight > 0:
+        dark_teacher = masked_mean_abs(output - teacher_ref, dark_mask)
+        total = total + args.dark_teacher_weight * dark_teacher
+        metrics["dark_teacher"] = float(dark_teacher.detach().item())
+
+    if args.dark_luma_weight > 0:
+        dark_luma = masked_mean_abs(
+            build_rgb_luma(output) - build_rgb_luma(target), dark_mask
+        )
+        total = total + args.dark_luma_weight * dark_luma
+        metrics["dark_luma"] = float(dark_luma.detach().item())
+
+    if args.dark_chroma_weight > 0:
+        if output_chroma is None or target_chroma is None:
+            output_chroma = output - output.mean(dim=1, keepdim=True)
+            target_chroma = target - target.mean(dim=1, keepdim=True)
+        dark_chroma = masked_mean_abs(output_chroma - target_chroma, dark_mask)
+        total = total + args.dark_chroma_weight * dark_chroma
+        metrics["dark_chroma"] = float(dark_chroma.detach().item())
 
     metrics["total"] = float(total.detach().item())
     return total, metrics
@@ -834,6 +916,16 @@ def format_metrics(metrics):
         parts.append(f"hi_balance={metrics['highlight_balance']:.6f}")
     if "highlight_cov" in metrics:
         parts.append(f"hi_cov={metrics['highlight_cov']:.3f}")
+    if "dark_l1" in metrics:
+        parts.append(f"dark={metrics['dark_l1']:.6f}")
+    if "dark_teacher" in metrics:
+        parts.append(f"dark_teacher={metrics['dark_teacher']:.6f}")
+    if "dark_luma" in metrics:
+        parts.append(f"dark_luma={metrics['dark_luma']:.6f}")
+    if "dark_chroma" in metrics:
+        parts.append(f"dark_chroma={metrics['dark_chroma']:.6f}")
+    if "dark_cov" in metrics:
+        parts.append(f"dark_cov={metrics['dark_cov']:.3f}")
     if "objective_psnr_norm_db" in metrics:
         parts.append(f"psnrN={metrics['objective_psnr_norm_db']:.2f}")
     if "objective_sssim_norm" in metrics:
@@ -1041,6 +1133,10 @@ def train_qat(model, pairs, device, compute_dtype, args,
             or args.highlight_teacher_weight > 0
             or args.highlight_chroma_weight > 0
             or args.highlight_balance_weight > 0
+            or args.dark_loss_weight > 0
+            or args.dark_teacher_weight > 0
+            or args.dark_luma_weight > 0
+            or args.dark_chroma_weight > 0
         ) else "monitor L1"
     else:
         score_name = f"monitor {args.monitor_score}"
@@ -1061,16 +1157,20 @@ def train_qat(model, pairs, device, compute_dtype, args,
     print(f"\n  Training: {args.epochs} epochs, lr={args.lr}, "
           f"crop={args.crop_size}, batch={batch_size}, {len(pairs)} pairs")
     print("  Strategy: adaptive mixed QAT "
-          "(W8A8 for speed, W8A16/FP16 for highlight-sensitive paths)")
+          "(W8A8 for speed, W8A16/FP16 for tone-sensitive paths)")
     print("  Loss recipe: "
           f"L1 + {args.teacher_loss_weight:.3f}*teacher "
           f"+ {args.highlight_loss_weight:.3f}*highlight "
           f"+ {args.highlight_teacher_weight:.3f}*highlight_teacher "
           f"+ {args.highlight_chroma_weight:.3f}*highlight_chroma "
-          f"+ {args.highlight_balance_weight:.3f}*highlight_balance")
+          f"+ {args.highlight_balance_weight:.3f}*highlight_balance "
+          f"+ {args.dark_loss_weight:.3f}*dark "
+          f"+ {args.dark_teacher_weight:.3f}*dark_teacher "
+          f"+ {args.dark_luma_weight:.3f}*dark_luma "
+          f"+ {args.dark_chroma_weight:.3f}*dark_chroma")
     print("  Crop sampling: "
           f"best-of-{max(1, int(args.highlight_crop_attempts))} random crops "
-          "biased toward bright neutral highlights")
+          "biased toward bright neutral highlights and shadow detail")
     if monitor_pairs:
         print(f"  Model selection: best {score_name} on {len(monitor_pairs)} "
               f"fixed full-image pairs")
@@ -1357,8 +1457,24 @@ def main():
                         help="Target intensity threshold for highlight-focused losses")
     parser.add_argument("--neutral-threshold", type=float, default=0.08,
                         help="Max target channel spread treated as near-neutral")
+    parser.add_argument("--dark-loss-weight", type=float, default=0.08,
+                        help="Extra L1 weight on non-black shadow/detail pixels")
+    parser.add_argument("--dark-teacher-weight", type=float, default=0.10,
+                        help="Extra teacher-anchor weight on dark shadow/detail pixels")
+    parser.add_argument("--dark-luma-weight", type=float, default=0.06,
+                        help="Extra luma-preservation weight in dark areas")
+    parser.add_argument("--dark-chroma-weight", type=float, default=0.04,
+                        help="Extra chroma-preservation weight in dark areas")
+    parser.add_argument("--dark-threshold", type=float, default=0.16,
+                        help="Target luma threshold for dark-area losses")
+    parser.add_argument("--dark-floor", type=float, default=0.01,
+                        help="Luma floor below which pure black pixels are down-weighted")
+    parser.add_argument("--dark-crop-weight", type=float, default=1.0,
+                        help="Relative crop-selection weight for dark-area coverage")
+    parser.add_argument("--dark-monitor-weight", type=float, default=1.0,
+                        help="Relative monitor-selection weight for dark-area coverage")
     parser.add_argument("--highlight-crop-attempts", type=int, default=4,
-                        help="Random crop attempts per image; keep the crop with the strongest neutral-highlight coverage")
+                        help="Random crop attempts per image; keep the crop with the strongest tone-protection coverage")
     parser.add_argument("--protect-agcm-controls", default="1", choices=["1", "0"],
                         help="Keep AGCM cond_scale/cond_shift layers in W8A16")
     parser.add_argument("--protect-sft-controls", default="1", choices=["1", "0"],
@@ -1603,22 +1719,30 @@ def main():
     elif args.val_sdr_dir or args.val_hdr_dir:
         raise ValueError("Provide both --val-sdr-dir and --val-hdr-dir, or neither")
 
-    monitor_pairs, monitor_stats = select_highlight_monitor_pairs(
+    monitor_pairs, monitor_stats = select_tone_protected_monitor_pairs(
         monitor_candidate_pairs, args.num_validate, args
     )
     if monitor_pairs:
-        print("  Highlight-aware monitor selection:")
+        print("  Tone-aware monitor selection:")
         print(f"    using {len(monitor_pairs)} full-image pairs "
               f"from {monitor_source} "
               f"(avg hi_cov={monitor_stats['avg_highlight_cov']:.4f}, "
               f"max={monitor_stats['max_highlight_cov']:.4f}, "
+              f"avg dark_cov={monitor_stats['avg_dark_cov']:.4f}, "
+              f"max={monitor_stats['max_dark_cov']:.4f}, "
               f"positive candidates={monitor_stats['positive_candidates']})")
         if monitor_stats["max_highlight_cov"] <= 0.0:
             print("    [warn] No monitor image contained qualifying highlight pixels")
+        if monitor_stats["max_dark_cov"] <= 0.0:
+            print("    [warn] No monitor image contained qualifying dark pixels")
 
     teacher_model = None
     teacher_dtype = compute_dtype
-    if args.teacher_loss_weight > 0 or args.highlight_teacher_weight > 0:
+    if (
+        args.teacher_loss_weight > 0
+        or args.highlight_teacher_weight > 0
+        or args.dark_teacher_weight > 0
+    ):
         print("\nPreparing PTQ teacher model ...")
         teacher_model = copy.deepcopy(model).to(dtype=teacher_dtype, device=device)
         teacher_model.eval()
@@ -1675,6 +1799,14 @@ def main():
             "highlight_balance_weight": args.highlight_balance_weight,
             "highlight_threshold": args.highlight_threshold,
             "neutral_threshold": args.neutral_threshold,
+            "dark_loss_weight": args.dark_loss_weight,
+            "dark_teacher_weight": args.dark_teacher_weight,
+            "dark_luma_weight": args.dark_luma_weight,
+            "dark_chroma_weight": args.dark_chroma_weight,
+            "dark_threshold": args.dark_threshold,
+            "dark_floor": args.dark_floor,
+            "dark_crop_weight": args.dark_crop_weight,
+            "dark_monitor_weight": args.dark_monitor_weight,
             "protect_agcm_controls": str(args.protect_agcm_controls).strip() != "0",
             "protect_sft_controls": str(args.protect_sft_controls).strip() != "0",
             "fp16_sensitive_layers": str(args.fp16_sensitive_layers).strip() != "0",
@@ -1683,15 +1815,21 @@ def main():
             "highlight_crop_attempts": args.highlight_crop_attempts,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
-            "monitor_selection": "highlight_coverage_topk",
+            "monitor_selection": "tone_protection_coverage_topk",
             "monitor_source": monitor_source,
             "monitor_score": args.monitor_score,
             "monitor_metric_max_side": args.monitor_metric_max_side,
             "val_sdr_dir": args.val_sdr_dir,
             "val_hdr_dir": args.val_hdr_dir,
+            "monitor_avg_tone_cov": monitor_stats["avg_tone_cov"],
+            "monitor_max_tone_cov": monitor_stats["max_tone_cov"],
             "monitor_avg_highlight_cov": monitor_stats["avg_highlight_cov"],
             "monitor_max_highlight_cov": monitor_stats["max_highlight_cov"],
+            "monitor_avg_dark_cov": monitor_stats["avg_dark_cov"],
+            "monitor_max_dark_cov": monitor_stats["max_dark_cov"],
             "monitor_positive_candidates": monitor_stats["positive_candidates"],
+            "monitor_highlight_positive_candidates": monitor_stats["highlight_positive_candidates"],
+            "monitor_dark_positive_candidates": monitor_stats["dark_positive_candidates"],
             "seed": seed,
             "deterministic": deterministic,
             "teacher_source": "ptq_checkpoint",

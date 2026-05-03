@@ -35,6 +35,7 @@ Core updates include:
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
+- QAT INT8 checkpoints are upgraded with the new tone-protected training recipe, improving highlight preservation and shadow-detail stability across the core `src/models/weights/` runtime set
 - HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
 - optimized GT sync algorithm with improved frame scanning and alignment detection
 - HDR GT status indicator in the GUI status line showing when fast path is active
@@ -851,11 +852,11 @@ python scripts/quantize/quantize_int8_full_qat.py
 ```
 - Starts from the PTQ full checkpoint and fine-tunes with fake quantization + STE
 - Full QAT is now a **PTQ-anchored** full-W8A8 path:
-  - freezes a curated set of highlight/color-sensitive layers during training
+  - freezes a curated set of tone/color-sensitive layers during training
   - also freezes SFT scale/shift control layers by default
-  - uses stronger teacher/highlight anchoring to reduce highlight tint drift while still exporting a full `W8A8` checkpoint
+  - uses stronger teacher/highlight/dark-area anchoring to reduce tone drift while still exporting a full `W8A8` checkpoint
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
-- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 loss)
+- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 + teacher + highlight/dark-aware losses)
   - **~4.0× compression vs FP16+HG**
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt` (HG)
@@ -883,16 +884,177 @@ python scripts/quantize/quantize_int8_mixed_qat.py
 ```
 - Starts from the PTQ mixed checkpoint and fine-tunes with fake quantization + STE
 - Mixed QAT is the **adaptive mixed-precision** path:
-  - keeps leaning on `W8A16` and curated `FP16` exemptions for the most highlight/color-sensitive layers
+  - keeps leaning on `W8A16` and curated `FP16` exemptions for the most tone/color-sensitive layers
   - SFT control protection is enabled by default
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth while preserving the FP16-sensitive exemptions
-- QAT now defaults to deterministic/repeatable training (`--seed`, deterministic mode), highlight-aware monitor selection, and early stopping
-- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 + teacher + highlight-aware losses)
+- QAT now defaults to deterministic/repeatable training (`--seed`, deterministic mode), tone-aware monitor selection, and early stopping
+- Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 + teacher + highlight/dark-aware losses)
   - **~4.0× compression vs FP16+HG**
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt` (no-HG)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
+
+Recommended tone-protected QAT refresh:
+```powershell
+py scripts/quantize/quantize_int8_mixed_qat.py `
+  --device cuda `
+  --ptq-checkpoint src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt `
+  --sdr-dir dataset/train_sdr `
+  --hdr-dir dataset/train_hdr `
+  --val-sdr-dir dataset/test_sdr `
+  --val-hdr-dir dataset/test_hdr `
+  --epochs 8 `
+  --lr 3e-6 `
+  --crop-size 384 `
+  --batch-size 1 `
+  --max-long-edge 1080 `
+  --num-validate 0 `
+  --monitor-score hybrid `
+  --monitor-metric-max-side 720 `
+  --teacher-loss-weight 0.25 `
+  --highlight-loss-weight 0.04 `
+  --highlight-teacher-weight 0.20 `
+  --highlight-chroma-weight 0.03 `
+  --highlight-balance-weight 0.04 `
+  --highlight-threshold 0.75 `
+  --neutral-threshold 0.08 `
+  --dark-loss-weight 0.10 `
+  --dark-teacher-weight 0.18 `
+  --dark-luma-weight 0.12 `
+  --dark-chroma-weight 0.04 `
+  --dark-threshold 0.16 `
+  --dark-floor 0.01 `
+  --dark-crop-weight 1.25 `
+  --dark-monitor-weight 1.25 `
+  --highlight-crop-attempts 4 `
+  --protect-agcm-controls 1 `
+  --protect-sft-controls 1 `
+  --fp16-sensitive-layers 1 `
+  --early-stop-patience 3 `
+  --early-stop-min-delta 5e-6 `
+  --seed 1234 `
+  --deterministic 1
+
+py scripts/quantize/quantize_int8_mixed_qat.py `
+  --device cuda `
+  --ptq-checkpoint src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt `
+  --sdr-dir dataset/train_sdr `
+  --hdr-dir dataset/train_hdr `
+  --val-sdr-dir dataset/test_sdr `
+  --val-hdr-dir dataset/test_hdr `
+  --epochs 8 `
+  --lr 3e-6 `
+  --crop-size 384 `
+  --batch-size 1 `
+  --max-long-edge 1080 `
+  --num-validate 0 `
+  --monitor-score hybrid `
+  --monitor-metric-max-side 720 `
+  --teacher-loss-weight 0.25 `
+  --highlight-loss-weight 0.04 `
+  --highlight-teacher-weight 0.20 `
+  --highlight-chroma-weight 0.03 `
+  --highlight-balance-weight 0.04 `
+  --highlight-threshold 0.75 `
+  --neutral-threshold 0.08 `
+  --dark-loss-weight 0.10 `
+  --dark-teacher-weight 0.18 `
+  --dark-luma-weight 0.12 `
+  --dark-chroma-weight 0.04 `
+  --dark-threshold 0.16 `
+  --dark-floor 0.01 `
+  --dark-crop-weight 1.25 `
+  --dark-monitor-weight 1.25 `
+  --highlight-crop-attempts 4 `
+  --protect-agcm-controls 1 `
+  --protect-sft-controls 1 `
+  --fp16-sensitive-layers 1 `
+  --early-stop-patience 3 `
+  --early-stop-min-delta 5e-6 `
+  --seed 1234 `
+  --deterministic 1
+
+py scripts/quantize/quantize_int8_full_qat.py `
+  --device cuda `
+  --ptq-checkpoint src/models/weights/Ensemble_AGCM_LE_int8_full.pt `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt `
+  --sdr-dir dataset/train_sdr `
+  --hdr-dir dataset/train_hdr `
+  --val-sdr-dir dataset/test_sdr `
+  --val-hdr-dir dataset/test_hdr `
+  --epochs 6 `
+  --lr 2e-6 `
+  --crop-size 384 `
+  --batch-size 1 `
+  --max-long-edge 1080 `
+  --num-validate 0 `
+  --monitor-score hybrid `
+  --monitor-metric-max-side 720 `
+  --teacher-loss-weight 0.35 `
+  --highlight-loss-weight 0.03 `
+  --highlight-teacher-weight 0.25 `
+  --highlight-chroma-weight 0.02 `
+  --highlight-balance-weight 0.03 `
+  --highlight-threshold 0.75 `
+  --neutral-threshold 0.08 `
+  --dark-loss-weight 0.08 `
+  --dark-teacher-weight 0.22 `
+  --dark-luma-weight 0.14 `
+  --dark-chroma-weight 0.04 `
+  --dark-threshold 0.16 `
+  --dark-floor 0.01 `
+  --dark-crop-weight 1.25 `
+  --dark-monitor-weight 1.25 `
+  --highlight-crop-attempts 4 `
+  --freeze-sensitive-layers 1 `
+  --freeze-sft-controls 1 `
+  --early-stop-patience 3 `
+  --early-stop-min-delta 5e-6 `
+  --seed 1234 `
+  --deterministic 1
+
+py scripts/quantize/quantize_int8_full_qat.py `
+  --device cuda `
+  --ptq-checkpoint src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt `
+  --sdr-dir dataset/train_sdr `
+  --hdr-dir dataset/train_hdr `
+  --val-sdr-dir dataset/test_sdr `
+  --val-hdr-dir dataset/test_hdr `
+  --epochs 6 `
+  --lr 2e-6 `
+  --crop-size 384 `
+  --batch-size 1 `
+  --max-long-edge 1080 `
+  --num-validate 0 `
+  --monitor-score hybrid `
+  --monitor-metric-max-side 720 `
+  --teacher-loss-weight 0.35 `
+  --highlight-loss-weight 0.03 `
+  --highlight-teacher-weight 0.25 `
+  --highlight-chroma-weight 0.02 `
+  --highlight-balance-weight 0.03 `
+  --highlight-threshold 0.75 `
+  --neutral-threshold 0.08 `
+  --dark-loss-weight 0.08 `
+  --dark-teacher-weight 0.22 `
+  --dark-luma-weight 0.14 `
+  --dark-chroma-weight 0.04 `
+  --dark-threshold 0.16 `
+  --dark-floor 0.01 `
+  --dark-crop-weight 1.25 `
+  --dark-monitor-weight 1.25 `
+  --highlight-crop-attempts 4 `
+  --freeze-sensitive-layers 1 `
+  --freeze-sft-controls 1 `
+  --early-stop-patience 3 `
+  --early-stop-min-delta 5e-6 `
+  --seed 1234 `
+  --deterministic 1
+```
 
 ### Pre-Dequantization
 
