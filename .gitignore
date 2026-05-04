@@ -49,6 +49,10 @@ src/models/weights/HG_weights.pth
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt
 !src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt
+!src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt
 
 # Calibration / training dataset (download separately)
 dataset/
