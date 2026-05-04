@@ -32,6 +32,13 @@ try:
     )
 except Exception:
     _HDR_FAST_SEEK_PTS_TOL_FRAMES = 0.60
+try:
+    _HDR_EXACT_BATCH_MAX_FRAMES = max(
+        1,
+        min(16, int(os.environ.get("HDRTVNET_HDR_EXACT_BATCH_MAX_FRAMES", "10"))),
+    )
+except Exception:
+    _HDR_EXACT_BATCH_MAX_FRAMES = 10
 
 
 def hdr_ffmpeg_ready() -> bool:
@@ -346,6 +353,138 @@ def read_hdr_video_frame_rgb16(
         while len(_HDR_FRAME_CACHE) > _HDR_FRAME_CACHE_MAX:
             _HDR_FRAME_CACHE.popitem(last=False)
     return out
+
+
+def _decode_rgb48_frames_batch(
+    cmd: list[str],
+    width: int,
+    height: int,
+    frame_indices: list[int],
+    cancel_check=None,
+) -> dict[int, np.ndarray | None]:
+    out: dict[int, np.ndarray | None] = {int(v): None for v in frame_indices}
+    frame_bytes = int(width) * int(height) * 3 * 2
+    if frame_bytes <= 0 or not frame_indices:
+        return out
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        while True:
+            try:
+                data, _stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if callable(cancel_check):
+                    try:
+                        if bool(cancel_check()):
+                            proc.kill()
+                            proc.communicate()
+                            return out
+                    except Exception:
+                        pass
+        if proc.returncode != 0:
+            return out
+    except Exception:
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        return out
+
+    data = data or b""
+    for pos, idx in enumerate(frame_indices):
+        start = int(pos) * frame_bytes
+        end = start + frame_bytes
+        if end > len(data):
+            break
+        try:
+            frame = np.frombuffer(data[start:end], dtype=np.uint16).reshape(
+                (height, width, 3)
+            )
+            out[int(idx)] = np.ascontiguousarray(frame)
+        except Exception:
+            out[int(idx)] = None
+    return out
+
+
+def read_hdr_video_frames_rgb16_exact(
+    path: str,
+    frame_indices,
+    cancel_check=None,
+) -> dict[int, np.ndarray | None]:
+    """Decode multiple exact HDR frames with one FFmpeg select pass per chunk.
+
+    This intentionally uses the same `select=eq(n,idx)` + `rgb48le` path as
+    read_hdr_video_frame_rgb16(..., prefer_fast_seek=False), but amortizes the
+    decoder scan across sorted benchmark post-verify frames.
+    """
+    try:
+        indices = sorted({max(0, int(v)) for v in frame_indices})
+    except Exception:
+        indices = []
+    if not indices:
+        return {}
+
+    result: dict[int, np.ndarray | None] = {int(v): None for v in indices}
+    ffmpeg = shutil.which("ffmpeg")
+    stream_info = _ffprobe_video_stream_info(path)
+    if not ffmpeg or not isinstance(stream_info, dict):
+        return result
+
+    width = int(stream_info.get("width") or 0)
+    height = int(stream_info.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return result
+
+    max_chunk = int(_HDR_EXACT_BATCH_MAX_FRAMES)
+    for start in range(0, len(indices), max_chunk):
+        if callable(cancel_check):
+            try:
+                if bool(cancel_check()):
+                    return result
+            except Exception:
+                pass
+        chunk = indices[start:start + max_chunk]
+        select_expr = "+".join(f"eq(n\\,{int(idx)})" for idx in chunk)
+        cmd = [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            path,
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"select={select_expr}",
+            "-vsync",
+            "0",
+            "-frames:v",
+            str(len(chunk)),
+            "-an",
+            "-sn",
+            "-dn",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb48le",
+            "-",
+        ]
+        result.update(
+            _decode_rgb48_frames_batch(
+                cmd,
+                width,
+                height,
+                chunk,
+                cancel_check=cancel_check,
+            )
+        )
+    return result
 
 
 def read_image_any(path: str) -> np.ndarray | None:

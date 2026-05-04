@@ -900,10 +900,10 @@ python scripts/quantize/quantize_int8_full.py
 python scripts/quantize/quantize_int8_full_qat.py
 ```
 - Starts from the PTQ full checkpoint and fine-tunes with fake quantization + STE
-- Full QAT is now a **PTQ-anchored** full-W8A8 path:
+- Full QAT starts from PTQ and can use either a PTQ or FP32 teacher:
   - freezes a curated set of tone/color-sensitive layers during training
   - also freezes SFT scale/shift control layers by default
-  - uses stronger teacher/highlight/dark-area anchoring to reduce tone drift while still exporting a full `W8A8` checkpoint
+  - the recommended paper recipe uses an FP32 teacher plus luma/chroma anchors to reduce DeltaE-ITP and HDR-VDP3 drift while still exporting a full `W8A8` checkpoint
 - Learnable weight/activation scales adapt to minimize reconstruction loss against HDR ground truth
 - Trains on SDR/HDR pairs from `dataset/` (256×256 random crops, L1 + teacher + highlight/dark-aware losses)
   - **~4.0× compression vs FP16+HG**
@@ -927,6 +927,94 @@ python scripts/quantize/quantize_int8_mixed.py
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt` (no-HG)
 
+Checkpoint recipe note:
+
+The app already includes the ready-to-use PTQ and QAT INT8 checkpoints for normal use. You do not need to run the commands below to launch the app, benchmark the included models, or use the provided INT8 presets. These recipes are kept as documentation/reproducibility references and for users who explicitly want to rebuild or modify the checkpoints themselves.
+
+Recommended PTQ checkpoint refresh for Full and Mixed INT8:
+
+Only run this when regenerating the INT8 base checkpoints. Full INT8 uses asymmetric percentile activation calibration, while Mixed INT8 adds the sensitivity sweep, tone/control protection, and a minimum W8A16 budget so sensitive layers do not get pushed too aggressively into W8A8.
+
+```powershell
+py scripts/quantize/quantize_int8_full.py `
+  --device cuda `
+  --calibration-device cuda `
+  --activation-quant asymmetric `
+  --calibration-dir dataset/train_sdr `
+  --num-calibrate 0 `
+  --num-validate 32 `
+  --calibration-method percentile `
+  --percentile 99.9 `
+  --percentile-low 0.1 `
+  --max-calib-samples 200000 `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_full.pt
+
+py scripts/quantize/quantize_int8_full.py `
+  --device cuda `
+  --calibration-device cuda `
+  --activation-quant asymmetric `
+  --use-hg 0 `
+  --calibration-dir dataset/train_sdr `
+  --num-calibrate 0 `
+  --num-validate 32 `
+  --calibration-method percentile `
+  --percentile 99.9 `
+  --percentile-low 0.1 `
+  --max-calib-samples 200000 `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt
+
+py scripts/quantize/quantize_int8_mixed.py `
+  --device cuda `
+  --sensitivity-device cuda `
+  --calibration-device cuda `
+  --layer-selection auto `
+  --auto-min-w8a16 16 `
+  --stability-weight 0.5 `
+  --stability-perturbation 0.0039215686 `
+  --stability-exposure-delta 0.01 `
+  --highlight-weight 0.10 `
+  --highlight-chroma-weight 0.05 `
+  --highlight-threshold 0.75 `
+  --neutral-threshold 0.08 `
+  --protect-agcm-controls 1 `
+  --protect-sft-controls 1 `
+  --num-sensitivity 128 `
+  --calibration-dir dataset/train_sdr `
+  --num-calibrate 0 `
+  --num-validate 16 `
+  --calibration-method percentile `
+  --percentile 99.9 `
+  --percentile-low 0.1 `
+  --max-calib-samples 200000 `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
+
+py scripts/quantize/quantize_int8_mixed.py `
+  --device cuda `
+  --sensitivity-device cuda `
+  --calibration-device cuda `
+  --use-hg 0 `
+  --layer-selection auto `
+  --auto-min-w8a16 16 `
+  --stability-weight 0.5 `
+  --stability-perturbation 0.0039215686 `
+  --stability-exposure-delta 0.01 `
+  --highlight-weight 0.10 `
+  --highlight-chroma-weight 0.05 `
+  --highlight-threshold 0.75 `
+  --neutral-threshold 0.08 `
+  --protect-agcm-controls 1 `
+  --protect-sft-controls 1 `
+  --num-sensitivity 128 `
+  --calibration-dir dataset/train_sdr `
+  --num-calibrate 0 `
+  --num-validate 16 `
+  --calibration-method percentile `
+  --percentile 99.9 `
+  --percentile-low 0.1 `
+  --max-calib-samples 200000 `
+  --output src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt
+```
+
 ### Mixed W8A8/W8A16/FP16 + QAT (Quantization-Aware Training, HG optional)
 ```bash
 python scripts/quantize/quantize_int8_mixed_qat.py
@@ -944,7 +1032,10 @@ python scripts/quantize/quantize_int8_mixed_qat.py
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt` (no-HG)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
-Recommended tone-protected QAT refresh:
+Recommended FP32-anchored tone-protected QAT refresh:
+
+Only run this if you want to remake the included QAT checkpoints. Use this path when the goal is checkpoint accuracy against the FP32 baseline. The current dataset logs show the older QAT recipe improving PSNR but slipping behind PTQ/FP32 on DeltaE-ITP and HDR-VDP3, so this recipe switches the teacher from the PTQ starting checkpoint to the FP32 baseline and adds global luma/chroma teacher anchors while reducing target-pull in dark/highlight regions.
+
 ```powershell
 py scripts/quantize/quantize_int8_mixed_qat.py `
   --device cuda `
@@ -955,34 +1046,37 @@ py scripts/quantize/quantize_int8_mixed_qat.py `
   --val-sdr-dir dataset/test_sdr `
   --val-hdr-dir dataset/test_hdr `
   --epochs 8 `
-  --lr 3e-6 `
+  --lr 2e-6 `
   --crop-size 384 `
   --batch-size 1 `
   --max-long-edge 1080 `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.25 `
-  --highlight-loss-weight 0.04 `
-  --highlight-teacher-weight 0.20 `
-  --highlight-chroma-weight 0.03 `
-  --highlight-balance-weight 0.04 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.55 `
+  --teacher-luma-weight 0.08 `
+  --teacher-chroma-weight 0.05 `
+  --highlight-loss-weight 0.025 `
+  --highlight-teacher-weight 0.30 `
+  --highlight-chroma-weight 0.02 `
+  --highlight-balance-weight 0.025 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.10 `
-  --dark-teacher-weight 0.18 `
-  --dark-luma-weight 0.12 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.05 `
+  --dark-teacher-weight 0.30 `
+  --dark-luma-weight 0.06 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
+  --dark-crop-weight 1.20 `
+  --dark-monitor-weight 1.20 `
   --highlight-crop-attempts 4 `
   --protect-agcm-controls 1 `
   --protect-sft-controls 1 `
   --fp16-sensitive-layers 1 `
   --early-stop-patience 3 `
-  --early-stop-min-delta 5e-6 `
+  --early-stop-min-delta 3e-6 `
   --seed 1234 `
   --deterministic 1
 
@@ -995,34 +1089,37 @@ py scripts/quantize/quantize_int8_mixed_qat.py `
   --val-sdr-dir dataset/test_sdr `
   --val-hdr-dir dataset/test_hdr `
   --epochs 8 `
-  --lr 3e-6 `
+  --lr 2e-6 `
   --crop-size 384 `
   --batch-size 1 `
   --max-long-edge 1080 `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.25 `
-  --highlight-loss-weight 0.04 `
-  --highlight-teacher-weight 0.20 `
-  --highlight-chroma-weight 0.03 `
-  --highlight-balance-weight 0.04 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.55 `
+  --teacher-luma-weight 0.08 `
+  --teacher-chroma-weight 0.05 `
+  --highlight-loss-weight 0.025 `
+  --highlight-teacher-weight 0.30 `
+  --highlight-chroma-weight 0.02 `
+  --highlight-balance-weight 0.025 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.10 `
-  --dark-teacher-weight 0.18 `
-  --dark-luma-weight 0.12 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.05 `
+  --dark-teacher-weight 0.30 `
+  --dark-luma-weight 0.06 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
+  --dark-crop-weight 1.20 `
+  --dark-monitor-weight 1.20 `
   --highlight-crop-attempts 4 `
   --protect-agcm-controls 1 `
   --protect-sft-controls 1 `
   --fp16-sensitive-layers 1 `
   --early-stop-patience 3 `
-  --early-stop-min-delta 5e-6 `
+  --early-stop-min-delta 3e-6 `
   --seed 1234 `
   --deterministic 1
 
@@ -1035,33 +1132,36 @@ py scripts/quantize/quantize_int8_full_qat.py `
   --val-sdr-dir dataset/test_sdr `
   --val-hdr-dir dataset/test_hdr `
   --epochs 6 `
-  --lr 2e-6 `
+  --lr 1.5e-6 `
   --crop-size 384 `
   --batch-size 1 `
   --max-long-edge 1080 `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.35 `
-  --highlight-loss-weight 0.03 `
-  --highlight-teacher-weight 0.25 `
-  --highlight-chroma-weight 0.02 `
-  --highlight-balance-weight 0.03 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.65 `
+  --teacher-luma-weight 0.10 `
+  --teacher-chroma-weight 0.06 `
+  --highlight-loss-weight 0.02 `
+  --highlight-teacher-weight 0.35 `
+  --highlight-chroma-weight 0.015 `
+  --highlight-balance-weight 0.02 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.08 `
-  --dark-teacher-weight 0.22 `
-  --dark-luma-weight 0.14 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.04 `
+  --dark-teacher-weight 0.34 `
+  --dark-luma-weight 0.06 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
+  --dark-crop-weight 1.20 `
+  --dark-monitor-weight 1.20 `
   --highlight-crop-attempts 4 `
   --freeze-sensitive-layers 1 `
   --freeze-sft-controls 1 `
   --early-stop-patience 3 `
-  --early-stop-min-delta 5e-6 `
+  --early-stop-min-delta 3e-6 `
   --seed 1234 `
   --deterministic 1
 
@@ -1074,40 +1174,43 @@ py scripts/quantize/quantize_int8_full_qat.py `
   --val-sdr-dir dataset/test_sdr `
   --val-hdr-dir dataset/test_hdr `
   --epochs 6 `
-  --lr 2e-6 `
+  --lr 1.5e-6 `
   --crop-size 384 `
   --batch-size 1 `
   --max-long-edge 1080 `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.35 `
-  --highlight-loss-weight 0.03 `
-  --highlight-teacher-weight 0.25 `
-  --highlight-chroma-weight 0.02 `
-  --highlight-balance-weight 0.03 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.65 `
+  --teacher-luma-weight 0.10 `
+  --teacher-chroma-weight 0.06 `
+  --highlight-loss-weight 0.02 `
+  --highlight-teacher-weight 0.35 `
+  --highlight-chroma-weight 0.015 `
+  --highlight-balance-weight 0.02 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.08 `
-  --dark-teacher-weight 0.22 `
-  --dark-luma-weight 0.14 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.04 `
+  --dark-teacher-weight 0.34 `
+  --dark-luma-weight 0.06 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
+  --dark-crop-weight 1.20 `
+  --dark-monitor-weight 1.20 `
   --highlight-crop-attempts 4 `
   --freeze-sensitive-layers 1 `
   --freeze-sft-controls 1 `
   --early-stop-patience 3 `
-  --early-stop-min-delta 5e-6 `
+  --early-stop-min-delta 3e-6 `
   --seed 1234 `
   --deterministic 1
 ```
 
 Recommended QAT (Film) source-color refresh:
 
-The Film recipe keeps the same highlight and dark-area protection as the FP32-anchored QAT recipe, but writes separate `_qat_film` checkpoints and adds SDR source-chroma anchoring so saturated film colors are less pulled toward the FP32 teacher's training-set color bias.
+Only run this if you want to remake or experiment with the included Film QAT checkpoints. The Film recipe writes separate `_qat_film` checkpoints. It keeps highlight protection, but intentionally softens dark-target/teacher pull and adds SDR source-chroma plus SDR source-shadow luma/detail anchors. This is the film-retention path for cases where the FP32 baseline inherits training-set color bias or makes shadows darker than the SDR source, causing low-light detail loss.
 
 ```powershell
 py scripts/quantize/quantize_int8_mixed_qat.py `
@@ -1126,27 +1229,39 @@ py scripts/quantize/quantize_int8_mixed_qat.py `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.25 `
-  --highlight-loss-weight 0.04 `
-  --highlight-teacher-weight 0.20 `
-  --highlight-chroma-weight 0.03 `
-  --highlight-balance-weight 0.04 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.35 `
+  --teacher-luma-weight 0.04 `
+  --teacher-chroma-weight 0.03 `
+  --highlight-loss-weight 0.03 `
+  --highlight-teacher-weight 0.22 `
+  --highlight-chroma-weight 0.025 `
+  --highlight-balance-weight 0.03 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.10 `
-  --dark-teacher-weight 0.18 `
-  --dark-luma-weight 0.12 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.04 `
+  --dark-teacher-weight 0.10 `
+  --dark-luma-weight 0.04 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
-  --source-chroma-weight 0.05 `
+  --dark-crop-weight 1.10 `
+  --dark-monitor-weight 1.10 `
+  --source-chroma-weight 0.06 `
   --source-chroma-saturation-threshold 0.05 `
   --source-chroma-luma-floor 0.02 `
   --source-chroma-ratio-clip 6.0 `
-  --source-chroma-crop-weight 0.75 `
-  --source-chroma-monitor-weight 0.75 `
+  --source-chroma-crop-weight 0.80 `
+  --source-chroma-monitor-weight 0.80 `
+  --source-shadow-luma-weight 0.12 `
+  --source-shadow-detail-weight 0.08 `
+  --source-shadow-threshold 0.30 `
+  --source-shadow-floor 0.015 `
+  --source-shadow-luma-scale 0.92 `
+  --source-shadow-detail-kernel 7 `
+  --source-shadow-detail-clip 2.0 `
+  --source-shadow-crop-weight 1.00 `
+  --source-shadow-monitor-weight 1.00 `
   --highlight-crop-attempts 4 `
   --protect-agcm-controls 1 `
   --protect-sft-controls 1 `
@@ -1172,27 +1287,39 @@ py scripts/quantize/quantize_int8_mixed_qat.py `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.25 `
-  --highlight-loss-weight 0.04 `
-  --highlight-teacher-weight 0.20 `
-  --highlight-chroma-weight 0.03 `
-  --highlight-balance-weight 0.04 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.35 `
+  --teacher-luma-weight 0.04 `
+  --teacher-chroma-weight 0.03 `
+  --highlight-loss-weight 0.03 `
+  --highlight-teacher-weight 0.22 `
+  --highlight-chroma-weight 0.025 `
+  --highlight-balance-weight 0.03 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.10 `
-  --dark-teacher-weight 0.18 `
-  --dark-luma-weight 0.12 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.04 `
+  --dark-teacher-weight 0.10 `
+  --dark-luma-weight 0.04 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
-  --source-chroma-weight 0.05 `
+  --dark-crop-weight 1.10 `
+  --dark-monitor-weight 1.10 `
+  --source-chroma-weight 0.06 `
   --source-chroma-saturation-threshold 0.05 `
   --source-chroma-luma-floor 0.02 `
   --source-chroma-ratio-clip 6.0 `
-  --source-chroma-crop-weight 0.75 `
-  --source-chroma-monitor-weight 0.75 `
+  --source-chroma-crop-weight 0.80 `
+  --source-chroma-monitor-weight 0.80 `
+  --source-shadow-luma-weight 0.12 `
+  --source-shadow-detail-weight 0.08 `
+  --source-shadow-threshold 0.30 `
+  --source-shadow-floor 0.015 `
+  --source-shadow-luma-scale 0.92 `
+  --source-shadow-detail-kernel 7 `
+  --source-shadow-detail-clip 2.0 `
+  --source-shadow-crop-weight 1.00 `
+  --source-shadow-monitor-weight 1.00 `
   --highlight-crop-attempts 4 `
   --protect-agcm-controls 1 `
   --protect-sft-controls 1 `
@@ -1218,27 +1345,39 @@ py scripts/quantize/quantize_int8_full_qat.py `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.35 `
-  --highlight-loss-weight 0.03 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.42 `
+  --teacher-luma-weight 0.05 `
+  --teacher-chroma-weight 0.035 `
+  --highlight-loss-weight 0.025 `
   --highlight-teacher-weight 0.25 `
   --highlight-chroma-weight 0.02 `
-  --highlight-balance-weight 0.03 `
+  --highlight-balance-weight 0.025 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.08 `
-  --dark-teacher-weight 0.22 `
-  --dark-luma-weight 0.14 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.035 `
+  --dark-teacher-weight 0.12 `
+  --dark-luma-weight 0.04 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
-  --source-chroma-weight 0.04 `
+  --dark-crop-weight 1.10 `
+  --dark-monitor-weight 1.10 `
+  --source-chroma-weight 0.05 `
   --source-chroma-saturation-threshold 0.05 `
   --source-chroma-luma-floor 0.02 `
   --source-chroma-ratio-clip 6.0 `
-  --source-chroma-crop-weight 0.75 `
-  --source-chroma-monitor-weight 0.75 `
+  --source-chroma-crop-weight 0.80 `
+  --source-chroma-monitor-weight 0.80 `
+  --source-shadow-luma-weight 0.10 `
+  --source-shadow-detail-weight 0.07 `
+  --source-shadow-threshold 0.30 `
+  --source-shadow-floor 0.015 `
+  --source-shadow-luma-scale 0.92 `
+  --source-shadow-detail-kernel 7 `
+  --source-shadow-detail-clip 2.0 `
+  --source-shadow-crop-weight 1.00 `
+  --source-shadow-monitor-weight 1.00 `
   --highlight-crop-attempts 4 `
   --freeze-sensitive-layers 1 `
   --freeze-sft-controls 1 `
@@ -1263,27 +1402,39 @@ py scripts/quantize/quantize_int8_full_qat.py `
   --num-validate 0 `
   --monitor-score hybrid `
   --monitor-metric-max-side 720 `
-  --teacher-loss-weight 0.35 `
-  --highlight-loss-weight 0.03 `
+  --teacher-source fp32 `
+  --teacher-loss-weight 0.42 `
+  --teacher-luma-weight 0.05 `
+  --teacher-chroma-weight 0.035 `
+  --highlight-loss-weight 0.025 `
   --highlight-teacher-weight 0.25 `
   --highlight-chroma-weight 0.02 `
-  --highlight-balance-weight 0.03 `
+  --highlight-balance-weight 0.025 `
   --highlight-threshold 0.75 `
   --neutral-threshold 0.08 `
-  --dark-loss-weight 0.08 `
-  --dark-teacher-weight 0.22 `
-  --dark-luma-weight 0.14 `
-  --dark-chroma-weight 0.04 `
+  --dark-loss-weight 0.035 `
+  --dark-teacher-weight 0.12 `
+  --dark-luma-weight 0.04 `
+  --dark-chroma-weight 0.03 `
   --dark-threshold 0.16 `
   --dark-floor 0.01 `
-  --dark-crop-weight 1.25 `
-  --dark-monitor-weight 1.25 `
-  --source-chroma-weight 0.04 `
+  --dark-crop-weight 1.10 `
+  --dark-monitor-weight 1.10 `
+  --source-chroma-weight 0.05 `
   --source-chroma-saturation-threshold 0.05 `
   --source-chroma-luma-floor 0.02 `
   --source-chroma-ratio-clip 6.0 `
-  --source-chroma-crop-weight 0.75 `
-  --source-chroma-monitor-weight 0.75 `
+  --source-chroma-crop-weight 0.80 `
+  --source-chroma-monitor-weight 0.80 `
+  --source-shadow-luma-weight 0.10 `
+  --source-shadow-detail-weight 0.07 `
+  --source-shadow-threshold 0.30 `
+  --source-shadow-floor 0.015 `
+  --source-shadow-luma-scale 0.92 `
+  --source-shadow-detail-kernel 7 `
+  --source-shadow-detail-clip 2.0 `
+  --source-shadow-crop-weight 1.00 `
+  --source-shadow-monitor-weight 1.00 `
   --highlight-crop-attempts 4 `
   --freeze-sensitive-layers 1 `
   --freeze-sft-controls 1 `

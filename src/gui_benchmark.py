@@ -61,12 +61,14 @@ from gui_config import (
 from gui_hdr_io import (
     FFMPEG_WINDOWS_DOWNLOAD_URL,
     hdr_ffmpeg_ready,
+    read_hdr_video_frames_rgb16_exact,
     read_hdr_video_frame_rgb16,
     read_image_any,
     write_hdr_tiff,
     tensor_to_bgr_u16,
 )
 from gui_media_probe import (
+    _crop_frame_to_active_area,
     _crop_gt_frame_to_pair_active_area,
     _frame_structure_similarity,
     _map_video_pair_frame_index,
@@ -222,9 +224,75 @@ try:
     )
 except Exception:
     _BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN = 0.035
+try:
+    _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES = max(
+        0,
+        min(
+            32,
+            int(os.environ.get("HDRTVNET_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES", "12")),
+        ),
+    )
+except Exception:
+    _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES = 12
 _BENCHMARK_USE_COMPILE_CACHE = str(
     os.environ.get("HDRTVNET_BENCHMARK_USE_COMPILE_CACHE", "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_benchmark_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+    if not np.isfinite(value):
+        return float(default)
+    return float(value)
+
+
+_FRAME_QC_MIN_MEAN = _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_QC_MIN_MEAN", 8.0)
+_FRAME_QC_MIN_P95 = _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_QC_MIN_P95", 22.0)
+_FRAME_QC_MAX_DARK_RATIO = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_MAX_DARK_RATIO",
+    0.80,
+)
+_FRAME_QC_MAX_MEAN = _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_QC_MAX_MEAN", 242.0)
+_FRAME_QC_MAX_P05 = _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_QC_MAX_P05", 232.0)
+_FRAME_QC_MAX_BRIGHT_RATIO = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_MAX_BRIGHT_RATIO",
+    0.75,
+)
+_FRAME_QC_MIN_STD = _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_QC_MIN_STD", 3.0)
+_FRAME_INTEREST_MAX_SIDE = int(
+    max(96, min(640, _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_INTEREST_MAX_SIDE", 320.0)))
+)
+_FRAME_QC_SKIP_HEAD_RATIO = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_SKIP_HEAD_RATIO",
+    0.025,
+)
+_FRAME_QC_SKIP_TAIL_RATIO = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_SKIP_TAIL_RATIO",
+    0.08,
+)
+_FRAME_QC_SKIP_HEAD_SECONDS = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_SKIP_HEAD_SECONDS",
+    120.0,
+)
+_FRAME_QC_SKIP_TAIL_SECONDS = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_SKIP_TAIL_SECONDS",
+    600.0,
+)
+_FRAME_QC_SKIP_MIN_FRAMES = int(max(
+    0,
+    _env_benchmark_float("HDRTVNET_BENCHMARK_FRAME_QC_SKIP_MIN_FRAMES", 6000.0),
+))
+_FRAME_QC_MAX_HEAD_SKIP_RATIO = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_MAX_HEAD_SKIP_RATIO",
+    0.08,
+)
+_FRAME_QC_MAX_TAIL_SKIP_RATIO = _env_benchmark_float(
+    "HDRTVNET_BENCHMARK_FRAME_QC_MAX_TAIL_SKIP_RATIO",
+    0.18,
+)
 
 
 def _new_mpv_widget() -> MpvHDRWidget:
@@ -601,24 +669,480 @@ def _local_align_gt_frame_for_benchmark(
     return info
 
 
+def _frame_looks_like_logo_or_credits(frame_bgr: np.ndarray | None) -> bool:
+    """Reject text-heavy dark title/credit frames without using OCR."""
+    if not isinstance(frame_bgr, np.ndarray) or frame_bgr.ndim < 2:
+        return False
+    try:
+        frame = _crop_frame_to_active_area(frame_bgr)
+        if not isinstance(frame, np.ndarray) or frame.size <= 0:
+            return False
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        h, w = frame.shape[:2]
+        longest = max(h, w)
+        if longest > 360:
+            scale = 360.0 / float(longest)
+            frame = cv2.resize(
+                frame,
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_f = gray.astype(np.float32, copy=False)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        sat_mean = float(np.mean(hsv[:, :, 1].astype(np.float32))) / 255.0
+        mean = float(np.mean(gray_f))
+        p50 = float(np.percentile(gray_f, 50))
+        p95 = float(np.percentile(gray_f, 95))
+        p99 = float(np.percentile(gray_f, 99))
+        dark_ratio = float(np.mean(gray_f < 40.0))
+        bright_ratio = float(np.mean(gray_f > 172.0))
+
+        if p99 < 155.0 or bright_ratio < 0.002:
+            return False
+
+        bright_mask = (gray > max(150.0, min(205.0, p95))).astype(np.uint8)
+        num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            bright_mask,
+            8,
+        )
+        small_text_components = 0
+        text_area = 0
+        frame_area = max(1, int(gray.shape[0] * gray.shape[1]))
+        for label in range(1, int(num_labels)):
+            x, y, bw, bh, area = stats[label]
+            if area < 6 or area > frame_area * 0.08:
+                continue
+            aspect = float(bw) / float(max(1, bh))
+            if 0.08 <= aspect <= 18.0:
+                small_text_components += 1
+                text_area += int(area)
+
+        edge_ratio = float(np.mean(cv2.Canny(gray, 48, 128) > 0))
+        text_area_ratio = float(text_area) / float(frame_area)
+
+        dark_credit_card = (
+            dark_ratio > 0.48
+            and p50 < 70.0
+            and sat_mean < 0.22
+            and small_text_components >= 12
+            and text_area_ratio < 0.32
+            and edge_ratio > 0.012
+        )
+        text_heavy_card = (
+            mean < 115.0
+            and sat_mean < 0.18
+            and small_text_components >= 24
+            and 0.006 <= text_area_ratio <= 0.28
+            and edge_ratio > 0.018
+        )
+        sparse_logo_card = (
+            dark_ratio > 0.62
+            and mean < 55.0
+            and p50 < 28.0
+            and sat_mean < 0.12
+            and p99 > 190.0
+            and 0.003 <= bright_ratio <= 0.18
+            and 4 <= small_text_components <= 28
+            and text_area_ratio < 0.20
+            and edge_ratio < 0.08
+        )
+        return bool(dark_credit_card or text_heavy_card or sparse_logo_card)
+    except Exception:
+        return False
+
+
+def _benchmark_frame_qc(frame_bgr: np.ndarray | None) -> tuple[bool, str]:
+    """Reject low-information video frames before deterministic benchmarking."""
+    if not isinstance(frame_bgr, np.ndarray) or frame_bgr.ndim < 2:
+        return False, "unreadable"
+    try:
+        frame = _crop_frame_to_active_area(frame_bgr)
+        if not isinstance(frame, np.ndarray) or frame.size <= 0:
+            return False, "empty"
+        if frame.ndim == 2:
+            gray = frame
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if gray.size <= 0:
+            return False, "empty"
+        gray_f = gray.astype(np.float32, copy=False)
+        mean = float(np.mean(gray_f))
+        std = float(np.std(gray_f))
+        p05 = float(np.percentile(gray_f, 5))
+        p95 = float(np.percentile(gray_f, 95))
+        dark_ratio = float(np.mean(gray_f <= 8.0))
+        bright_ratio = float(np.mean(gray_f >= 247.0))
+    except Exception:
+        return False, "qc_failed"
+
+    if (
+        mean < _FRAME_QC_MIN_MEAN
+        or p95 < _FRAME_QC_MIN_P95
+        or dark_ratio > _FRAME_QC_MAX_DARK_RATIO
+    ):
+        return False, "too_dark"
+    if (
+        mean > _FRAME_QC_MAX_MEAN
+        or p05 > _FRAME_QC_MAX_P05
+        or bright_ratio > _FRAME_QC_MAX_BRIGHT_RATIO
+    ):
+        return False, "too_bright"
+    if std < _FRAME_QC_MIN_STD:
+        return False, "flat"
+    if _frame_looks_like_logo_or_credits(frame):
+        return False, "logo_or_credits"
+    return True, "ok"
+
+
+def _frame_visual_interest_score(frame_bgr: np.ndarray | None) -> float:
+    """Deterministic proxy for an iconic frame: detail, color, contrast, composition."""
+    if not isinstance(frame_bgr, np.ndarray) or frame_bgr.ndim < 2:
+        return 0.0
+    try:
+        frame = _crop_frame_to_active_area(frame_bgr)
+        if not isinstance(frame, np.ndarray) or frame.size <= 0:
+            return 0.0
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        h, w = frame.shape[:2]
+        max_side = max(96, int(_FRAME_INTEREST_MAX_SIDE))
+        longest = max(h, w)
+        if longest > max_side:
+            scale = float(max_side) / float(longest)
+            frame = cv2.resize(
+                frame,
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_f = gray.astype(np.float32, copy=False)
+        mean = float(np.mean(gray_f))
+        std = float(np.std(gray_f))
+        p05 = float(np.percentile(gray_f, 5))
+        p95 = float(np.percentile(gray_f, 95))
+        contrast_score = float(np.clip((p95 - p05) / 128.0, 0.0, 1.35))
+        texture_score = float(np.clip(std / 64.0, 0.0, 1.35))
+        exposure_score = float(np.clip(1.0 - abs(mean - 116.0) / 116.0, 0.0, 1.0))
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1].astype(np.float32) / 255.0
+        sat_score = float(np.clip(
+            (0.55 * (float(np.mean(sat)) / 0.32))
+            + (0.45 * (float(np.percentile(sat, 90)) / 0.62)),
+            0.0,
+            1.35,
+        ))
+
+        edges = cv2.Canny(gray, 56, 144)
+        edge_ratio = float(np.mean(edges > 0))
+        edge_score = float(np.clip(edge_ratio / 0.075, 0.0, 1.45))
+        if edge_ratio > 0.30:
+            edge_score *= float(np.clip((0.42 - edge_ratio) / 0.12, 0.25, 1.0))
+
+        gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        mag_peak = max(float(np.percentile(mag, 95)), 1e-6)
+        saliency = np.clip(mag / mag_peak, 0.0, 1.0) + (0.35 * sat)
+        sh, sw = saliency.shape[:2]
+        yy, xx = np.mgrid[0:sh, 0:sw].astype(np.float32)
+        x = (xx / max(1.0, float(sw - 1))) * 2.0 - 1.0
+        y = (yy / max(1.0, float(sh - 1))) * 2.0 - 1.0
+        center_weight = np.exp(-1.85 * ((x * x) + (y * y)))
+        thirds_x = np.minimum(np.abs(x - (1.0 / 3.0)), np.abs(x + (1.0 / 3.0)))
+        thirds_y = np.minimum(np.abs(y - (1.0 / 3.0)), np.abs(y + (1.0 / 3.0)))
+        thirds_weight = np.exp(-10.0 * np.minimum(thirds_x, thirds_y))
+        comp_weight = (0.65 * center_weight) + (0.35 * thirds_weight)
+        global_sal = float(np.mean(saliency)) + 1e-6
+        weighted_sal = float(np.sum(saliency * comp_weight) / (np.sum(comp_weight) + 1e-6))
+        composition_score = float(np.clip((weighted_sal / global_sal - 0.82) / 0.75, 0.0, 1.35))
+
+        score = (
+            0.24 * contrast_score
+            + 0.22 * edge_score
+            + 0.18 * texture_score
+            + 0.16 * sat_score
+            + 0.12 * composition_score
+            + 0.08 * exposure_score
+        )
+        return float(np.clip(score, 0.0, 1.5))
+    except Exception:
+        return 0.0
+
+
+def _select_spread_from_scored_frames(
+    scored: list[tuple[float, int]],
+    desired_count: int,
+) -> list[int]:
+    """Pick high-scoring frames while forcing temporal spread."""
+    desired = max(1, int(desired_count))
+    best_by_idx: dict[int, float] = {}
+    for score, idx in scored:
+        try:
+            idx_i = int(idx)
+            score_f = float(score)
+        except Exception:
+            continue
+        if not np.isfinite(score_f):
+            continue
+        if idx_i not in best_by_idx or score_f > best_by_idx[idx_i]:
+            best_by_idx[idx_i] = score_f
+    if not best_by_idx:
+        return []
+    if len(best_by_idx) <= desired:
+        return sorted(best_by_idx)
+
+    ranked = sorted(
+        ((score, idx) for idx, score in best_by_idx.items()),
+        key=lambda item: (-item[0], item[1]),
+    )
+    idx_values = sorted(best_by_idx)
+    span = max(1, int(idx_values[-1]) - int(idx_values[0]) + 1)
+    min_spacing = max(1, span // max(2, desired * 2))
+    chosen: list[int] = []
+
+    def _accept(candidate: int, gap: int) -> bool:
+        if candidate in chosen:
+            return False
+        if gap <= 0:
+            return True
+        return all(abs(int(candidate) - int(c)) >= gap for c in chosen)
+
+    gaps = [min_spacing]
+    while gaps[-1] > 1:
+        next_gap = max(1, gaps[-1] // 2)
+        if next_gap == gaps[-1]:
+            break
+        gaps.append(next_gap)
+    gaps.append(0)
+
+    for gap in gaps:
+        for _score, idx in ranked:
+            if _accept(idx, gap):
+                chosen.append(int(idx))
+                if len(chosen) >= desired:
+                    return sorted(chosen)
+    return sorted(chosen[:desired])
+
+
+def _benchmark_movie_frame_bounds(
+    total_frames: int,
+    fps: float | None = None,
+) -> tuple[int, int]:
+    """Return inclusive frame bounds after skipping likely logos/credits."""
+    total = max(0, int(total_frames or 0))
+    if total <= 1 or total < int(_FRAME_QC_SKIP_MIN_FRAMES):
+        return 0, max(0, total - 1)
+    fps_f = float(fps or 0.0)
+    if not np.isfinite(fps_f) or fps_f <= 0.0:
+        fps_f = 0.0
+
+    head_by_ratio = int(round(total * max(0.0, float(_FRAME_QC_SKIP_HEAD_RATIO))))
+    tail_by_ratio = int(round(total * max(0.0, float(_FRAME_QC_SKIP_TAIL_RATIO))))
+    head_by_time = int(round(fps_f * max(0.0, float(_FRAME_QC_SKIP_HEAD_SECONDS))))
+    tail_by_time = int(round(fps_f * max(0.0, float(_FRAME_QC_SKIP_TAIL_SECONDS))))
+    head_skip = max(head_by_ratio, head_by_time)
+    tail_skip = max(tail_by_ratio, tail_by_time)
+
+    head_cap = int(round(total * max(0.0, float(_FRAME_QC_MAX_HEAD_SKIP_RATIO))))
+    tail_cap = int(round(total * max(0.0, float(_FRAME_QC_MAX_TAIL_SKIP_RATIO))))
+    if head_cap > 0:
+        head_skip = min(head_skip, head_cap)
+    if tail_cap > 0:
+        tail_skip = min(tail_skip, tail_cap)
+
+    if head_skip + tail_skip >= total - 2:
+        return 0, max(0, total - 1)
+    return max(0, head_skip), max(0, total - tail_skip - 1)
+
+
+def _video_frame_idx_passes_movie_region_qc(
+    frame_idx_0b: int,
+    total_frames: int,
+    fps: float | None = None,
+) -> bool:
+    if int(total_frames or 0) <= 1:
+        return True
+    start_idx, end_idx = _benchmark_movie_frame_bounds(total_frames, fps)
+    idx = max(0, int(frame_idx_0b))
+    return start_idx <= idx <= end_idx
+
+
+def _video_frame_idx_passes_benchmark_qc(
+    cap: cv2.VideoCapture,
+    frame_idx_0b: int,
+    total_frames: int | None = None,
+    fps: float | None = None,
+) -> bool:
+    if total_frames is None:
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        except Exception:
+            total_frames = 0
+    if fps is None:
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception:
+            fps = 0.0
+    if not _video_frame_idx_passes_movie_region_qc(
+        frame_idx_0b,
+        int(total_frames or 0),
+        fps,
+    ):
+        return False
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx_0b)))
+        ok, frame = cap.read()
+    except Exception:
+        return False
+    if not ok or frame is None:
+        return False
+    passed, _reason = _benchmark_frame_qc(frame)
+    return bool(passed)
+
+
+def _filter_video_frame_indices_for_benchmark_qc(
+    video_path: str,
+    frame_indices_1b: list[int],
+) -> list[int]:
+    if not frame_indices_1b:
+        return []
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    except Exception:
+        total_frames = 0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    except Exception:
+        fps = 0.0
+    try:
+        for frame_1b in frame_indices_1b:
+            try:
+                frame_1b_i = max(1, int(frame_1b))
+            except Exception:
+                continue
+            if frame_1b_i in seen:
+                continue
+            seen.add(frame_1b_i)
+            if _video_frame_idx_passes_benchmark_qc(
+                cap,
+                frame_1b_i - 1,
+                total_frames=total_frames,
+                fps=fps,
+            ):
+                out.append(frame_1b_i)
+    finally:
+        cap.release()
+    return out
+
+
+def _score_video_frame_indices_for_interest(
+    video_path: str,
+    frame_indices_1b: list[int],
+) -> list[tuple[float, int]]:
+    if not frame_indices_1b:
+        return []
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return []
+    scored: list[tuple[float, int]] = []
+    seen: set[int] = set()
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    except Exception:
+        total_frames = 0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    except Exception:
+        fps = 0.0
+    try:
+        for frame_1b in frame_indices_1b:
+            try:
+                frame_1b_i = max(1, int(frame_1b))
+            except Exception:
+                continue
+            if frame_1b_i in seen:
+                continue
+            seen.add(frame_1b_i)
+            if not _video_frame_idx_passes_movie_region_qc(
+                frame_1b_i - 1,
+                total_frames,
+                fps,
+            ):
+                continue
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_1b_i - 1)
+                ok, frame = cap.read()
+            except Exception:
+                continue
+            if not ok or frame is None:
+                continue
+            passed, _reason = _benchmark_frame_qc(frame)
+            if not passed:
+                continue
+            scored.append((_frame_visual_interest_score(frame), frame_1b_i - 1))
+    finally:
+        cap.release()
+    return scored
+
+
 def _detect_distinct_video_frames(
     video_path: str,
     desired_count: int = 10,
     max_scan_points: int = 260,
 ) -> list[int]:
+    frames, _scores = _detect_distinct_video_frames_with_scores(
+        video_path,
+        desired_count=desired_count,
+        max_scan_points=max_scan_points,
+    )
+    return frames
+
+
+def _detect_distinct_video_frames_with_scores(
+    video_path: str,
+    desired_count: int = 10,
+    max_scan_points: int = 260,
+) -> tuple[list[int], dict[int, float]]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         cap.release()
-        return []
+        return [], {}
 
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception:
+            fps = 0.0
         if total <= 1:
-            return [1]
+            if _video_frame_idx_passes_benchmark_qc(
+                cap,
+                0,
+                total_frames=total,
+                fps=fps,
+            ):
+                return [1], {}
+            return [], {}
 
+        start_idx, end_idx = _benchmark_movie_frame_bounds(total, fps)
+        if end_idx < start_idx:
+            start_idx, end_idx = 0, total - 1
+        available = max(1, end_idx - start_idx + 1)
         scan_points = max(desired_count * 18, 80)
-        scan_points = min(scan_points, max_scan_points, total)
-        idxs = np.linspace(0, total - 1, num=scan_points, dtype=np.int64)
+        scan_points = min(scan_points, max_scan_points, available)
+        idxs = np.linspace(start_idx, end_idx, num=scan_points, dtype=np.int64)
 
         prev_hist = None
         prev_luma = None
@@ -629,55 +1153,45 @@ def _detect_distinct_video_frames(
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
+            passed_qc, _reason = _benchmark_frame_qc(frame)
+            if not passed_qc:
+                continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
             hist = cv2.normalize(hist, hist).flatten()
             luma = float(np.mean(gray))
             texture = float(np.std(gray)) / 64.0
-            score = texture
+            interest = _frame_visual_interest_score(frame)
+            scene_score = 0.0
             if prev_hist is not None:
                 scene = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
                 luma_jump = abs(luma - float(prev_luma or 0.0)) / 255.0
-                score = (scene * 0.78) + (luma_jump * 0.18) + (texture * 0.04)
+                scene_score = (scene * 0.78) + (luma_jump * 0.18)
+            score = (
+                (0.62 * interest)
+                + (0.28 * scene_score)
+                + (0.10 * min(max(texture, 0.0), 1.5))
+            )
             scored.append((float(score), int(idx)))
             prev_hist = hist
             prev_luma = luma
 
         if not scored:
-            return [1]
+            return [], {}
 
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        min_spacing = max(1, total // max(2, desired_count * 2))
-
-        chosen: list[int] = []
-
-        def _accept(candidate: int) -> bool:
-            for c in chosen:
-                if abs(int(candidate) - int(c)) < min_spacing:
-                    return False
-            return True
-
-        for _score, idx in scored:
-            if _accept(idx):
-                chosen.append(int(idx))
-            if len(chosen) >= desired_count:
-                break
-
-        anchors = [0.08, 0.22, 0.38, 0.52, 0.68, 0.82, 0.92]
-        for ratio in anchors:
-            if len(chosen) >= desired_count:
-                break
-            idx = int(round((total - 1) * float(ratio)))
-            if _accept(idx):
-                chosen.append(idx)
-
+        chosen = _select_spread_from_scored_frames(scored, desired_count)
+        score_by_idx = {int(idx): float(score) for score, idx in scored}
         chosen = sorted({max(0, min(total - 1, int(v))) for v in chosen})
         if len(chosen) > desired_count:
             chosen = chosen[:desired_count]
         if not chosen:
             chosen = [0]
         # UI displays 1-based frame numbering.
-        return [int(v) + 1 for v in chosen]
+        frames_1b = [int(v) + 1 for v in chosen]
+        return frames_1b, {
+            int(v) + 1: float(score_by_idx.get(int(v), 0.0))
+            for v in chosen
+        }
     finally:
         cap.release()
 
@@ -689,6 +1203,7 @@ class BenchmarkTask:
     sdr_path: str
     gt_path: str
     frame_idx: int | None = None
+    interest_score: float | None = None
 
 
 @dataclass
@@ -1211,6 +1726,46 @@ class _BenchmarkWorker(QObject):
                 ):
                     suspects = suspects[: int(max_verify)]
                 total_verify = max(1, len(suspects))
+
+                exact_base_idx_by_row: dict[int, int] = {}
+                exact_indices_by_gt: dict[str, set[int]] = {}
+                for row_idx, task, _fast_score in suspects:
+                    base_idx = _map_gt_frame_for_sdr(
+                        task.sdr_path,
+                        task.gt_path,
+                        task.frame_idx,
+                    )
+                    base_idx = max(0, int(base_idx or 0))
+                    exact_base_idx_by_row[int(row_idx)] = int(base_idx)
+                    exact_indices_by_gt.setdefault(task.gt_path, set()).add(int(base_idx))
+
+                exact_gt_frames_by_path: dict[str, dict[int, np.ndarray | None]] = {}
+                for gt_path, idx_set in exact_indices_by_gt.items():
+                    idxs = sorted(int(v) for v in idx_set)
+                    if (
+                        not idxs
+                        or _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES <= 0
+                        or len(idxs) > int(_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES)
+                    ):
+                        continue
+                    self.progress.emit(
+                        90,
+                        f"Post-verify exact GT batch: {len(idxs)} frame(s)",
+                    )
+                    decoded_batch, canceled_now = self._run_blocking_with_cancel(
+                        read_hdr_video_frames_rgb16_exact,
+                        gt_path,
+                        idxs,
+                        cancel_check=self._is_canceled,
+                        canceled_fallback={},
+                        poll_interval_s=0.20,
+                    )
+                    if canceled_now or self._is_canceled():
+                        self.canceled.emit("Benchmark canceled during post verification.")
+                        return
+                    if isinstance(decoded_batch, dict):
+                        exact_gt_frames_by_path[gt_path] = decoded_batch
+
                 for j, (row_idx, task, fast_score) in enumerate(suspects):
                     if self._is_canceled():
                         self.canceled.emit("Benchmark canceled during post verification.")
@@ -1223,11 +1778,13 @@ class _BenchmarkWorker(QObject):
                     )
 
                     row = rows[row_idx]
-                    strict_base_gt_frame_idx = _map_gt_frame_for_sdr(
-                        task.sdr_path,
-                        task.gt_path,
-                        task.frame_idx,
-                    )
+                    strict_base_gt_frame_idx = exact_base_idx_by_row.get(int(row_idx))
+                    if strict_base_gt_frame_idx is None:
+                        strict_base_gt_frame_idx = _map_gt_frame_for_sdr(
+                            task.sdr_path,
+                            task.gt_path,
+                            task.frame_idx,
+                        )
                     sdr_eval_saved = self._to_u8_for_alignment(
                         read_image_any(str(row.get("sdr_image") or ""))
                     )
@@ -1252,34 +1809,37 @@ class _BenchmarkWorker(QObject):
                         align_info.get("frame_idx", strict_base_gt_frame_idx or 0) or 0
                     )
 
-                    strict_rgb16, canceled_now = self._run_blocking_with_cancel(
-                        read_hdr_video_frame_rgb16,
-                        task.gt_path,
-                        max(0, int(strict_gt_frame_idx or 0)),
-                        prefer_fast_seek=False,
-                        canceled_fallback=None,
-                    )
+                    decoded_for_gt = exact_gt_frames_by_path.get(task.gt_path) or {}
+                    strict_rgb16 = decoded_for_gt.get(max(0, int(strict_gt_frame_idx or 0)))
+                    canceled_now = False
+                    if strict_rgb16 is None:
+                        strict_rgb16, canceled_now = self._run_blocking_with_cancel(
+                            read_hdr_video_frame_rgb16,
+                            task.gt_path,
+                            max(0, int(strict_gt_frame_idx or 0)),
+                            prefer_fast_seek=False,
+                            canceled_fallback=None,
+                        )
+                        if canceled_now or self._is_canceled():
+                            self.canceled.emit("Benchmark canceled during post verification.")
+                            return
 
-                    if canceled_now or self._is_canceled():
-                        self.canceled.emit("Benchmark canceled during post verification.")
-                        return
-                    
                     if strict_rgb16 is None and strict_gt_frame_idx != int(
                         strict_base_gt_frame_idx or 0
                     ):
                         strict_gt_frame_idx = max(0, int(strict_base_gt_frame_idx or 0))
-
-                    strict_rgb16, canceled_now = self._run_blocking_with_cancel(
-                        read_hdr_video_frame_rgb16,
-                        task.gt_path,
-                        strict_gt_frame_idx,
-                        prefer_fast_seek=False,
-                        canceled_fallback=None,
-                    )
-
-                    if canceled_now or self._is_canceled():
-                        self.canceled.emit("Benchmark canceled during post verification.")
-                        return
+                        strict_rgb16 = decoded_for_gt.get(strict_gt_frame_idx)
+                        if strict_rgb16 is None:
+                            strict_rgb16, canceled_now = self._run_blocking_with_cancel(
+                                read_hdr_video_frame_rgb16,
+                                task.gt_path,
+                                strict_gt_frame_idx,
+                                prefer_fast_seek=False,
+                                canceled_fallback=None,
+                            )
+                            if canceled_now or self._is_canceled():
+                                self.canceled.emit("Benchmark canceled during post verification.")
+                                return
 
                     if strict_rgb16 is None:
                         continue
@@ -1710,7 +2270,7 @@ class ModelBenchmarkDialog(QDialog):
         self._spn_video_subset.setRange(1, 240)
         self._spn_video_subset.setValue(10)
         self._cmb_video_avg_mode.setToolTip(
-            "Matches the dataset average-mode workflow. Deterministic subset samples evenly from the checked candidate frames."
+            "Matches the dataset average-mode workflow. Deterministic subset picks spread-out, visually interesting checked frames."
         )
         self._spn_video_subset.setToolTip(
             "Number of checked candidate frames to evaluate when Average deterministic subset is selected."
@@ -2077,7 +2637,7 @@ class ModelBenchmarkDialog(QDialog):
             activate=True,
         )
 
-    def _load_frame_detect_cache(self) -> dict[str, list[int]]:
+    def _load_frame_detect_cache(self) -> dict[str, object]:
         path = str(getattr(self, "_frame_detect_cache_path", "") or "").strip()
         if not path or not os.path.isfile(path):
             return {}
@@ -2086,18 +2646,34 @@ class ModelBenchmarkDialog(QDialog):
                 payload = json.load(f)
             if not isinstance(payload, dict):
                 return {}
-            out: dict[str, list[int]] = {}
+            out: dict[str, object] = {}
             for key, value in payload.items():
-                if not isinstance(key, str) or not isinstance(value, list):
+                if not isinstance(key, str):
+                    continue
+                frames_raw = value
+                scores_raw = {}
+                if isinstance(value, dict):
+                    frames_raw = value.get("frames", [])
+                    scores_raw = value.get("scores", {})
+                if not isinstance(frames_raw, list):
                     continue
                 frames: list[int] = []
-                for item in value:
+                for item in frames_raw:
                     try:
                         frames.append(int(item))
                     except Exception:
                         continue
                 if frames:
-                    out[key] = frames
+                    if isinstance(scores_raw, dict):
+                        scores: dict[str, float] = {}
+                        for score_key, score_value in scores_raw.items():
+                            try:
+                                scores[str(int(score_key))] = float(score_value)
+                            except Exception:
+                                continue
+                        out[key] = {"frames": frames, "scores": scores}
+                    else:
+                        out[key] = frames
             return out
         except Exception:
             return {}
@@ -2119,7 +2695,7 @@ class ModelBenchmarkDialog(QDialog):
             sig = f"{os.path.abspath(video_path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
         except Exception:
             sig = os.path.abspath(video_path) if video_path else str(video_path or "")
-        return f"{sig}|count={int(max(1, desired_count))}"
+        return f"{sig}|count={int(max(1, desired_count))}|qc=4|interest=1|credits=1"
 
     def last_session_dir(self) -> str | None:
         return self._session_dir
@@ -3553,23 +4129,62 @@ class ModelBenchmarkDialog(QDialog):
 
         pool_count = max(1, int(self._spn_detect_frame_count.value()))
         cache_key = self._frame_detect_cache_key(sdr_path, pool_count)
-        frames = list(self._frame_detect_cache.get(cache_key) or [])
+        interest_by_frame: dict[int, float] = {}
+        cache_needs_save = False
+        cached_payload = self._frame_detect_cache.get(cache_key)
+        if isinstance(cached_payload, dict):
+            frames = list(cached_payload.get("frames") or [])
+            scores_payload = cached_payload.get("scores") or {}
+            if isinstance(scores_payload, dict):
+                for key, value in scores_payload.items():
+                    try:
+                        interest_by_frame[int(key)] = float(value)
+                    except Exception:
+                        continue
+        else:
+            frames = list(cached_payload or [])
+        if frames:
+            frames = _filter_video_frame_indices_for_benchmark_qc(sdr_path, frames)
+            if not all(int(frame_1b) in interest_by_frame for frame_1b in frames):
+                interest_by_frame.update({
+                    int(idx) + 1: float(score)
+                    for score, idx in _score_video_frame_indices_for_interest(
+                        sdr_path,
+                        frames,
+                    )
+                })
+                cache_needs_save = True
         used_cache = bool(frames)
         if not frames:
             # Increase scan budget with requested count to keep higher-count runs useful,
             # while keeping deterministic behavior for the same source+count.
             scan_cap = min(4000, max(260, pool_count * 24))
-            frames = _detect_distinct_video_frames(
+            frames, interest_by_frame = _detect_distinct_video_frames_with_scores(
                 sdr_path,
                 desired_count=pool_count,
                 max_scan_points=scan_cap,
             )
             if frames:
-                self._frame_detect_cache[cache_key] = list(frames)
+                self._frame_detect_cache[cache_key] = {
+                    "frames": list(frames),
+                    "scores": {
+                        str(int(frame_1b)): float(score)
+                        for frame_1b, score in interest_by_frame.items()
+                    },
+                }
                 while len(self._frame_detect_cache) > 64:
                     oldest_key = next(iter(self._frame_detect_cache))
                     self._frame_detect_cache.pop(oldest_key, None)
                 self._save_frame_detect_cache()
+        elif cache_needs_save:
+            self._frame_detect_cache[cache_key] = {
+                "frames": list(frames),
+                "scores": {
+                    str(int(frame_1b)): float(score)
+                    for frame_1b, score in interest_by_frame.items()
+                },
+            }
+            self._save_frame_detect_cache()
         if not frames:
             QMessageBox.warning(
                 self,
@@ -3582,6 +4197,10 @@ class ModelBenchmarkDialog(QDialog):
         for fidx in frames:
             item = QListWidgetItem(f"Frame {int(fidx)}")
             item.setData(Qt.ItemDataRole.UserRole, int(fidx))
+            item.setData(
+                Qt.ItemDataRole.UserRole.value + 1,
+                float(interest_by_frame.get(int(fidx), 0.0)),
+            )
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
             self._lst_video_frames.addItem(item)
@@ -3592,6 +4211,9 @@ class ModelBenchmarkDialog(QDialog):
         self._lbl_video_note.setText(
             f"{len(frames)} deterministic candidate frames detected "
             f"(pool {pool_count}, {'cache hit' if used_cache else 'fresh scan'}). "
+            "Black, blown-out, flat, logo, and credit-style frames are skipped by deterministic QC. "
+            "The opening and ending movie regions are avoided by default. "
+            "Candidates are ranked for visual interest while staying temporally spread out. "
             "Average mode controls how many checked candidates are benchmarked. "
             f"{note}"
         )
@@ -3690,12 +4312,19 @@ class ModelBenchmarkDialog(QDialog):
 
         checked_frames: list[int] = []
         all_frames: list[int] = []
+        interest_by_frame: dict[int, float] = {}
         for i in range(self._lst_video_frames.count()):
             item = self._lst_video_frames.item(i)
             try:
                 frame_1b = int(item.data(Qt.ItemDataRole.UserRole))
             except Exception:
                 continue
+            try:
+                interest_by_frame[frame_1b] = float(
+                    item.data(Qt.ItemDataRole.UserRole.value + 1)
+                )
+            except Exception:
+                pass
             all_frames.append(frame_1b)
             if item.checkState() == Qt.CheckState.Checked:
                 checked_frames.append(frame_1b)
@@ -3704,13 +4333,25 @@ class ModelBenchmarkDialog(QDialog):
 
         avg_mode = str(self._cmb_video_avg_mode.currentData() or "selected")
         if avg_mode == "all":
-            frames = list(all_frames)
+            frames = _filter_video_frame_indices_for_benchmark_qc(sdr_path, list(all_frames))
+            if not frames:
+                raise RuntimeError(
+                    "All detected frames were rejected by black/overbright deterministic QC."
+                )
         elif avg_mode == "subset":
             if not checked_frames:
                 raise RuntimeError(
                     "Check at least one candidate frame before using deterministic subset mode."
                 )
             subset_n = max(1, int(self._spn_video_subset.value()))
+            checked_frames = _filter_video_frame_indices_for_benchmark_qc(
+                sdr_path,
+                sorted(set(checked_frames)),
+            )
+            if not checked_frames:
+                raise RuntimeError(
+                    "All checked candidate frames were rejected by black/overbright deterministic QC."
+                )
             frame_tasks = [
                 BenchmarkTask(
                     task_id=f"frame_{int(frame_1b)}",
@@ -3718,10 +4359,11 @@ class ModelBenchmarkDialog(QDialog):
                     sdr_path=sdr_path,
                     gt_path=gt_path,
                     frame_idx=max(0, int(frame_1b) - 1),
+                    interest_score=interest_by_frame.get(int(frame_1b)),
                 )
                 for frame_1b in sorted(set(checked_frames))
             ]
-            return self._deterministic_subset(frame_tasks, subset_n)
+            return self._deterministic_video_subset(frame_tasks, subset_n)
         else:
             frames = list(checked_frames)
         if not frames:
@@ -3738,6 +4380,7 @@ class ModelBenchmarkDialog(QDialog):
                     sdr_path=sdr_path,
                     gt_path=gt_path,
                     frame_idx=frame_0b,
+                    interest_score=interest_by_frame.get(int(frame_1b)),
                 )
             )
         return tasks
@@ -3750,6 +4393,57 @@ class ModelBenchmarkDialog(QDialog):
         step = float(len(tasks) - 1) / float(count - 1)
         idxs = sorted({int(round(i * step)) for i in range(count)})
         return [tasks[max(0, min(len(tasks) - 1, idx))] for idx in idxs]
+
+    def _deterministic_video_subset(
+        self,
+        tasks: list[BenchmarkTask],
+        count: int,
+    ) -> list[BenchmarkTask]:
+        if count <= 0 or len(tasks) <= count:
+            return list(tasks)
+        if not tasks:
+            return []
+        video_path = str(tasks[0].sdr_path or "")
+        if not video_path or any(str(t.sdr_path or "") != video_path for t in tasks):
+            return self._deterministic_subset(tasks, count)
+        frame_to_task: dict[int, BenchmarkTask] = {}
+        for task in tasks:
+            if task.frame_idx is None:
+                return self._deterministic_subset(tasks, count)
+            frame_to_task[int(task.frame_idx)] = task
+        scored: list[tuple[float, int]] = []
+        missing_scores = False
+        for task in tasks:
+            try:
+                score = float(task.interest_score)
+            except Exception:
+                missing_scores = True
+                break
+            if not np.isfinite(score):
+                missing_scores = True
+                break
+            scored.append((score, int(task.frame_idx or 0)))
+        if missing_scores:
+            scored = _score_video_frame_indices_for_interest(
+                video_path,
+                [int(idx) + 1 for idx in sorted(frame_to_task)],
+            )
+        chosen = _select_spread_from_scored_frames(scored, count)
+        selected = [
+            frame_to_task[idx]
+            for idx in chosen
+            if idx in frame_to_task
+        ]
+        if len(selected) < min(count, len(tasks)):
+            selected_ids = {int(t.frame_idx or 0) for t in selected}
+            for task in self._deterministic_subset(tasks, count):
+                frame_idx = int(task.frame_idx or 0)
+                if frame_idx not in selected_ids:
+                    selected.append(task)
+                    selected_ids.add(frame_idx)
+                if len(selected) >= min(count, len(tasks)):
+                    break
+        return sorted(selected[:count], key=lambda t: int(t.frame_idx or 0))
 
     def _build_dataset_tasks(self) -> list[BenchmarkTask]:
         if not self._dataset_pairs:
