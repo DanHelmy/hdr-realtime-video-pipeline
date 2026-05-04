@@ -265,6 +265,16 @@ except Exception:
 _BENCHMARK_USE_COMPILE_CACHE = str(
     os.environ.get("HDRTVNET_BENCHMARK_USE_COMPILE_CACHE", "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
+try:
+    _BENCHMARK_QUEUE_TASK_CACHE_MAX = max(
+        0,
+        min(
+            128,
+            int(os.environ.get("HDRTVNET_BENCHMARK_QUEUE_TASK_CACHE_MAX", "32")),
+        ),
+    )
+except Exception:
+    _BENCHMARK_QUEUE_TASK_CACHE_MAX = 32
 _BENCHMARK_POST_VERIFY_CACHE_VERSION = "gt-postverify-v1"
 _BENCHMARK_POST_VERIFY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
 _BENCHMARK_POST_VERIFY_CACHE_BYTES = 0
@@ -1330,6 +1340,24 @@ class BenchmarkTask:
     interest_score: float | None = None
 
 
+def _clone_benchmark_tasks(tasks: list[BenchmarkTask]) -> list[BenchmarkTask]:
+    return [
+        BenchmarkTask(
+            task_id=str(task.task_id),
+            label=str(task.label),
+            sdr_path=str(task.sdr_path),
+            gt_path=str(task.gt_path),
+            frame_idx=None if task.frame_idx is None else int(task.frame_idx),
+            interest_score=(
+                None
+                if task.interest_score is None
+                else float(task.interest_score)
+            ),
+        )
+        for task in tasks
+    ]
+
+
 @dataclass
 class BenchmarkRunConfig:
     mode: str
@@ -2371,6 +2399,8 @@ class ModelBenchmarkDialog(QDialog):
         self._preview_processor_cache: dict[tuple[str, bool, str, str], HDRTVNetTorch] = {}
         self._frame_detect_cache_path = os.path.join(self._logs_root, "benchmark_frame_cache.json")
         self._frame_detect_cache = self._load_frame_detect_cache()
+        self._video_pair_validation_cache: OrderedDict[tuple, tuple[bool, str]] = OrderedDict()
+        self._video_task_cache: OrderedDict[tuple, list[BenchmarkTask]] = OrderedDict()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -2907,6 +2937,81 @@ class ModelBenchmarkDialog(QDialog):
         except Exception:
             sig = os.path.abspath(video_path) if video_path else str(video_path or "")
         return f"{sig}|count={int(max(1, desired_count))}|qc=4|interest=1|credits=1"
+
+    def _video_pair_cache_key(self, sdr_path: str, gt_path: str) -> tuple:
+        return (
+            "video-pair-v1",
+            _post_verify_file_token(sdr_path),
+            _post_verify_file_token(gt_path),
+        )
+
+    def _video_task_cache_key(self, sdr_path: str, gt_path: str) -> tuple:
+        avg_mode = str(self._cmb_video_avg_mode.currentData() or "selected")
+        subset_n = max(1, int(self._spn_video_subset.value())) if avg_mode == "subset" else 0
+        frame_state: list[tuple[int, int, float | None]] = []
+        for i in range(self._lst_video_frames.count()):
+            item = self._lst_video_frames.item(i)
+            try:
+                frame_1b = int(item.data(Qt.ItemDataRole.UserRole))
+            except Exception:
+                continue
+            score_key: float | None = None
+            try:
+                score = float(item.data(Qt.ItemDataRole.UserRole.value + 1))
+                if np.isfinite(score):
+                    score_key = round(score, 6)
+            except Exception:
+                score_key = None
+            checked = 1 if item.checkState() == Qt.CheckState.Checked else 0
+            frame_state.append((frame_1b, checked, score_key))
+        qc_signature = (
+            float(_FRAME_QC_MIN_MEAN),
+            float(_FRAME_QC_MIN_P95),
+            float(_FRAME_QC_MAX_DARK_RATIO),
+            float(_FRAME_QC_MAX_MEAN),
+            float(_FRAME_QC_MAX_P05),
+            float(_FRAME_QC_MAX_BRIGHT_RATIO),
+            float(_FRAME_QC_MIN_STD),
+            float(_FRAME_QC_SKIP_HEAD_RATIO),
+            float(_FRAME_QC_SKIP_TAIL_RATIO),
+            float(_FRAME_QC_SKIP_HEAD_SECONDS),
+            float(_FRAME_QC_SKIP_TAIL_SECONDS),
+            int(_FRAME_QC_SKIP_MIN_FRAMES),
+            float(_FRAME_QC_MAX_HEAD_SKIP_RATIO),
+            float(_FRAME_QC_MAX_TAIL_SKIP_RATIO),
+        )
+        return (
+            "video-task-v2",
+            _post_verify_file_token(sdr_path),
+            _post_verify_file_token(gt_path),
+            avg_mode,
+            subset_n,
+            tuple(frame_state),
+            qc_signature,
+        )
+
+    def _get_cached_video_tasks(self, key: tuple) -> list[BenchmarkTask] | None:
+        if _BENCHMARK_QUEUE_TASK_CACHE_MAX <= 0:
+            return None
+        cache = getattr(self, "_video_task_cache", None)
+        if not isinstance(cache, OrderedDict):
+            return None
+        tasks = cache.get(key)
+        if tasks is None:
+            return None
+        cache.move_to_end(key)
+        return _clone_benchmark_tasks(tasks)
+
+    def _set_cached_video_tasks(self, key: tuple, tasks: list[BenchmarkTask]) -> None:
+        if _BENCHMARK_QUEUE_TASK_CACHE_MAX <= 0:
+            return
+        cache = getattr(self, "_video_task_cache", None)
+        if not isinstance(cache, OrderedDict):
+            return
+        cache[key] = _clone_benchmark_tasks(tasks)
+        cache.move_to_end(key)
+        while len(cache) > _BENCHMARK_QUEUE_TASK_CACHE_MAX:
+            cache.popitem(last=False)
 
     def last_session_dir(self) -> str | None:
         return self._session_dir
@@ -4219,6 +4324,23 @@ class ModelBenchmarkDialog(QDialog):
             self._txt_session_root.setText(path)
 
     def _validate_video_pair(self, sdr_path: str, gt_path: str) -> tuple[bool, str]:
+        key = self._video_pair_cache_key(sdr_path, gt_path)
+        cache = getattr(self, "_video_pair_validation_cache", None)
+        if isinstance(cache, OrderedDict):
+            cached = cache.get(key)
+            if cached is not None:
+                cache.move_to_end(key)
+                return bool(cached[0]), str(cached[1])
+
+        ok, note = self._validate_video_pair_uncached(sdr_path, gt_path)
+        if ok and isinstance(cache, OrderedDict) and _BENCHMARK_QUEUE_TASK_CACHE_MAX > 0:
+            cache[key] = (bool(ok), str(note))
+            cache.move_to_end(key)
+            while len(cache) > _BENCHMARK_QUEUE_TASK_CACHE_MAX:
+                cache.popitem(last=False)
+        return bool(ok), str(note)
+
+    def _validate_video_pair_uncached(self, sdr_path: str, gt_path: str) -> tuple[bool, str]:
         if not os.path.isfile(sdr_path):
             return False, "SDR video path is invalid."
         if not os.path.isfile(gt_path):
@@ -4520,6 +4642,10 @@ class ModelBenchmarkDialog(QDialog):
         ok, note = self._validate_video_pair(sdr_path, gt_path)
         if not ok:
             raise RuntimeError(note)
+        task_cache_key = self._video_task_cache_key(sdr_path, gt_path)
+        cached_tasks = self._get_cached_video_tasks(task_cache_key)
+        if cached_tasks is not None:
+            return cached_tasks
 
         checked_frames: list[int] = []
         all_frames: list[int] = []
@@ -4574,7 +4700,9 @@ class ModelBenchmarkDialog(QDialog):
                 )
                 for frame_1b in sorted(set(checked_frames))
             ]
-            return self._deterministic_video_subset(frame_tasks, subset_n)
+            tasks = self._deterministic_video_subset(frame_tasks, subset_n)
+            self._set_cached_video_tasks(task_cache_key, tasks)
+            return tasks
         else:
             frames = list(checked_frames)
         if not frames:
@@ -4594,6 +4722,7 @@ class ModelBenchmarkDialog(QDialog):
                     interest_score=interest_by_frame.get(int(frame_1b)),
                 )
             )
+        self._set_cached_video_tasks(task_cache_key, tasks)
         return tasks
 
     def _deterministic_subset(self, tasks: list[BenchmarkTask], count: int) -> list[BenchmarkTask]:
