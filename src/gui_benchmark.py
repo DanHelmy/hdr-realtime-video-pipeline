@@ -10,6 +10,7 @@ import tempfile
 import queue
 import threading
 import webbrowser
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import cv2
@@ -235,9 +236,39 @@ try:
     )
 except Exception:
     _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES = 12
+try:
+    _BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES = max(
+        0,
+        min(
+            512,
+            int(os.environ.get("HDRTVNET_BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES", "64")),
+        ),
+    )
+except Exception:
+    _BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES = 64
+try:
+    _BENCHMARK_POST_VERIFY_CACHE_MAX_BYTES = max(
+        0,
+        int(
+            float(
+                os.environ.get(
+                    "HDRTVNET_BENCHMARK_POST_VERIFY_CACHE_MAX_MB",
+                    "512",
+                )
+            )
+            * 1024.0
+            * 1024.0
+        ),
+    )
+except Exception:
+    _BENCHMARK_POST_VERIFY_CACHE_MAX_BYTES = 512 * 1024 * 1024
 _BENCHMARK_USE_COMPILE_CACHE = str(
     os.environ.get("HDRTVNET_BENCHMARK_USE_COMPILE_CACHE", "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
+_BENCHMARK_POST_VERIFY_CACHE_VERSION = "gt-postverify-v1"
+_BENCHMARK_POST_VERIFY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
+_BENCHMARK_POST_VERIFY_CACHE_BYTES = 0
+_BENCHMARK_POST_VERIFY_CACHE_LOCK = threading.Lock()
 
 
 def _env_benchmark_float(name: str, default: float) -> float:
@@ -521,6 +552,98 @@ def _map_gt_frame_for_sdr(
     if _is_video_path(sdr_path) and _is_video_path(gt_path):
         return _map_video_pair_frame_index(sdr_path, gt_path, int(frame_idx))
     return max(0, int(frame_idx))
+
+
+def _post_verify_file_token(path: str) -> tuple[str, int, int]:
+    try:
+        abs_path = os.path.normcase(os.path.abspath(str(path or "")))
+        st = os.stat(abs_path)
+        return abs_path, int(st.st_mtime_ns), int(st.st_size)
+    except Exception:
+        return os.path.normcase(os.path.abspath(str(path or ""))), 0, 0
+
+
+def _post_verify_cache_key(
+    *,
+    sdr_path: str,
+    gt_path: str,
+    source_frame_idx: int | None,
+    mapped_gt_frame_idx: int,
+    out_w: int,
+    out_h: int,
+) -> tuple:
+    return (
+        _BENCHMARK_POST_VERIFY_CACHE_VERSION,
+        _post_verify_file_token(sdr_path),
+        _post_verify_file_token(gt_path),
+        -1 if source_frame_idx is None else int(source_frame_idx),
+        int(mapped_gt_frame_idx),
+        int(out_w),
+        int(out_h),
+        int(_BENCHMARK_GT_LOCAL_SEARCH_FRAMES),
+        float(_BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN),
+    )
+
+
+def _post_verify_payload_nbytes(payload: dict | None) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    frame = payload.get("strict_gt_eval")
+    if isinstance(frame, np.ndarray):
+        return int(frame.nbytes)
+    return 0
+
+
+def _clone_post_verify_payload(payload: dict) -> dict:
+    cloned = dict(payload)
+    frame = cloned.get("strict_gt_eval")
+    if isinstance(frame, np.ndarray):
+        cloned["strict_gt_eval"] = np.ascontiguousarray(frame)
+    align_info = cloned.get("align_info")
+    if isinstance(align_info, dict):
+        cloned["align_info"] = dict(align_info)
+    return cloned
+
+
+def _get_post_verify_gt_cache(key: tuple) -> dict | None:
+    if (
+        _BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES <= 0
+        or _BENCHMARK_POST_VERIFY_CACHE_MAX_BYTES <= 0
+    ):
+        return None
+    with _BENCHMARK_POST_VERIFY_CACHE_LOCK:
+        payload = _BENCHMARK_POST_VERIFY_CACHE.get(key)
+        if payload is None:
+            return None
+        _BENCHMARK_POST_VERIFY_CACHE.move_to_end(key)
+        return _clone_post_verify_payload(payload)
+
+
+def _set_post_verify_gt_cache(key: tuple, payload: dict) -> None:
+    global _BENCHMARK_POST_VERIFY_CACHE_BYTES
+    if (
+        _BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES <= 0
+        or _BENCHMARK_POST_VERIFY_CACHE_MAX_BYTES <= 0
+        or not isinstance(payload.get("strict_gt_eval"), np.ndarray)
+    ):
+        return
+    stored = _clone_post_verify_payload(payload)
+    payload_bytes = _post_verify_payload_nbytes(stored)
+    if payload_bytes <= 0 or payload_bytes > _BENCHMARK_POST_VERIFY_CACHE_MAX_BYTES:
+        return
+    with _BENCHMARK_POST_VERIFY_CACHE_LOCK:
+        previous = _BENCHMARK_POST_VERIFY_CACHE.pop(key, None)
+        if previous is not None:
+            _BENCHMARK_POST_VERIFY_CACHE_BYTES -= _post_verify_payload_nbytes(previous)
+        _BENCHMARK_POST_VERIFY_CACHE[key] = stored
+        _BENCHMARK_POST_VERIFY_CACHE_BYTES += payload_bytes
+        while (
+            len(_BENCHMARK_POST_VERIFY_CACHE) > _BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES
+            or _BENCHMARK_POST_VERIFY_CACHE_BYTES > _BENCHMARK_POST_VERIFY_CACHE_MAX_BYTES
+        ):
+            _old_key, old_payload = _BENCHMARK_POST_VERIFY_CACHE.popitem(last=False)
+            _BENCHMARK_POST_VERIFY_CACHE_BYTES -= _post_verify_payload_nbytes(old_payload)
+        _BENCHMARK_POST_VERIFY_CACHE_BYTES = max(0, _BENCHMARK_POST_VERIFY_CACHE_BYTES)
 
 
 def _to_u8_for_alignment_frame(frame: np.ndarray | None) -> np.ndarray | None:
@@ -1730,6 +1853,9 @@ class _BenchmarkWorker(QObject):
 
                 exact_base_idx_by_row: dict[int, int] = {}
                 exact_indices_by_gt: dict[str, set[int]] = {}
+                post_verify_cache_by_row: dict[int, dict] = {}
+                post_verify_cache_key_by_row: dict[int, tuple] = {}
+                post_verify_cache_hits = 0
                 for row_idx, task, _fast_score in suspects:
                     base_idx = _map_gt_frame_for_sdr(
                         task.sdr_path,
@@ -1738,9 +1864,31 @@ class _BenchmarkWorker(QObject):
                     )
                     base_idx = max(0, int(base_idx or 0))
                     exact_base_idx_by_row[int(row_idx)] = int(base_idx)
+                    cache_key = _post_verify_cache_key(
+                        sdr_path=task.sdr_path,
+                        gt_path=task.gt_path,
+                        source_frame_idx=task.frame_idx,
+                        mapped_gt_frame_idx=int(base_idx),
+                        out_w=out_w,
+                        out_h=out_h,
+                    )
+                    post_verify_cache_key_by_row[int(row_idx)] = cache_key
+                    cached_payload = _get_post_verify_gt_cache(cache_key)
+                    if cached_payload is not None:
+                        post_verify_cache_by_row[int(row_idx)] = cached_payload
+                        post_verify_cache_hits += 1
+                        continue
                     exact_indices_by_gt.setdefault(task.gt_path, set()).add(int(base_idx))
 
                 exact_gt_frames_by_path: dict[str, dict[int, np.ndarray | None]] = {}
+                if post_verify_cache_hits:
+                    self.progress.emit(
+                        90,
+                        (
+                            "Post-verify GT cache: "
+                            f"{post_verify_cache_hits}/{total_verify} hit(s)"
+                        ),
+                    )
                 for gt_path, idx_set in exact_indices_by_gt.items():
                     idxs = sorted(int(v) for v in idx_set)
                     if (
@@ -1786,55 +1934,84 @@ class _BenchmarkWorker(QObject):
                             task.gt_path,
                             task.frame_idx,
                         )
-                    sdr_eval_saved = self._to_u8_for_alignment(
-                        read_image_any(str(row.get("sdr_image") or ""))
+                    cached_verify = post_verify_cache_by_row.get(int(row_idx))
+                    cache_hit = (
+                        isinstance(cached_verify, dict)
+                        and isinstance(cached_verify.get("strict_gt_eval"), np.ndarray)
                     )
-                    
-                    align_info, canceled_now = self._run_blocking_with_cancel(
-                        _local_align_gt_frame_for_benchmark,
-                        cancel_check=self._is_canceled,
-                        sdr_path=task.sdr_path,
-                        gt_path=task.gt_path,
-                        mapped_gt_frame_idx=max(0, int(strict_base_gt_frame_idx or 0)),
-                        sdr_eval_u8=sdr_eval_saved,
-                        out_w=out_w,
-                        out_h=out_h,
-                        canceled_fallback={"canceled": True},
-                    )
-
-                    if canceled_now or self._is_canceled() or bool(align_info.get("canceled", False)):
-                        self.canceled.emit("Benchmark canceled during post verification.")
-                        return
-                    
-                    strict_gt_frame_idx = int(
-                        align_info.get("frame_idx", strict_base_gt_frame_idx or 0) or 0
-                    )
-
-                    decoded_for_gt = exact_gt_frames_by_path.get(task.gt_path) or {}
-                    strict_rgb16 = decoded_for_gt.get(max(0, int(strict_gt_frame_idx or 0)))
-                    canceled_now = False
-                    if strict_rgb16 is None:
-                        strict_rgb16, canceled_now = self._run_blocking_with_cancel(
-                            read_hdr_video_frame_rgb16,
-                            task.gt_path,
-                            max(0, int(strict_gt_frame_idx or 0)),
-                            prefer_fast_seek=False,
-                            canceled_fallback=None,
+                    strict_gt_eval = None
+                    strict_score = None
+                    sdr_eval_saved = None
+                    if cache_hit:
+                        strict_gt_eval = np.ascontiguousarray(
+                            cached_verify.get("strict_gt_eval")
                         )
-                        if canceled_now or self._is_canceled():
-                            self.canceled.emit("Benchmark canceled during post verification.")
+                        cache_hit = (
+                            strict_gt_eval.ndim == 3
+                            and int(strict_gt_eval.shape[1]) == int(out_w)
+                            and int(strict_gt_eval.shape[0]) == int(out_h)
+                        )
+                    if cache_hit:
+                        align_info = dict(cached_verify.get("align_info") or {})
+                        strict_gt_frame_idx = int(
+                            cached_verify.get(
+                                "strict_gt_frame_idx",
+                                align_info.get("frame_idx", strict_base_gt_frame_idx or 0),
+                            )
+                            or 0
+                        )
+                        try:
+                            strict_score = cached_verify.get("strict_score")
+                            strict_score = (
+                                None if strict_score is None else float(strict_score)
+                            )
+                        except Exception:
+                            strict_score = None
+                    else:
+                        sdr_eval_saved = self._to_u8_for_alignment(
+                            read_image_any(str(row.get("sdr_image") or ""))
+                        )
+
+                        align_info, canceled_now = self._run_blocking_with_cancel(
+                            _local_align_gt_frame_for_benchmark,
+                            cancel_check=self._is_canceled,
+                            sdr_path=task.sdr_path,
+                            gt_path=task.gt_path,
+                            mapped_gt_frame_idx=max(
+                                0,
+                                int(strict_base_gt_frame_idx or 0),
+                            ),
+                            sdr_eval_u8=sdr_eval_saved,
+                            out_w=out_w,
+                            out_h=out_h,
+                            canceled_fallback={"canceled": True},
+                        )
+
+                        if (
+                            canceled_now
+                            or self._is_canceled()
+                            or bool(align_info.get("canceled", False))
+                        ):
+                            self.canceled.emit(
+                                "Benchmark canceled during post verification."
+                            )
                             return
 
-                    if strict_rgb16 is None and strict_gt_frame_idx != int(
-                        strict_base_gt_frame_idx or 0
-                    ):
-                        strict_gt_frame_idx = max(0, int(strict_base_gt_frame_idx or 0))
-                        strict_rgb16 = decoded_for_gt.get(strict_gt_frame_idx)
+                        strict_gt_frame_idx = int(
+                            align_info.get("frame_idx", strict_base_gt_frame_idx or 0)
+                            or 0
+                        )
+
+                        decoded_for_gt = exact_gt_frames_by_path.get(task.gt_path) or {}
+                        strict_rgb16 = decoded_for_gt.get(
+                            max(0, int(strict_gt_frame_idx or 0))
+                        )
+                        canceled_now = False
                         if strict_rgb16 is None:
                             strict_rgb16, canceled_now = self._run_blocking_with_cancel(
                                 read_hdr_video_frame_rgb16,
                                 task.gt_path,
-                                strict_gt_frame_idx,
+                                max(0, int(strict_gt_frame_idx or 0)),
                                 prefer_fast_seek=False,
                                 canceled_fallback=None,
                             )
@@ -1842,24 +2019,44 @@ class _BenchmarkWorker(QObject):
                                 self.canceled.emit("Benchmark canceled during post verification.")
                                 return
 
-                    if strict_rgb16 is None:
-                        continue
+                        if strict_rgb16 is None and strict_gt_frame_idx != int(
+                            strict_base_gt_frame_idx or 0
+                        ):
+                            strict_gt_frame_idx = max(0, int(strict_base_gt_frame_idx or 0))
+                            strict_rgb16 = decoded_for_gt.get(strict_gt_frame_idx)
+                            if strict_rgb16 is None:
+                                strict_rgb16, canceled_now = self._run_blocking_with_cancel(
+                                    read_hdr_video_frame_rgb16,
+                                    task.gt_path,
+                                    strict_gt_frame_idx,
+                                    prefer_fast_seek=False,
+                                    canceled_fallback=None,
+                                )
+                                if canceled_now or self._is_canceled():
+                                    self.canceled.emit("Benchmark canceled during post verification.")
+                                    return
 
-                    strict_gt_eval = np.ascontiguousarray(
-                        _letterbox_bgr(
-                            _crop_gt_frame_to_pair_active_area(
-                                np.ascontiguousarray(strict_rgb16[:, :, ::-1]),
-                                task.sdr_path,
-                                task.gt_path,
-                            ),
-                            out_w,
-                            out_h,
+                        if strict_rgb16 is None:
+                            continue
+
+                        strict_gt_eval = np.ascontiguousarray(
+                            _letterbox_bgr(
+                                _crop_gt_frame_to_pair_active_area(
+                                    np.ascontiguousarray(strict_rgb16[:, :, ::-1]),
+                                    task.sdr_path,
+                                    task.gt_path,
+                                ),
+                                out_w,
+                                out_h,
+                            )
                         )
-                    )
 
                     strict_u8 = self._to_u8_for_alignment(strict_gt_eval)
-                    strict_score = None
-                    if sdr_eval_saved is not None and strict_u8 is not None:
+                    if (
+                        not cache_hit
+                        and sdr_eval_saved is not None
+                        and strict_u8 is not None
+                    ):
                         try:
                             strict_score = _frame_structure_similarity(
                                 sdr_eval_saved,
@@ -1867,6 +2064,21 @@ class _BenchmarkWorker(QObject):
                             )
                         except Exception:
                             strict_score = None
+                    if not cache_hit:
+                        cache_key = post_verify_cache_key_by_row.get(int(row_idx))
+                        if cache_key is not None:
+                            _set_post_verify_gt_cache(
+                                cache_key,
+                                {
+                                    "strict_gt_eval": strict_gt_eval,
+                                    "strict_gt_frame_idx": int(strict_gt_frame_idx),
+                                    "strict_base_gt_frame_idx": int(
+                                        strict_base_gt_frame_idx or 0
+                                    ),
+                                    "strict_score": strict_score,
+                                    "align_info": dict(align_info),
+                                },
+                            )
 
                     replace_reasons: list[str] = []
                     try:

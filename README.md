@@ -49,6 +49,7 @@ Core updates include:
 - HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and conservative cached constant frame offsets
 - compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
 - benchmark video runs now post-verify GT frames by exact decode and local frame alignment before final metrics are reported
+- queued video benchmarks reuse a bounded in-memory post-verify GT cache for repeated SDR/HDR/frame/resolution pairs, skipping redundant exact GT decode/alignment while still recomputing HDR Convert outputs and metrics per checkpoint
 - compare preparation now uses a cancelable application-modal progress dialog so pending compare seeks can be canceled cleanly
 - native `Browser Window Capture (Experimental)` video path
 - modern Windows direct window capture backend for browser-window video
@@ -170,6 +171,7 @@ cd hdr-realtime-video-pipeline
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
 - Video frame selection can detect a larger deterministic candidate pool, then use the same average-mode workflow as datasets (`selected`, `all`, or deterministic subset) for final scoring
 - Video benchmark metrics are finalized by an exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
+- Queued video runs reuse a bounded in-memory post-verify GT cache for repeated source/GT/frame/resolution pairs. This reuses only the verified GT frame/alignment side; HDR Convert outputs and metrics are still recomputed for every checkpoint.
 - Dataset image pairs stay on the image decoder path; video sync/crop probes are only used for actual video files
 
 ![Benchmark Tab](docs/images/v5-benchmark-tab.png)
@@ -334,6 +336,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - **GUI status indicator** shows "HDR GT: fast path active" when using optimized processing
   - a cached sync scan estimates constant SDR/HDR lead-lag offsets and reports the detected frame offset, but keeps offset `0` unless a nonzero offset is clearly better
   - benchmark video runs add a per-sample local GT-frame search during post-verify, so final metrics are based on the best nearby exact-decoded GT frame instead of a stale fast seek
+  - queued benchmark runs reuse verified exact GT frames from a bounded memory cache when the SDR file, HDR GT file, selected frame, mapped GT frame, resolution, and alignment settings match
   - compare, objective metrics, and benchmark use the same mapped GT-frame lookup
   - same-canvas GT files are no longer cropped per frame, avoiding accidental zoomed GT previews/metrics
 
