@@ -41,7 +41,7 @@ Core updates include:
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
-- QAT INT8 checkpoints now support both the FP32-anchored tone-protected recipe and a separate `QAT (Film)` source-color recipe, giving reproducible paths for paper comparisons between strict FP32 fidelity and SDR-film color retention
+- QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and source-color-preserving `QAT (Film)`, with Full/Mixed and HG/no-HG variants available for reproducible paper comparisons between strict FP32 fidelity and SDR-film color retention
 - HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
 - optimized GT sync algorithm with improved frame scanning and alignment detection
 - HDR GT status indicator in the GUI status line showing when fast path is active
@@ -791,6 +791,8 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 | **INT8 Mixed (QAT)** | Mixed W8A8/W8A16/FP16-sensitive layers + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
 | **INT8 Mixed (QAT) (Film)** | Mixed QAT with SDR source-chroma anchoring (HG optional) | ~4.0× vs FP16+HG |
 
+The app includes ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints. The Film variants are separate deployable checkpoints (`*_qat_film.pt` and `*_qat_film_nohg.pt`) rather than runtime color presets.
+
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
 On NVIDIA, existing quantized checkpoints are still the source files for INT8 modes, but TensorRT export converts their W8/W8A8 wrappers into ONNX `QuantizeLinear` / `DequantizeLinear` Q/DQ graphs before engine build. This is TensorRT's explicit quantization path: calibration/scales are embedded before ONNX export, and no runtime calibration table is used. FP32 modes build FP32 TensorRT engines; FP16 modes build FP16 TensorRT engines.
@@ -910,6 +912,8 @@ python scripts/quantize/quantize_int8_full_qat.py
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt` (no-HG)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film.pt` (HG, Film)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt` (no-HG, Film)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
 ### Mixed W8A8/W8A16/FP16-Sensitive Layers (HG optional)
@@ -929,7 +933,7 @@ python scripts/quantize/quantize_int8_mixed.py
 
 Checkpoint recipe note:
 
-The app already includes the ready-to-use PTQ and QAT INT8 checkpoints for normal use. You do not need to run the commands below to launch the app, benchmark the included models, or use the provided INT8 presets. These recipes are kept as documentation/reproducibility references and for users who explicitly want to rebuild or modify the checkpoints themselves.
+The app already includes the ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints for normal use. You do not need to run the commands below to launch the app, benchmark the included models, or use the provided INT8 presets. These recipes are kept as documentation/reproducibility references and for users who explicitly want to rebuild or modify the checkpoints themselves.
 
 Recommended PTQ checkpoint refresh for Full and Mixed INT8:
 
@@ -1030,6 +1034,8 @@ python scripts/quantize/quantize_int8_mixed_qat.py
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt` (no-HG)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film.pt` (HG, Film)
+    - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt` (no-HG, Film)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
 Recommended FP32-anchored tone-protected QAT refresh:
