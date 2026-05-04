@@ -97,6 +97,7 @@ from gui_scaling import (
     _normalize_shader_paths,
 )
 from gui_widgets import _CompareVideoPane
+from gui_window_utils import configure_independent_window
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     HDRTVNetTorch,
@@ -2123,11 +2124,9 @@ class ModelBenchmarkDialog(QDialog):
         logs_root: str,
         parent=None,
     ):
-        super().__init__(parent)
-        self.setWindowFlag(Qt.WindowType.Dialog, True)
-        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        super().__init__(None)
+        self._owner_widget = parent
+        configure_independent_window(self)
         self.setSizeGripEnabled(True)
         self.setWindowTitle("Model Quality Benchmark")
         self.setModal(True)

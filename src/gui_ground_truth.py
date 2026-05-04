@@ -5,6 +5,7 @@ import os
 from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
+from gui_window_utils import configure_independent_window
 from gui_media_probe import (
     _probe_hdr_input,
     _probe_video_active_area_info,
@@ -254,7 +255,9 @@ class GroundTruthMixin:
         label = "Loading HDR ground-truth ..."
         if gt_path:
             label = f"Loading HDR ground-truth: {os.path.basename(gt_path)} ..."
-        progress = QProgressDialog(label, "Cancel", 0, 0, self)
+        progress = QProgressDialog(label, "Cancel", 0, 0, None)
+        progress._owner_widget = self
+        configure_independent_window(progress, maximize=False)
         progress.setWindowTitle("HDR Ground Truth")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)

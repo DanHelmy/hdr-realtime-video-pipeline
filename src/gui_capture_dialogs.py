@@ -17,6 +17,7 @@ from gui_config import (
     LIVE_CAPTURE_OBSERVE_FPS,
     LIVE_CAPTURE_PROCESS_FPS,
 )
+from gui_window_utils import configure_independent_window
 from window_capture_source import (
     WindowCaptureTarget,
     attach_best_browser_tab_session,
@@ -41,7 +42,9 @@ class WindowCaptureDialog(QDialog):
         initial_target: WindowCaptureTarget | None = None,
         parent=None,
     ):
-        super().__init__(parent)
+        super().__init__(None)
+        self._owner_widget = parent
+        configure_independent_window(self, maximize=False)
         self.setWindowTitle("Browser Window Capture (Experimental)")
         self.resize(820, 320)
         self._initial_session_id = str(initial_session_id or "").strip()

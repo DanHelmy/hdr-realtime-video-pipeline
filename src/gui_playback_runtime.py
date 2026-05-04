@@ -69,6 +69,7 @@ from gui_scaling import (
     _ensure_filmgrain_shader,
 )
 from gui_widgets import _KernelCacheClearWorker
+from gui_window_utils import configure_independent_window
 from gui_capture_dialogs import WindowCaptureDialog
 from windows_runtime import project_cache_root
 from window_capture_source import (
@@ -683,7 +684,9 @@ class PlaybackRuntimeMixin:
         if verify_key in self._runtime_compile_verified_keys():
             return True
 
-        progress = QProgressDialog("Verifying cached kernels ...", None, 0, 0, self)
+        progress = QProgressDialog("Verifying cached kernels ...", None, 0, 0, None)
+        progress._owner_widget = self
+        configure_independent_window(progress, maximize=False)
         progress.setWindowTitle("Verify Kernel Cache")
         progress.setMinimumDuration(0)
         progress.setCancelButton(None)
@@ -827,7 +830,9 @@ class PlaybackRuntimeMixin:
         if not _env_enabled("HDRTVNET_AUTO_DOWNLOAD_CLONE_ASSETS", "1"):
             return False, ["Automatic asset download is disabled by environment."]
 
-        dlg = QProgressDialog("Downloading required files ...", None, 0, 0, self)
+        dlg = QProgressDialog("Downloading required files ...", None, 0, 0, None)
+        dlg._owner_widget = self
+        configure_independent_window(dlg, maximize=False)
         dlg.setWindowTitle("Downloading Required Files")
         dlg.setCancelButton(None)
         dlg.setMinimumDuration(0)
@@ -1619,7 +1624,9 @@ class PlaybackRuntimeMixin:
             return
 
         if dirs:
-            dlg = QProgressDialog("Clearing kernel cache...", None, 0, 0, self)
+            dlg = QProgressDialog("Clearing kernel cache...", None, 0, 0, None)
+            dlg._owner_widget = self
+            configure_independent_window(dlg, maximize=False)
             dlg.setWindowTitle("Clear Kernel Cache")
             dlg.setMinimumDuration(0)
             dlg.setCancelButton(None)
@@ -2065,7 +2072,9 @@ class PlaybackRuntimeMixin:
         if self._export_progress_dlg is not None:
             return self._export_progress_dlg
 
-        progress = QProgressDialog("Preparing export ...", "Cancel", 0, 100, self)
+        progress = QProgressDialog("Preparing export ...", "Cancel", 0, 100, None)
+        progress._owner_widget = self
+        configure_independent_window(progress, maximize=False)
         progress.setWindowTitle("Export Video")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PyQt6.QtCore import Qt, QProcess, QTimer
+from PyQt6.QtCore import QProcess, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -18,6 +18,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from gui_window_utils import configure_independent_window
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_MAX_W = 1920
 _DEFAULT_MAX_H = 1080
@@ -28,14 +30,11 @@ class _CompileDialog(QDialog):
     in-process (loading screen during playback start)."""
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(None)
+        self._owner_widget = parent
         self.setWindowTitle("Compiling Kernels")
         self.setFixedSize(460, 160)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog
-            | Qt.WindowType.CustomizeWindowHint
-            | Qt.WindowType.WindowTitleHint
-        )
+        configure_independent_window(self, minimize=False, maximize=False, close=False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
@@ -78,14 +77,11 @@ class _PrecompileOptionsDialog(QDialog):
         max_h: int = _DEFAULT_MAX_H,
         parent=None,
     ):
-        super().__init__(parent)
+        super().__init__(None)
+        self._owner_widget = parent
         self.setWindowTitle("Pre-compile Kernels")
         self.setMinimumSize(420, 260)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog
-            | Qt.WindowType.WindowTitleHint
-            | Qt.WindowType.WindowCloseButtonHint
-        )
+        configure_independent_window(self, maximize=False)
 
         self._precision_combo = QComboBox()
         self._precision_combo.addItems(precision_keys)
@@ -142,14 +138,11 @@ class _PrecompileDialog(QDialog):
                  hg_weights: str | None = None, clear_cache: bool = False,
                  predequantize_mode: str = "auto",
                  parent=None):
-        super().__init__(parent)
+        super().__init__(None)
+        self._owner_widget = parent
         self.setWindowTitle("Pre-compile Kernels")
         self.setMinimumSize(540, 340)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog
-            | Qt.WindowType.WindowTitleHint
-            | Qt.WindowType.WindowCloseButtonHint
-        )
+        configure_independent_window(self)
 
         self._resolutions = resolutions
         self._precision = precision

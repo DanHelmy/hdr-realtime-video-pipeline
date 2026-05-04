@@ -40,6 +40,7 @@ from gui_media_probe import _probe_hdr_input, _probe_video_timing_info
 from gui_pipeline_worker_frame_processing import PipelineWorkerFrameProcessingMixin
 from gui_pipeline_worker_model import PipelineWorkerModelMixin, _resolve_predequantize_arg
 from gui_scaling import _letterbox_bgr
+from gui_window_utils import configure_independent_window
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     HDRTVNetTorch,
@@ -107,7 +108,9 @@ class ExportOptionsDialog(QDialog):
         initial_use_hg: bool | None = None,
         parent=None,
     ):
-        super().__init__(parent)
+        super().__init__(None)
+        self._owner_widget = parent
+        configure_independent_window(self)
         self.setWindowTitle("Export Video")
         self.setModal(True)
         self.resize(760, 520)

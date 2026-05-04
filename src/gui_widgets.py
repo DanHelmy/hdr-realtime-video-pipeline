@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gui_window_utils import configure_independent_window
+
 from gui_hdr_io import frame_to_rgb48_bytes
 
 
@@ -258,10 +260,7 @@ class CompareFrameDialog(QDialog):
         super().__init__(None)
         self.setObjectName("CompareFrameDialog")
         self._owner_widget = parent
-        self.setWindowFlag(Qt.WindowType.Dialog, True)
-        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        configure_independent_window(self)
         self.setSizeGripEnabled(True)
         self.setWindowTitle("Frame Compare")
         self.resize(1500, 760)

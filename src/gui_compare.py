@@ -22,6 +22,7 @@ from gui_scaling import (
     _normalize_shader_paths,
 )
 from gui_widgets import CompareFrameDialog
+from gui_window_utils import configure_independent_window
 
 try:
     import mpv as mpv_lib
@@ -178,7 +179,9 @@ class CompareViewMixin:
         label = "Preparing frame compare ..."
         if frame_number is not None:
             label = f"Preparing frame compare at frame {int(frame_number)} ..."
-        progress = QProgressDialog(label, "Cancel", 0, 0, self)
+        progress = QProgressDialog(label, "Cancel", 0, 0, None)
+        progress._owner_widget = self
+        configure_independent_window(progress, maximize=False)
         progress.setWindowTitle("Frame Compare")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
