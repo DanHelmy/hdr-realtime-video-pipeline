@@ -688,6 +688,7 @@ class MpvHDRWidget(QWidget):
             wid=wid,
             vo="gpu-next",
             gpu_api="vulkan",
+            hwdec="no",
             demuxer="rawvideo",
             demuxer_rawvideo_w=str(width),
             demuxer_rawvideo_h=str(height),
