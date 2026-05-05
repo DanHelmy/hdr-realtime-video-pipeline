@@ -44,6 +44,7 @@ from gui_compile_dialogs import (
     _CompileDialog,
     _PrecompileOptionsDialog,
     _PrecompileDialog,
+    _python_executable_for_clean_subprocess,
 )
 from gui_benchmark import ModelBenchmarkDialog
 from gui_export import ExportOptionsDialog, VideoExportWorker
@@ -715,6 +716,7 @@ class PlaybackRuntimeMixin:
             args += ["--hg-weights", _HG_WEIGHTS_PATH]
 
         process = QProcess(self)
+        process.setWorkingDirectory(_ROOT)
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         env = process.processEnvironment()
         if env.isEmpty():
@@ -755,7 +757,7 @@ class PlaybackRuntimeMixin:
         process.finished.connect(loop.quit)
         timeout.timeout.connect(_on_timeout)
 
-        process.start(sys.executable, ["-u"] + args)
+        process.start(_python_executable_for_clean_subprocess(), ["-u"] + args)
         if not process.waitForStarted(5000):
             progress.close()
             QApplication.processEvents()

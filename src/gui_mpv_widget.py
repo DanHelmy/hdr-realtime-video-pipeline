@@ -687,8 +687,8 @@ class MpvHDRWidget(QWidget):
         mpv_kwargs = dict(
             wid=wid,
             vo="gpu-next",
-            gpu_api="vulkan",
-            hwdec="d3d11va",
+            gpu_api="d3d11",
+            hwdec="auto",
             demuxer="rawvideo",
             demuxer_rawvideo_w=str(width),
             demuxer_rawvideo_h=str(height),

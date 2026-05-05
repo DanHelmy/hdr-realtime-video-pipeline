@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PyQt6.QtCore import QProcess, QTimer
+from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -21,8 +21,37 @@ from PyQt6.QtWidgets import (
 from gui_window_utils import configure_independent_window
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
 _DEFAULT_MAX_W = 1920
 _DEFAULT_MAX_H = 1080
+
+
+def _python_executable_for_clean_subprocess() -> str:
+    """Return the Python that should run helper scripts from the GUI.
+
+    After GUI restarts, ``sys.executable`` can point at the base interpreter on
+    some Windows venv layouts. Prefer the project venv when it exists so tools
+    use the same installed torch/PyQt environment as the launcher.
+    """
+    candidates = []
+    if os.name == "nt":
+        candidates.append(os.path.join(_ROOT, "venv", "Scripts", "python.exe"))
+    else:
+        candidates.append(os.path.join(_ROOT, "venv", "bin", "python"))
+    candidates.append(sys.executable)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = os.path.abspath(candidate)
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(path):
+            return path
+    return sys.executable
 
 
 class _CompileDialog(QDialog):
@@ -155,6 +184,7 @@ class _PrecompileDialog(QDialog):
             self._predequantize_mode = "auto"
         self._process: QProcess | None = None
         self._finished_ok = False
+        self._finish_handled = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -186,10 +216,9 @@ class _PrecompileDialog(QDialog):
         layout.addWidget(self._log, 1)
 
         btn_row = QHBoxLayout()
-        self._btn_close = QPushButton("Close")
+        self._btn_close = QPushButton("Cancel")
         self._btn_close.setFixedSize(90, 28)
-        self._btn_close.setEnabled(False)
-        self._btn_close.clicked.connect(self.accept)
+        self._btn_close.clicked.connect(self._on_close_clicked)
         btn_row.addStretch()
         btn_row.addWidget(self._btn_close)
         layout.addLayout(btn_row)
@@ -211,12 +240,12 @@ class _PrecompileDialog(QDialog):
             args += ["--clear-cache"]
 
         self._process = QProcess(self)
+        self._process.setWorkingDirectory(_ROOT)
         self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         # Force UTF-8 so Unicode chars (→, ×, etc.) in model print() don't
         # crash on Windows cp1252 console encoding.
         env = self._process.processEnvironment()
         if env.isEmpty():
-            from PyQt6.QtCore import QProcessEnvironment
             env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUNBUFFERED", "1")
@@ -228,11 +257,19 @@ class _PrecompileDialog(QDialog):
         self._process.setProcessEnvironment(env)
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.finished.connect(self._on_finished)
+        self._process.errorOccurred.connect(self._on_process_error)
 
-        self._log.append(f"$ python {' '.join(os.path.basename(a) for a in args)}\n")
-        self._process.start(sys.executable, ["-u"] + args)
+        python_exe = _python_executable_for_clean_subprocess()
+        self._log.append(
+            f"$ {os.path.basename(python_exe)} "
+            f"{' '.join(os.path.basename(a) for a in args)}\n"
+        )
+        self._process.start(python_exe, ["-u"] + args)
+        QTimer.singleShot(5000, self._check_started)
 
     def _on_stdout(self):
+        if self._process is None:
+            return
         data = self._process.readAllStandardOutput()
         text = bytes(data).decode("utf-8", errors="replace").rstrip()
         if text:
@@ -241,15 +278,50 @@ class _PrecompileDialog(QDialog):
             sb = self._log.verticalScrollBar()
             sb.setValue(sb.maximum())
 
-    def _on_finished(self, exit_code, _status):
+    def _check_started(self):
+        if self._finish_handled or self._process is None:
+            return
+        if self._process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self._finish_with_error(
+            "Compiler process did not stay running. Check the log above for errors."
+        )
+
+    def _on_process_error(self, error):
+        if self._finish_handled:
+            return
+        detail = ""
+        try:
+            detail = self._process.errorString() if self._process is not None else ""
+        except Exception:
+            detail = ""
+        self._finish_with_error(f"Compiler process error: {error}. {detail}".strip())
+
+    def _finish_with_error(self, message: str):
+        if self._finish_handled:
+            return
+        self._finish_handled = True
         self._bar.setRange(0, 1)
         self._bar.setValue(1)
+        self._btn_close.setText("Close")
+        self._btn_close.setEnabled(True)
+        self._log.append(f"\n{message}")
+        sb = self._log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_finished(self, exit_code, _status):
+        if self._finish_handled:
+            return
+        self._finish_handled = True
+        self._bar.setRange(0, 1)
+        self._bar.setValue(1)
+        self._btn_close.setText("Close")
         self._btn_close.setEnabled(True)
 
         if exit_code == 0:
             self._finished_ok = True
             self._log.append("\nDone - kernels cached to disk.")
-            self._log.append("Starting playback ...")
+            self._log.append("Pre-compile finished.")
             # Auto-close after a brief pause so the user sees the result
             QTimer.singleShot(800, self.accept)
         else:
@@ -258,6 +330,16 @@ class _PrecompileDialog(QDialog):
 
         sb = self._log.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _on_close_clicked(self):
+        if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
+            self._log.append("\nCanceling compiler process ...")
+            self._process.kill()
+            self._process.waitForFinished(3000)
+            self._finished_ok = False
+            self.reject()
+            return
+        self.accept()
 
     def closeEvent(self, event):
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:

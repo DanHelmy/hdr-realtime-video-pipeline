@@ -561,7 +561,7 @@ On NVIDIA, PyTorch-specific tuning and kernel-cache tools are hidden because inf
 
 ### mpv Display / Color Path
 
-Both SDR and HDR panes are rendered through embedded **mpv** (vulkan):
+Both SDR and HDR panes are rendered through embedded **mpv** (d3d11):
 
 - **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
 - **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
