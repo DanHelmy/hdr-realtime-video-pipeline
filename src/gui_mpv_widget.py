@@ -242,7 +242,7 @@ class MpvHDRWidget(QWidget):
         self._last_scale_error: str | None = None
         self._active_vo: str = "gpu-next"
         self._target_colorspace_hint: str = "no"
-        self._requested_gpu_api: str = "vulkan"
+        self._requested_gpu_api: str = "d3d11"
 
         self._mpv_lib = mpv_lib
         self._mpv_diag = bool(mpv_diag)
@@ -820,7 +820,7 @@ class MpvHDRWidget(QWidget):
                 startup_exc = exc
 
         if player is None:
-            self._last_scale_error = f"mpv startup failed with gpu-next/vulkan: {startup_exc}"
+            self._last_scale_error = f"mpv startup failed with gpu-next/d3d11: {startup_exc}"
             print(f"[mpv] {self._last_scale_error}")
             try:
                 self.runtime_notice.emit(self._last_scale_error)
