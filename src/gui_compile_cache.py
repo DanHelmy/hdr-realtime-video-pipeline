@@ -15,6 +15,13 @@ _TRITON_CACHE = (
     / "cache"
 )
 _CACHE_NAMESPACE = compile_cache_namespace(__file__)
+DEFAULT_COMPILE_MODE = "max-autotune"
+DEFAULT_MEMORY_FORMAT = (
+    "channels-last"
+    if str(os.environ.get("HDRTVNET_CHANNELS_LAST", "")).strip().lower()
+    in {"1", "true", "yes", "on", "y"}
+    else "contiguous"
+)
 
 
 def _compiled_marker_path() -> _pathlib.Path:
@@ -51,6 +58,14 @@ def _model_compile_id(precision: str, model_path: str) -> str:
     return _model_hash(model_path)
 
 
+def _normalize_memory_format(memory_format: str | None = None) -> str:
+    text = str(memory_format or DEFAULT_MEMORY_FORMAT).strip().lower()
+    text = text.replace("_", "-")
+    if text in {"channels-last", "nhwc"}:
+        return "channels-last"
+    return "contiguous"
+
+
 def _compiled_key(
     w: int,
     h: int,
@@ -58,13 +73,15 @@ def _compiled_key(
     model_path: str,
     use_hg: bool,
     predequantize_mode: str = "auto",
-    compile_mode: str = "max-autotune",
+    compile_mode: str = DEFAULT_COMPILE_MODE,
+    memory_format: str = DEFAULT_MEMORY_FORMAT,
 ) -> str:
     pdq = str(predequantize_mode or "auto").strip().lower()
     if pdq not in {"auto", "on", "off"}:
         pdq = "auto"
+    fmt = _normalize_memory_format(memory_format)
     mh = _model_compile_id(precision, model_path)
-    return f"{_CACHE_NAMESPACE}:{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_{mh}"
+    return f"{_CACHE_NAMESPACE}:{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{fmt}_{pdq}_{mh}"
 
 
 def _payload_shares_fp16_predequantized_graph(
@@ -76,6 +93,7 @@ def _payload_shares_fp16_predequantized_graph(
     use_hg: bool,
     compile_mode: str,
     predequantize_mode: str,
+    memory_format: str,
 ) -> bool:
     text = str(payload or "").strip()
     if not text:
@@ -84,13 +102,14 @@ def _payload_shares_fp16_predequantized_graph(
     if not text.startswith(prefix_base):
         return False
 
+    fmt = _normalize_memory_format(memory_format)
     if str(precision).startswith("int8") and str(predequantize_mode) == "on":
-        fp16_prefix = f"{w}x{h}_fp16_hg{int(use_hg)}_{compile_mode}_"
+        fp16_prefix = f"{w}x{h}_fp16_hg{int(use_hg)}_{compile_mode}_{fmt}_"
         return text.startswith(fp16_prefix)
 
     if str(precision) == "fp16":
         int8_prefix = f"{w}x{h}_int8-"
-        int8_suffix = f"_hg{int(use_hg)}_{compile_mode}_on_"
+        int8_suffix = f"_hg{int(use_hg)}_{compile_mode}_{fmt}_on_"
         return text.startswith(int8_prefix) and int8_suffix in text
 
     return False
@@ -102,11 +121,13 @@ def _legacy_compiled_keys(
     precision: str,
     model_path: str,
     use_hg: bool,
-    compile_mode: str = "max-autotune",
+    compile_mode: str = DEFAULT_COMPILE_MODE,
+    memory_format: str = DEFAULT_MEMORY_FORMAT,
 ) -> tuple[str]:
     mh = _model_hash(model_path)
+    fmt = _normalize_memory_format(memory_format)
     # Legacy GUI marker format (no predequantization mode)
-    k1 = f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{mh}"
+    k1 = f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{fmt}_{mh}"
     return (k1,)
 
 
@@ -117,7 +138,8 @@ def _is_compiled(
     model_path: str,
     use_hg: bool,
     predequantize_mode: str = "auto",
-    compile_mode: str = "max-autotune",
+    compile_mode: str = DEFAULT_COMPILE_MODE,
+    memory_format: str = DEFAULT_MEMORY_FORMAT,
 ) -> bool:
     """Check if clean-compiled kernels exist for this config."""
     mp = _compiled_marker_path()
@@ -131,6 +153,7 @@ def _is_compiled(
         pdq = str(predequantize_mode or "auto").strip().lower()
         if pdq not in {"auto", "on", "off"}:
             pdq = "auto"
+        fmt = _normalize_memory_format(memory_format)
         lines = set(mp.read_text(encoding="utf-8").splitlines())
         key = _compiled_key(
             w,
@@ -140,6 +163,7 @@ def _is_compiled(
             use_hg,
             predequantize_mode=pdq,
             compile_mode=compile_mode,
+            memory_format=fmt,
         )
         key_payload = _marker_payload(key)
         if key in lines:
@@ -156,6 +180,7 @@ def _is_compiled(
                 use_hg=bool(use_hg),
                 compile_mode=str(compile_mode),
                 predequantize_mode=str(pdq),
+                memory_format=fmt,
             ):
                 return True
         if not str(precision).startswith("int8"):
@@ -163,7 +188,7 @@ def _is_compiled(
             # modes. Accept older markers that were mistakenly written with
             # "_on" / "_off" suffixes.
             prefix_payload = (
-                f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_"
+                f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{fmt}_"
             )
             for line in lines:
                 if _marker_payload(line).startswith(prefix_payload):
@@ -173,7 +198,7 @@ def _is_compiled(
             # used model-hash suffixes, so PTQ/QAT variants could differ only
             # in the final token.
             prefix_payload = (
-                f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{pdq}_"
+                f"{w}x{h}_{precision}_hg{int(use_hg)}_{compile_mode}_{fmt}_{pdq}_"
             )
             for line in lines:
                 if _marker_payload(line).startswith(prefix_payload):
@@ -188,7 +213,8 @@ def _mark_compiled(
     model_path: str,
     use_hg: bool,
     predequantize_mode: str = "auto",
-    compile_mode: str = "max-autotune",
+    compile_mode: str = DEFAULT_COMPILE_MODE,
+    memory_format: str = DEFAULT_MEMORY_FORMAT,
 ):
     """Record that kernels for this config were compiled cleanly."""
     mp = _compiled_marker_path()
@@ -201,6 +227,7 @@ def _mark_compiled(
         use_hg,
         predequantize_mode=predequantize_mode,
         compile_mode=compile_mode,
+        memory_format=memory_format,
     )
     existing = set()
     if mp.is_file():

@@ -22,6 +22,12 @@ int8_proof*.csv
 *.txt
 logs/
 
+# Generated model/runtime caches
+src/models/compile_cache/
+src/models/engines/
+src/models/onnx/
+*.engine
+
 # Benchmark scripts (development only, not part of pipeline)
 benchmark_*.py
 

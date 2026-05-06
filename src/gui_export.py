@@ -849,11 +849,12 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     device="auto",
                     precision=str(cfg.get("precision") or "fp16"),
                     compile_model=bool(self._config.use_max_autotune),
-                    compile_mode="max-autotune",
+                    compile_mode="auto",
                     predequantize=_resolve_predequantize_arg(
                         str(self._config.predequantize_mode)
                     ),
                     use_hg=self._config.use_hg,
+                    warmup_passes=0,
                 )
             with self._runtime_lock:
                 self._processor = processor

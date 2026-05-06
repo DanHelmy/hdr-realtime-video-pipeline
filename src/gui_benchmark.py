@@ -1658,9 +1658,10 @@ class _BenchmarkWorker(QObject):
                     precision=model_precision,
                     compile_model=bool(compile_cache_ready),
                     force_compile=bool(compile_cache_ready),
-                    compile_mode="max-autotune" if compile_cache_ready else "default",
+                    compile_mode="auto" if compile_cache_ready else "default",
                     predequantize=_resolve_predequantize_arg(str(cfg.predequantize_mode)),
                     use_hg=bool(cfg.use_hg),
+                    warmup_passes=0,
                 )
                 if getattr(processor, "_compiled", False):
                     cfg.runtime_mode = (
@@ -3561,9 +3562,10 @@ class ModelBenchmarkDialog(QDialog):
                     precision=model_precision,
                     compile_model=bool(compile_ready),
                     force_compile=bool(compile_ready),
-                    compile_mode="max-autotune" if compile_ready else "default",
+                    compile_mode="auto" if compile_ready else "default",
                     predequantize=_resolve_predequantize_arg(predequantize_mode),
                     use_hg=bool(use_hg),
+                    warmup_passes=0,
                 )
         except Exception:
             return None

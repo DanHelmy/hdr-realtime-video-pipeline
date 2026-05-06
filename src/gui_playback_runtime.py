@@ -44,6 +44,7 @@ from gui_compile_dialogs import (
     _CompileDialog,
     _PrecompileOptionsDialog,
     _PrecompileDialog,
+    _kill_process_tree,
     _python_executable_for_clean_subprocess,
 )
 from gui_benchmark import ModelBenchmarkDialog
@@ -72,7 +73,7 @@ from gui_scaling import (
 from gui_widgets import _KernelCacheClearWorker
 from gui_window_utils import configure_independent_window
 from gui_capture_dialogs import WindowCaptureDialog
-from windows_runtime import project_cache_root
+from windows_runtime import project_cache_profiles_root, project_cache_root
 from window_capture_source import (
     WindowCaptureTarget,
     capture_target_to_cli_args,
@@ -757,7 +758,7 @@ class PlaybackRuntimeMixin:
             state["timed_out"] = True
             try:
                 if process.state() != QProcess.ProcessState.NotRunning:
-                    process.kill()
+                    _kill_process_tree(process)
             except Exception:
                 pass
             loop.quit()
@@ -781,13 +782,20 @@ class PlaybackRuntimeMixin:
                 workflow_name=workflow_name,
             )
 
-        timeout.start(45000)
+        try:
+            verify_timeout_s = float(
+                os.environ.get("HDRTVNET_COMPILE_VERIFY_TIMEOUT_SECONDS", "1200")
+            )
+        except Exception:
+            verify_timeout_s = 1200.0
+        verify_timeout_ms = int(max(60.0, min(3600.0, verify_timeout_s)) * 1000)
+        timeout.start(verify_timeout_ms)
         loop.exec()
         timeout.stop()
         _drain_output()
         if process.state() != QProcess.ProcessState.NotRunning:
             try:
-                process.kill()
+                _kill_process_tree(process)
             except Exception:
                 pass
             process.waitForFinished(3000)
@@ -1408,11 +1416,12 @@ class PlaybackRuntimeMixin:
             model_path=model_path,
             use_hg=self._chk_hg.isChecked(),
             hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
-            clear_cache=False,
+            clear_cache=opts.selected_clean_compile(),
             predequantize_mode=self._effective_precompile_predequantize_mode(
                 prec_arg,
                 getattr(self, "_predequantize_mode", "auto"),
             ),
+            quality_trials=opts.selected_quality_trials(),
             parent=self,
         )
         dlg.exec()  # modal - blocks until user closes
@@ -1428,10 +1437,8 @@ class PlaybackRuntimeMixin:
                 "NVIDIA uses cached .engine files under src/models/engines instead of PyTorch kernel caches.",
             )
             return
-        import getpass
         import pathlib
         import re
-        import tempfile
         if self._playing or (self._worker is not None and self._worker.isRunning()):
             QMessageBox.information(
                 self,
@@ -1450,17 +1457,26 @@ class PlaybackRuntimeMixin:
         triton_dir = triton_root / "cache"
 
         all_cache_dirs = []
-        if triton_dir.is_dir() and any(triton_dir.iterdir()):
+        profiles_root = pathlib.Path(project_cache_profiles_root(__file__))
+        explicit_cache_root = bool(str(os.environ.get("HDRTVNET_CACHE_DIR", "")).strip())
+        if (
+            not explicit_cache_root
+            and profiles_root.is_dir()
+            and any(profiles_root.iterdir())
+        ):
+            all_cache_dirs.append(profiles_root)
+        elif triton_dir.is_dir() and any(triton_dir.iterdir()):
             all_cache_dirs.append(triton_dir)
 
         inductor_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
         if not inductor_dir:
-            inductor_dir = os.path.join(
-                tempfile.gettempdir(),
-                f"torchinductor_{getpass.getuser()}",
-            )
+            inductor_dir = os.path.join(project_cache_root(__file__), "torchinductor")
         inductor_path = pathlib.Path(inductor_dir)
-        if inductor_path.is_dir() and any(inductor_path.iterdir()):
+        if (
+            not all_cache_dirs
+            and inductor_path.is_dir()
+            and any(inductor_path.iterdir())
+        ):
             all_cache_dirs.append(inductor_path)
 
         marker_path = _compiled_marker_path()
@@ -1493,8 +1509,8 @@ class PlaybackRuntimeMixin:
 
         marker_lines = _read_marker_lines()
         key_re = re.compile(
-            r"^(?:(?P<ns>[^:]+):)?(?P<w>\d+)x(?P<h>\d+)_(?P<precision>[^_]+)_hg[01]_[^_]+_"
-            r"(?:(?:auto|on|off)_)?(?:[A-Za-z0-9-]+)$"
+            r"^(?:(?P<ns>[^:]+):)?(?P<w>\d+)x(?P<h>\d+)_"
+            r"(?P<precision>[^_]+)_hg[01]_.*$"
         )
         marker_groups: dict[tuple[str, int, int], set[str]] = {}
         for line in marker_lines:

@@ -6,7 +6,6 @@ import hashlib
 import os
 import pathlib
 import threading
-import tempfile
 
 _timer_lock = threading.Lock()
 _timer_refcount = 0
@@ -27,15 +26,6 @@ def ensure_windows_supported(component: str) -> None:
     )
 
 
-def default_cache_root() -> str:
-    """Return a stable per-user cache root for Windows builds."""
-    local_app = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-    if local_app:
-        return os.path.join(local_app, "HDRTVNetCache")
-    return os.path.join(tempfile.gettempdir(), "HDRTVNetCache")
-
-
-_PROJECT_CACHE_LAYOUT_VERSION = "p1"
 _COMPILE_NAMESPACE_VERSION = "v2"
 _COMPILE_NAMESPACE_CACHE: dict[str, str] = {}
 
@@ -117,37 +107,30 @@ def compile_cache_namespace(current_file: str | None = None) -> str:
 
 
 def _project_cache_root_base(current_file: str | None = None) -> str:
-    """Return a cache base unique to this local project checkout."""
+    """Return the repo-local cache base for this checkout."""
     project_root = pathlib.Path(project_root_from_path(current_file)).resolve()
-    project_name = project_root.name or "project"
-    safe_name = "".join(
-        ch if (ch.isalnum() or ch in ("-", "_")) else "_"
-        for ch in project_name
-    ).strip("_") or "project"
-    normalized_path = os.path.normcase(str(project_root))
-    digest = hashlib.sha256()
-    digest.update(_PROJECT_CACHE_LAYOUT_VERSION.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(normalized_path.encode("utf-8", errors="surrogatepass"))
-    project_id = digest.hexdigest()[:16]
-    return os.path.join(
-        default_cache_root(),
-        "projects",
-        f"{safe_name}_{project_id}",
-    )
+    return str(project_root / "src" / "models" / "compile_cache")
 
 
 def _compile_profiles_root(base: str) -> str:
-    return os.path.join(base, "compile_profiles")
+    return os.path.join(base, "profiles")
+
+
+def project_cache_profiles_root(current_file: str | None = None) -> str:
+    """Return the repo-local parent folder that contains compile profiles."""
+    explicit = os.environ.get("HDRTVNET_CACHE_DIR")
+    if explicit:
+        return explicit
+    return _compile_profiles_root(_project_cache_root_base(current_file))
+
 
 def project_cache_root(current_file: str | None = None) -> str:
     """Return the cache root for this local checkout and compile namespace."""
     explicit = os.environ.get("HDRTVNET_CACHE_DIR")
     if explicit:
         return explicit
-    base = _project_cache_root_base(current_file)
     ns = compile_cache_namespace(current_file)
-    return os.path.join(_compile_profiles_root(base), ns)
+    return os.path.join(project_cache_profiles_root(current_file), ns)
 
 
 def enable_high_resolution_timer(period_ms: int = 1) -> bool:

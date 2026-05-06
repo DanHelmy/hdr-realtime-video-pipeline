@@ -72,6 +72,32 @@ def _torch_compile_warmup_runs() -> int:
     return min(10, max(1, value))
 
 
+_DEFAULT_TORCH_COMPILE_MODE = "max-autotune"
+_AUTO_ASSUME_ALIGNED_SHAPES = {
+    (1920, 1080),
+    (1280, 720),
+}
+
+
+def _use_channels_last_by_default() -> bool:
+    # ROCm max-autotune can benchmark a different kernel set for NHWC tensors,
+    # and on RDNA cards that is not always faster. Keep ROCm contiguous unless
+    # explicitly opted in for A/B testing.
+    if not _env_bool("HDRTVNET_CHANNELS_LAST", False):
+        return False
+    return True
+
+
+def _assume_aligned_shapes_for_resolution(width: int, height: int) -> bool:
+    value = os.environ.get("HDRTVNET_ASSUME_ALIGNED_SHAPES", "auto")
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    if text in {"force", "always"}:
+        return True
+    return (int(width), int(height)) in _AUTO_ASSUME_ALIGNED_SHAPES
+
+
 # ===================================================================
 # Weight-only INT8 replacement layers (gpt-fast / torchao style)
 # ===================================================================
@@ -822,7 +848,8 @@ class HDRTVNetTorch:
     Optimizations applied automatically per platform:
       * torch.inference_mode() (lower overhead than no_grad).
       * Pre-allocated GPU tensors to avoid per-frame allocation.
-      * AMD/CUDA PyTorch path: cudnn.benchmark + channels_last.
+      * CUDA PyTorch path: cudnn.benchmark + optional channels_last tensors.
+      * ROCm PyTorch path: contiguous tensors by default for max-autotune.
       * AMD PyTorch path: torch.compile with max-autotune when available.
       * Optional CUDA-graph replay for static-shape inputs.
       * Pre-dequantize INT8 weights on PyTorch backends without tensor cores (auto).
@@ -838,9 +865,13 @@ class HDRTVNetTorch:
                  compile_model=True, force_compile=False, compile_mode="auto",
                  use_cuda_graphs=False, force_channels_last=False,
                  predequantize="auto", hg_weights=None, use_hg=True,
-                 warmup_passes=3):
+                 warmup_passes=3, fast_condition_resize=False):
         self.model_path = model_path
         self._warmup_passes = warmup_passes
+        self._fast_condition_resize = (
+            bool(fast_condition_resize)
+            or _env_bool("HDRTVNET_FAST_COND_RESIZE", False)
+        )
         self.device = self._resolve_device(device)
         self.precision = self._resolve_precision(precision, self.device)
         self._use_cuda = self.device.type == "cuda"
@@ -853,6 +884,9 @@ class HDRTVNetTorch:
         self._is_flat_model = False  # True for old-style FX quantized models
         self._is_w8_model = False    # True for GPU W8 weight-only INT8
         self._predequantize = predequantize  # "auto", True, or False
+        self._compile_mode = None
+        self._assume_aligned_shapes = None
+        self._assume_aligned_log_key = None
 
         # ---- Print platform info ------------------------------------------
         if self._use_cuda:
@@ -862,22 +896,35 @@ class HDRTVNetTorch:
 
         self.model = self._load_model(model_path)
 
-        # ---- Platform-specific: channels_last + cudnn.benchmark -----------
-        # AMD continues to use the PyTorch runtime, with channels_last applied
-        # by default as the AMD fast path requested by the GUI/runtime layer.
-        if self._use_cuda and (_IS_ROCM or _IS_NVIDIA or force_channels_last):
+        # ---- Platform-specific: memory format + cudnn.benchmark -----------
+        # NVIDIA PyTorch keeps the historical channels_last fast path. ROCm
+        # defaults to contiguous because max-autotune can pick worse kernels
+        # with channels_last on some AMD cards; opt in with env/CLI to compare.
+        self._memory_format_name = "contiguous"
+        use_channels_last = (
+            self._use_cuda
+            and (
+                bool(force_channels_last)
+                or _IS_NVIDIA
+                or (_IS_ROCM and _use_channels_last_by_default())
+            )
+        )
+        if use_channels_last:
             try:
                 torch.backends.cudnn.benchmark = True
             except Exception:
                 pass
             self.model = self.model.to(memory_format=torch.channels_last)
             self._use_channels_last = True
+            self._memory_format_name = "channels-last"
             if _IS_ROCM:
                 print("ROCm: cudnn.benchmark + channels_last enabled")
             else:
                 print("NVIDIA: cudnn.benchmark + channels_last enabled")
         else:
             self._use_channels_last = False
+            if self._use_cuda and _IS_ROCM:
+                print("ROCm: channels_last disabled; using contiguous tensors")
 
         # ---- torch.compile (PyTorch 2.x) ----------------------------------
         # NVIDIA / ROCm-Linux: auto-enabled when Triton is available.
@@ -902,7 +949,7 @@ class HDRTVNetTorch:
                     print(f"ROCm-Windows: {src}, enabling torch.compile...")
                 try:
                     if compile_mode == "auto":
-                        compile_mode = "max-autotune"
+                        compile_mode = _DEFAULT_TORCH_COMPILE_MODE
                     dynamic = _torch_compile_dynamic_setting()
                     fullgraph = _env_bool("HDRTVNET_COMPILE_FULLGRAPH", False)
                     self.model = torch.compile(
@@ -912,6 +959,7 @@ class HDRTVNetTorch:
                         dynamic=dynamic,
                     )
                     self._compiled = True
+                    self._compile_mode = str(compile_mode)
                     print(
                         "torch.compile enabled "
                         f"(mode={compile_mode}, dynamic={dynamic}, fullgraph={fullgraph})"
@@ -945,6 +993,8 @@ class HDRTVNetTorch:
 
         print(f"PyTorch device : {self.device}")
         print(f"PyTorch precision: {self.precision}")
+        if self._fast_condition_resize:
+            print("Condition resize: fast bilinear path enabled")
 
         # ---- Automatic warmup for optimal performance -----------------------
         # Run a few forward passes to initialize kernels, compile shaders,
@@ -991,6 +1041,7 @@ class HDRTVNetTorch:
             return
         # Use a default size if static input size not known yet
         h, w = self.expected_hw or (1080, 1920)
+        self._configure_assume_aligned_shapes(w, h)
         cond_h, cond_w = max(1, h // 4), max(1, w // 4)
         mem_fmt = (
             torch.channels_last
@@ -1300,6 +1351,30 @@ class HDRTVNetTorch:
 
         return model
 
+    def _configure_assume_aligned_shapes(self, width: int, height: int) -> None:
+        enabled = _assume_aligned_shapes_for_resolution(width, height)
+        root = getattr(self.model, "_orig_mod", self.model)
+        updated = 0
+        try:
+            modules = root.modules()
+        except Exception:
+            modules = ()
+        for module in modules:
+            if hasattr(module, "assume_aligned_shapes"):
+                if bool(getattr(module, "assume_aligned_shapes")) != enabled:
+                    setattr(module, "assume_aligned_shapes", enabled)
+                    updated += 1
+
+        self._assume_aligned_shapes = enabled
+        log_key = (int(width), int(height), bool(enabled))
+        if self._assume_aligned_log_key != log_key:
+            state = "enabled" if enabled else "disabled"
+            print(
+                f"Aligned-shape fast graph {state} for "
+                f"{int(width)}x{int(height)}"
+            )
+            self._assume_aligned_log_key = log_key
+
     # -----------------------------------------------------------------------
     # Buffer management " allocate once, reuse every frame
     # -----------------------------------------------------------------------
@@ -1307,6 +1382,7 @@ class HDRTVNetTorch:
         """Allocate / reallocate persistent GPU tensors when resolution changes.
         For the common case (fixed resolution) this is a no-op after the first
         frame."""
+        self._configure_assume_aligned_shapes(w, h)
         if self._buf_hw == (h, w):
             return
         self._buf_hw = (h, w)
@@ -1367,24 +1443,34 @@ class HDRTVNetTorch:
             non_blocking=self._use_cuda,
         )
 
-        # Condition tensor (0.25- spatial)
-        try:
+        # Condition tensor (0.25- spatial). The fast path matches v0.6 and is
+        # useful for throughput A/B tests; bicubic+antialias remains default.
+        if self._fast_condition_resize:
             cond = F.interpolate(
                 self._gpu_input,
                 scale_factor=0.25,
-                mode="bicubic",
-                align_corners=False,
-                recompute_scale_factor=False,
-                antialias=True,
-            )
-        except TypeError:
-            cond = F.interpolate(
-                self._gpu_input,
-                scale_factor=0.25,
-                mode="bicubic",
+                mode="bilinear",
                 align_corners=False,
                 recompute_scale_factor=False,
             )
+        else:
+            try:
+                cond = F.interpolate(
+                    self._gpu_input,
+                    scale_factor=0.25,
+                    mode="bicubic",
+                    align_corners=False,
+                    recompute_scale_factor=False,
+                    antialias=True,
+                )
+            except TypeError:
+                cond = F.interpolate(
+                    self._gpu_input,
+                    scale_factor=0.25,
+                    mode="bicubic",
+                    align_corners=False,
+                    recompute_scale_factor=False,
+                )
         self._gpu_cond.copy_(cond, non_blocking=self._use_cuda)
 
         return self._gpu_input, self._gpu_cond
@@ -1507,6 +1593,7 @@ class HDRTVNetTorch:
         if not self._compiled:
             return
 
+        self._configure_assume_aligned_shapes(width, height)
         print(
             f"Warming up torch.compile cache for {width}x{height} - "
             "this may take several minutes on first run...",

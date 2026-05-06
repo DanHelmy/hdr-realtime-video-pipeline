@@ -71,6 +71,10 @@ class HDRUNet3T1(nn.Module):
         elif act_type == 'leakyrelu':
             self.act = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
+        # Runtime may flip this before the first torch.compile trace for
+        # GUI-aligned presets. Keep safe alignment as the default.
+        self.assume_aligned_shapes = False
+
     @staticmethod
     def _align_to(x, ref):
         """Center-crop/pad x so spatial size matches ref (H, W)."""
@@ -99,7 +103,53 @@ class HDRUNet3T1(nn.Module):
             x = F.pad(x, (pl, pr, pt, pb), mode='replicate')
         return x
 
-    def forward(self, x):
+    def _forward_assume_aligned(self, x):
+        # v0.6-style fast path for GUI presets whose skip shapes are known to
+        # line up exactly (1080p/720p). Avoid shape checks inside compile graph.
+        if self.weighting_network:
+            mask = self.mask_est(x[0])
+            mask_out = mask * x[0]
+        else:
+            mask_out = x[0] # long skip connection
+
+        cond = self.cond_first(x[1])
+        cond1 = self.CondNet1(cond)
+        cond2 = self.CondNet2(cond)
+        cond3 = self.CondNet3(cond)
+        cond4 = self.CondNet4(cond)
+
+        fea0 = self.act(self.conv_first(x[0]))
+
+        fea0 = self.SFT_layer1((fea0, cond1))
+        fea0 = self.act(self.HR_conv1(fea0))
+
+        fea1 = self.act(self.down_conv1(fea0))
+        fea1, _ = self.recon_trunk1((fea1, cond2))
+
+        fea2 = self.act(self.down_conv2(fea1))
+        fea2, _ = self.recon_trunk2((fea2, cond3))
+
+        fea3 = self.act(self.down_conv3(fea2))
+        out, _ = self.recon_trunk3((fea3, cond4))
+
+        out = out + fea3
+
+        out = self.act(self.up_conv1(out)) + fea2
+        out, _ = self.recon_trunk4((out, cond3))
+
+        out = self.act(self.up_conv2(out)) + fea1
+        out, _ = self.recon_trunk5((out, cond2))
+
+        out = self.act(self.up_conv3(out)) + fea0
+        out = self.SFT_layer2((out, cond1))
+
+        out = self.act(self.HR_conv2(out))
+
+        out = self.conv_last(out)
+        out = mask_out + out
+        return out, x[0]
+
+    def _forward_safe_aligned(self, x):
         # x[0]: img; x[1]: cond
         if self.weighting_network:
             mask = self.mask_est(x[0])
@@ -129,19 +179,33 @@ class HDRUNet3T1(nn.Module):
 
         out = out + fea3
 
-        out = self._align_to(self.act(self.up_conv1(out)), fea2) + fea2
+        up = self.act(self.up_conv1(out))
+        if up.shape[-2:] != fea2.shape[-2:]:
+            up = self._align_to(up, fea2)
+        out = up + fea2
         out, _ = self.recon_trunk4((out, cond3))
 
-        out = self._align_to(self.act(self.up_conv2(out)), fea1) + fea1
+        up = self.act(self.up_conv2(out))
+        if up.shape[-2:] != fea1.shape[-2:]:
+            up = self._align_to(up, fea1)
+        out = up + fea1
         out, _ = self.recon_trunk5((out, cond2))
 
-        out = self._align_to(self.act(self.up_conv3(out)), fea0) + fea0
+        up = self.act(self.up_conv3(out))
+        if up.shape[-2:] != fea0.shape[-2:]:
+            up = self._align_to(up, fea0)
+        out = up + fea0
         out = self.SFT_layer2((out, cond1))
 
         out = self.act(self.HR_conv2(out))
 
         out = self.conv_last(out)
-        out = self._align_to(out, mask_out)
+        if out.shape[-2:] != mask_out.shape[-2:]:
+            out = self._align_to(out, mask_out)
         out = mask_out + out
         return out, x[0]
 
+    def forward(self, x):
+        if self.assume_aligned_shapes:
+            return self._forward_assume_aligned(x)
+        return self._forward_safe_aligned(x)

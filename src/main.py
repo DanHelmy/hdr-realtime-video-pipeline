@@ -5,7 +5,7 @@ import cv2
 
 from windows_runtime import ensure_windows_supported, project_cache_root
 
-# Pin caches to a stable user path (avoid Temp churn/permissions).
+# Pin PyTorch/Triton caches inside this checkout so generated kernels are visible.
 ensure_windows_supported("HDRTVNet++ CLI")
 
 _cache_root = project_cache_root(__file__)
@@ -41,6 +41,63 @@ TARGET_HEIGHT = 1080
 # Pre-allocated letterbox canvas to avoid allocation every frame
 _letterbox_canvas = None
 _letterbox_shape = None
+
+
+def _compiled_marker_predequantize_mode(precision: str, selected_mode: str, processor) -> str:
+    if not str(precision or "").strip().lower().startswith("int8"):
+        return "auto"
+    mode = str(selected_mode or "auto").strip().lower()
+    if mode not in {"auto", "on", "off"}:
+        mode = "auto"
+    if mode != "auto":
+        return mode
+    try:
+        is_w8_model = bool(getattr(processor, "_is_w8_model"))
+    except Exception:
+        return "auto"
+    return "off" if is_w8_model else "on"
+
+
+def _mark_cli_compile_cache(processor, width: int, height: int, args) -> None:
+    """Let the GUI reuse max-autotune kernels produced by CLI warmup."""
+    if _IS_NVIDIA or not getattr(processor, "_compiled", False):
+        return
+    precision = str(getattr(processor, "precision", "") or args.precision).strip().lower()
+    if not precision:
+        return
+    try:
+        from gui_compile_cache import _mark_compiled
+
+        _mark_compiled(
+            int(width),
+            int(height),
+            precision,
+            model_path=str(args.model),
+            use_hg=str(args.use_hg).strip() != "0",
+            predequantize_mode=_compiled_marker_predequantize_mode(
+                precision,
+                str(args.predequantize),
+                processor,
+            ),
+            compile_mode=str(
+                getattr(processor, "_compile_mode", None)
+                or (
+                    "max-autotune"
+                    if str(args.compile_mode) == "auto"
+                    else args.compile_mode
+                )
+            ),
+            memory_format=str(
+                getattr(processor, "_memory_format_name", None)
+                or (
+                    "channels-last"
+                    if getattr(args, "channels_last", False)
+                    else "contiguous"
+                )
+            ),
+        )
+    except Exception as exc:
+        print(f"WARNING: could not write GUI compile marker: {exc}")
 
 def letterbox_frame(frame, target_w, target_h):
     global _letterbox_canvas, _letterbox_shape
@@ -131,8 +188,17 @@ def parse_args():
     parser.add_argument(
         "--compile-mode",
         default="auto",
-        choices=["auto", "default", "reduce-overhead", "max-autotune"],
-        help="torch.compile mode for PyTorch backends (auto = 'max-autotune')"
+        choices=[
+            "auto",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
+        help=(
+            "torch.compile mode for PyTorch backends "
+            "(auto = 'max-autotune')"
+        )
     )
     parser.add_argument(
         "--cuda-graphs",
@@ -153,6 +219,14 @@ def parse_args():
              "'auto' enables on GPUs without INT8 tensor cores (e.g. AMD RDNA3), "
              "giving FP16 inference speed with compressed checkpoint storage. "
              "'on' forces pre-dequantization, 'off' keeps INT8 runtime dequant."
+    )
+    parser.add_argument(
+        "--fast-cond-resize",
+        action="store_true",
+        help=(
+            "Use the v0.6 bilinear condition downsample path instead of "
+            "bicubic+antialias. Faster, but may slightly change output."
+        ),
     )
     parser.add_argument(
         "--cache-resolution",
@@ -257,6 +331,8 @@ def main():
                 predequantize=predeq,
                 hg_weights=args.hg_weights,
                 use_hg=str(args.use_hg).strip() != "0",
+                warmup_passes=0,
+                fast_condition_resize=args.fast_cond_resize,
             )
     except TypeError as exc:
         # Backward-compat for older HDRTVNetTorch without HG args.
@@ -271,6 +347,8 @@ def main():
                 use_cuda_graphs=args.cuda_graphs,
                 force_channels_last=args.channels_last,
                 predequantize=predeq,
+                warmup_passes=0,
+                fast_condition_resize=args.fast_cond_resize,
             )
         else:
             raise
@@ -284,10 +362,13 @@ def main():
         if cache_res == "auto":
             # Use the video's actual processing resolution
             processor.warmup_compile(_proc_w, _proc_h)
+            _mark_cli_compile_cache(processor, _proc_w, _proc_h, args)
         elif cache_res and cache_res != "none":
             try:
                 cw, ch = cache_res.split("x")
-                processor.warmup_compile(int(cw), int(ch))
+                cw_i, ch_i = int(cw), int(ch)
+                processor.warmup_compile(cw_i, ch_i)
+                _mark_cli_compile_cache(processor, cw_i, ch_i, args)
             except ValueError:
                 print(f"Invalid --cache-resolution '{args.cache_resolution}', "
                       "expected WIDTHxHEIGHT (e.g. 1920x1080). Skipping warmup.")

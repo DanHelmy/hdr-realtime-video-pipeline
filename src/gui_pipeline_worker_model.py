@@ -138,11 +138,12 @@ class PipelineWorkerModelMixin:
                     device="auto",
                     precision=cfg["precision"],
                     compile_model=bool(compile_model),
-                    compile_mode="max-autotune",
+                    compile_mode="auto",
                     predequantize=_resolve_predequantize_arg(
                         getattr(self, "_predequantize_mode", "auto")
                     ),
                     use_hg=self._use_hg,
+                    warmup_passes=0,
                 )
         except Exception as exc:
             self._processor = None

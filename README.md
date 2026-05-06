@@ -13,7 +13,7 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, backend-specific inference, export, and live browser-window viewing.
 
-`main` currently tracks **v6.0-in-progress**. It contains unreleased development work for the next release, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with channels-last optimization.
+`main` currently tracks **v6.0-in-progress**. It contains unreleased development work for the next release, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with `torch.compile`/Triton optimization.
 
 Latest stable tagged release: **v5.1**.
 
@@ -26,7 +26,7 @@ Core updates include:
 - cached TensorRT engines under `src/models/engines/` using `{model}_{resolution}_{mode}.engine`
 - no NVIDIA PyTorch fallback: TensorRT build/load errors are logged and shown to the user without crashing the app
 - PyTorch-specific tuning controls are hidden on NVIDIA
-- AMD keeps the PyTorch runtime, with channels-last tensors and benchmark mode enabled
+- AMD keeps the PyTorch runtime, with contiguous tensors by default and opt-in channels-last testing
 - AMD benchmark runs use cached `max-autotune` PyTorch kernels when the exact compile cache is already present, otherwise they stay eager to avoid surprise compile stalls
 - AMD INT8 `Auto` pre-dequantization behavior is preserved
 - new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking, including queued multi-run benchmark batches
@@ -58,7 +58,7 @@ Core updates include:
 - Browser Window Capture now feeds mpv a steady low-FPS stream and lets mpv repeat frames on display vsync instead of forcing 60 fps pipe writes
 - Browser Window Capture waits for the HDR mpv display handoff after cold compile, avoiding the occasional black HDR pane / inactive-HDR startup race
 - cleaner startup logging by filtering harmless Qt DPI-awareness warning spam
-- project-scoped PyTorch kernel caches on AMD so separate local clones do not reuse or delete each other's kernels
+- repo-local PyTorch kernel caches on AMD under `src/models/compile_cache/` so users can see and delete generated kernels
 - bounded cached-kernel verification with clear-and-recompile recovery when an incompatible cache would otherwise hang warmup
 - continued playback/export cleanup from the `v2.x` and `v3.0` work
 
@@ -309,7 +309,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **AMD PyTorch path keeps existing controls**
   - PyTorch compile/eager controls remain available on AMD
   - INT8 pre-dequantization controls remain available on AMD
-  - channels-last is enabled for AMD PyTorch tensors
+  - channels-last is opt-in for AMD PyTorch tensors; contiguous is the default compile/runtime format
   - `Auto` pre-dequantization for AMD INT8 still resolves to pre-dequantize-on
 
 - **NVIDIA UI is TensorRT-focused**
@@ -386,7 +386,8 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **Startup logging is cleaner**
   - harmless Qt DPI-awareness warnings are filtered so launch logs stay focused on real problems
 - **Kernel cache behavior is safer and more local**
-  - AMD PyTorch compile caches are scoped per local project checkout, so multiple local copies no longer reuse or wipe each other's kernels
+  - AMD PyTorch compile caches are stored under `src/models/compile_cache/`, so generated kernels stay visible beside the repo instead of hiding in AppData
+  - multiple local copies no longer reuse or wipe each other's kernels
   - FP16 and predequantized mixed INT8 cache markers now line up consistently in both directions when they share the same effective compiled graph
   - cached-kernel verification now detects incompatible "compiled" caches before playback/export enters a stuck warmup path
   - when verification stops, the dialog prioritizes retrying verification or clean recompilation instead of immediately suggesting cache deletion
@@ -455,7 +456,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Hybrid backend selection** | NVIDIA uses TensorRT engines exclusively; AMD uses the existing PyTorch runtime |
 | **TensorRT engine cache** | NVIDIA engines are built on demand per model/resolution/mode and reused from `src/models/engines/` |
 | **Clear TensorRT engine cache** | NVIDIA-only tool for deleting selected or all cached `.engine` files |
-| **PyTorch kernel compilation** | AMD can use Triton/torch.compile caches in a clean subprocess; caches are project-scoped and verified before reuse |
+| **PyTorch kernel compilation** | AMD can use Triton/torch.compile caches in a clean subprocess; caches are repo-local under `src/models/compile_cache/` and verified before reuse |
 | **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
 | **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
 | **Film grain** | Optional film grain restoration (mpv shader) |
@@ -505,12 +506,11 @@ python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Ta
 - `HDR-VDP3` now has a built-in local bridge at `scripts/hdrvdp3_bridge.py`.
   - The built-in bridge accepts BT.2100 PQ input frames and converts them to absolute display luminance / photometric values before calling `hdrvdp3`.
   - The GUI will use it automatically when `HDRTVNET_HDRVDP3_CMD` is not set.
-  - If an HDR-VDP3 toolbox is already present from an older run, it is reused and copied into the repo-local folder when possible.
+  - If an HDR-VDP3 toolbox is already present under `third_party/hdrvdp/`, it is reused.
   - New toolbox downloads only happen when GNU Octave is available.
   - First HDR-VDP3 run auto-downloads toolbox files into:
     - `third_party/hdrvdp/`
-  - If the repo location is not writable, it falls back to:
-    - `%LOCALAPPDATA%\HDRTVNetCache\hdrvdp\`
+  - If the repo location is not writable, set `HDRTVNET_HDRVDP_CACHE_DIR` intentionally to choose a custom cache path.
   - Requires **GNU Octave** installed and available in `PATH`.
 - You can still override with your own command using env var `HDRTVNET_HDRVDP3_CMD`.
   - Template placeholders: `{test}` / `{pred}`, `{reference}` / `{ref}`, and `{encoding}`.
@@ -660,11 +660,14 @@ Compiled PyTorch kernels are **cached to disk**, so:
 - subsequent playback on an exact cache hit skips the clean precompile subprocess
 - export max-autotune reuses the same compile cache and only compiles cleanly on a real cache miss
 - benchmark reuses the same cache when available but does not launch a new compile on a miss; it falls back to eager for that run
+- caches are stored in `src/models/compile_cache/` by default, next to the project instead of in AppData
 - caches are scoped to the current local project checkout instead of being shared implicitly across different local copies of the repo
+- older builds may have left `%LOCALAPPDATA%\HDRTVNetCache\`; current AMD compile caches do not use that location
 - if an old or incompatible cache looks "compiled" but would hang warmup, the app can stop early and ask to clear/recompile the current project's cache
 
 PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, `mode=max-autotune`, and two warmup passes. Advanced overrides:
 
+- `HDRTVNET_CACHE_DIR=path` intentionally moves the AMD PyTorch/Triton compile cache to a custom location; unset it to keep caches repo-local.
 - `HDRTVNET_COMPILE_DYNAMIC=0|1|auto` controls shape specialization; default is `0`.
 - `HDRTVNET_COMPILE_FULLGRAPH=1` can be used for experiments, but default is `0` for compatibility.
 - `HDRTVNET_COMPILE_WARMUP_RUNS=N` controls compile warmup passes; default is `2`.
@@ -677,9 +680,9 @@ PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, 
 ### Requirements
 
 - Python 3.12 (setup scripts target 3.12 for all backends)
-- PyTorch 2.9.1 backend wheels from the requirement files
+- Backend-specific PyTorch wheels from the requirement files
 - NVIDIA: CUDA 12.6 PyTorch wheels plus TensorRT CUDA 12 bindings/libs and ONNX export dependencies
-- AMD: ROCm-Windows PyTorch plus optional HIP SDK for compiled PyTorch kernels
+- AMD: ROCm-Windows 7.1.1 PyTorch stack plus optional HIP SDK for compiled PyTorch kernels
 - OpenCV, NumPy
 
 ### Setup
@@ -703,7 +706,7 @@ Optional flags:
 This repo now provides backend-specific requirement files under `requirements/`:
 
 - `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`torch==2.9.1+cu126`, `torchvision==0.24.1`, `torchaudio==2.9.1`) + ONNX/TensorRT engine build/runtime deps
-- `requirements/requirements-amd.txt` -> common deps + ROCm-Windows SDK/PyTorch wheels (+ `triton-windows`)
+- `requirements/requirements-amd.txt` -> common deps + ROCm-Windows 7.1.1 SDK/PyTorch wheels (`torch==2.9.0+rocmsdk20251116`, `torchvision==0.24.0+rocmsdk20251116`, `torchaudio==2.9.0+rocmsdk20251116`) + `triton-windows`
 - `requirements/requirements-common.txt` -> shared app deps only (use with manual CPU PyTorch install)
 
 Equivalent setup scripts:
@@ -780,7 +783,7 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 - Pinned (page-locked) host memory for async H2D/D2H DMA transfers
 - `torch.inference_mode()` throughout
 - NVIDIA TensorRT engines built on demand and cached per model/resolution/mode
-- AMD channels-last PyTorch tensors with benchmark mode enabled
+- AMD PyTorch tensors use contiguous memory format by default, with channels-last available as an opt-in test
 - Async video prefetch queue
 - mpv fast path: skips GPU→CPU postprocess when mpv handles HDR display
 
@@ -854,10 +857,10 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 | `--model PATH` | Model weights path (default: `src/models/weights/Ensemble_AGCM_LE.pth`) |
 | `--device auto\|cuda\|cpu` | Device selection (default: auto) |
 | `--precision auto\|fp16\|fp32\|int8-full\|int8-mixed` | Inference precision (default: auto → fp16 on GPU) |
-| `--compile-mode auto\|default\|reduce-overhead\|max-autotune` | PyTorch backend only; torch.compile mode (auto = max-autotune) |
+| `--compile-mode auto\|default\|reduce-overhead\|max-autotune\|max-autotune-no-cudagraphs` | PyTorch backend only; torch.compile mode (auto = max-autotune) |
 | `--force-compile` | AMD PyTorch only; force `torch.compile` on ROCm-Windows when HIP SDK auto-detection fails |
 | `--no-compile` | PyTorch backend only; disable `torch.compile` entirely |
-| `--channels-last` | PyTorch backend only; force channels_last memory format (AMD now enables it automatically) |
+| `--channels-last` | PyTorch backend only; force channels_last memory format for testing (AMD defaults to contiguous) |
 | `--cuda-graphs` | PyTorch backend only; enable CUDA graph replay for static shapes |
 | `--predequantize auto\|on\|off` | AMD PyTorch INT8; pre-dequantize INT8 weights to FP16 at load time (`auto` resolves on for AMD) |
 | `--use-hg 1\|0` | Enable HG refinement (1 = on, 0 = off) |
@@ -1463,7 +1466,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | FP16 inference | ✅ | ✅ | Fallback to FP32 |
 | INT8 quantization | Existing quantized checkpoints exported through TensorRT; W8A8 uses explicit Q/DQ, Mixed W8A16 exports as FP ops, no runtime calibration | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
 | CUDA graphs | Not used | ✅ | N/A |
-| channels_last | Not used in TensorRT engine runtime | Auto on AMD PyTorch | N/A |
+| channels_last | Not used in TensorRT engine runtime | Opt-in on AMD PyTorch | N/A |
 
 ### TensorRT Engine Cache (NVIDIA)
 

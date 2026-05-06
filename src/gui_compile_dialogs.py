@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
@@ -24,6 +26,20 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _DEFAULT_MAX_W = 1920
 _DEFAULT_MAX_H = 1080
+
+
+def _default_quality_trials() -> int:
+    # Keep the normal GUI path fast. Users can opt into repeated clean trials
+    # from the dialog or with HDRTVNET_GUI_AUTOTUNE_QUALITY_TRIALS.
+    raw = os.environ.get(
+        "HDRTVNET_GUI_AUTOTUNE_QUALITY_TRIALS",
+        os.environ.get("HDRTVNET_AUTOTUNE_QUALITY_TRIALS", "1"),
+    )
+    try:
+        value = int(raw)
+    except Exception:
+        value = 1
+    return min(10, max(1, value))
 
 
 def _python_executable_for_clean_subprocess() -> str:
@@ -52,6 +68,31 @@ def _python_executable_for_clean_subprocess() -> str:
         if os.path.isfile(path):
             return path
     return sys.executable
+
+
+def _kill_process_tree(process: QProcess | None) -> None:
+    if process is None:
+        return
+    if process.state() == QProcess.ProcessState.NotRunning:
+        return
+    if os.name == "nt":
+        try:
+            pid = int(process.processId())
+        except Exception:
+            pid = 0
+        if pid > 0:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+                return
+            except Exception:
+                pass
+    process.kill()
 
 
 class _CompileDialog(QDialog):
@@ -179,6 +220,31 @@ class _PrecompileOptionsDialog(QDialog):
         layout.addWidget(QLabel("Resolution to compile:"))
         layout.addWidget(self._res_combo)
 
+        layout.addWidget(QLabel("Autotune quality:"))
+        self._quality_combo = QComboBox()
+        quality_options = [
+            ("Fast single trial (recommended)", 1),
+            ("Best-of-3 clean trials", 3),
+            ("Best-of-5 clean trials", 5),
+        ]
+        for label, value in quality_options:
+            self._quality_combo.addItem(label, value)
+        default_trials = _default_quality_trials()
+        closest = min(
+            range(len(quality_options)),
+            key=lambda idx: abs(quality_options[idx][1] - default_trials),
+        )
+        self._quality_combo.setCurrentIndex(closest)
+        layout.addWidget(self._quality_combo)
+
+        self._clean_compile = QCheckBox("Clean recompile first")
+        self._clean_compile.setChecked(True)
+        self._clean_compile.setToolTip(
+            "Deletes the current project kernel cache before compiling so stale "
+            "or unlucky autotune picks cannot be reused."
+        )
+        layout.addWidget(self._clean_compile)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         btn_ok = QPushButton("Start")
@@ -195,6 +261,15 @@ class _PrecompileOptionsDialog(QDialog):
     def selected_precision(self) -> str:
         return self._precision_combo.currentText()
 
+    def selected_quality_trials(self) -> int:
+        try:
+            return int(self._quality_combo.currentData())
+        except Exception:
+            return _default_quality_trials()
+
+    def selected_clean_compile(self) -> bool:
+        return bool(self._clean_compile.isChecked())
+
 
 class _PrecompileDialog(QDialog):
     """Modal dialog that launches ``compile_kernels.py`` in a separate
@@ -204,6 +279,7 @@ class _PrecompileDialog(QDialog):
                  model_path: str | None = None, use_hg: bool = True,
                  hg_weights: str | None = None, clear_cache: bool = False,
                  predequantize_mode: str = "auto",
+                 quality_trials: int | None = None,
                  parent=None):
         super().__init__(None)
         self._owner_widget = parent
@@ -217,6 +293,8 @@ class _PrecompileDialog(QDialog):
         self._use_hg = bool(use_hg)
         self._hg_weights = hg_weights
         self._clear_cache = clear_cache
+        self._quality_trials = _default_quality_trials() if quality_trials is None else int(quality_trials)
+        self._quality_trials = min(10, max(1, self._quality_trials))
         self._predequantize_mode = str(predequantize_mode).strip().lower()
         if self._predequantize_mode not in {"auto", "on", "off"}:
             self._predequantize_mode = "auto"
@@ -234,8 +312,14 @@ class _PrecompileDialog(QDialog):
 
         detail = QLabel(
             f"Resolutions: {', '.join(resolutions)}  |  Precision: {precision}\n"
-            "This runs in a clean process for best kernel quality.\n"
-            "First compilation may take 2\u20135 minutes per resolution.\n"
+            + (
+                f"Best-of-{self._quality_trials} clean autotune trials; fastest cache wins.\n"
+                f"Expect roughly {self._quality_trials}x first-compile time.\n"
+                if self._quality_trials > 1
+                else "This runs in a clean process for best kernel quality.\n"
+            )
+            + "A short GPU clock pre-warm runs before autotune timing.\n"
+            + "First compilation may take 2\u20135 minutes per resolution.\n"
             "If autotune quality looks unusually bad, restarting the PC before "
             "recompiling can help."
         )
@@ -276,6 +360,8 @@ class _PrecompileDialog(QDialog):
             args += ["--hg-weights", self._hg_weights]
         if self._clear_cache:
             args += ["--clear-cache"]
+        if self._quality_trials > 1:
+            args += ["--quality-trials", str(self._quality_trials)]
 
         self._process = QProcess(self)
         self._process.setWorkingDirectory(_ROOT)
@@ -372,7 +458,7 @@ class _PrecompileDialog(QDialog):
     def _on_close_clicked(self):
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
             self._log.append("\nCanceling compiler process ...")
-            self._process.kill()
+            _kill_process_tree(self._process)
             self._process.waitForFinished(3000)
             self._finished_ok = False
             self.reject()
@@ -381,7 +467,7 @@ class _PrecompileDialog(QDialog):
 
     def closeEvent(self, event):
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
-            self._process.kill()
+            _kill_process_tree(self._process)
             self._process.waitForFinished(3000)
         super().closeEvent(event)
 

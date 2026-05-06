@@ -5,9 +5,9 @@ Local HDR-VDP3 bridge for the GUI.
 Usage:
     python scripts/hdrvdp3_bridge.py --test <img> --reference <img>
 
-It reuses an existing HDR-VDP3 toolbox if present, otherwise auto-downloads it
-into `third_party/hdrvdp/` when writable (falling back to a per-user cache
-directory), then invokes Octave to compute a quality score and prints:
+It reuses an existing repo-local HDR-VDP3 toolbox if present, otherwise
+auto-downloads it into `third_party/hdrvdp/`, then invokes Octave to compute
+a quality score and prints:
     HDRVDP3_SCORE=<float>
 """
 
@@ -37,14 +37,6 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _fallback_hdrvdp_cache_dir() -> Path:
-    """Return per-user fallback cache directory for HDR-VDP3 toolbox files."""
-    local_app = os.environ.get("LOCALAPPDATA")
-    if local_app:
-        return Path(local_app) / "HDRTVNetCache" / "hdrvdp"
-    return Path.home() / ".cache" / "hdrtvnet" / "hdrvdp"
-
-
 def _repo_hdrvdp_base_dir(root: Path) -> Path:
     return root / "third_party" / "hdrvdp"
 
@@ -61,7 +53,7 @@ def _dir_is_writable(base: Path) -> bool:
 
 
 def _default_hdrvdp_base_dir(root: Path) -> Path:
-    """Prefer a repo-local HDR-VDP3 directory, with per-user cache fallback."""
+    """Return the repo-local HDR-VDP3 directory unless explicitly overridden."""
     cache_override = str(os.environ.get("HDRTVNET_HDRVDP_CACHE_DIR", "") or "").strip()
     if cache_override:
         return Path(cache_override)
@@ -69,7 +61,10 @@ def _default_hdrvdp_base_dir(root: Path) -> Path:
     repo_base = _repo_hdrvdp_base_dir(root)
     if _dir_is_writable(repo_base):
         return repo_base
-    return _fallback_hdrvdp_cache_dir()
+    raise RuntimeError(
+        "Repo-local HDR-VDP3 cache is not writable. Move the project to a "
+        "writable folder or set HDRTVNET_HDRVDP_CACHE_DIR intentionally."
+    )
 
 
 def _toolbox_probe(base: Path) -> Path | None:
@@ -91,38 +86,7 @@ def _existing_hdrvdp_toolbox(root: Path) -> Path | None:
     if repo_toolbox is not None:
         return repo_toolbox
 
-    fallback_base = _fallback_hdrvdp_cache_dir()
-    fallback_toolbox = _toolbox_probe(fallback_base)
-    if fallback_toolbox is not None:
-        if _maybe_migrate_toolbox_to_repo(root, fallback_toolbox):
-            migrated = _toolbox_probe(_repo_hdrvdp_base_dir(root))
-            if migrated is not None:
-                return migrated
-        return fallback_toolbox
-
     return None
-
-
-def _maybe_migrate_toolbox_to_repo(root: Path, source_toolbox: Path) -> bool:
-    """Best-effort copy of an older cached toolbox into the repo-local directory."""
-    cache_override = str(os.environ.get("HDRTVNET_HDRVDP_CACHE_DIR", "") or "").strip()
-    if cache_override:
-        return False
-
-    repo_base = _repo_hdrvdp_base_dir(root)
-    if not _dir_is_writable(repo_base):
-        return False
-
-    destination = repo_base / HDRVDP_VERSION
-    if (destination / "hdrvdp3.m").is_file():
-        return True
-
-    try:
-        repo_base.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_toolbox, destination, dirs_exist_ok=True)
-    except Exception:
-        return False
-    return (destination / "hdrvdp3.m").is_file()
 
 
 def _safe_extract(zf: zipfile.ZipFile, dst: Path):
