@@ -51,8 +51,23 @@ print("HDRTVNET_GUI_IMPORT_OK")
     )
     Set-Content -Path $probePath -Value $probeCode -Encoding UTF8
     try {
-        $output = (& $PythonExe $probePath 2>&1 | Out-String)
-        $rc = $LASTEXITCODE
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $PythonExe
+        $psi.Arguments = ('"{0}"' -f $probePath)
+        $psi.WorkingDirectory = $Repo
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $proc = [System.Diagnostics.Process]::new()
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        $rc = $proc.ExitCode
+        $output = (($stdout, $stderr) -join "")
     } finally {
         Remove-Item -LiteralPath $probePath -ErrorAction SilentlyContinue
     }

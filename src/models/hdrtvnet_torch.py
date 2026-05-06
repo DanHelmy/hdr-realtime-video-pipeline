@@ -39,8 +39,9 @@ if os.name == "nt" and _IS_ROCM:
 else:
     _HAS_HIP_SDK, _HIP_SDK_ROOT = False, None
 
-# Enable TF32 on Ampere+ GPUs " harmless no-op on AMD
-if hasattr(torch, "set_float32_matmul_precision"):
+# Enable TF32 on Ampere+ NVIDIA GPUs. Keep ROCm out of this path to avoid
+# PyTorch 2.9 TF32 deprecation warnings for an optimization AMD cannot use.
+if _IS_NVIDIA and hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
 
 
