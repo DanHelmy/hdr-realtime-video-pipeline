@@ -69,7 +69,46 @@ def _patch_triton_amd_include_dirs() -> None:
             normalized.add(key)
 
 
+def _patch_inductor_rocm_cluster_dims() -> None:
+    """Add missing Triton cluster metadata expected by Torch 2.9 Inductor."""
+    if not _HAS_TRITON or os.name != "nt" or not _IS_ROCM:
+        return
+    try:
+        from torch._inductor.runtime import triton_heuristics
+    except Exception:
+        return
+
+    cls = getattr(triton_heuristics, "TritonCompileResult", None)
+    if cls is None or getattr(cls, "_hdrtvnet_rocm_cluster_patch", False):
+        return
+    original_make_launcher = getattr(cls, "make_launcher", None)
+    if original_make_launcher is None:
+        return
+
+    def _make_launcher_with_cluster_dims(self):
+        kernel = getattr(self, "kernel", None)
+        metadata = getattr(kernel, "metadata", None)
+        if metadata is not None and not hasattr(metadata, "cluster_dims"):
+            try:
+                fields = tuple(getattr(metadata, "_fields", ()))
+                if fields and hasattr(metadata, "_asdict"):
+                    values = dict(metadata._asdict())
+                    values["cluster_dims"] = (1, 1, 1)
+                    meta_cls = cls._kernel_metadata_cls(tuple(values.keys()))
+                    kernel.metadata = meta_cls(**values)
+                else:
+                    # Last-resort path for non-namedtuple metadata objects.
+                    setattr(metadata, "cluster_dims", (1, 1, 1))
+            except Exception:
+                pass
+        return original_make_launcher(self)
+
+    cls.make_launcher = _make_launcher_with_cluster_dims
+    cls._hdrtvnet_rocm_cluster_patch = True
+
+
 _patch_triton_amd_include_dirs()
+_patch_inductor_rocm_cluster_dims()
 
 if os.name == "nt" and _IS_ROCM:
     _HAS_HIP_SDK, _HIP_SDK_ROOT = detect_hip_sdk_windows()
