@@ -742,13 +742,21 @@ class HDRTVNetTorch:
       * AMD PyTorch path: torch.compile with max-autotune when available.
       * Optional CUDA-graph replay for static-shape inputs.
       * Pre-dequantize INT8 weights on PyTorch backends without tensor cores (auto).
+      * Automatic warmup to initialize kernels and eliminate first-frame lag.
+
+    Args:
+        warmup_passes: Number of dummy inference passes to run during init.
+                       Default=3. Set to 0 to disable. Higher values help
+                       torch.compile converge on optimal kernel selection.
     """
 
     def __init__(self, model_path, device="auto", precision="auto",
                  compile_model=True, force_compile=False, compile_mode="auto",
                  use_cuda_graphs=False, force_channels_last=False,
-                 predequantize="auto", hg_weights=None, use_hg=True):
+                 predequantize="auto", hg_weights=None, use_hg=True,
+                 warmup_passes=3):
         self.model_path = model_path
+        self._warmup_passes = warmup_passes
         self.device = self._resolve_device(device)
         self.precision = self._resolve_precision(precision, self.device)
         self._use_cuda = self.device.type == "cuda"
@@ -854,6 +862,13 @@ class HDRTVNetTorch:
         print(f"PyTorch device : {self.device}")
         print(f"PyTorch precision: {self.precision}")
 
+        # ---- Automatic warmup for optimal performance -----------------------
+        # Run a few forward passes to initialize kernels, compile shaders,
+        # and activate optimization hooks. This eliminates first-frame lag.
+        if self._use_cuda and self._warmup_passes > 0:
+            print(f"Warming up with {self._warmup_passes} inference passes...")
+            self._warmup()
+
     # -----------------------------------------------------------------------
     # Device / precision helpers
     # -----------------------------------------------------------------------
@@ -882,6 +897,46 @@ class HDRTVNetTorch:
         if device.type != "cuda" and p == "fp16":
             return "fp32"
         return p
+
+    # -----------------------------------------------------------------------
+    # Warmup
+    # -----------------------------------------------------------------------
+    def _warmup(self):
+        """Run dummy forward passes to warm up kernels and compile caches."""
+        if self.model is None:
+            return
+        # Use a default size if static input size not known yet
+        h, w = self.expected_hw or (1080, 1920)
+        cond_h, cond_w = max(1, h // 4), max(1, w // 4)
+        mem_fmt = (
+            torch.channels_last
+            if self._use_channels_last
+            else torch.contiguous_format
+        )
+        dummy = torch.randn(
+            (1, 3, h, w),
+            device=self.device,
+            dtype=self._dtype,
+        ).to(memory_format=mem_fmt)
+        dummy_cond = torch.randn(
+            (1, 3, cond_h, cond_w),
+            device=self.device,
+            dtype=self._dtype,
+        ).to(memory_format=mem_fmt)
+
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            for _ in range(self._warmup_passes):
+                if self._is_flat_model:
+                    _ = self.model(dummy, dummy_cond)
+                else:
+                    _ = self.model((dummy, dummy_cond))
+        if self._use_cuda:
+            torch.cuda.synchronize(self.device)
+        elapsed = time.perf_counter() - t0
+        per_pass = elapsed / max(self._warmup_passes, 1) * 1000
+        print(f"  Warmup done: {self._warmup_passes} passes in {elapsed:.2f}s "
+              f"({per_pass:.1f} ms/pass)")
 
     # -----------------------------------------------------------------------
     # Model loading
