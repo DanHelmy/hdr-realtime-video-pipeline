@@ -32,10 +32,15 @@ import os
 import sys
 import time
 
-from windows_runtime import ensure_windows_supported, project_cache_root
+from windows_runtime import (
+    configure_rocm_sdk_environment,
+    ensure_windows_supported,
+    project_cache_root,
+)
 
 # Pin PyTorch/Triton caches inside this checkout so generated kernels are visible.
 ensure_windows_supported("HDRTVNet++ kernel compiler")
+configure_rocm_sdk_environment()
 
 _cache_root = project_cache_root(__file__)
 try:
@@ -687,7 +692,23 @@ def main():
         print(f"{prefix} ({i}/{total}) {action} for {w}x{h} ...")
         sys.stdout.flush()
         t0 = time.perf_counter()
-        processor.warmup_compile(w, h)
+        try:
+            processor.warmup_compile(w, h)
+        except Exception as exc:
+            print(
+                f"{prefix} ERROR: torch.compile warmup failed for {w}x{h}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(3)
+        if not bool(getattr(processor, "_compiled", False)):
+            print(
+                f"{prefix} ERROR: torch.compile fell back to eager for {w}x{h}; "
+                "compiled cache was not generated.",
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(3)
         elapsed = time.perf_counter() - t0
         print(f"{prefix} ({i}/{total}) {w}x{h} done in {elapsed:.1f}s")
         sys.stdout.flush()

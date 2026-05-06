@@ -4,6 +4,7 @@ import pathlib
 import re
 import threading
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -13,6 +14,14 @@ import torch.nn.functional as F
 from hip_sdk_detection import detect_hip_sdk_windows
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE
 from models.hdrtvnet_modules.HG_Composite_arch import HG_Composite
+_ROCM_INCLUDE_DIRS = []
+try:
+    from windows_runtime import configure_rocm_sdk_environment, rocm_sdk_include_dirs
+
+    configure_rocm_sdk_environment()
+    _ROCM_INCLUDE_DIRS = rocm_sdk_include_dirs()
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,12 +36,40 @@ _HAS_COMPILE = hasattr(torch, "compile")          # PyTorch >= 2.0
 _HAS_CUDA_GRAPHS = hasattr(torch.cuda, "CUDAGraph")  # PyTorch >= 1.10
 _IS_ROCM = hasattr(torch.version, "hip") and torch.version.hip is not None
 _IS_NVIDIA = torch.cuda.is_available() and not _IS_ROCM
+if _IS_ROCM:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Please use the new API settings to control TF32 behavior.*",
+        category=UserWarning,
+    )
 
 try:
     import triton  # noqa: F401
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
+
+
+def _patch_triton_amd_include_dirs() -> None:
+    """Work around ROCm 7.1.1 wheels where Triton misses _rocm_sdk_core/include."""
+    if not _HAS_TRITON or os.name != "nt" or not _IS_ROCM:
+        return
+    try:
+        from triton.backends.amd import driver as amd_driver
+    except Exception:
+        return
+    include_dirs = getattr(amd_driver, "include_dirs", None)
+    if not isinstance(include_dirs, list):
+        return
+    normalized = {os.path.normcase(os.path.normpath(str(p))) for p in include_dirs}
+    for include_dir in _ROCM_INCLUDE_DIRS:
+        key = os.path.normcase(os.path.normpath(str(include_dir)))
+        if key not in normalized:
+            include_dirs.append(str(include_dir))
+            normalized.add(key)
+
+
+_patch_triton_amd_include_dirs()
 
 if os.name == "nt" and _IS_ROCM:
     _HAS_HIP_SDK, _HIP_SDK_ROOT = detect_hip_sdk_windows()
@@ -1625,6 +1662,11 @@ class HDRTVNetTorch:
             warmup_runs = _torch_compile_warmup_runs()
             for i in range(warmup_runs):
                 self.process(dummy)  # triggers full compile -> Triton disk cache
+                if not self._compiled:
+                    raise RuntimeError(
+                        "torch.compile failed during warmup and fell back to "
+                        "eager mode; no compiled kernel cache was generated."
+                    )
                 if self._use_cuda:
                     torch.cuda.synchronize()
                 if warmup_runs > 1:

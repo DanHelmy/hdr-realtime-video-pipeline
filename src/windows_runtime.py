@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import os
 import pathlib
+import sys
 import threading
 
 _timer_lock = threading.Lock()
@@ -24,6 +25,87 @@ def ensure_windows_supported(component: str) -> None:
     raise SystemExit(
         f"{component} is Windows-only. Unsupported platform: {os.name}."
     )
+
+
+def _has_hip_runtime_header(root: str | os.PathLike[str]) -> bool:
+    try:
+        return (pathlib.Path(root) / "include" / "hip" / "hip_runtime.h").is_file()
+    except Exception:
+        return False
+
+
+def _rocm_env_candidate_roots() -> list[pathlib.Path]:
+    roots: list[pathlib.Path] = []
+    for base in {sys.prefix, getattr(sys, "base_prefix", sys.prefix)}:
+        if not base:
+            continue
+        site = pathlib.Path(base) / "Lib" / "site-packages"
+        # ROCm 7.1.1 wheels put hip_runtime.h under _rocm_sdk_core while
+        # Triton may otherwise discover _rocm_sdk_devel first.
+        roots.append(site / "_rocm_sdk_core")
+        roots.append(site / "_rocm_sdk_devel")
+
+    for env_key in ("HIP_PATH", "ROCM_PATH", "ROCM_HOME"):
+        value = os.environ.get(env_key)
+        if value:
+            roots.append(pathlib.Path(value))
+
+    roots.extend(
+        [
+            pathlib.Path(r"C:\Program Files\AMD\ROCm\7.1"),
+            pathlib.Path(r"C:\Program Files\AMD\ROCm"),
+        ]
+    )
+
+    uniq: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            normalized = os.path.normcase(str(root.resolve()))
+        except Exception:
+            normalized = os.path.normcase(str(root))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        uniq.append(root)
+    return uniq
+
+
+def configure_rocm_sdk_environment() -> str | None:
+    """Point ROCm/Triton discovery at a root with HIP headers when available."""
+    if os.name != "nt":
+        return None
+    selected: pathlib.Path | None = None
+    for root in _rocm_env_candidate_roots():
+        if _has_hip_runtime_header(root):
+            selected = root
+            break
+    if selected is None:
+        return None
+
+    selected_str = str(selected)
+    for env_key in ("HIP_PATH", "ROCM_PATH", "ROCM_HOME"):
+        os.environ[env_key] = selected_str
+    return selected_str
+
+
+def rocm_sdk_include_dirs() -> list[str]:
+    """Return ROCm include dirs that contain HIP headers, ordered by preference."""
+    includes: list[str] = []
+    seen: set[str] = set()
+    for root in _rocm_env_candidate_roots():
+        include_dir = pathlib.Path(root) / "include"
+        if not (include_dir / "hip" / "hip_runtime.h").is_file():
+            continue
+        try:
+            key = os.path.normcase(str(include_dir.resolve()))
+        except Exception:
+            key = os.path.normcase(str(include_dir))
+        if key in seen:
+            continue
+        seen.add(key)
+        includes.append(str(include_dir))
+    return includes
 
 
 _COMPILE_NAMESPACE_VERSION = "v2"
