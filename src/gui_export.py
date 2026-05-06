@@ -49,6 +49,8 @@ from models.hdrtvnet_torch import (
     _HAS_TRITON,
     _IS_NVIDIA,
     _IS_ROCM,
+    tensorrt_engine_path,
+    tensorrt_mode_name,
 )
 from video_source import VideoSource
 
@@ -814,13 +816,31 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
             else:
                 self.progress.emit(0, "Loading export model ...")
             if _IS_NVIDIA:
+                mode_name = f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}"
+                trt_mode_name = tensorrt_mode_name(
+                    str(cfg.get("precision") or "fp16"),
+                    mode_name,
+                )
+                engine_path = tensorrt_engine_path(
+                    model_path,
+                    int(self._config.width),
+                    int(self._config.height),
+                    trt_mode_name,
+                )
+                if os.path.isfile(engine_path):
+                    self.progress.emit(0, "Loading cached TensorRT engine ...")
+                else:
+                    self.progress.emit(
+                        0,
+                        "Building TensorRT engine for this export. First run can take a few minutes ...",
+                    )
                 processor = HDRTVNetTensorRT(
                     model_path,
                     device="auto",
                     precision=str(cfg.get("precision") or "fp16"),
                     engine_width=int(self._config.width),
                     engine_height=int(self._config.height),
-                    mode_name=f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}",
+                    mode_name=mode_name,
                     use_hg=self._config.use_hg,
                 )
             else:

@@ -62,23 +62,25 @@ class _CompileDialog(QDialog):
         super().__init__(None)
         self._owner_widget = parent
         self.setWindowTitle("Compiling Kernels")
-        self.setFixedSize(460, 160)
+        self.setFixedSize(520, 180)
         configure_independent_window(self, minimize=False, maximize=False, close=False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(8)
 
-        title = QLabel("Compiling optimized GPU kernels...")
-        title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        layout.addWidget(title)
+        self._lbl_title = QLabel("Compiling optimized GPU kernels...")
+        self._lbl_title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._lbl_title.setWordWrap(True)
+        layout.addWidget(self._lbl_title)
 
-        detail = QLabel(
+        self._lbl_detail = QLabel(
             "First run at this resolution may take 2\u20135 minutes.\n"
             "Subsequent runs load from cache in seconds."
         )
-        detail.setProperty("muted", True)
-        layout.addWidget(detail)
+        self._lbl_detail.setWordWrap(True)
+        self._lbl_detail.setProperty("muted", True)
+        layout.addWidget(self._lbl_detail)
 
         bar = QProgressBar()
         bar.setRange(0, 0)                 # indeterminate / busy animation
@@ -87,8 +89,44 @@ class _CompileDialog(QDialog):
         layout.addWidget(bar)
 
         self._lbl_status = QLabel("")
+        self._lbl_status.setWordWrap(True)
         self._lbl_status.setProperty("accentText", True)
         layout.addWidget(self._lbl_status)
+
+    def set_message(self, *, window_title: str, title: str, detail: str):
+        self.setWindowTitle(window_title)
+        self._lbl_title.setText(title)
+        self._lbl_detail.setText(detail)
+
+    def configure_for_tensorrt(
+        self,
+        *,
+        cache_miss: bool,
+        width: int,
+        height: int,
+        precision: str,
+    ):
+        resolution = f"{int(width)}x{int(height)}"
+        if cache_miss:
+            self.set_message(
+                window_title="Building TensorRT Engine",
+                title="Building optimized TensorRT engine...",
+                detail=(
+                    f"First run for {precision} at {resolution} can take a few minutes.\n"
+                    "The finished engine is cached and reused on later runs."
+                ),
+            )
+            self.set_status("Exporting ONNX and optimizing TensorRT tactics ...")
+        else:
+            self.set_message(
+                window_title="Loading TensorRT Engine",
+                title="Loading cached TensorRT engine...",
+                detail=(
+                    f"TensorRT engine cache found for {precision} at {resolution}.\n"
+                    "Playback will start as soon as the runtime is ready."
+                ),
+            )
+            self.set_status("Loading cached TensorRT engine ...")
 
     def set_status(self, text: str):
         self._lbl_status.setText(text)

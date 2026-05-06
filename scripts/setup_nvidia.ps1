@@ -53,6 +53,13 @@ except Exception as exc:
     ok = False
 
 try:
+    import tensorrt_libs
+    print("[setup-nvidia] TensorRT CUDA 12 libraries import OK")
+except Exception as exc:
+    print(f"[setup-nvidia] WARNING: TensorRT CUDA 12 libraries import failed: {exc}")
+    ok = False
+
+try:
     import tensorrt as trt
     print(f"[setup-nvidia] TensorRT {trt.__version__}")
     _ = trt.Builder(trt.Logger(trt.Logger.WARNING))
@@ -108,7 +115,7 @@ Write-Step "Installing NVIDIA dependencies..."
 if (-not $SkipPipUpgrade) {
     & $venvPython -m pip install --upgrade pip setuptools wheel
 }
-& $venvPython -m pip install -r $reqFile
+& $venvPython -m pip install --prefer-binary -r $reqFile
 
 Write-Step "Checking NVIDIA TensorRT runtime..."
 $trtReady = Test-NvidiaTensorRTRuntime -PythonExe $venvPython

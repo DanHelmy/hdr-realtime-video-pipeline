@@ -87,6 +87,8 @@ try:
         _HAS_TRITON,
         _IS_NVIDIA,
         _IS_ROCM,
+        tensorrt_engine_path,
+        tensorrt_mode_name,
     )
 except Exception:
     _HAS_COMPILE = False
@@ -94,6 +96,12 @@ except Exception:
     _HAS_TRITON = False
     _IS_NVIDIA = False
     _IS_ROCM = False
+
+    def tensorrt_engine_path(*a, **kw) -> str:  # type: ignore[misc]
+        return ""
+
+    def tensorrt_mode_name(*a, **kw) -> str:  # type: ignore[misc]
+        return ""
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -2750,6 +2758,18 @@ class PlaybackRuntimeMixin:
         # If the Triton + Inductor cache is already warm from a previous
         # compile, the subprocess finishes in seconds and auto-closes.
         model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
+        tensorrt_engine_cache_miss = False
+        if _IS_NVIDIA:
+            trt_cfg = PRECISIONS.get(gui_prec, {})
+            trt_mode = f"{gui_prec}_{'hg' if self._chk_hg.isChecked() else 'nohg'}"
+            trt_engine_mode = tensorrt_mode_name(
+                trt_cfg.get("precision", prec_arg),
+                trt_mode,
+            )
+            trt_engine = tensorrt_engine_path(model_path, pw, ph, trt_engine_mode)
+            tensorrt_engine_cache_miss = bool(
+                trt_engine and not os.path.isfile(trt_engine)
+            )
         self._autotune_warning_needed = False
         if self._runtime_execution_mode_uses_compile():
             compile_ready = self._is_compile_ready_for_runtime(
@@ -2942,8 +2962,12 @@ class PlaybackRuntimeMixin:
         # this may include the one-time TensorRT engine build for this mode.
         self._compile_dlg = _CompileDialog(self)
         if _IS_NVIDIA:
-            self._compile_dlg.setWindowTitle("Preparing TensorRT Engine")
-            self._compile_dlg.set_status("Loading or building TensorRT engine ...")
+            self._compile_dlg.configure_for_tensorrt(
+                cache_miss=tensorrt_engine_cache_miss,
+                width=pw,
+                height=ph,
+                precision=gui_prec,
+            )
         self._compile_dlg.show()
 
         self._prepare_playback_logging_for_start()
@@ -3424,6 +3448,31 @@ class PlaybackRuntimeMixin:
                         precision=new_prec,
                         view=self._cmb_view.currentText(),
                         use_hg=self._chk_hg.isChecked(),
+                        upscale=current_upscale,
+                        film_grain=self._chk_film_grain.isChecked()
+                        if hasattr(self, "_chk_film_grain")
+                        else None,
+                        hdr_gt=self._hdr_ground_truth_path,
+                        autoplay=True,
+                        start_frame=int(self._seek_slider.value()),
+                    )
+                    return
+            elif _IS_NVIDIA:
+                use_hg = self._chk_hg.isChecked()
+                trt_cfg = PRECISIONS.get(new_prec, {})
+                trt_mode = f"{new_prec}_{'hg' if use_hg else 'nohg'}"
+                trt_engine_mode = tensorrt_mode_name(trt_cfg.get("precision", new_prec), trt_mode)
+                trt_engine_path = tensorrt_engine_path(target_model_path, cur_pw, cur_ph, trt_engine_mode)
+                if not os.path.isfile(trt_engine_path):
+                    self.statusBar().showMessage(
+                        f"TensorRT engine for {new_prec} not built at {cur_pw}x{cur_ph}; restarting to build."
+                    )
+                    self._save_user_settings()
+                    self._restart_with_active_source(
+                        resolution=new_res,
+                        precision=new_prec,
+                        view=self._cmb_view.currentText(),
+                        use_hg=use_hg,
                         upscale=current_upscale,
                         film_grain=self._chk_film_grain.isChecked()
                         if hasattr(self, "_chk_film_grain")

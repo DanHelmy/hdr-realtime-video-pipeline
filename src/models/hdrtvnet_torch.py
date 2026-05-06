@@ -387,8 +387,15 @@ class TRTQDQConv2d(nn.Module):
             return x
         scale = self.x_scale.to(device=x.device)
         if self.activation_asymmetric:
-            zp = self.x_zero_point.to(device=x.device)
-            return torch.fake_quantize_per_tensor_affine(x, scale, zp, 0, 255)
+            # TRT GPU requires symmetric INT8 (zero_point=0). Convert the
+            # asymmetric UINT8 calibration by expanding the scale to cover
+            # both sides of the asymmetric float range.
+            zp = self.x_zero_point.float().to(device=x.device)
+            sym_scale = torch.clamp(
+                torch.max(zp * scale, (255.0 - zp) * scale) / 127.0, min=1e-8
+            )
+            zp_zero = torch.tensor(0, dtype=torch.int32, device=x.device)
+            return torch.fake_quantize_per_tensor_affine(x, sym_scale, zp_zero, -128, 127)
         zp = torch.tensor(0, dtype=torch.int32, device=x.device)
         return torch.fake_quantize_per_tensor_affine(x, scale, zp, -128, 127)
 
@@ -455,8 +462,15 @@ class TRTQDQLinear(nn.Module):
             return x
         scale = self.x_scale.to(device=x.device)
         if self.activation_asymmetric:
-            zp = self.x_zero_point.to(device=x.device)
-            return torch.fake_quantize_per_tensor_affine(x, scale, zp, 0, 255)
+            # TRT GPU requires symmetric INT8 (zero_point=0). Convert the
+            # asymmetric UINT8 calibration by expanding the scale to cover
+            # both sides of the asymmetric float range.
+            zp = self.x_zero_point.float().to(device=x.device)
+            sym_scale = torch.clamp(
+                torch.max(zp * scale, (255.0 - zp) * scale) / 127.0, min=1e-8
+            )
+            zp_zero = torch.tensor(0, dtype=torch.int32, device=x.device)
+            return torch.fake_quantize_per_tensor_affine(x, sym_scale, zp_zero, -128, 127)
         zp = torch.tensor(0, dtype=torch.int32, device=x.device)
         return torch.fake_quantize_per_tensor_affine(x, scale, zp, -128, 127)
 
@@ -479,10 +493,75 @@ class TRTQDQLinear(nn.Module):
         return F.linear(x, w, bias)
 
 
+class TRTFloatConv2d(nn.Module):
+    """Conv2d export module for W8A16 layers as a plain FP TensorRT op."""
+
+    def __init__(self, w8_mod):
+        super().__init__()
+        self.stride = w8_mod.stride
+        self.padding = w8_mod.padding
+        self.dilation = w8_mod.dilation
+        self.groups = w8_mod.groups
+
+        scale = w8_mod.scale.detach().float()
+        weight = w8_mod.weight_int8.detach().float() * scale.view(-1, 1, 1, 1)
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        if w8_mod.bias is not None:
+            self.bias = nn.Parameter(w8_mod.bias.detach().float().clone(),
+                                     requires_grad=False)
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight.to(dtype=x.dtype)
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.conv2d(x, w, bias, self.stride, self.padding,
+                        self.dilation, self.groups)
+
+
+class TRTFloatLinear(nn.Module):
+    """Linear export module for W8A16 layers as a plain FP TensorRT op."""
+
+    def __init__(self, w8_mod):
+        super().__init__()
+        scale = w8_mod.scale.detach().float()
+        weight = w8_mod.weight_int8.detach().float() * scale.view(-1, 1)
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        if w8_mod.bias is not None:
+            self.bias = nn.Parameter(w8_mod.bias.detach().float().clone(),
+                                     requires_grad=False)
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight.to(dtype=x.dtype)
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, w, bias)
+
+
+class _GlobalAvgPool2d(nn.Module):
+    """TRT-compatible replacement for AdaptiveAvgPool2d(1) — exports as ReduceMean."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=(2, 3), keepdim=True)
+
+
+def _patch_adaptive_avgpool_for_trt(model: nn.Module) -> None:
+    """Replace AdaptiveAvgPool2d(output_size=1) in-place with ReduceMean-based equivalent.
+
+    TensorRT 10.x does not support the SequenceEmpty ONNX op that the dynamo exporter
+    emits for AdaptiveAvgPool2d when it is lowered through aten.as_strided.
+    """
+    for name, child in list(model.named_children()):
+        if isinstance(child, nn.AdaptiveAvgPool2d) and child.output_size in (1, (1, 1)):
+            setattr(model, name, _GlobalAvgPool2d())
+        else:
+            _patch_adaptive_avgpool_for_trt(child)
+
+
 def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
     """Replace W8/W8A8 runtime wrappers with TensorRT-friendly Q/DQ modules."""
     converted_w8a8 = 0
-    converted_w8 = 0
+    converted_w8_fp = 0
     for name, module in list(model.named_modules()):
         if not isinstance(module, (W8Conv2d, W8A8Conv2d, W8Linear, W8A8Linear)):
             continue
@@ -491,19 +570,24 @@ def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
         for p in parts[:-1]:
             parent = getattr(parent, p)
         quantize_activation = isinstance(module, (W8A8Conv2d, W8A8Linear))
-        if isinstance(module, (W8Conv2d, W8A8Conv2d)):
+        if quantize_activation and isinstance(module, W8A8Conv2d):
             replacement = TRTQDQConv2d(module, quantize_activation)
-        else:
-            replacement = TRTQDQLinear(module, quantize_activation)
-        setattr(parent, parts[-1], replacement)
-        if quantize_activation:
             converted_w8a8 += 1
+        elif quantize_activation and isinstance(module, W8A8Linear):
+            replacement = TRTQDQLinear(module, quantize_activation)
+            converted_w8a8 += 1
+        elif isinstance(module, W8Conv2d):
+            replacement = TRTFloatConv2d(module)
+            converted_w8_fp += 1
         else:
-            converted_w8 += 1
-    if converted_w8a8 or converted_w8:
+            replacement = TRTFloatLinear(module)
+            converted_w8_fp += 1
+        setattr(parent, parts[-1], replacement)
+    if converted_w8a8 or converted_w8_fp:
         print(
             "TensorRT Q/DQ export: "
-            f"{converted_w8a8} W8A8 layers, {converted_w8} W8A16 layers"
+            f"{converted_w8a8} W8A8 layers, "
+            f"{converted_w8_fp} W8A16 layers exported as FP"
         )
     return model
 
@@ -1542,7 +1626,8 @@ def tensorrt_onnx_path(
 def tensorrt_mode_name(precision: str, mode: str) -> str:
     mode_name = str(mode or precision or "mode")
     if str(precision).startswith("int8") and "qdq" not in mode_name.lower():
-        mode_name = f"{mode_name}_qdqv1"
+        qdq_version = "qdqv2" if str(precision).startswith("int8-mixed") else "qdqv1"
+        mode_name = f"{mode_name}_{qdq_version}"
     return mode_name
 
 
@@ -1581,6 +1666,7 @@ def _export_tensorrt_onnx_from_model(
     export_model = getattr(model, "_orig_mod", model).eval()
     if str(precision).startswith("int8"):
         export_model = _convert_model_to_tensorrt_qdq(export_model).eval()
+    _patch_adaptive_avgpool_for_trt(export_model)
     wrapper = _ONNXExportWrapper(export_model, flat_model=flat_model).eval()
     h, w = int(height), int(width)
     cond_h, cond_w = max(1, h // 4), max(1, w // 4)
@@ -1722,12 +1808,11 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
         network = builder.create_network(flags)
         parser = trt.OnnxParser(network, logger)
-        with open(onnx_path, "rb") as f:
-            if not parser.parse(f.read()):
-                errors = []
-                for i in range(parser.num_errors):
-                    errors.append(str(parser.get_error(i)))
-                raise RuntimeError("ONNX parse failed:\n" + "\n".join(errors))
+        if not parser.parse_from_file(onnx_path):
+            errors = []
+            for i in range(parser.num_errors):
+                errors.append(str(parser.get_error(i)))
+            raise RuntimeError("ONNX parse failed:\n" + "\n".join(errors))
 
         config = builder.create_builder_config()
         workspace_gb = float(os.environ.get("HDRTVNET_TRT_WORKSPACE_GB", "4"))

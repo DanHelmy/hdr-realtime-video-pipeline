@@ -301,7 +301,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - engines are built only when a mode/model/resolution is activated
   - cache files are saved under `src/models/engines/`
 - engine names follow `{model}_{resolution}_{mode}.engine`
-- INT8 TensorRT engine names include a `qdqv1` mode suffix so older non-Q/DQ cache files are not reused
+- INT8 TensorRT engine names include a Q/DQ version suffix so older incompatible cache files are not reused
   - existing engines load directly on later runs
   - if engine build/load fails, the app logs the error, informs the user, and does not crash
   - NVIDIA does not fall back to PyTorch inference
@@ -623,7 +623,7 @@ The first time you play, export, or benchmark a given model/resolution/mode comb
 
 `src/models/engines/{model}_{resolution}_{mode}.engine`
 
-INT8 TensorRT modes include a `qdqv1` suffix in the mode portion of the filename.
+INT8 TensorRT modes include a Q/DQ version suffix in the mode portion of the filename. Mixed INT8 uses the newer `qdqv2` suffix because W8A16 layers are exported as plain FP TensorRT ops while true W8A8 layers keep explicit Q/DQ.
 
 If the engine is missing, the app loads the selected `.pt` / `.pth` model, exports a cached ONNX file with the same model/resolution/mode stem when needed, builds a TensorRT engine, saves it, and then runs inference through that engine. Later runs load the `.engine` directly. If an ONNX file already exists but the engine does not, the app reuses the ONNX file to rebuild the engine.
 
@@ -678,7 +678,7 @@ PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, 
 
 - Python 3.12 (setup scripts target 3.12 for all backends)
 - PyTorch 2.9.1 backend wheels from the requirement files
-- NVIDIA: TensorRT Python bindings plus ONNX export dependencies
+- NVIDIA: CUDA 12.6 PyTorch wheels plus TensorRT CUDA 12 bindings/libs and ONNX export dependencies
 - AMD: ROCm-Windows PyTorch plus optional HIP SDK for compiled PyTorch kernels
 - OpenCV, NumPy
 
@@ -702,7 +702,7 @@ Optional flags:
 
 This repo now provides backend-specific requirement files under `requirements/`:
 
-- `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`cu126`) + ONNX/TensorRT engine build/runtime deps
+- `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`torch==2.9.1+cu126`, `torchvision==0.24.1`, `torchaudio==2.9.1`) + ONNX/TensorRT engine build/runtime deps
 - `requirements/requirements-amd.txt` -> common deps + ROCm-Windows SDK/PyTorch wheels (+ `triton-windows`)
 - `requirements/requirements-common.txt` -> shared app deps only (use with manual CPU PyTorch install)
 
@@ -717,9 +717,11 @@ Equivalent setup scripts:
 
 **NVIDIA (CUDA, Python 3.12):**
 ```bash
-pip install -r requirements/requirements-nvidia.txt
+.\venv\Scripts\python.exe -m pip install --prefer-binary -r requirements/requirements-nvidia.txt
 ```
 NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export cached ONNX artifacts during first-time model/resolution/mode builds, but Triton is not required for NVIDIA inference.
+
+The NVIDIA requirement file installs PyTorch from the CUDA 12.6 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `tensorrt_cu12_bindings>=10.0`, and `tensorrt_cu12_libs>=10.0`. The Python import name remains `tensorrt`; the split package names are the NVIDIA CUDA 12 wheel names.
 
 `setup.bat` / `scripts/setup_nvidia.ps1` performs a post-install NVIDIA runtime check:
 
@@ -727,10 +729,11 @@ NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.
 - `torch.cuda`
 - `onnx`
 - `onnxscript`
-- `tensorrt`
+- `tensorrt_libs`
+- `tensorrt` import from the CUDA 12 bindings wheel
 - TensorRT builder creation
 
-A separate CUDA Toolkit/SDK is not required in the AMD HIP SDK sense when the pip wheels provide the needed runtime libraries. If the TensorRT check fails, update the NVIDIA driver first; if it still fails, install the matching NVIDIA CUDA Toolkit / TensorRT runtime from NVIDIA and rerun setup.
+A separate CUDA Toolkit/SDK is not required in the AMD HIP SDK sense when the pip wheels provide the needed runtime libraries. If the TensorRT check fails, update the NVIDIA driver first, then rerun setup with a fresh venv. If the wheel-provided TensorRT runtime still cannot import/build, install the matching NVIDIA CUDA Toolkit / TensorRT runtime from NVIDIA and rerun setup.
 
 **AMD ROCm-Windows (Python 3.12):**
 ```bash
@@ -813,7 +816,7 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, existing quantized checkpoints are still the source files for INT8 modes, but TensorRT export converts their W8/W8A8 wrappers into ONNX `QuantizeLinear` / `DequantizeLinear` Q/DQ graphs before engine build. This is TensorRT's explicit quantization path: calibration/scales are embedded before ONNX export, and no runtime calibration table is used. FP32 modes build FP32 TensorRT engines; FP16 modes build FP16 TensorRT engines.
+On NVIDIA, existing quantized checkpoints are still the source files for INT8 modes, but TensorRT export converts W8A8 wrappers into ONNX `QuantizeLinear` / `DequantizeLinear` Q/DQ graphs before engine build. In Mixed INT8, weight-only W8A16 layers are exported as plain FP ops to avoid Q/DQ overhead around layers that cannot run as true activation-quantized INT8. Calibration/scales are embedded before ONNX export, and no runtime calibration table is used. FP32 modes build FP32 TensorRT engines; FP16 modes build FP16 TensorRT engines.
 
 ---
 
@@ -1458,7 +1461,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | Engine/cache behavior | On-demand `.engine` build + cached load | `torch.compile` cache when enabled | N/A |
 | torch.compile | Not used | Auto (Windows: needs HIP SDK) | Not supported |
 | FP16 inference | ✅ | ✅ | Fallback to FP32 |
-| INT8 quantization | Existing quantized checkpoints exported as explicit Q/DQ TensorRT engines, no runtime calibration | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
+| INT8 quantization | Existing quantized checkpoints exported through TensorRT; W8A8 uses explicit Q/DQ, Mixed W8A16 exports as FP ops, no runtime calibration | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
 | CUDA graphs | Not used | ✅ | N/A |
 | channels_last | Not used in TensorRT engine runtime | Auto on AMD PyTorch | N/A |
 
@@ -1472,7 +1475,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | Different model/resolution/mode | Build a new `.engine` once |
 | Build/load failure | Log and inform user; no NVIDIA PyTorch fallback |
 | Manual clear | `Tools -> Clear TensorRT Engine Cache ...` |
-| Live size metric | GUI shows `Checkpoint: ... MB`; NVIDIA uses the cached ONNX export size, AMD uses the PyTorch checkpoint size |
+| Live size metric | GUI shows `Engine: ... MB` on NVIDIA from the cached TensorRT `.engine`; AMD keeps `Checkpoint: ... MB` from the PyTorch checkpoint |
 
 Manual engine prebuild:
 

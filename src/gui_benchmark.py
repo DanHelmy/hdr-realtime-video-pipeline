@@ -106,6 +106,8 @@ from models.hdrtvnet_torch import (
     _HAS_TRITON,
     _IS_NVIDIA,
     _IS_ROCM,
+    tensorrt_engine_path,
+    tensorrt_mode_name,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
@@ -1624,13 +1626,28 @@ class _BenchmarkWorker(QObject):
                 ),
             )
             if _IS_NVIDIA:
+                mode_name = f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}"
+                trt_mode_name = tensorrt_mode_name(model_precision, mode_name)
+                engine_path = tensorrt_engine_path(
+                    model_path,
+                    out_w,
+                    out_h,
+                    trt_mode_name,
+                )
+                if os.path.isfile(engine_path):
+                    self.progress.emit(0, "Loading cached TensorRT engine ...")
+                else:
+                    self.progress.emit(
+                        0,
+                        "Building TensorRT engine for benchmark. First run can take a few minutes ...",
+                    )
                 processor = HDRTVNetTensorRT(
                     model_path,
                     device="auto",
                     precision=model_precision,
                     engine_width=out_w,
                     engine_height=out_h,
-                    mode_name=f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}",
+                    mode_name=mode_name,
                     use_hg=bool(cfg.use_hg),
                 )
                 cfg.runtime_mode = "TensorRT"

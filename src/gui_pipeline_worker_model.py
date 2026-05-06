@@ -5,7 +5,13 @@ import sys
 
 import torch
 
-from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
+from models.hdrtvnet_torch import (
+    HDRTVNetTensorRT,
+    HDRTVNetTorch,
+    _IS_NVIDIA,
+    tensorrt_engine_path,
+    tensorrt_mode_name,
+)
 from gui_config import PRECISIONS, _select_model_path
 
 
@@ -101,6 +107,22 @@ class PipelineWorkerModelMixin:
         try:
             if _IS_NVIDIA:
                 mode_name = f"{key}_{'hg' if self._use_hg else 'nohg'}"
+                trt_mode_name = tensorrt_mode_name(cfg["precision"], mode_name)
+                trt_engine = tensorrt_engine_path(
+                    path,
+                    int(cw),
+                    int(ch),
+                    trt_mode_name,
+                )
+                if announce_ready:
+                    if os.path.isfile(trt_engine):
+                        self.status_message.emit(
+                            f"Loading cached TensorRT engine for {cw}x{ch} ({key}) ..."
+                        )
+                    else:
+                        self.status_message.emit(
+                            f"Building TensorRT engine for {cw}x{ch} ({key}) ..."
+                        )
                 self._processor = HDRTVNetTensorRT(
                     path,
                     device="auto",
@@ -133,7 +155,7 @@ class PipelineWorkerModelMixin:
         if announce_ready:
             if getattr(self._processor, "_trt_engine", None) is not None:
                 self.status_message.emit(
-                    f"Loading TensorRT engine for {cw}x{ch} ({key}) ..."
+                    f"Priming TensorRT runtime for {cw}x{ch} ({key}) ..."
                 )
             elif getattr(self._processor, "_compiled", False):
                 self.status_message.emit(
