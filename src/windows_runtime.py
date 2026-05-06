@@ -40,7 +40,7 @@ def _rocm_env_candidate_roots() -> list[pathlib.Path]:
         if not base:
             continue
         site = pathlib.Path(base) / "Lib" / "site-packages"
-        # ROCm 7.1.1 wheels put hip_runtime.h under _rocm_sdk_core while
+        # Some ROCm wheels put hip_runtime.h under _rocm_sdk_core while
         # Triton may otherwise discover _rocm_sdk_devel first.
         roots.append(site / "_rocm_sdk_core")
         roots.append(site / "_rocm_sdk_devel")
@@ -50,12 +50,13 @@ def _rocm_env_candidate_roots() -> list[pathlib.Path]:
         if value:
             roots.append(pathlib.Path(value))
 
-    roots.extend(
-        [
-            pathlib.Path(r"C:\Program Files\AMD\ROCm\7.1"),
-            pathlib.Path(r"C:\Program Files\AMD\ROCm"),
-        ]
-    )
+    rocm_root = pathlib.Path(r"C:\Program Files\AMD\ROCm")
+    roots.append(rocm_root)
+    if rocm_root.is_dir():
+        try:
+            roots.extend(p for p in sorted(rocm_root.iterdir()) if p.is_dir())
+        except Exception:
+            pass
 
     uniq: list[pathlib.Path] = []
     seen: set[str] = set()

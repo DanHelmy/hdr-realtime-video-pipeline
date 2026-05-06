@@ -682,7 +682,7 @@ PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, 
 - Python 3.12 (setup scripts target 3.12 for all backends)
 - Backend-specific PyTorch wheels from the requirement files
 - NVIDIA: CUDA 12.6 PyTorch wheels plus TensorRT CUDA 12 bindings/libs and ONNX export dependencies
-- AMD: ROCm-Windows 7.1.1 PyTorch stack plus optional HIP SDK for compiled PyTorch kernels
+- AMD: ROCm-Windows 7.2.1 PyTorch stack plus optional HIP SDK for compiled PyTorch kernels
 - OpenCV, NumPy
 
 ### Setup
@@ -706,7 +706,7 @@ Optional flags:
 This repo now provides backend-specific requirement files under `requirements/`:
 
 - `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`torch==2.9.1+cu126`, `torchvision==0.24.1`, `torchaudio==2.9.1`) + ONNX/TensorRT engine build/runtime deps
-- `requirements/requirements-amd.txt` -> common deps + ROCm-Windows 7.1.1 SDK/PyTorch wheels (`torch==2.9.0+rocmsdk20251116`, `torchvision==0.24.0+rocmsdk20251116`, `torchaudio==2.9.0+rocmsdk20251116`) + `triton-windows`
+- `requirements/requirements-amd.txt` -> common deps + ROCm-Windows 7.2.1 SDK/PyTorch wheels (`torch==2.9.1+rocm7.2.1`, `torchvision==0.24.1+rocm7.2.1`, `torchaudio==2.9.1+rocm7.2.1`) + `triton-windows`
 - `requirements/requirements-common.txt` -> shared app deps only (use with manual CPU PyTorch install)
 
 Equivalent setup scripts:

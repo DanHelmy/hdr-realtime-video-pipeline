@@ -51,7 +51,7 @@ except ImportError:
 
 
 def _patch_triton_amd_include_dirs() -> None:
-    """Work around ROCm 7.1.1 wheels where Triton misses _rocm_sdk_core/include."""
+    """Work around ROCm wheels where Triton misses _rocm_sdk_core/include."""
     if not _HAS_TRITON or os.name != "nt" or not _IS_ROCM:
         return
     try:
