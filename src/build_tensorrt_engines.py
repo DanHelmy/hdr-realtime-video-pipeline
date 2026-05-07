@@ -22,6 +22,7 @@ if _HERE not in sys.path:
 
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
+    cleanup_tensorrt_onnx_after_engine,
     tensorrt_engine_path,
     tensorrt_mode_name,
     tensorrt_onnx_path,
@@ -87,7 +88,7 @@ def main() -> int:
     parser.add_argument(
         "--force-onnx",
         action="store_true",
-        help="Also remove the cached .onnx file before rebuilding.",
+        help="Remove any stale .onnx before rebuilding.",
     )
     parser.add_argument(
         "--opt-level",
@@ -158,8 +159,7 @@ def main() -> int:
             os.remove(onnx_path)
         if os.path.isfile(engine_path):
             print(f"[tensorrt] cache hit: {engine_path}")
-            if os.path.isfile(onnx_path):
-                print(f"[tensorrt] onnx: {onnx_path}")
+            cleanup_tensorrt_onnx_after_engine(onnx_path, engine_path)
             if args.benchmark_runs <= 0:
                 continue
         print(
@@ -201,8 +201,6 @@ def main() -> int:
             )
         del processor
         print(f"[tensorrt] ready: {engine_path}")
-        if os.path.isfile(onnx_path):
-            print(f"[tensorrt] onnx: {onnx_path}")
 
     return 0
 

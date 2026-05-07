@@ -1792,6 +1792,18 @@ def tensorrt_onnx_path(
     return os.path.splitext(tensorrt_engine_path(model_path, width, height, mode))[0] + ".onnx"
 
 
+def cleanup_tensorrt_onnx_after_engine(onnx_path: str, engine_path: str) -> bool:
+    if not onnx_path or not os.path.isfile(engine_path) or not os.path.isfile(onnx_path):
+        return False
+    try:
+        os.remove(onnx_path)
+        print(f"TensorRT ONNX removed after engine ready: {onnx_path}")
+        return True
+    except Exception as exc:
+        print(f"TensorRT ONNX cleanup skipped: {exc}")
+        return False
+
+
 def tensorrt_mode_name(precision: str, mode: str) -> str:
     mode_name = str(mode or precision or "mode")
     if str(precision).startswith("int8") and "qdq" not in mode_name.lower():
@@ -1826,11 +1838,13 @@ def _export_tensorrt_onnx_from_model(
     device: torch.device,
     precision: str,
     flat_model: bool,
-    force: bool = False,
 ) -> str:
-    if os.path.isfile(onnx_path) and not force:
-        print(f"TensorRT ONNX cache hit: {onnx_path}")
-        return onnx_path
+    if os.path.isfile(onnx_path):
+        try:
+            os.remove(onnx_path)
+            print(f"TensorRT stale ONNX removed before export: {onnx_path}")
+        except Exception as exc:
+            print(f"TensorRT stale ONNX removal skipped: {exc}")
 
     export_model = getattr(model, "_orig_mod", model).eval()
     if str(precision).startswith("int8"):
@@ -1936,6 +1950,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             self._build_engine_from_loaded_model()
         else:
             print(f"TensorRT engine cache hit: {self.engine_path}")
+            cleanup_tensorrt_onnx_after_engine(self.onnx_path, self.engine_path)
 
         # Runtime must not retain the PyTorch model after the engine exists.
         self.model = None
@@ -1967,9 +1982,9 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             device=self.device,
             precision=self.precision,
             flat_model=getattr(self, "_is_flat_model", False),
-            force=False,
         )
         self._build_engine_from_onnx(onnx_path, trt)
+        cleanup_tensorrt_onnx_after_engine(onnx_path, self.engine_path)
 
     def _build_engine_from_onnx(self, onnx_path: str, trt) -> None:
         logger = trt.Logger(trt.Logger.INFO)

@@ -6,11 +6,6 @@ import torch
 
 from gui_config import _select_model_path
 
-try:
-    from models.hdrtvnet_torch import _IS_NVIDIA
-except Exception:
-    _IS_NVIDIA = False
-
 
 class PipelineWorkerRuntimeMetricsMixin:
     """Live metrics emit helper for PipelineWorker."""
@@ -77,29 +72,19 @@ class PipelineWorkerRuntimeMetricsMixin:
             prec_label = "Bypass (HDR input)"
             model_size_label = "Checkpoint"
         else:
-            engine_path = (
-                str(getattr(self._processor, "engine_path", "") or "")
-                if _IS_NVIDIA
-                else ""
-            )
             cache_key = (
                 str(self._precision_key),
                 bool(self._use_hg),
-                engine_path,
             )
             model_size_label = "Checkpoint"
             if getattr(self, "_metrics_model_size_key", None) != cache_key:
                 model_mb = 0.0
                 cached_label = "Checkpoint"
-                if _IS_NVIDIA and engine_path and os.path.isfile(engine_path):
-                    model_mb = os.path.getsize(engine_path) / (1024 * 1024)
-                    cached_label = "Engine"
-                else:
-                    model_path = _select_model_path(self._precision_key, self._use_hg)
-                    model_mb = os.path.getsize(model_path) / (1024 * 1024)
-                    if self._use_hg and self._precision_key in ("FP16", "FP32"):
-                        if os.path.isfile(hg_weights_path):
-                            model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
+                model_path = _select_model_path(self._precision_key, self._use_hg)
+                model_mb = os.path.getsize(model_path) / (1024 * 1024)
+                if self._use_hg and self._precision_key in ("FP16", "FP32"):
+                    if os.path.isfile(hg_weights_path):
+                        model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
                 self._metrics_model_size_key = cache_key
                 self._metrics_model_size_mb = model_mb
                 self._metrics_model_size_label = cached_label

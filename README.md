@@ -446,7 +446,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
-| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint/export artifact size, precision, processing resolution |
+| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint size, precision, processing resolution |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, queued multi-run batches, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
@@ -625,7 +625,7 @@ The first time you play, export, or benchmark a given model/resolution/mode comb
 
 INT8 TensorRT modes include a Q/DQ version suffix in the mode portion of the filename. Mixed INT8 uses the newer `qdqv2` suffix because W8A16 layers are exported as plain FP TensorRT ops while true W8A8 layers keep explicit Q/DQ.
 
-If the engine is missing, the app loads the selected `.pt` / `.pth` model, exports a cached ONNX file with the same model/resolution/mode stem when needed, builds a TensorRT engine, saves it, and then runs inference through that engine. Later runs load the `.engine` directly. If an ONNX file already exists but the engine does not, the app reuses the ONNX file to rebuild the engine.
+If the engine is missing, the app loads the selected `.pt` / `.pth` model, exports a temporary ONNX file with the same model/resolution/mode stem, builds a TensorRT engine, saves it, removes the ONNX file, and then runs inference through that engine. Later runs load the `.engine` directly.
 
 The GUI creates the TensorRT engine only when the user activates a mode whose engine is missing. You can also pre-build NVIDIA engines manually:
 
@@ -647,7 +647,7 @@ Advanced TensorRT build environment overrides:
 - `HDRTVNET_TRT_DEDICATED_STREAM=1|0` runs TensorRT enqueue on a non-default CUDA stream; default is `1`.
 - `HDRTVNET_TRT_AUX_STREAMS=N` optionally sets TensorRT build-time auxiliary stream count.
 
-The manual prebuild script also exposes `--opt-level`, `--workspace-gb`, `--timing-cache`, `--aux-streams`, `--force-onnx`, and `--benchmark-runs` so NVIDIA test machines can rebuild and report comparable numbers from one command.
+The manual prebuild script also exposes `--opt-level`, `--workspace-gb`, `--timing-cache`, `--aux-streams`, `--force-onnx`, and `--benchmark-runs` so NVIDIA test machines can rebuild and report comparable numbers from one command. `--force-onnx` is mainly for clearing stale ONNX files left by older builds.
 
 If the TensorRT engine build or load fails, the error is logged and shown to the user. The app does not silently fall back to PyTorch on NVIDIA.
 
@@ -722,7 +722,7 @@ Equivalent setup scripts:
 ```bash
 .\venv\Scripts\python.exe -m pip install --prefer-binary -r requirements/requirements-nvidia.txt
 ```
-NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export cached ONNX artifacts during first-time model/resolution/mode builds, but Triton is not required for NVIDIA inference.
+NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export temporary ONNX artifacts during first-time model/resolution/mode builds, but Triton is not required for NVIDIA inference.
 
 The NVIDIA requirement file installs PyTorch from the CUDA 12.6 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `tensorrt_cu12_bindings>=10.0`, and `tensorrt_cu12_libs>=10.0`. The Python import name remains `tensorrt`; the split package names are the NVIDIA CUDA 12 wheel names.
 
@@ -1472,13 +1472,12 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 
 | Scenario | Behavior |
 |---|---|
-| First run for model/resolution/mode | Load checkpoint, export cached `.onnx`, build `.engine` |
+| First run for model/resolution/mode | Load checkpoint, export temporary `.onnx`, build `.engine`, remove `.onnx` |
 | Cached model/resolution/mode | Load `.engine` directly |
-| Missing engine with cached ONNX | Rebuild `.engine` from cached `.onnx` |
 | Different model/resolution/mode | Build a new `.engine` once |
 | Build/load failure | Log and inform user; no NVIDIA PyTorch fallback |
 | Manual clear | `Tools -> Clear TensorRT Engine Cache ...` |
-| Live size metric | GUI shows `Engine: ... MB` on NVIDIA from the cached TensorRT `.engine`; AMD keeps `Checkpoint: ... MB` from the PyTorch checkpoint |
+| Live size metric | GUI shows `Checkpoint: ... MB` from the selected `.pt` / `.pth` checkpoint on NVIDIA and AMD |
 
 Manual engine prebuild:
 
