@@ -2976,6 +2976,10 @@ class PlaybackRuntimeMixin:
             ),
             expect_display_handoff=bool(use_mpv_pipeline),
         )
+        try:
+            self._worker.set_sdr_visible(self._is_sdr_output_visible())
+        except Exception:
+            pass
 
         # Show loading dialog while the worker loads the runtime. On NVIDIA
         # this may include the one-time TensorRT engine build for this mode.

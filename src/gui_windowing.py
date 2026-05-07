@@ -63,6 +63,25 @@ class WindowingMixin:
         widget.setParent(None)
         host_layout.addWidget(widget)
 
+    def _is_sdr_output_visible(self) -> bool:
+        if self._sdr_float_window is not None and self._sdr_float_window.isVisible():
+            return True
+        if self._video_tabs is None:
+            return True
+        idx = self._video_tabs.currentIndex()
+        if idx < 0:
+            return True
+        label = self._video_tabs.tabText(idx)
+        return label in {"SDR", "Side by Side"}
+
+    def _sync_worker_sdr_visibility(self) -> bool:
+        visible = self._is_sdr_output_visible()
+        try:
+            self._worker.set_sdr_visible(visible)
+        except Exception:
+            pass
+        return visible
+
     def _on_video_tab_changed(self, index: int):
         if self._video_tabs is None or index < 0:
             return
@@ -98,6 +117,8 @@ class WindowingMixin:
 
         self._with_layout_freeze(_apply_tab_switch, refresh_delay=40)
         if self._playing:
+            self._sync_worker_sdr_visibility()
+        if self._playing:
             self._relock_timeline(delay_ms=140, drop_frames=3)
 
     def _on_app_state_changed(self, state: Qt.ApplicationState):
@@ -127,6 +148,8 @@ class WindowingMixin:
             self._btn_pop_sdr.setText("Dock SDR")
 
         self._with_layout_freeze(_apply_pop, refresh_delay=40)
+        if self._playing:
+            self._sync_worker_sdr_visibility()
         if self._playing:
             self._relock_timeline(delay_ms=160, drop_frames=3)
 
@@ -194,6 +217,8 @@ class WindowingMixin:
                 self._btn_pop_hdr.setText("Pop HDR")
 
         self._with_layout_freeze(_apply_dock, refresh_delay=40)
+        if self._playing and str(key).lower() == "sdr":
+            self._sync_worker_sdr_visibility()
         if self._playing:
             self._relock_timeline(delay_ms=160, drop_frames=3)
             if str(key).lower() == "hdr":
@@ -808,9 +833,8 @@ class WindowingMixin:
                 self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
         # Let the worker skip unnecessary copies / postprocess
         if self._playing:
-            # Keep SDR path running so tab switches stay instantaneous.
-            self._worker.set_sdr_visible(True)
-            if self._last_sdr_frame is not None:
+            sdr_visible = self._sync_worker_sdr_visibility()
+            if sdr_visible and self._last_sdr_frame is not None:
                 if self._disp_sdr_cpu is not None:
                     self._disp_sdr_cpu.update_frame(self._last_sdr_frame)
             # Any view change can desync; relock the timeline.
