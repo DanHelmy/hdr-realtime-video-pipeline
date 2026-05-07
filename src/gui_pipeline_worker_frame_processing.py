@@ -513,6 +513,27 @@ class PipelineWorkerFrameProcessingMixin:
         # File playback may carry an absolute presentation time. Live capture
         # uses the feeder's steady low-FPS clock and mpv's display sync.
         queue_present_t = present_t
+        if (
+            queue_present_t is None
+            and getattr(self, "_capture_target", None)
+            and mpv_w is not None
+            and self._sdr_visible
+            and self._sdr_mpv_widget is not None
+        ):
+            try:
+                capture_fps = float(self._capture_target.get("fps", 24.0) or 24.0)
+            except Exception:
+                capture_fps = 24.0
+            try:
+                delay_frames = float(
+                    os.environ.get("HDRTVNET_LIVE_PAIR_PRESENT_DELAY_FRAMES", "0.75")
+                )
+            except Exception:
+                delay_frames = 0.75
+            interval_s = 1.0 / max(1.0, capture_fps)
+            queue_present_t = time.perf_counter() + (
+                interval_s * max(0.0, min(2.0, delay_frames))
+            )
         need_display_frame = self._input_is_hdr or self._sdr_visible or mpv_w is None
         display_frame = _letterbox_bgr(frame, out_w, out_h) if need_display_frame else None
         model_latency_ms = 0.0

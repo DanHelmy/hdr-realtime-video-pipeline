@@ -63,15 +63,22 @@ class WindowingMixin:
         widget.setParent(None)
         host_layout.addWidget(widget)
 
+    def _current_video_tab_label(self) -> str:
+        if self._video_tabs is None:
+            return ""
+        idx = self._video_tabs.currentIndex()
+        if idx < 0:
+            return ""
+        return str(self._video_tabs.tabText(idx) or "")
+
     def _is_sdr_output_visible(self) -> bool:
         if self._sdr_float_window is not None and self._sdr_float_window.isVisible():
             return True
         if self._video_tabs is None:
             return True
-        idx = self._video_tabs.currentIndex()
-        if idx < 0:
+        label = self._current_video_tab_label()
+        if not label:
             return True
-        label = self._video_tabs.tabText(idx)
         return label in {"SDR", "Side by Side"}
 
     def _sync_worker_sdr_visibility(self) -> bool:
@@ -82,13 +89,32 @@ class WindowingMixin:
             pass
         return visible
 
+    def _schedule_sdr_reactivation_relock(self):
+        """Re-pair mpv outputs after leaving HDR-only playback."""
+        if not self._playing:
+            return
+
+        def _do(drop_frames: int):
+            if not self._playing:
+                return
+            if self._worker is not None:
+                self._worker.flush_hdr_queue(drop_frames=drop_frames)
+            if not self._is_live_window_capture_active():
+                self._resync_audio_to_current_timeline()
+
+        QTimer.singleShot(70, lambda: _do(3))
+        QTimer.singleShot(190, lambda: _do(2))
+
     def _on_video_tab_changed(self, index: int):
         if self._video_tabs is None or index < 0:
             return
-        self._pause_for_ui_transition()
+        new_label = str(self._video_tabs.tabText(index) or "")
+        old_label = str(getattr(self, "_active_video_tab_label", "") or "")
+        reactivate_sdr = old_label == "HDR" and new_label in {"SDR", "Side by Side"}
+        self._pause_for_ui_transition(duration_ms=260 if reactivate_sdr else None)
 
         def _apply_tab_switch():
-            label = self._video_tabs.tabText(index)
+            label = new_label
             if label == "Side by Side":
                 # Side-by-side needs both panes docked in the split hosts.
                 if self._sdr_float_window is not None:
@@ -116,9 +142,12 @@ class WindowingMixin:
             self._save_user_settings()
 
         self._with_layout_freeze(_apply_tab_switch, refresh_delay=40)
+        self._active_video_tab_label = new_label
         if self._playing:
             self._sync_worker_sdr_visibility()
-        if self._playing:
+        if self._playing and reactivate_sdr:
+            self._schedule_sdr_reactivation_relock()
+        elif self._playing:
             self._relock_timeline(delay_ms=140, drop_frames=3)
 
     def _on_app_state_changed(self, state: Qt.ApplicationState):

@@ -2977,6 +2977,7 @@ class PlaybackRuntimeMixin:
             expect_display_handoff=bool(use_mpv_pipeline),
         )
         try:
+            self._active_video_tab_label = self._current_video_tab_label()
             self._worker.set_sdr_visible(self._is_sdr_output_visible())
         except Exception:
             pass

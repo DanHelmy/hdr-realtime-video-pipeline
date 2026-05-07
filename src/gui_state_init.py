@@ -168,6 +168,7 @@ class StateInitMixin:
         self._startup_frame_relock_token = 0
         self._last_sdr_frame = None
         self._last_hdr_frame = None
+        self._active_video_tab_label = ""
         self._compare_dialog = None
         self._compare_snapshot_pending = False
         self._compare_progress_dlg = None

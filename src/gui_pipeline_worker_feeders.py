@@ -175,11 +175,12 @@ class PipelineWorkerFeedersMixin:
                     if item is None:
                         break
 
+                    source_t = None
                     ready_event = None
                     if isinstance(item, tuple) and len(item) == 3:
-                        _source_t, tensor, ready_event = item
+                        source_t, tensor, ready_event = item
                     elif isinstance(item, tuple) and len(item) == 2:
-                        _source_t, tensor = item
+                        source_t, tensor = item
                     else:
                         tensor = item
 
@@ -193,7 +194,13 @@ class PipelineWorkerFeedersMixin:
                         tensor,
                         rgb48_host_state,
                     )
-                    if next_present_t <= 0.0:
+                    try:
+                        item_present_t = float(source_t) if source_t is not None else 0.0
+                    except Exception:
+                        item_present_t = 0.0
+                    if item_present_t > 0.0:
+                        next_present_t = item_present_t
+                    elif next_present_t <= 0.0:
                         next_present_t = time.perf_counter()
 
                 if latest_rgb48_bytes is None:
@@ -295,8 +302,9 @@ class PipelineWorkerFeedersMixin:
                     if item is None:
                         break
 
+                    source_t = None
                     if isinstance(item, tuple) and len(item) == 2:
-                        _source_t, frame = item
+                        source_t, frame = item
                     else:
                         frame = item
 
@@ -308,7 +316,13 @@ class PipelineWorkerFeedersMixin:
                     except Exception:
                         latest_rgb48_bytes = None
 
-                    if next_present_t <= 0.0:
+                    try:
+                        item_present_t = float(source_t) if source_t is not None else 0.0
+                    except Exception:
+                        item_present_t = 0.0
+                    if item_present_t > 0.0:
+                        next_present_t = item_present_t
+                    elif next_present_t <= 0.0:
                         next_present_t = time.perf_counter()
 
                 if latest_rgb48_bytes is None:
