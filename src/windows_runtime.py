@@ -141,7 +141,15 @@ def _compile_signature_files(project_root: str) -> list[pathlib.Path]:
 
     models_dir = root / "src" / "models"
     if models_dir.is_dir():
-        files.extend(sorted(models_dir.rglob("*.py")))
+        generated_dirs = {"__pycache__", "compile_cache", "engines", "onnx"}
+        for p in sorted(models_dir.rglob("*.py")):
+            try:
+                rel_parts = set(p.relative_to(models_dir).parts)
+            except ValueError:
+                rel_parts = set(p.parts)
+            if rel_parts & generated_dirs:
+                continue
+            files.append(p)
 
     for rel in (
         ("src", "gui_compile_cache.py"),

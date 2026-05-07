@@ -360,6 +360,7 @@ class _PrecompileDialog(QDialog):
             args += ["--hg-weights", self._hg_weights]
         if self._clear_cache:
             args += ["--clear-cache"]
+        args += ["--gpu-prewarm-seconds", os.environ.get("HDRTVNET_AUTOTUNE_GPU_PREWARM_SECONDS", "15")]
         if self._quality_trials > 1:
             args += ["--quality-trials", str(self._quality_trials)]
 
