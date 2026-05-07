@@ -620,7 +620,10 @@ class WindowingMixin:
             duration_ms if duration_ms is not None else self._ui_pause_duration_ms
         )
         # FSR shader refresh can stall mpv a bit longer during UI changes.
-        if self._active_mpv_scale_kernel == "fsr":
+        if bool(getattr(self, "_active_use_mpv", False)) and (
+            str(getattr(self, "_active_mpv_scale_kernel", "") or "").strip().lower()
+            == "fsr"
+        ):
             delay += 140
         delay = max(60, delay)
 

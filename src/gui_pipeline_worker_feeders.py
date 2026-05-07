@@ -14,8 +14,9 @@ from timer import sleep_until
 
 _LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.042  # ~1/24 second for better 24fps cadence
 _LIVE_SMOOTH_MAX_CATCHUP_FRAMES = 3  # Allow more catchup for smoother playback
+_DEFAULT_FEEDER_GPU_RGB48 = "0" if bool(getattr(torch.version, "hip", None)) else "1"
 _FEEDER_GPU_RGB48 = str(
-    os.environ.get("HDRTVNET_FEEDER_GPU_RGB48", "1")
+    os.environ.get("HDRTVNET_FEEDER_GPU_RGB48", _DEFAULT_FEEDER_GPU_RGB48)
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 

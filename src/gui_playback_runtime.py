@@ -2850,7 +2850,10 @@ class PlaybackRuntimeMixin:
         self._active_use_hg = self._chk_hg.isChecked()
         self._active_upscale_mode = upscale_choice
         # Keep mpv initialized whenever available so view switches are UI-only.
-        use_mpv_pipeline = self._disp_hdr_mpv is not None
+        disable_mpv_pipeline = str(
+            os.environ.get("HDRTVNET_DISABLE_MPV", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        use_mpv_pipeline = self._disp_hdr_mpv is not None and not disable_mpv_pipeline
         self._active_use_mpv = use_mpv_pipeline
         self._startup_sync_pending = bool(use_mpv_pipeline and (not is_window_source))
         self._mpv_start_resync_t = 0.0

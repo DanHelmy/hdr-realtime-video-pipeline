@@ -12,7 +12,7 @@ from gui_config import (
     _normalize_source_mode,
 )
 from window_capture_source import target_from_hwnd
-from gui_scaling import UPSCALER_CHOICES
+from gui_scaling import BEST_MPV_SCALE, DEFAULT_UPSCALER, UPSCALER_CHOICES
 
 
 class StateInitMixin:
@@ -31,8 +31,12 @@ class StateInitMixin:
         self._active_precision = None
         self._active_resolution = None
         self._active_use_mpv = False
+        self._active_mpv_scale_kernel = BEST_MPV_SCALE
+        self._active_mpv_scale_antiring = 0.15
+        self._active_mpv_cas = 0.0
         self._sdr_mpv_feed_from_worker = False
         self._active_use_hg = bool(DEFAULT_USE_HG)
+        self._active_upscale_mode = DEFAULT_UPSCALER
         self._active_film_grain = False
         self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
         self._last_seek_frame = 0
