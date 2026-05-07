@@ -117,21 +117,6 @@ def _slug(text: str) -> str:
     return (value or "session")[:80]
 
 
-def _find_resident_evil_video() -> str:
-    root = _ROOT / "TestMovies"
-    matches = []
-    if root.is_dir():
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            name = path.name.lower()
-            if "resident evil" in name or "re9" in name:
-                matches.append(path)
-    if not matches:
-        raise FileNotFoundError("No Resident Evil video was found under TestMovies.")
-    return str(sorted(matches, key=lambda p: str(p).lower())[0])
-
-
 def _stats(samples: list[dict], key: str) -> dict | None:
     vals = []
     for sample in samples:
@@ -561,8 +546,8 @@ def parse_args():
     )
     parser.add_argument(
         "--video",
-        default="resident-evil",
-        help="Video path, or 'resident-evil' to auto-pick the TestMovies Resident Evil file.",
+        required=True,
+        help="Video path to benchmark.",
     )
     parser.add_argument(
         "--resolutions",
@@ -603,8 +588,8 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
-    if str(args.video).strip().lower() in {"resident-evil", "resident_evil", "re9"}:
-        args.video = _find_resident_evil_video()
+    if not os.path.isfile(args.video):
+        raise FileNotFoundError(f"Video not found: {args.video}")
     args.use_hg = str(args.use_hg).strip() != "0"
 
     source_slug = _slug(pathlib.Path(args.video).stem)
