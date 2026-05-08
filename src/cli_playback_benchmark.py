@@ -23,6 +23,21 @@ configure_rocm_sdk_environment()
 _HERE = pathlib.Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _CACHE_ROOT = project_cache_root(__file__)
+_DLL_DIR_HANDLES = []
+
+
+def _prepend_dll_search_path(path: pathlib.Path) -> None:
+    path_text = str(path)
+    if not path_text or not path.is_dir():
+        return
+    os.environ["PATH"] = path_text + os.pathsep + os.environ.get("PATH", "")
+    try:
+        _DLL_DIR_HANDLES.append(os.add_dll_directory(path_text))
+    except Exception:
+        pass
+
+
+_prepend_dll_search_path(_HERE)
 os.makedirs(_CACHE_ROOT, exist_ok=True)
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE_ROOT, "torchinductor"))
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_CACHE_ROOT, "triton"))
@@ -53,6 +68,20 @@ _RUN_PRESETS = {
         "model": _weight("Ensemble_AGCM_LE.pth"),
         "label": "fp32",
     },
+    "int8-mixed-ptq": {
+        "precision": "int8-mixed",
+        "model": _weight("Ensemble_AGCM_LE_int8_mixed.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg.pt"),
+        "predequantize": "on",
+        "label": "int8_mixed_ptq_predeq",
+    },
+    "int8-full-ptq": {
+        "precision": "int8-full",
+        "model": _weight("Ensemble_AGCM_LE_int8_full.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+        "predequantize": "on",
+        "label": "int8_full_ptq_predeq",
+    },
     "int8-mixed-qat": {
         "precision": "int8-mixed",
         "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
@@ -67,7 +96,31 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
     },
+    "int8-mixed-qat-film": {
+        "precision": "int8-mixed",
+        "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt"),
+        "predequantize": "on",
+        "label": "int8_mixed_qat_film_predeq",
+    },
+    "int8-full-qat-film": {
+        "precision": "int8-full",
+        "model": _weight("Ensemble_AGCM_LE_int8_full_qat_film.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt"),
+        "predequantize": "on",
+        "label": "int8_full_qat_film_predeq",
+    },
 }
+_DEFAULT_RUNS = [
+    "fp32",
+    "fp16",
+    "int8-mixed-ptq",
+    "int8-full-ptq",
+    "int8-mixed-qat",
+    "int8-full-qat",
+    "int8-mixed-qat-film",
+    "int8-full-qat-film",
+]
 
 _CSV_FIELDS = [
     "elapsed_s",
@@ -193,6 +246,7 @@ class _DisplaySink:
         self._start_mpv(int(width), int(height), float(fps) if fps and fps > 0 else 30.0)
 
     def _start_mpv(self, width: int, height: int, fps: float) -> None:
+        _prepend_dll_search_path(_HERE)
         try:
             import mpv as mpv_lib
         except (OSError, ImportError) as exc:
@@ -712,7 +766,7 @@ def parse_args():
     parser.add_argument(
         "--runs",
         nargs="+",
-        default=["fp16", "fp32", "int8-mixed-qat", "int8-full-qat"],
+        default=list(_DEFAULT_RUNS),
         choices=tuple(_RUN_PRESETS.keys()),
         help="Precision/model presets to run.",
     )

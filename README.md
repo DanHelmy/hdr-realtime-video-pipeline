@@ -849,6 +849,42 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
 ```
 
+### Playback Log Batch Benchmark
+
+For unattended runtime logging, use `src/cli_playback_benchmark.py`. This is intentionally a CLI workflow rather than a GUI feature: the GUI `Model Quality Benchmark` is still the main tool for objective quality metrics and preview-based comparisons, while this script is for collecting playback-style FPS/latency logs across several precision/resolution combinations without babysitting the app.
+
+The script writes the same playback-session style files used by the GUI:
+
+- batch summary: `logs/playback_sessions/<timestamp>_<source>_cli_batch/batch_summary.csv`
+- per run: `summary.txt`, `session.json`, and `runtime_metrics.csv`
+- per-run folders: `<resolution>_<preset>_<hg|nohg>/`
+
+Example from the repo root, using the mpv display path and logging 3 minutes per run:
+
+```cmd
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "path\to\video.mp4" --resolutions 1280x720 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat int8-mixed-qat-film int8-full-qat-film --duration-s 180 --warmup-frames 120 --sample-interval 120 --use-hg 0 --compile-mode max-autotune --display
+```
+
+`--display` uses the embedded mpv HDR path by default, including the raw RGB48LE feed/display cost in `render_ms` and total frame latency. The CLI prepends the repo `src/` folder to the Windows DLL search path so `src/libmpv-2.dll` is found the same way the GUI finds it. If mpv is unavailable or you explicitly want the older OpenCV display path, add:
+
+```cmd
+--display-backend opencv
+```
+
+Useful flags:
+
+| Flag | Description |
+|---|---|
+| `--video PATH` | Video to benchmark; required |
+| `--resolutions WxH ...` | Processing resolutions, e.g. `1280x720 1920x1080` |
+| `--runs ...` | Presets: `fp32`, `fp16`, `int8-mixed-ptq`, `int8-full-ptq`, `int8-mixed-qat`, `int8-full-qat`, `int8-mixed-qat-film`, `int8-full-qat-film` |
+| `--duration-s N` | Timed duration per run after warmup |
+| `--warmup-frames N` | Frames skipped before logging stats |
+| `--sample-interval N` | Timed frames between console/log samples |
+| `--use-hg 1\|0` | Enable/disable HG refinement |
+| `--display` | Show processed frames and include display cost |
+| `--display-backend mpv\|opencv` | Display backend used with `--display`; default is `mpv` |
+
 <details>
 <summary><strong>All CLI Flags</strong></summary>
 
