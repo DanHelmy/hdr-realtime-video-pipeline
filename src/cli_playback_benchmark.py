@@ -154,9 +154,156 @@ def _resize_frame(frame, width: int, height: int):
     return cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA)
 
 
-def _show_frame(window_name: str, frame) -> bool:
-    cv2.imshow(window_name, frame)
-    return (cv2.waitKey(1) & 0xFF) != 27
+def _bgr_to_rgb48_bytes(frame: np.ndarray, host_state: dict) -> bytes:
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("Expected HxWx3 frame.")
+    shape = (int(frame.shape[0]), int(frame.shape[1]), 3)
+    arr = host_state.get("numpy")
+    if host_state.get("shape") != shape or arr is None:
+        arr = np.empty(shape, dtype=np.uint16)
+        host_state["shape"] = shape
+        host_state["numpy"] = arr
+    if frame.dtype == np.uint8:
+        np.multiply(frame[:, :, ::-1], np.uint16(257), out=arr, casting="unsafe")
+    elif frame.dtype == np.uint16:
+        np.copyto(arr, frame[:, :, ::-1], casting="unsafe")
+    else:
+        src = frame.astype(np.float32, copy=False)
+        if src.max(initial=0.0) <= 1.0:
+            src = src * 65535.0
+        arr[:] = np.clip(src[:, :, ::-1], 0.0, 65535.0).astype(np.uint16)
+    return arr.tobytes()
+
+
+class _DisplaySink:
+    def __init__(self, args, width: int, height: int, fps: float):
+        self.enabled = bool(args.display)
+        self.backend = str(getattr(args, "display_backend", "mpv") or "mpv").strip().lower()
+        self.window_name = "HDRTVNet++ CLI Benchmark"
+        self._app = None
+        self._mpv_widget = None
+        self._rgb48_state: dict = {}
+
+        if not self.enabled:
+            return
+        if self.backend == "opencv":
+            return
+        if self.backend != "mpv":
+            raise ValueError(f"Unknown display backend: {self.backend}")
+        self._start_mpv(int(width), int(height), float(fps) if fps and fps > 0 else 30.0)
+
+    def _start_mpv(self, width: int, height: int, fps: float) -> None:
+        try:
+            import mpv as mpv_lib
+        except (OSError, ImportError) as exc:
+            raise RuntimeError(
+                "mpv display requested, but python-mpv/libmpv is unavailable. "
+                "Use --display-backend opencv for the old display path."
+            ) from exc
+
+        try:
+            from PyQt6.QtWidgets import QApplication
+        except ImportError as exc:
+            raise RuntimeError(
+                "mpv display requested, but PyQt6 is unavailable. "
+                "Use --display-backend opencv for the old display path."
+            ) from exc
+
+        from gui_mpv_widget import MpvHDRWidget
+        from gui_scaling import (
+            BEST_MPV_SCALE,
+            FILMGRAIN_SHADER_PATH,
+            FSR_SHADER_PATH,
+            SSIM_SUPERRES_SHADER_PATH,
+            _ensure_filmgrain_shader,
+            _ensure_fsr_shader,
+            _ensure_ssim_superres_shader,
+            _normalize_shader_paths,
+        )
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(["HDRTVNet++ CLI Benchmark"])
+        self._app = app
+
+        mpv_diag = str(os.environ.get("HDRTVNET_MPV_DIAG", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        widget = MpvHDRWidget(
+            mpv_lib=mpv_lib,
+            mpv_diag=mpv_diag,
+            normalize_shader_paths=_normalize_shader_paths,
+            ensure_fsr_shader=_ensure_fsr_shader,
+            ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
+            ensure_filmgrain_shader=_ensure_filmgrain_shader,
+            best_mpv_scale=BEST_MPV_SCALE,
+            fsr_shader_path=FSR_SHADER_PATH,
+            ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
+            filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
+        )
+        widget.setWindowTitle(self.window_name)
+        widget.resize(int(width), int(height))
+        widget.show()
+        app.processEvents()
+
+        started = widget.start_playback(
+            int(width),
+            int(height),
+            fps=float(fps),
+            scale_kernel="bicubic",
+            scale_antiring=0.0,
+            force_hdr_metadata=True,
+            vsync_timed=False,
+        )
+        if not started:
+            widget.close()
+            app.processEvents()
+            raise RuntimeError(
+                getattr(widget, "_last_scale_error", None) or "mpv display startup failed."
+            )
+        self._mpv_widget = widget
+
+    def show(self, frame) -> bool:
+        if not self.enabled:
+            return True
+        if self.backend == "opencv":
+            cv2.imshow(self.window_name, frame)
+            return (cv2.waitKey(1) & 0xFF) != 27
+
+        widget = self._mpv_widget
+        app = self._app
+        if widget is None or app is None:
+            return False
+        widget.feed_frame(_bgr_to_rgb48_bytes(frame, self._rgb48_state))
+        app.processEvents()
+        return bool(widget.isVisible())
+
+    def close(self) -> None:
+        if self.backend == "opencv":
+            try:
+                cv2.destroyWindow(self.window_name)
+            except Exception:
+                pass
+            return
+        widget = self._mpv_widget
+        app = self._app
+        if widget is not None:
+            try:
+                widget.stop_playback()
+            except Exception:
+                pass
+            try:
+                widget.close()
+            except Exception:
+                pass
+        if app is not None:
+            try:
+                app.processEvents()
+            except Exception:
+                pass
 
 
 def _compiled_marker_predequantize_mode(precision: str, selected_mode: str, processor) -> str:
@@ -284,7 +431,7 @@ def _write_session_files(
         f"Started: {started_at or 'n/a'}",
         f"Ended: {ended_at or 'n/a'}",
         f"Source: {source_label or 'n/a'}",
-        "Source Mode: cli_headless",
+        f"Source Mode: {settings.get('source_mode') or 'cli_headless'}",
         "",
         "Settings:",
         f"  Precision: {settings.get('precision') or 'n/a'}",
@@ -392,8 +539,11 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
     fps_samples = deque(maxlen=10000)
     model_latency_values: list[float] = []
     runtime_samples: list[dict] = []
+    display = None
 
     try:
+        if args.display:
+            display = _DisplaySink(args, width, height, fps)
         while frame_idx < max_frames:
             t0 = time.perf_counter()
             ok, frame = source.read()
@@ -404,8 +554,8 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
             t2 = time.perf_counter()
             out, pre_t, run_t, post_t = processor.process_timed(frame)
             t3 = time.perf_counter()
-            if args.display:
-                if not _show_frame("HDRTVNet++ CLI Benchmark", out):
+            if display is not None:
+                if not display.show(out):
                     break
             t4 = time.perf_counter()
 
@@ -487,11 +637,8 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
             source.release()
         except Exception:
             pass
-        if args.display:
-            try:
-                cv2.destroyWindow("HDRTVNet++ CLI Benchmark")
-            except Exception:
-                pass
+        if display is not None:
+            display.close()
         del processor
         if torch.cuda.is_available():
             try:
@@ -506,8 +653,13 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
         if model_latency_values
         else None
     )
+    source_mode = (
+        f"cli_display_{args.display_backend}"
+        if bool(args.display)
+        else "cli_headless"
+    )
     settings = {
-        "source_mode": "cli_headless",
+        "source_mode": source_mode,
         "precision": str(run["label"]),
         "resolution": f"{width}x{height}",
         "upscale_mode": "none",
@@ -520,6 +672,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
         "model_path": str(run["model"]),
         "duration_s": float(args.duration_s),
         "warmup_frames": int(args.warmup_frames),
+        "display_backend": str(args.display_backend) if bool(args.display) else None,
     }
     worker_summary = {
         "avg_model_latency_ms": avg_model_latency,
@@ -542,7 +695,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run headless CLI benchmarks and write GUI-style playback logs."
+        description="Run CLI playback benchmarks and write GUI-style playback logs."
     )
     parser.add_argument(
         "--video",
@@ -575,7 +728,13 @@ def parse_args():
     parser.add_argument(
         "--display",
         action="store_true",
-        help="Show processed frames in an OpenCV window and include display cost in timing.",
+        help="Show processed frames and include display cost in timing.",
+    )
+    parser.add_argument(
+        "--display-backend",
+        default="mpv",
+        choices=["mpv", "opencv"],
+        help="Display backend used with --display. Defaults to mpv, matching the GUI HDR path.",
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument(
@@ -598,6 +757,8 @@ def main() -> int:
     batch_dir.mkdir(parents=True, exist_ok=True)
     print(f"[bench] Video: {args.video}", flush=True)
     print(f"[bench] Output: {batch_dir}", flush=True)
+    if args.display:
+        print(f"[bench] Display: {args.display_backend}", flush=True)
 
     results = []
     for resolution in args.resolutions:
