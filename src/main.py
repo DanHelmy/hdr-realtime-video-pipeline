@@ -30,11 +30,10 @@ os.environ.setdefault(
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 import numpy as np
-import psutil
 import torch
 from collections import deque
+from cli_display import CliDisplaySink
 from video_source import VideoSource
-from timer import FPSTimer
 from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
 
 VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
@@ -157,7 +156,13 @@ def parse_args():
         action="store_true",
         help="Report preprocess/session/postprocess timing breakdown"
     )
-    parser.add_argument("--no-display", action="store_true", help="Disable cv2.imshow for pure throughput testing")
+    parser.add_argument("--no-display", action="store_true", help="Disable display for pure throughput testing")
+    parser.add_argument(
+        "--display-backend",
+        default="mpv",
+        choices=["mpv", "opencv"],
+        help="Display backend when display is enabled (default: mpv)",
+    )
     parser.add_argument(
         "--device",
         default="auto",
@@ -378,14 +383,20 @@ def main():
                 print(f"Invalid --cache-resolution '{args.cache_resolution}', "
                       "expected WIDTHxHEIGHT (e.g. 1920x1080). Skipping warmup.")
 
-    timer = FPSTimer()
+    display = None
+    if not args.no_display:
+        display = CliDisplaySink(
+            enabled=True,
+            backend=args.display_backend,
+            width=_proc_w,
+            height=_proc_h,
+            fps=float(getattr(source, "fps", 0.0) or 30.0),
+            window_name="HDRTVNet++ CLI",
+        )
+
     frame_idx = 0
     stats_frames = 0
 
-    # ---- Static metrics (computed once) --------------------------------
-    model_size_mb = os.path.getsize(args.model) / (1024 * 1024)
-    process = psutil.Process(os.getpid())
-    use_cuda = torch.cuda.is_available() and args.device != "cpu"
     decode_ms = 0.0
     resize_ms = 0.0
     infer_ms = 0.0
@@ -435,52 +446,9 @@ def main():
             run_t = 0.0
             post_t = 0.0
         t3 = time.perf_counter()
-        fps = timer.update()
 
-        if not args.no_display:
-            # ---- Gather live metrics ------------------------------------
-            latency_ms = (t3 - t0) * 1000.0  # decode + resize + infer
-            cpu_mem_mb = process.memory_info().rss / (1024 * 1024)
-            if use_cuda:
-                gpu_mem_mb = torch.cuda.memory_allocated() / (1024 * 1024)
-            else:
-                gpu_mem_mb = 0.0
-
-            # ---- Draw metrics overlay (ROI-only, avoids full-frame copy) --
-            overlay_lines = [
-                f"FPS: {fps:.2f}",
-                f"Latency: {latency_ms:.1f} ms/frame",
-                f"GPU Memory: {gpu_mem_mb:.1f} MB",
-                f"CPU Memory: {cpu_mem_mb:.1f} MB",
-                f"Model Size: {model_size_mb:.2f} MB",
-            ]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
-            thickness = 2
-            color = (0, 255, 0)
-            y_start = 30
-            line_height = 30
-
-            # Compute box dimensions from text
-            max_text_w = 0
-            for line in overlay_lines:
-                (tw, _), _ = cv2.getTextSize(line, font, font_scale, thickness)
-                max_text_w = max(max_text_w, tw)
-            box_x, box_y = 10, 5
-            box_w = max_text_w + 30
-            box_h = len(overlay_lines) * line_height + 10
-
-            # Alpha-blend only the small overlay ROI (not the entire frame)
-            # ~300x fewer pixels than full-frame addWeighted at 1080p
-            roi = output[box_y:box_y + box_h, box_x:box_x + box_w]
-            roi //= 3  # fast integer darken (~33% brightness, no float/alloc)
-
-            for i, line in enumerate(overlay_lines):
-                cv2.putText(output, line, (20, y_start + i * line_height),
-                            font, font_scale, color, thickness)
-
-            cv2.imshow("HDRTVNet PyTorch", output)
-            if cv2.waitKey(1) & 0xFF == 27:
+        if display is not None:
+            if not display.show(output):
                 break
         t4 = time.perf_counter()
 
@@ -565,7 +533,10 @@ def main():
         print(msg)
 
     source.release()
-    cv2.destroyAllWindows()
+    if display is not None:
+        display.close()
+    else:
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

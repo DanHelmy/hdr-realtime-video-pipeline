@@ -23,31 +23,16 @@ configure_rocm_sdk_environment()
 _HERE = pathlib.Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _CACHE_ROOT = project_cache_root(__file__)
-_DLL_DIR_HANDLES = []
-
-
-def _prepend_dll_search_path(path: pathlib.Path) -> None:
-    path_text = str(path)
-    if not path_text or not path.is_dir():
-        return
-    os.environ["PATH"] = path_text + os.pathsep + os.environ.get("PATH", "")
-    try:
-        _DLL_DIR_HANDLES.append(os.add_dll_directory(path_text))
-    except Exception:
-        pass
-
-
-_prepend_dll_search_path(_HERE)
 os.makedirs(_CACHE_ROOT, exist_ok=True)
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE_ROOT, "torchinductor"))
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_CACHE_ROOT, "triton"))
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 import cv2
-import numpy as np
 import psutil
 import torch
 
+from cli_display import CliDisplaySink
 from gui_compile_cache import _mark_compiled
 from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
 from video_source import VideoSource
@@ -205,159 +190,6 @@ def _resize_frame(frame, width: int, height: int):
     if frame.shape[1] == int(width) and frame.shape[0] == int(height):
         return frame
     return cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA)
-
-
-def _bgr_to_rgb48_bytes(frame: np.ndarray, host_state: dict) -> bytes:
-    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
-        raise ValueError("Expected HxWx3 frame.")
-    shape = (int(frame.shape[0]), int(frame.shape[1]), 3)
-    arr = host_state.get("numpy")
-    if host_state.get("shape") != shape or arr is None:
-        arr = np.empty(shape, dtype=np.uint16)
-        host_state["shape"] = shape
-        host_state["numpy"] = arr
-    if frame.dtype == np.uint8:
-        np.multiply(frame[:, :, ::-1], np.uint16(257), out=arr, casting="unsafe")
-    elif frame.dtype == np.uint16:
-        np.copyto(arr, frame[:, :, ::-1], casting="unsafe")
-    else:
-        src = frame.astype(np.float32, copy=False)
-        if src.max(initial=0.0) <= 1.0:
-            src = src * 65535.0
-        arr[:] = np.clip(src[:, :, ::-1], 0.0, 65535.0).astype(np.uint16)
-    return arr.tobytes()
-
-
-class _DisplaySink:
-    def __init__(self, args, width: int, height: int, fps: float):
-        self.enabled = bool(args.display)
-        self.backend = str(getattr(args, "display_backend", "mpv") or "mpv").strip().lower()
-        self.window_name = "HDRTVNet++ CLI Benchmark"
-        self._app = None
-        self._mpv_widget = None
-        self._rgb48_state: dict = {}
-
-        if not self.enabled:
-            return
-        if self.backend == "opencv":
-            return
-        if self.backend != "mpv":
-            raise ValueError(f"Unknown display backend: {self.backend}")
-        self._start_mpv(int(width), int(height), float(fps) if fps and fps > 0 else 30.0)
-
-    def _start_mpv(self, width: int, height: int, fps: float) -> None:
-        _prepend_dll_search_path(_HERE)
-        try:
-            import mpv as mpv_lib
-        except (OSError, ImportError) as exc:
-            raise RuntimeError(
-                "mpv display requested, but python-mpv/libmpv is unavailable. "
-                "Use --display-backend opencv for the old display path."
-            ) from exc
-
-        try:
-            from PyQt6.QtWidgets import QApplication
-        except ImportError as exc:
-            raise RuntimeError(
-                "mpv display requested, but PyQt6 is unavailable. "
-                "Use --display-backend opencv for the old display path."
-            ) from exc
-
-        from gui_mpv_widget import MpvHDRWidget
-        from gui_scaling import (
-            BEST_MPV_SCALE,
-            FILMGRAIN_SHADER_PATH,
-            FSR_SHADER_PATH,
-            SSIM_SUPERRES_SHADER_PATH,
-            _ensure_filmgrain_shader,
-            _ensure_fsr_shader,
-            _ensure_ssim_superres_shader,
-            _normalize_shader_paths,
-        )
-
-        app = QApplication.instance()
-        if app is None:
-            app = QApplication(["HDRTVNet++ CLI Benchmark"])
-        self._app = app
-
-        mpv_diag = str(os.environ.get("HDRTVNET_MPV_DIAG", "0")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        widget = MpvHDRWidget(
-            mpv_lib=mpv_lib,
-            mpv_diag=mpv_diag,
-            normalize_shader_paths=_normalize_shader_paths,
-            ensure_fsr_shader=_ensure_fsr_shader,
-            ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
-            ensure_filmgrain_shader=_ensure_filmgrain_shader,
-            best_mpv_scale=BEST_MPV_SCALE,
-            fsr_shader_path=FSR_SHADER_PATH,
-            ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
-            filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
-        )
-        widget.setWindowTitle(self.window_name)
-        widget.resize(int(width), int(height))
-        widget.show()
-        app.processEvents()
-
-        started = widget.start_playback(
-            int(width),
-            int(height),
-            fps=float(fps),
-            scale_kernel="bicubic",
-            scale_antiring=0.0,
-            force_hdr_metadata=True,
-            vsync_timed=False,
-        )
-        if not started:
-            widget.close()
-            app.processEvents()
-            raise RuntimeError(
-                getattr(widget, "_last_scale_error", None) or "mpv display startup failed."
-            )
-        self._mpv_widget = widget
-
-    def show(self, frame) -> bool:
-        if not self.enabled:
-            return True
-        if self.backend == "opencv":
-            cv2.imshow(self.window_name, frame)
-            return (cv2.waitKey(1) & 0xFF) != 27
-
-        widget = self._mpv_widget
-        app = self._app
-        if widget is None or app is None:
-            return False
-        widget.feed_frame(_bgr_to_rgb48_bytes(frame, self._rgb48_state))
-        app.processEvents()
-        return bool(widget.isVisible())
-
-    def close(self) -> None:
-        if self.backend == "opencv":
-            try:
-                cv2.destroyWindow(self.window_name)
-            except Exception:
-                pass
-            return
-        widget = self._mpv_widget
-        app = self._app
-        if widget is not None:
-            try:
-                widget.stop_playback()
-            except Exception:
-                pass
-            try:
-                widget.close()
-            except Exception:
-                pass
-        if app is not None:
-            try:
-                app.processEvents()
-            except Exception:
-                pass
 
 
 def _compiled_marker_predequantize_mode(precision: str, selected_mode: str, processor) -> str:
@@ -597,7 +429,14 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
 
     try:
         if args.display:
-            display = _DisplaySink(args, width, height, fps)
+            display = CliDisplaySink(
+                enabled=True,
+                backend=args.display_backend,
+                width=width,
+                height=height,
+                fps=fps,
+                window_name="HDRTVNet++ CLI Benchmark",
+            )
         while frame_idx < max_frames:
             t0 = time.perf_counter()
             ok, frame = source.read()

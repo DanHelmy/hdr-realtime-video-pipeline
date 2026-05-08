@@ -825,7 +825,7 @@ On NVIDIA, existing quantized checkpoints are still the source files for INT8 mo
 
 ## CLI Mode
 
-For headless benchmarking or scripted workflows:
+For CLI playback, headless benchmarking, or scripted workflows. `src/main.py` uses the shared CLI display path: mpv by default, OpenCV only when requested with `--display-backend opencv`. The displayed video is clean output without the old on-frame metrics overlay; timing is still printed to the console.
 
 ```bash
 # Default (auto device: TensorRT on NVIDIA, PyTorch on AMD/CPU)
@@ -904,6 +904,7 @@ Useful flags:
 | `--prefetch N` | Video reader prefetch queue size (default: 8) |
 | `--model-stage-timing` | Report pre/run/post timing breakdown |
 | `--no-display` | Headless mode for pure throughput testing |
+| `--display-backend mpv\|opencv` | Display backend for `src/main.py`; default is `mpv` |
 | `--warmup N` | Frames to skip before collecting stats (default: 30) |
 | `--timing-interval N` | Frames between timing reports (default: 120) |
 | `--max-frames N` | Stop after N frames (0 = full video) |
