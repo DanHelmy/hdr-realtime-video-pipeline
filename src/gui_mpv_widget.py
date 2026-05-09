@@ -6,7 +6,6 @@ import os
 import queue as _queue
 import threading
 
-import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
@@ -149,18 +148,6 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
         options["temporal_dither"] = "yes"
         options["temporal_dither_period"] = str(_env_int_any((f"{env_prefix}TEMPORAL_DITHER_PERIOD", "HDRTVNET_MPV_TEMPORAL_DITHER_PERIOD"), 1, min_value=1, max_value=128))
     return options
-
-def _env_hdr_target_peak_nits() -> str:
-    raw = str(os.environ.get("HDRTVNET_MPV_HDR_TARGET_PEAK_NITS", "auto") or "auto").strip().lower()
-    if raw == "auto":
-        return "auto"
-    try:
-        val = float(raw)
-    except Exception:
-        return "auto"
-    if not np.isfinite(val) or val <= 0.0:
-        return "auto"
-    return f"{val:.0f}"
 
 def _mpv_live_interpolation_enabled() -> bool:
     # Favor lower latency for live capture; interpolation can add delay.
@@ -681,7 +668,6 @@ class MpvHDRWidget(QWidget):
         # Use gpu-next + colorspace hint so mpv can adapt target output while
         # dragging between HDR/SDR displays (with a compatibility fallback).
         self._target_colorspace_hint = "auto"
-        hdr_target_peak = _env_hdr_target_peak_nits()
         deband_options = _mpv_deband_options(live_capture=live_capture)
         dither_options = _mpv_dither_options(live_capture=live_capture)
         mpv_kwargs = dict(

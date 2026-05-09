@@ -17,6 +17,14 @@ function Test-SetupRelatedImportFailure([string]$Output) {
     return [bool]($Output -match "(?i)(ModuleNotFoundError|ImportError|No module named|DLL load failed|The specified module could not be found|cannot import name)")
 }
 
+function Test-EnvFlagEnabled([string]$Name) {
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $false
+    }
+    return [bool]($value.Trim() -match '(?i)^(1|true|yes|on|y)$')
+}
+
 function Invoke-SetupPrompt([string]$Reason) {
     Write-Host ""
     Write-Warning $Reason
@@ -88,21 +96,26 @@ if (-not (Test-Path $venvPython)) {
 }
 
 Write-Host "[run-gui] Using Python: $venvPython"
-Write-Host "[run-gui] Checking GUI imports..."
-$probe = Test-GuiImport -PythonExe $venvPython -Repo $repoRoot
-if (-not $probe.Success) {
-    if (Test-SetupRelatedImportFailure $probe.Output) {
-        if (Invoke-SetupPrompt "A required Python package or DLL looks missing. This usually means setup needs to be run again after an update.") {
-            Invoke-SetupNow
-            $probe = Test-GuiImport -PythonExe $venvPython -Repo $repoRoot
-        }
-    }
+$runImportCheck = Test-EnvFlagEnabled "HDRTVNET_CHECK_GUI_IMPORT"
+if ($runImportCheck) {
+    Write-Host "[run-gui] Checking GUI imports..."
+    $probe = Test-GuiImport -PythonExe $venvPython -Repo $repoRoot
     if (-not $probe.Success) {
-        if (-not [string]::IsNullOrWhiteSpace($probe.Output)) {
-            Write-Host $probe.Output
+        if (Test-SetupRelatedImportFailure $probe.Output) {
+            if (Invoke-SetupPrompt "A required Python package or DLL looks missing. This usually means setup needs to be run again after an update.") {
+                Invoke-SetupNow
+                $probe = Test-GuiImport -PythonExe $venvPython -Repo $repoRoot
+            }
         }
-        throw "GUI dependency check failed. Run setup.bat to refresh the environment."
+        if (-not $probe.Success) {
+            if (-not [string]::IsNullOrWhiteSpace($probe.Output)) {
+                Write-Host $probe.Output
+            }
+            throw "GUI dependency check failed. Run setup.bat to refresh the environment."
+        }
     }
+} else {
+    Write-Host "[run-gui] Skipping full GUI import check. Set HDRTVNET_CHECK_GUI_IMPORT=1 to run it."
 }
 
 Write-Host "[run-gui] Launching GUI (first launch can take up to ~60s)..."
