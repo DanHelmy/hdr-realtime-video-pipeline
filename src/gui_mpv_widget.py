@@ -150,8 +150,28 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
     return options
 
 def _mpv_live_interpolation_enabled() -> bool:
-    # Favor lower latency for live capture; interpolation can add delay.
-    return False
+    # Browser-window capture runs at a capped processing cadence. Use mpv's
+    # display-resample path, but keep the default temporal scaler restrained so
+    # motion does not pick up a strong soap-opera blend.
+    return _env_bool_any(
+        (
+            "HDRTVNET_LIVE_MPV_INTERPOLATION",
+            "HDRTVNET_BROWSER_MPV_INTERPOLATION",
+        ),
+        True,
+    )
+
+
+def _mpv_live_tscale() -> str:
+    value = str(
+        os.environ.get(
+            "HDRTVNET_LIVE_MPV_TSCALE",
+            os.environ.get("HDRTVNET_BROWSER_MPV_TSCALE", "mitchell"),
+        )
+    ).strip().lower().replace("-", "_")
+    if not value:
+        return "mitchell"
+    return value
 
 
 def _without_deband_options(kwargs: dict) -> dict:
@@ -704,7 +724,7 @@ class MpvHDRWidget(QWidget):
         if use_interpolation:
             mpv_kwargs.update(
                 interpolation=True,
-                tscale="oversample",
+                tscale=_mpv_live_tscale(),
             )
         shader_paths = self._build_shader_paths(
             use_fsr=use_fsr,
