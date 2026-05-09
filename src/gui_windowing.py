@@ -327,6 +327,7 @@ class WindowingMixin:
             self._immersive_saved_margins = (m.left(), m.top(), m.right(), m.bottom())
             self._immersive_saved_spacing = self._root_layout.spacing()
             self._immersive_saved_view_mode = self._cmb_view.currentText()
+            self._begin_immersive_timeline_overlay()
 
             for w in targets.values():
                 if w is not None and w.isVisible():
@@ -337,6 +338,7 @@ class WindowingMixin:
                 self._video_tabs.tabBar().setVisible(False)
             return
 
+        self._end_immersive_timeline_overlay()
         for key, w in targets.items():
             want = self._immersive_saved_vis.get(key, True)
             if w is not None:
@@ -352,7 +354,72 @@ class WindowingMixin:
         if self._immersive_saved_view_mode:
             self._set_view_mode_silently(self._immersive_saved_view_mode)
 
+    def _begin_immersive_timeline_overlay(self):
+        row = self._row3_widget
+        if row is None or getattr(self, "_immersive_timeline_overlay", False):
+            return
+        if _normalize_source_mode(getattr(self, "_source_mode", None)) == SOURCE_MODE_WINDOW:
+            return
+        parent = row.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        index = layout.indexOf(row) if layout is not None else -1
+        self._immersive_row3_parent = parent
+        self._immersive_row3_layout = layout
+        self._immersive_row3_index = index
+        if layout is not None:
+            layout.removeWidget(row)
+        row.setParent(self)
+        row.setVisible(True)
+        row.raise_()
+        self._immersive_timeline_overlay = True
+        self._position_immersive_timeline_overlay()
+
+    def _end_immersive_timeline_overlay(self):
+        row = self._row3_widget
+        if row is None or not getattr(self, "_immersive_timeline_overlay", False):
+            return
+        layout = getattr(self, "_immersive_row3_layout", None)
+        parent = getattr(self, "_immersive_row3_parent", None)
+        index = int(getattr(self, "_immersive_row3_index", -1))
+        row.hide()
+        if parent is not None:
+            row.setParent(parent)
+        if layout is not None:
+            if index < 0 or index > layout.count():
+                layout.addWidget(row)
+            else:
+                layout.insertWidget(index, row)
+        row.setVisible(
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            != SOURCE_MODE_WINDOW
+        )
+        self._immersive_timeline_overlay = False
+        self._immersive_row3_parent = None
+        self._immersive_row3_layout = None
+        self._immersive_row3_index = -1
+
+    def _position_immersive_timeline_overlay(self):
+        row = self._row3_widget
+        if row is None or not getattr(self, "_immersive_timeline_overlay", False):
+            return
+        margin = 16
+        hint = row.sizeHint()
+        width = max(240, self.width() - (margin * 2))
+        height = max(44, hint.height())
+        x = margin
+        y = max(margin, self.height() - height - margin)
+        row.setGeometry(x, y, width, height)
+        row.raise_()
+
+    def _show_immersive_timeline_overlay(self):
+        row = self._row3_widget
+        if row is None or not getattr(self, "_immersive_timeline_overlay", False):
+            return
+        row.setVisible(True)
+        self._position_immersive_timeline_overlay()
+
     def _position_ui_overlay(self):
+        self._position_immersive_timeline_overlay()
         if self._ui_overlay_btn is None:
             return
         margin = 16
@@ -368,10 +435,7 @@ class WindowingMixin:
         if not self._ui_hidden:
             self._ui_overlay_btn.hide()
             return
-        if self._row3_widget is not None:
-            self._row3_widget.setVisible(
-                getattr(self, "_source_mode", "video") != "window_capture"
-            )
+        self._show_immersive_timeline_overlay()
         self._position_ui_overlay()
         self._ui_overlay_btn.show()
         self._ui_overlay_btn.raise_()
@@ -383,8 +447,18 @@ class WindowingMixin:
         self._ui_overlay_timer.start(int(self._ui_overlay_hide_ms))
 
     def _hide_ui_overlay(self):
+        if (
+            getattr(self, "_immersive_timeline_overlay", False)
+            and self._seek_slider is not None
+            and self._seek_slider.isSliderDown()
+        ):
+            if self._ui_overlay_timer is not None:
+                self._ui_overlay_timer.start(int(self._ui_overlay_hide_ms))
+            return
         if self._ui_overlay_btn is not None:
             self._ui_overlay_btn.hide()
+        if getattr(self, "_immersive_timeline_overlay", False) and self._row3_widget is not None:
+            self._row3_widget.hide()
 
     def _toggle_ui_visibility(self):
         if not self._playing:

@@ -211,6 +211,10 @@ class StateInitMixin:
         self._ui_anim_effects = {}
         self._ui_anim_running = {}
         self._ui_anim_duration_ms = 0
+        self._immersive_timeline_overlay = False
+        self._immersive_row3_parent = None
+        self._immersive_row3_layout = None
+        self._immersive_row3_index = -1
         self._layout_freeze_depth = 0
         self._saved_window_geometry = None
         self._saved_window_state = Qt.WindowState.WindowNoState
