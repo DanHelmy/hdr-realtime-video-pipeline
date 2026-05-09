@@ -35,6 +35,7 @@ Core updates include:
   - `PSNR` / `SSIM` run on linear HDR frames
   - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
 - display-side HDR tone mapping (BT.2390) for improved visual presentation, applied consistently across HDR panes when enabled; does not affect objective metrics or exported HDR content
+- monitor-based playback upscaling: the selected mpv upscale mode now applies whenever the active display is larger than the processing resolution, including 1080p on 1440p/4K monitors
 - lightweight high-highlight debanding is enabled for live HDR playback, while heavier sky deblocking/temporal cleanup remains opt-in and does not affect objective metrics, compare snapshots, or benchmark results
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
@@ -349,6 +350,11 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - clean first launches default to `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
   - existing `.gui_prefs.json` settings still win, so local user choices are preserved
 
+- **Monitor-based playback upscale**
+  - the `Resolution` control still selects model processing size (`1080p`, `720p`, `540p`, or source-limited fallback)
+  - the `Upscale` control now applies whenever the active monitor is larger than that processing frame, so `1080p` can still use `SSimSuperRes`, `FSR`, or `EWA LanczosSharp` on 1440p/4K displays
+  - moving the main window or popped-out HDR view between monitors updates the mpv scale/CAS settings without restarting inference
+
 ### Previous v5.1 Highlights
 
 - **Objective metric domains are now consistent across compare and benchmark**
@@ -457,7 +463,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **TensorRT engine cache** | NVIDIA engines are built on demand per model/resolution/mode and reused from `src/models/engines/` |
 | **Clear TensorRT engine cache** | NVIDIA-only tool for deleting selected or all cached `.engine` files |
 | **PyTorch kernel compilation** | AMD can use Triton/torch.compile caches in a clean subprocess; caches are repo-local under `src/models/compile_cache/` and verified before reuse |
-| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback) and scale to 1080p output using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** |
+| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback); playback upscales against the active monitor using **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** when the monitor is larger than the processed frame |
 | **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
 | **Film grain** | Optional film grain restoration (mpv shader) |
 | **Video export** | Separate export dialog with native resolution/FPS defaults, independent model preset selection, and ProRes 422 HQ output |
@@ -566,6 +572,13 @@ Both SDR and HDR panes are rendered through embedded **mpv** (d3d11):
 - **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
 - **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
+
+Playback scaling is monitor-based:
+
+- `Resolution` controls model processing size and cache/engine selection, not the final monitor target.
+- `Upscale` controls the mpv presentation scaler and is used whenever the active HDR display is larger than the processed frame.
+- A small window on a 4K monitor keeps the same upscale policy as fullscreen on that monitor for consistent playback behavior.
+- Moving the app or a popped-out HDR view between monitors hot-swaps the mpv scale/CAS settings without restarting the model pipeline.
 
 ### HDR Playback Cleanup
 

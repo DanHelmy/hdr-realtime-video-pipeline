@@ -166,7 +166,7 @@ def _source_mode_label(mode: str | None) -> str:
 
 # Resolution-scale presets (process lower resolution).
 RESOLUTION_SCALES = {
-    "1080p": None,  # full output resolution path (no upscale stage)
+    "1080p": None,  # full processing/output preset; monitor upscale is separate
     "720p": (1280, 720),
     "540p": (960, 540),
 }

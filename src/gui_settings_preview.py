@@ -28,6 +28,7 @@ from gui_config import (
 from gui_scaling import (
     UPSCALER_CHOICES,
     DEFAULT_UPSCALER,
+    _is_upscale_required,
 )
 
 
@@ -45,27 +46,29 @@ _PREFS_PATH = os.path.join(_ROOT, ".gui_prefs.json")
 class SettingsPreviewMixin:
     """Settings persistence and idle preview/timeline helpers for MainWindow."""
 
+    def _resolution_upscale_allowed(self, scale_key: str | None = None) -> bool:
+        """Whether the selected processing preset will upscale on this monitor."""
+        key = str(scale_key if scale_key is not None else self._cmb_res.currentText())
+        if key == "Source":
+            key = str(getattr(self, "_source_max_resolution_key", "1080p") or "1080p")
+        if key not in RESOLUTION_SCALES:
+            return False
+        proc_w, proc_h = _processing_preset_dims(key)
+        try:
+            target_w, target_h = self._current_upscale_target_dims()
+        except Exception:
+            target_w, target_h = MAX_W, MAX_H
+        return _is_upscale_required(proc_w, proc_h, target_w, target_h)
+
     def _sync_upscale_controls(self):
-        """Enable/disable upscale selector based on resolution preset."""
+        """Enable/disable upscale selector based on monitor target."""
         if not hasattr(self, "_cmb_upscale") or self._cmb_upscale is None:
             return
-        scale_key = self._cmb_res.currentText()
-        top_key = str(getattr(self, "_source_max_resolution_key", "1080p") or "1080p")
-        top_dims = _processing_preset_dims(top_key)
-        sel_dims = _processing_preset_dims(scale_key)
-        allow = (
-            scale_key in {"540p", "720p"}
-            and sel_dims[0] < top_dims[0]
-            and sel_dims[1] < top_dims[1]
-        )
+        allow = self._resolution_upscale_allowed()
         self._cmb_upscale.blockSignals(True)
-        if allow:
-            self._cmb_upscale.setEnabled(True)
-            if self._cmb_upscale.currentText() not in UPSCALER_CHOICES:
-                self._cmb_upscale.setCurrentText(DEFAULT_UPSCALER)
-        else:
+        if self._cmb_upscale.currentText() not in UPSCALER_CHOICES:
             self._cmb_upscale.setCurrentText(DEFAULT_UPSCALER)
-            self._cmb_upscale.setEnabled(False)
+        self._cmb_upscale.setEnabled(bool(allow))
         self._cmb_upscale.blockSignals(False)
 
     def _refresh_resolution_options_for_video(self, path: str):
@@ -114,7 +117,10 @@ class SettingsPreviewMixin:
             if _source_is_below_processing_preset(
                 source_dims[0], source_dims[1], top_key
             ):
-                msg += f" No upscale is applied when {top_key} is selected."
+                msg += (
+                    f" {top_key} still uses monitor-based upscale when the "
+                    "display is larger."
+                )
             self.statusBar().showMessage(msg)
 
     def _load_user_settings(
@@ -301,6 +307,9 @@ class SettingsPreviewMixin:
         et = event.type()
         if et == QEvent.Type.Resize:
             self._position_ui_overlay()
+            self._sync_upscale_controls()
+        elif et == QEvent.Type.Move:
+            self._sync_upscale_controls()
         if et in (
             QEvent.Type.MouseMove,
             QEvent.Type.MouseButtonPress,
@@ -324,7 +333,9 @@ class SettingsPreviewMixin:
         if not self._playing:
             return False
         upscale_changed = False
-        if hasattr(self, "_cmb_upscale") and self._cmb_res.currentText() in {"540p", "720p"}:
+        if hasattr(self, "_cmb_upscale") and self._resolution_upscale_allowed(
+            self._cmb_res.currentText()
+        ):
             upscale_changed = self._cmb_upscale.currentText() != self._active_upscale_mode
         film_grain_changed = False
         if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:

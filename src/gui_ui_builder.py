@@ -256,7 +256,7 @@ class UiBuilderMixin:
             QSizePolicy.Policy.Fixed,
         )
         self._cmb_upscale.setToolTip(
-            "Upscale kernel for 540p/720p. 1080p stays native (no upscale)."
+            "Upscale kernel used when the active monitor is larger than the processing resolution."
         )
         row1.addWidget(self._cmb_upscale, 4, 1)
         row1.setColumnStretch(0, 0)

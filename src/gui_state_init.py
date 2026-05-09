@@ -28,6 +28,10 @@ class StateInitMixin:
         self._pending_mpv_start = None
         self._pending_sdr_mpv_start = None
         self._last_res = None
+        self._cur_output_w = 1920
+        self._cur_output_h = 1080
+        self._cur_upscale_target_w = 1920
+        self._cur_upscale_target_h = 1080
         self._active_precision = None
         self._active_resolution = None
         self._active_use_mpv = False

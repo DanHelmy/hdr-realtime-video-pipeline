@@ -59,7 +59,6 @@ from required_clone_assets import (
     missing_required_clone_assets,
 )
 from gui_scaling import (
-    BEST_UPSCALE_MODE,
     UPSCALER_CHOICES,
     DEFAULT_UPSCALER,
     _limited_playback_fps,
@@ -67,6 +66,7 @@ from gui_scaling import (
     _select_hdr_scale_antiring,
     _select_mpv_cas_strength,
     _normalize_upscale_choice,
+    _is_upscale_required,
     _ensure_fsr_shader,
     _ensure_filmgrain_shader,
 )
@@ -1368,6 +1368,8 @@ class PlaybackRuntimeMixin:
         self._worker.resolve_display_handoff()
         self._note_live_audio_compile_ready()
         self._sync_screen_change_hooks()
+        self._apply_monitor_upscale_settings(announce=False)
+        self._sync_upscale_controls()
 
     def _precompile_kernels(self):
         """Open the pre-compile dialog - runs compile_kernels.py as a
@@ -2716,6 +2718,9 @@ class PlaybackRuntimeMixin:
             pw, ph = scale_dims
         else:
             pw, ph = ow, oh
+        scale_target_w, scale_target_h = self._current_upscale_target_dims()
+        self._cur_upscale_target_w = int(scale_target_w)
+        self._cur_upscale_target_h = int(scale_target_h)
 
         source_max_key = getattr(self, "_source_max_resolution_key", "1080p")
         source_dims = getattr(self, "_source_video_dims", None)
@@ -2725,17 +2730,22 @@ class PlaybackRuntimeMixin:
             and len(source_dims) == 2
             and scale_key == source_max_key
         ):
-            disable_top_preset_sharpen = _source_is_below_processing_preset(
-                source_dims[0], source_dims[1], scale_key
+            disable_top_preset_sharpen = (
+                _source_is_below_processing_preset(
+                    source_dims[0], source_dims[1], scale_key
+                )
+                and not _is_upscale_required(
+                    pw, ph, scale_target_w, scale_target_h
+                )
             )
 
-        # Select upscale kernel choice (only allowed for 540p/720p presets)
-        upscale_choice = DEFAULT_UPSCALER
-        if scale_key in {"540p", "720p"}:
-            upscale_choice = self._cmb_upscale.currentText() or DEFAULT_UPSCALER
+        # The selected upscale mode applies to any processing preset when the
+        # active monitor is larger than the processed frame.
+        upscale_choice = self._cmb_upscale.currentText() or DEFAULT_UPSCALER
         # Resolve FSR availability up-front so we don't report it if it can't load.
         if (
-            _normalize_upscale_choice(upscale_choice) == "fsr"
+            _is_upscale_required(pw, ph, scale_target_w, scale_target_h)
+            and _normalize_upscale_choice(upscale_choice) == "fsr"
             and not _ensure_fsr_shader()
         ):
             self.statusBar().showMessage(
@@ -2887,14 +2897,19 @@ class PlaybackRuntimeMixin:
             if (not is_window_source) and (not self._audio_available):
                 mpv_audio_path = self._video_path
             self._active_mpv_scale_kernel = _select_hdr_scale_kernel(
-                pw, ph, ow, oh, upscale_choice
+                pw, ph, scale_target_w, scale_target_h, upscale_choice
             )
             self._active_mpv_scale_antiring = _select_hdr_scale_antiring(
-                pw, ph, ow, oh, self._active_mpv_scale_kernel
+                pw, ph, scale_target_w, scale_target_h, self._active_mpv_scale_kernel
             )
             using_fsr = self._active_mpv_scale_kernel == "fsr"
             self._active_mpv_cas = _select_mpv_cas_strength(
-                pw, ph, ow, oh, using_fsr, self._active_mpv_scale_kernel
+                pw,
+                ph,
+                scale_target_w,
+                scale_target_h,
+                using_fsr,
+                self._active_mpv_scale_kernel,
             )
             if disable_top_preset_sharpen:
                 self._active_mpv_cas = 0.0
@@ -2997,10 +3012,17 @@ class PlaybackRuntimeMixin:
         self._prepare_playback_logging_for_start()
         self._worker.start()
         self._set_process_priority(True)
-        if pw != ow or ph != oh:
+        if _is_upscale_required(pw, ph, scale_target_w, scale_target_h):
             upscale_backend = "mpv GPU" if use_mpv_pipeline else "CPU fallback"
             self.statusBar().showMessage(
-                f"Upscale active: {pw}x{ph} -> {ow}x{oh} via {BEST_UPSCALE_MODE} ({upscale_backend})"
+                f"Monitor upscale active: {pw}x{ph} -> "
+                f"{scale_target_w}x{scale_target_h} via {upscale_choice} "
+                f"({upscale_backend})"
+            )
+        elif pw != ow or ph != oh:
+            self.statusBar().showMessage(
+                f"Lower-res processing active: {pw}x{ph} -> {ow}x{oh}; "
+                "monitor target does not need upscale."
             )
         else:
             self.statusBar().showMessage(
@@ -3289,9 +3311,7 @@ class PlaybackRuntimeMixin:
             if hasattr(self, "_cmb_upscale")
             else DEFAULT_UPSCALER
         )
-        new_upscale = DEFAULT_UPSCALER
-        if new_res in {"540p", "720p"}:
-            new_upscale = current_upscale or DEFAULT_UPSCALER
+        new_upscale = current_upscale or DEFAULT_UPSCALER
         upscale_changed = new_upscale != self._active_upscale_mode
         film_grain_changed = False
         if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:
@@ -3392,9 +3412,15 @@ class PlaybackRuntimeMixin:
             # Pause both SDR/HDR + audio briefly so the hot-swap doesn't
             # desync the two pipelines.
             cur_pw, cur_ph = self._last_res if self._last_res else (MAX_W, MAX_H)
-            ow, oh = self._cur_output_w, self._cur_output_h
-            kernel = _select_hdr_scale_kernel(cur_pw, cur_ph, ow, oh, new_upscale)
-            antiring = _select_hdr_scale_antiring(cur_pw, cur_ph, ow, oh, kernel)
+            target_w, target_h = self._current_upscale_target_dims()
+            self._cur_upscale_target_w = int(target_w)
+            self._cur_upscale_target_h = int(target_h)
+            kernel = _select_hdr_scale_kernel(
+                cur_pw, cur_ph, target_w, target_h, new_upscale
+            )
+            antiring = _select_hdr_scale_antiring(
+                cur_pw, cur_ph, target_w, target_h, kernel
+            )
 
             def _apply_upscale_hot_swap() -> bool:
                 if not self._disp_hdr_mpv.set_scale_kernel(kernel, antiring):
@@ -3409,16 +3435,22 @@ class PlaybackRuntimeMixin:
                 if (
                     isinstance(source_dims, tuple)
                     and len(source_dims) == 2
-                    and active_scale_key == getattr(self, "_source_max_resolution_key", "1080p")
+                    and active_scale_key
+                    == getattr(self, "_source_max_resolution_key", "1080p")
                 ):
-                    disable_top_preset_sharpen = _source_is_below_processing_preset(
-                        source_dims[0], source_dims[1], active_scale_key
+                    disable_top_preset_sharpen = (
+                        _source_is_below_processing_preset(
+                            source_dims[0], source_dims[1], active_scale_key
+                        )
+                        and not _is_upscale_required(
+                            cur_pw, cur_ph, target_w, target_h
+                        )
                     )
                 self._active_mpv_cas = _select_mpv_cas_strength(
                     cur_pw,
                     cur_ph,
-                    ow,
-                    oh,
+                    target_w,
+                    target_h,
                     using_fsr=(kernel == "fsr"),
                     scale_kernel=kernel,
                 )

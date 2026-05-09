@@ -8,7 +8,18 @@ import psutil
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QTimer, Qt
 from PyQt6.QtWidgets import QApplication, QGraphicsOpacityEffect, QVBoxLayout, QWidget
 
-from gui_config import SOURCE_MODE_WINDOW, _normalize_source_mode
+from gui_config import (
+    SOURCE_MODE_WINDOW,
+    _normalize_source_mode,
+    _source_is_below_processing_preset,
+)
+from gui_scaling import (
+    DEFAULT_UPSCALER,
+    _is_upscale_required,
+    _select_hdr_scale_antiring,
+    _select_hdr_scale_kernel,
+    _select_mpv_cas_strength,
+)
 from gui_widgets import DetachedVideoWindow
 
 
@@ -509,24 +520,24 @@ class WindowingMixin:
         except Exception:
             return None
 
-    def _widget_screen_signature(self, widget: QWidget | None) -> str | None:
-        if widget is None:
-            return None
+    def _screen_for_widget(self, widget: QWidget | None = None):
+        """Resolve the screen that owns a widget's top-level window."""
         screen = None
-        try:
-            wh = widget.windowHandle()
-            if wh is not None:
-                screen = wh.screen()
-        except Exception:
-            screen = None
-        if screen is None:
+        if widget is not None:
             try:
-                top = widget.window()
-                wh = top.windowHandle() if top is not None else None
+                wh = widget.windowHandle()
                 if wh is not None:
                     screen = wh.screen()
             except Exception:
                 screen = None
+            if screen is None:
+                try:
+                    top = widget.window()
+                    wh = top.windowHandle() if top is not None else None
+                    if wh is not None:
+                        screen = wh.screen()
+                except Exception:
+                    screen = None
         if screen is None:
             try:
                 wh = self.windowHandle()
@@ -536,6 +547,133 @@ class WindowingMixin:
                 screen = None
         if screen is None:
             screen = QApplication.primaryScreen()
+        return screen
+
+    def _current_upscale_target_dims(self) -> tuple[int, int]:
+        """Use the HDR view's active monitor as the presentation-scale target."""
+        widget = (
+            self._disp_hdr_mpv
+            if getattr(self, "_disp_hdr_mpv", None) is not None
+            else self
+        )
+        screen = self._screen_for_widget(widget)
+        if screen is None:
+            return (1920, 1080)
+        try:
+            g = screen.geometry()
+            dpr = float(screen.devicePixelRatio())
+            w = int(round(float(g.width()) * max(1.0, dpr)))
+            h = int(round(float(g.height()) * max(1.0, dpr)))
+            return max(2, w), max(2, h)
+        except Exception:
+            return (1920, 1080)
+
+    def _disable_active_top_preset_sharpen(
+        self,
+        target_w: int,
+        target_h: int,
+        proc_w: int,
+        proc_h: int,
+    ) -> bool:
+        """Avoid sharpening source-bucket padding when no monitor upscale exists."""
+        source_dims = getattr(self, "_source_video_dims", None)
+        if not (isinstance(source_dims, tuple) and len(source_dims) == 2):
+            return False
+        active_scale_key = str(
+            getattr(self, "_active_resolution", None)
+            or self._cmb_res.currentText()
+            or ""
+        ).strip()
+        if active_scale_key == "Source":
+            active_scale_key = str(
+                getattr(self, "_source_max_resolution_key", "1080p") or "1080p"
+            )
+        if active_scale_key != str(
+            getattr(self, "_source_max_resolution_key", "1080p") or "1080p"
+        ):
+            return False
+        if not _source_is_below_processing_preset(
+            source_dims[0], source_dims[1], active_scale_key
+        ):
+            return False
+        return not _is_upscale_required(proc_w, proc_h, target_w, target_h)
+
+    def _apply_monitor_upscale_settings(self, announce: bool = False) -> bool:
+        """Recompute HDR mpv scaling after moving between monitors."""
+        if not self._playing or not getattr(self, "_active_use_mpv", False):
+            return False
+        if self._disp_hdr_mpv is None or self._last_res is None:
+            return False
+        proc_w, proc_h = self._last_res
+        target_w, target_h = self._current_upscale_target_dims()
+        self._cur_upscale_target_w = int(target_w)
+        self._cur_upscale_target_h = int(target_h)
+        upscale_choice = (
+            self._cmb_upscale.currentText()
+            if hasattr(self, "_cmb_upscale") and self._cmb_upscale is not None
+            else DEFAULT_UPSCALER
+        ) or DEFAULT_UPSCALER
+        kernel = _select_hdr_scale_kernel(
+            proc_w,
+            proc_h,
+            target_w,
+            target_h,
+            upscale_choice,
+        )
+        antiring = _select_hdr_scale_antiring(
+            proc_w,
+            proc_h,
+            target_w,
+            target_h,
+            kernel,
+        )
+        cas = _select_mpv_cas_strength(
+            proc_w,
+            proc_h,
+            target_w,
+            target_h,
+            using_fsr=(kernel == "fsr"),
+            scale_kernel=kernel,
+        )
+        if self._disable_active_top_preset_sharpen(
+            target_w, target_h, proc_w, proc_h
+        ):
+            cas = 0.0
+
+        ok = True
+        if (
+            str(kernel) != str(getattr(self, "_active_mpv_scale_kernel", ""))
+            or abs(
+                float(antiring)
+                - float(getattr(self, "_active_mpv_scale_antiring", 0.0))
+            )
+            > 1e-6
+        ):
+            ok = bool(self._disp_hdr_mpv.set_scale_kernel(kernel, antiring)) and ok
+        if (
+            ok
+            and abs(float(cas) - float(getattr(self, "_active_mpv_cas", 0.0)))
+            > 1e-6
+        ):
+            ok = bool(self._disp_hdr_mpv.set_cas_strength(cas)) and ok
+        if not ok:
+            return False
+
+        self._active_mpv_scale_kernel = kernel
+        self._active_mpv_scale_antiring = float(antiring)
+        self._active_mpv_cas = float(cas)
+        self._active_upscale_mode = str(upscale_choice)
+        if announce and _is_upscale_required(proc_w, proc_h, target_w, target_h):
+            self.statusBar().showMessage(
+                f"Monitor upscale active: {proc_w}x{proc_h} -> "
+                f"{target_w}x{target_h} via {upscale_choice}"
+            )
+        return True
+
+    def _widget_screen_signature(self, widget: QWidget | None) -> str | None:
+        if widget is None:
+            return None
+        screen = self._screen_for_widget(widget)
         return self._screen_signature(screen)
 
     def _attach_screen_change_hook(self, widget: QWidget | None):
@@ -563,6 +701,11 @@ class WindowingMixin:
         self._attach_screen_change_hook(self._disp_sdr_mpv)
 
     def _on_screen_changed(self, _screen=None):
+        try:
+            self._sync_upscale_controls()
+            self._update_apply_button_state()
+        except Exception:
+            pass
         if not self._playing:
             return
         self._schedule_window_state_refresh(0, soft_only=True)
@@ -955,6 +1098,7 @@ class WindowingMixin:
             # Defer full mpv refresh while paused to avoid blackscreen.
             self._deferred_mpv_refresh = True
             if display_changed:
+                self._apply_monitor_upscale_settings(announce=False)
                 self._apply_mpv_runtime_filters(2)
             return
         self._deferred_mpv_refresh = False
@@ -970,6 +1114,12 @@ class WindowingMixin:
         # Let mpv handle output colorspace adaptation; only reassert runtime
         # filters when the active display actually changed.
         if display_changed:
+            self._apply_monitor_upscale_settings(announce=True)
+            try:
+                self._sync_upscale_controls()
+                self._update_apply_button_state()
+            except Exception:
+                pass
             self._apply_mpv_runtime_filters(2)
         # Relock video/audio after any window/layout refresh.
         self._relock_timeline(drop_frames=3)

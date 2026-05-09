@@ -68,7 +68,7 @@ def _select_hdr_scale_kernel(
     upscale_choice: str | None = None,
 ) -> str:
     """Pick mpv scale kernel for HDR output."""
-    if proc_w == out_w and proc_h == out_h:
+    if not _is_upscale_required(proc_w, proc_h, out_w, out_h):
         return "bicubic"
     if upscale_choice:
         return _normalize_upscale_choice(upscale_choice)
@@ -83,7 +83,7 @@ def _select_hdr_scale_antiring(
     scale_kernel: str | None = None,
 ) -> float:
     """Tune antiring strength by processing resolution and kernel."""
-    if proc_w >= out_w and proc_h >= out_h:
+    if not _is_upscale_required(proc_w, proc_h, out_w, out_h):
         return 0.0
     k = str(scale_kernel or "").strip().lower()
     if k == "fsr":
@@ -110,7 +110,7 @@ def _select_mpv_cas_strength(
     scale_kernel: str | None = None,
 ) -> float:
     """Select CAS sharpening strength for HDR upscale."""
-    if proc_w >= out_w and proc_h >= out_h:
+    if not _is_upscale_required(proc_w, proc_h, out_w, out_h):
         return 0.0
     if using_fsr:
         return 0.0
@@ -135,6 +135,21 @@ def _normalize_upscale_choice(choice: str) -> str:
     if "ssim" in c:
         return "ssim_superres"
     return BEST_MPV_SCALE
+
+
+def _is_upscale_required(
+    proc_w: int,
+    proc_h: int,
+    target_w: int,
+    target_h: int,
+) -> bool:
+    """Return true when a 16:9 processing frame grows on the target display."""
+    try:
+        pw, ph = int(proc_w), int(proc_h)
+        tw, th = int(target_w), int(target_h)
+    except Exception:
+        return False
+    return pw > 0 and ph > 0 and tw > pw and th > ph
 
 
 def _ensure_fsr_shader() -> bool:

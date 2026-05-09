@@ -23,6 +23,10 @@ class LifecycleMixin:
         self._active_mpv_scale_antiring = 0.15
         self._active_mpv_cas = 0.0
         self._active_upscale_mode = DEFAULT_UPSCALER
+        self._cur_output_w = 1920
+        self._cur_output_h = 1080
+        self._cur_upscale_target_w = 1920
+        self._cur_upscale_target_h = 1080
         self._active_film_grain = False
         self._startup_sync_pending = False
         self._startup_frame_relock_pending = False
