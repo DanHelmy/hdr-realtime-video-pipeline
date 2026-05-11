@@ -135,6 +135,84 @@ def _normalize_runtime_execution_mode(mode: str) -> str:
 class PlaybackRuntimeMixin:
     """Playback, restart/apply settings, and compile/file tool flows for MainWindow."""
 
+    def _current_playback_scale_status(self) -> str:
+        if not bool(getattr(self, "_playing", False)):
+            return ""
+        if self._last_res is None:
+            return ""
+        proc_w, proc_h = self._last_res
+        try:
+            target_w, target_h = self._current_upscale_target_dims(proc_w, proc_h)
+        except Exception:
+            target_w = int(getattr(self, "_cur_upscale_target_w", 0) or 0)
+            target_h = int(getattr(self, "_cur_upscale_target_h", 0) or 0)
+        if target_w <= 0 or target_h <= 0:
+            target_w = int(getattr(self, "_cur_output_w", proc_w) or proc_w)
+            target_h = int(getattr(self, "_cur_output_h", proc_h) or proc_h)
+        mode_label = str(
+            getattr(self, "_active_upscale_mode", None) or DEFAULT_UPSCALER
+        )
+        if _is_upscale_required(proc_w, proc_h, target_w, target_h):
+            return (
+                f"Monitor upscale active: {proc_w}x{proc_h} -> "
+                f"{target_w}x{target_h} via {mode_label}"
+            )
+        output_w = int(getattr(self, "_cur_output_w", proc_w) or proc_w)
+        output_h = int(getattr(self, "_cur_output_h", proc_h) or proc_h)
+        if proc_w != output_w or proc_h != output_h:
+            return (
+                f"Lower-res processing active: {proc_w}x{proc_h} -> "
+                f"{output_w}x{output_h}; current pane does not need upscale."
+            )
+        return f"No upscale stage: processing at {output_w}x{output_h}."
+
+    def _refresh_playback_scale_status(self, force: bool = False) -> bool:
+        if not bool(getattr(self, "_playing", False)):
+            self._stop_playback_scale_status_timer()
+            return False
+        if not force and time.perf_counter() < float(
+            getattr(self, "_upscale_status_guard_until", 0.0)
+        ):
+            return False
+        status = self._current_playback_scale_status()
+        if not status:
+            return False
+        self._last_playback_scale_status = status
+        try:
+            current = str(self.statusBar().currentMessage() or "")
+        except Exception:
+            current = ""
+        if force or current != status:
+            self.statusBar().showMessage(status)
+        return True
+
+    def _ensure_playback_scale_status_timer(self) -> None:
+        if getattr(self, "_playback_scale_status_timer", None) is not None:
+            return
+        self._playback_scale_status_timer = QTimer(self)
+        self._playback_scale_status_timer.setSingleShot(False)
+        self._playback_scale_status_timer.timeout.connect(
+            self._refresh_playback_scale_status
+        )
+
+    def _start_playback_scale_status_timer(self) -> None:
+        self._ensure_playback_scale_status_timer()
+        timer = getattr(self, "_playback_scale_status_timer", None)
+        if timer is None:
+            return
+        try:
+            interval_ms = int(os.environ.get("HDRTVNET_PLAYBACK_STATUS_MS", "900"))
+        except ValueError:
+            interval_ms = 900
+        timer.stop()
+        timer.start(max(250, interval_ms))
+        self._refresh_playback_scale_status(force=True)
+
+    def _stop_playback_scale_status_timer(self) -> None:
+        timer = getattr(self, "_playback_scale_status_timer", None)
+        if timer is not None:
+            timer.stop()
+
     def _stop_active_browser_tab_session(self) -> None:
         return
 
@@ -1370,6 +1448,7 @@ class PlaybackRuntimeMixin:
         self._sync_screen_change_hooks()
         self._apply_monitor_upscale_settings(announce=False)
         self._sync_upscale_controls()
+        self._refresh_playback_scale_status(force=True)
 
     def _precompile_kernels(self):
         """Open the pre-compile dialog - runs compile_kernels.py as a
@@ -2718,7 +2797,10 @@ class PlaybackRuntimeMixin:
             pw, ph = scale_dims
         else:
             pw, ph = ow, oh
-        scale_target_w, scale_target_h = self._current_upscale_target_dims()
+        scale_target_w, scale_target_h = self._current_upscale_target_dims(pw, ph)
+        actual_target_w, actual_target_h = self._current_actual_upscale_target_dims(
+            pw, ph
+        )
         self._cur_upscale_target_w = int(scale_target_w)
         self._cur_upscale_target_h = int(scale_target_h)
 
@@ -2735,7 +2817,7 @@ class PlaybackRuntimeMixin:
                     source_dims[0], source_dims[1], scale_key
                 )
                 and not _is_upscale_required(
-                    pw, ph, scale_target_w, scale_target_h
+                    pw, ph, actual_target_w, actual_target_h
                 )
             )
 
@@ -2906,8 +2988,8 @@ class PlaybackRuntimeMixin:
             self._active_mpv_cas = _select_mpv_cas_strength(
                 pw,
                 ph,
-                scale_target_w,
-                scale_target_h,
+                actual_target_w,
+                actual_target_h,
                 using_fsr,
                 self._active_mpv_scale_kernel,
             )
@@ -3028,6 +3110,7 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage(
                 f"No upscale stage: processing at {ow}x{oh}."
             )
+        self._start_playback_scale_status_timer()
         self._post_seek_resync_frames = 0
         self._pending_seek_on_resume = None
         if self._startup_sync_pending:
@@ -3281,8 +3364,32 @@ class PlaybackRuntimeMixin:
         if self._playing:
             self._update_apply_button_state()
 
+    def _show_upscale_selection_status(self, mode: str):
+        mode_label = str(mode or DEFAULT_UPSCALER)
+        self._upscale_status_guard_until = time.perf_counter() + 3.0
+        if not self._playing:
+            self.statusBar().showMessage(f"Upscale preference saved: {mode_label}")
+            return
+        cur_pw, cur_ph = self._last_res if self._last_res else (MAX_W, MAX_H)
+        try:
+            actual_w, actual_h = self._current_actual_upscale_target_dims(
+                cur_pw, cur_ph
+            )
+            active_now = _is_upscale_required(cur_pw, cur_ph, actual_w, actual_h)
+        except Exception:
+            active_now = False
+        if active_now:
+            self.statusBar().showMessage(
+                f"Upscale selected: {mode_label} (click Apply to use now)"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Upscale preference saved: {mode_label} (inactive at current pane size)"
+            )
+
     def _on_upscale_changed(self, _mode: str):
         self._sync_upscale_controls()
+        self._show_upscale_selection_status(_mode)
         if self._playing:
             self._update_apply_button_state()
 
@@ -3412,7 +3519,13 @@ class PlaybackRuntimeMixin:
             # Pause both SDR/HDR + audio briefly so the hot-swap doesn't
             # desync the two pipelines.
             cur_pw, cur_ph = self._last_res if self._last_res else (MAX_W, MAX_H)
-            target_w, target_h = self._current_upscale_target_dims()
+            target_w, target_h = self._current_upscale_target_dims(cur_pw, cur_ph)
+            actual_w, actual_h = self._current_actual_upscale_target_dims(
+                cur_pw, cur_ph
+            )
+            actual_upscale_active = _is_upscale_required(
+                cur_pw, cur_ph, actual_w, actual_h
+            )
             self._cur_upscale_target_w = int(target_w)
             self._cur_upscale_target_h = int(target_h)
             kernel = _select_hdr_scale_kernel(
@@ -3443,14 +3556,14 @@ class PlaybackRuntimeMixin:
                             source_dims[0], source_dims[1], active_scale_key
                         )
                         and not _is_upscale_required(
-                            cur_pw, cur_ph, target_w, target_h
+                            cur_pw, cur_ph, actual_w, actual_h
                         )
                     )
                 self._active_mpv_cas = _select_mpv_cas_strength(
                     cur_pw,
                     cur_ph,
-                    target_w,
-                    target_h,
+                    actual_w,
+                    actual_h,
                     using_fsr=(kernel == "fsr"),
                     scale_kernel=kernel,
                 )
@@ -3458,15 +3571,29 @@ class PlaybackRuntimeMixin:
                     self._active_mpv_cas = 0.0
                 self._disp_hdr_mpv.set_cas_strength(self._active_mpv_cas)
                 self._active_upscale_mode = new_upscale
+                mode_label = str(self._active_upscale_mode or "")
+                using_shader = kernel == "fsr" or "ssim" in str(kernel).lower()
+                if actual_upscale_active:
+                    state = "shader active" if using_shader else "kernel active"
+                    status_message = f"Upscale hot-swap: {mode_label} ({state})"
+                else:
+                    status_message = (
+                        f"Upscale preference saved: {mode_label} "
+                        "(inactive at current pane size)"
+                    )
+                self._upscale_status_guard_until = time.perf_counter() + 6.0
 
                 def _announce():
-                    mode_label = str(self._active_upscale_mode or "")
-                    using_shader = kernel == "fsr" or "ssim" in str(kernel).lower()
-                    self.statusBar().showMessage(
-                        f"Upscale hot-swap: {mode_label} ({'shader active' if using_shader else 'kernel active'})"
+                    if str(getattr(self, "_active_upscale_mode", "") or "") != str(new_upscale):
+                        return
+                    self._upscale_status_guard_until = max(
+                        float(getattr(self, "_upscale_status_guard_until", 0.0)),
+                        time.perf_counter() + 2.0,
                     )
+                    self.statusBar().showMessage(status_message)
 
-                QTimer.singleShot(80, _announce)
+                for delay_ms in (80, 900, 2200, 4200):
+                    QTimer.singleShot(delay_ms, _announce)
                 self._save_user_settings()
                 return True
 

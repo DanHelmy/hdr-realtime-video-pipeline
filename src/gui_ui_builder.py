@@ -256,7 +256,7 @@ class UiBuilderMixin:
             QSizePolicy.Policy.Fixed,
         )
         self._cmb_upscale.setToolTip(
-            "Upscale kernel used when the active monitor is larger than the processing resolution."
+            "Preferred upscale method. It is applied when the current monitor or pane is larger than the processing resolution."
         )
         row1.addWidget(self._cmb_upscale, 4, 1)
         row1.setColumnStretch(0, 0)

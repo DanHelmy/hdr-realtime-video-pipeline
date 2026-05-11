@@ -311,7 +311,7 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
-            preview_scale_kernel="bicubic",
+            preview_scale_kernel=best_mpv_scale,
             preview_cas_strength=0.0,
             preview_film_grain=False,
         )
@@ -321,7 +321,7 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
-            preview_scale_kernel="bicubic",
+            preview_scale_kernel=best_mpv_scale,
             preview_cas_strength=0.0,
             preview_film_grain=False,
         )
@@ -331,7 +331,7 @@ class CompareFrameDialog(QDialog):
             mpv_available=mpv_available,
             mpv_widget_factory=mpv_widget_factory,
             best_mpv_scale=best_mpv_scale,
-            preview_scale_kernel="bicubic",
+            preview_scale_kernel=best_mpv_scale,
             preview_cas_strength=0.0,
             preview_film_grain=False,
         )

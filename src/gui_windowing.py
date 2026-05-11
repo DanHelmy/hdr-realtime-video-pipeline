@@ -549,8 +549,54 @@ class WindowingMixin:
             screen = QApplication.primaryScreen()
         return screen
 
-    def _current_upscale_target_dims(self) -> tuple[int, int]:
-        """Use the HDR view's active monitor as the presentation-scale target."""
+    @staticmethod
+    def _fit_content_to_bounds(
+        bounds_w: int,
+        bounds_h: int,
+        src_w: int | None = None,
+        src_h: int | None = None,
+    ) -> tuple[int, int]:
+        """Fit the processed frame aspect into a physical-pixel target box."""
+        bw = max(2, int(bounds_w))
+        bh = max(2, int(bounds_h))
+        sw = max(1, int(src_w or 16))
+        sh = max(1, int(src_h or 9))
+        scale = min(float(bw) / float(sw), float(bh) / float(sh))
+        return (
+            max(2, int(round(float(sw) * scale))),
+            max(2, int(round(float(sh) * scale))),
+        )
+
+    @staticmethod
+    def _blend_dims(
+        a: tuple[int, int],
+        b: tuple[int, int],
+        b_weight: float,
+    ) -> tuple[int, int]:
+        w = max(0.0, min(1.0, float(b_weight)))
+        return (
+            max(2, int(round((float(a[0]) * (1.0 - w)) + (float(b[0]) * w)))),
+            max(2, int(round((float(a[1]) * (1.0 - w)) + (float(b[1]) * w)))),
+        )
+
+    def _current_hdr_pane_bounds(self) -> tuple[int, int] | None:
+        widget = (
+            self._disp_hdr_mpv
+            if getattr(self, "_disp_hdr_mpv", None) is not None
+            else self
+        )
+        try:
+            size = widget.size()
+            dpr = float(widget.devicePixelRatioF())
+            w = int(round(float(size.width()) * max(1.0, dpr)))
+            h = int(round(float(size.height()) * max(1.0, dpr)))
+            if w > 16 and h > 16:
+                return max(2, w), max(2, h)
+        except Exception:
+            pass
+        return None
+
+    def _current_monitor_bounds(self) -> tuple[int, int]:
         widget = (
             self._disp_hdr_mpv
             if getattr(self, "_disp_hdr_mpv", None) is not None
@@ -567,6 +613,78 @@ class WindowingMixin:
             return max(2, w), max(2, h)
         except Exception:
             return (1920, 1080)
+
+    def _is_hdr_side_by_side_visible(self) -> bool:
+        try:
+            if self._current_video_tab_label() == "Side by Side":
+                return True
+        except Exception:
+            pass
+        try:
+            return (
+                getattr(self, "_side_hdr_host", None) is not None
+                and self._disp_hdr.parentWidget() is self._side_hdr_host
+            )
+        except Exception:
+            return False
+
+    def _is_fullscreenish_video_layout(self) -> bool:
+        try:
+            if bool(getattr(self, "_borderless_full_window", False)):
+                return True
+            return bool(self.windowState() & Qt.WindowState.WindowFullScreen)
+        except Exception:
+            return False
+
+    def _current_actual_upscale_target_dims(
+        self,
+        proc_w: int | None = None,
+        proc_h: int | None = None,
+    ) -> tuple[int, int]:
+        """Physical pixels currently available to the HDR video image."""
+        pane_bounds = self._current_hdr_pane_bounds()
+        if pane_bounds is None:
+            pane_bounds = self._current_monitor_bounds()
+        return self._fit_content_to_bounds(
+            pane_bounds[0],
+            pane_bounds[1],
+            proc_w,
+            proc_h,
+        )
+
+    def _current_upscale_target_dims(
+        self,
+        proc_w: int | None = None,
+        proc_h: int | None = None,
+    ) -> tuple[int, int]:
+        """Hybrid target: monitor-led, pane-aware for windowed layouts."""
+        monitor_bounds = self._current_monitor_bounds()
+        monitor_target = self._fit_content_to_bounds(
+            monitor_bounds[0],
+            monitor_bounds[1],
+            proc_w,
+            proc_h,
+        )
+        pane_bounds = self._current_hdr_pane_bounds()
+        if pane_bounds is None:
+            return monitor_target
+        pane_target = self._fit_content_to_bounds(
+            pane_bounds[0],
+            pane_bounds[1],
+            proc_w,
+            proc_h,
+        )
+        coverage = min(
+            float(pane_target[0]) / max(1.0, float(monitor_target[0])),
+            float(pane_target[1]) / max(1.0, float(monitor_target[1])),
+        )
+        if coverage >= 0.92 or self._is_fullscreenish_video_layout():
+            return monitor_target
+        if self._is_hdr_side_by_side_visible():
+            return pane_target
+
+        pane_weight = max(0.20, min(0.70, (0.88 - coverage) / 0.80))
+        return self._blend_dims(monitor_target, pane_target, pane_weight)
 
     def _disable_active_top_preset_sharpen(
         self,
@@ -605,14 +723,15 @@ class WindowingMixin:
         if self._disp_hdr_mpv is None or self._last_res is None:
             return False
         proc_w, proc_h = self._last_res
-        target_w, target_h = self._current_upscale_target_dims()
+        target_w, target_h = self._current_upscale_target_dims(proc_w, proc_h)
+        actual_w, actual_h = self._current_actual_upscale_target_dims(proc_w, proc_h)
         self._cur_upscale_target_w = int(target_w)
         self._cur_upscale_target_h = int(target_h)
-        upscale_choice = (
-            self._cmb_upscale.currentText()
-            if hasattr(self, "_cmb_upscale") and self._cmb_upscale is not None
-            else DEFAULT_UPSCALER
-        ) or DEFAULT_UPSCALER
+        # Use the applied runtime mode here. The combo box is only a pending
+        # preference until the user clicks Apply.
+        upscale_choice = str(
+            getattr(self, "_active_upscale_mode", None) or DEFAULT_UPSCALER
+        )
         kernel = _select_hdr_scale_kernel(
             proc_w,
             proc_h,
@@ -630,13 +749,13 @@ class WindowingMixin:
         cas = _select_mpv_cas_strength(
             proc_w,
             proc_h,
-            target_w,
-            target_h,
+            actual_w,
+            actual_h,
             using_fsr=(kernel == "fsr"),
             scale_kernel=kernel,
         )
         if self._disable_active_top_preset_sharpen(
-            target_w, target_h, proc_w, proc_h
+            actual_w, actual_h, proc_w, proc_h
         ):
             cas = 0.0
 
@@ -1093,11 +1212,22 @@ class WindowingMixin:
         self._window_refresh_soft_only = False
         self._sync_screen_change_hooks()
         display_changed = self._detect_mpv_screen_change()
+        target_changed = False
+        try:
+            target_w, target_h = self._current_upscale_target_dims(
+                *(self._last_res or (None, None))
+            )
+            target_changed = (
+                int(target_w) != int(getattr(self, "_cur_upscale_target_w", 0))
+                or int(target_h) != int(getattr(self, "_cur_upscale_target_h", 0))
+            )
+        except Exception:
+            target_changed = False
         paused = bool(self._worker is not None and self._worker.is_paused)
         if paused:
             # Defer full mpv refresh while paused to avoid blackscreen.
             self._deferred_mpv_refresh = True
-            if display_changed:
+            if display_changed or target_changed or soft_only:
                 self._apply_monitor_upscale_settings(announce=False)
                 self._apply_mpv_runtime_filters(2)
             return
@@ -1111,15 +1241,16 @@ class WindowingMixin:
             if paused:
                 self._disp_sdr_mpv.set_paused(True)
 
-        # Let mpv handle output colorspace adaptation; only reassert runtime
-        # filters when the active display actually changed.
-        if display_changed:
-            self._apply_monitor_upscale_settings(announce=True)
+        # Recompute the presentation scaler whenever the monitor or pane size
+        # changes; small side-by-side panes should not keep fullscreen tuning.
+        if display_changed or target_changed or soft_only:
+            self._apply_monitor_upscale_settings(announce=display_changed)
             try:
                 self._sync_upscale_controls()
                 self._update_apply_button_state()
             except Exception:
                 pass
-            self._apply_mpv_runtime_filters(2)
+            if display_changed:
+                self._apply_mpv_runtime_filters(2)
         # Relock video/audio after any window/layout refresh.
         self._relock_timeline(drop_frames=3)

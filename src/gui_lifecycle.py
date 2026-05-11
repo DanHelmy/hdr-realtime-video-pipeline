@@ -48,6 +48,9 @@ class LifecycleMixin:
         self._deferred_mpv_refresh = False
         if self._audio_fade_timer is not None:
             self._audio_fade_timer.stop()
+        if getattr(self, "_playback_scale_status_timer", None) is not None:
+            self._playback_scale_status_timer.stop()
+        self._last_playback_scale_status = ""
         self._apply_volume_to_backends()
         self._post_seek_resync_frames = 0
         self._pending_seek_on_resume = None

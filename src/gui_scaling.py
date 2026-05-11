@@ -87,6 +87,12 @@ def _select_hdr_scale_antiring(
         return 0.0
     k = str(scale_kernel or "").strip().lower()
     if k == "fsr":
+        try:
+            max_ratio = max(float(out_w) / float(proc_w), float(out_h) / float(proc_h))
+        except Exception:
+            max_ratio = 1.0
+        if max_ratio > 2.01:
+            return 0.16 if (proc_h <= 720 or proc_w <= 1280) else 0.10
         return 0.0
     if "ssim" in k:
         return 0.0

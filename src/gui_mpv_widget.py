@@ -174,6 +174,32 @@ def _mpv_live_tscale() -> str:
     return value
 
 
+def _mpv_downscale_kernel(*, hdr: bool = True) -> str:
+    env_name = "HDRTVNET_MPV_DSCALE" if hdr else "HDRTVNET_MPV_SDR_DSCALE"
+    fallback = os.environ.get("HDRTVNET_MPV_DSCALE", "catmull_rom")
+    value = str(os.environ.get(env_name, fallback if hdr else "mitchell"))
+    value = value.strip().lower().replace("-", "_")
+    if value in {"", "none", "no", "off"}:
+        return ""
+    return value
+
+
+def _mpv_downscale_antiring(*, hdr: bool = True) -> float:
+    if hdr:
+        return _env_float(
+            "HDRTVNET_MPV_DSCALE_ANTIRING",
+            0.35,
+            min_value=0.0,
+            max_value=1.0,
+        )
+    return _env_float(
+        "HDRTVNET_MPV_SDR_DSCALE_ANTIRING",
+        0.20,
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+
 def _without_deband_options(kwargs: dict) -> dict:
     clean = dict(kwargs)
     for key in (
@@ -463,6 +489,26 @@ class MpvHDRWidget(QWidget):
     def _set_shader_chain(self, shader_paths: list[str]) -> bool:
         return self._set_glsl_shaders(self._normalize_shader_paths(shader_paths))
 
+    def _apply_presentation_scaler_defaults(self):
+        p = self._player
+        if p is None:
+            return
+        hdr_path = bool(self._force_hdr_metadata)
+        settings = {
+            "correct-downscaling": "yes",
+            "linear-downscaling": "yes" if hdr_path else "no",
+        }
+        dscale = _mpv_downscale_kernel(hdr=hdr_path)
+        if dscale:
+            settings["dscale"] = dscale
+            settings["dscale-antiring"] = str(_mpv_downscale_antiring(hdr=hdr_path))
+        for name, value in settings.items():
+            try:
+                p.command("set", name, value)
+            except Exception as exc:
+                if self._diag_enabled:
+                    print(f"[mpv] presentation scaler option {name}={value} failed: {exc}")
+
     @staticmethod
     def _kernel_antiring(scale_kernel: str) -> tuple[str, float]:
         k = str(scale_kernel or "bicubic").strip().lower()
@@ -475,6 +521,13 @@ class MpvHDRWidget(QWidget):
         if k in {"ewa_lanczossharp", "ewa_lanczos"}:
             return "ewa_lanczossharp", 0.20
         return k, 0.0
+
+    def _fsr_residual_scale_kernel(self) -> str:
+        """High-quality scaler for any residual scale after FSR's EASU pass."""
+        k = str(self._best_mpv_scale or "ewa_lanczossharp").strip().lower()
+        if not k or k == "fsr":
+            return "ewa_lanczossharp"
+        return k
 
     def _attach_audio_async(self, audio_path: str):
         def _worker():
@@ -690,6 +743,7 @@ class MpvHDRWidget(QWidget):
         self._target_colorspace_hint = "auto"
         deband_options = _mpv_deband_options(live_capture=live_capture)
         dither_options = _mpv_dither_options(live_capture=live_capture)
+        fsr_residual_kernel = self._fsr_residual_scale_kernel()
         mpv_kwargs = dict(
             wid=wid,
             vo="gpu-next",
@@ -710,8 +764,8 @@ class MpvHDRWidget(QWidget):
             demuxer_max_bytes=max_demux,
             demuxer_readahead_secs=str(readahead_secs),
             video_sync="display-resample" if vsync_timed else "desync",
-            scale="bilinear" if use_fsr else str(kernel_name),
-            cscale="bilinear" if use_fsr else str(kernel_name),
+            scale=fsr_residual_kernel if use_fsr else str(kernel_name),
+            cscale=fsr_residual_kernel if use_fsr else str(kernel_name),
             scale_antiring=str(antiring),
             cscale_antiring=str(antiring),
         )
@@ -836,6 +890,7 @@ class MpvHDRWidget(QWidget):
             self._pipe_name = None
             return False
         self._player = player
+        self._apply_presentation_scaler_defaults()
         pipe_ready = threading.Event()
         self._feeder = threading.Thread(
             target=self._pipe_feeder_fn,
@@ -1022,8 +1077,9 @@ class MpvHDRWidget(QWidget):
             if requested_kernel == "ssim_superres" and not use_ssim:
                 use_ssim = False
             if use_fsr:
-                p.command("set", "scale", "bilinear")
-                p.command("set", "cscale", "bilinear")
+                residual_kernel = self._fsr_residual_scale_kernel()
+                p.command("set", "scale", residual_kernel)
+                p.command("set", "cscale", residual_kernel)
             else:
                 p.command("set", "scale", kernel)
                 p.command("set", "cscale", kernel)
@@ -1056,6 +1112,7 @@ class MpvHDRWidget(QWidget):
         p = self._player
         if p is None:
             return False
+        self._apply_presentation_scaler_defaults()
         try:
             cas_val = float(cas_strength or 0.0)
         except Exception:

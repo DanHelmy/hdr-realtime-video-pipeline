@@ -2753,7 +2753,7 @@ class ModelBenchmarkDialog(QDialog):
             mpv_available=_HAS_MPV,
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
-            preview_scale_kernel="bicubic",
+            preview_scale_kernel=BEST_MPV_SCALE,
             preview_cas_strength=0.0,
             preview_film_grain=False,
 
@@ -2764,7 +2764,7 @@ class ModelBenchmarkDialog(QDialog):
             mpv_available=_HAS_MPV,
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
-            preview_scale_kernel="bicubic",
+            preview_scale_kernel=BEST_MPV_SCALE,
             preview_cas_strength=0.0,
             preview_film_grain=False,
         )
@@ -2774,7 +2774,7 @@ class ModelBenchmarkDialog(QDialog):
             mpv_available=_HAS_MPV,
             mpv_widget_factory=_new_mpv_widget if _HAS_MPV else None,
             best_mpv_scale=BEST_MPV_SCALE,
-            preview_scale_kernel="bicubic",
+            preview_scale_kernel=BEST_MPV_SCALE,
             preview_cas_strength=0.0,
             preview_film_grain=False,
         )

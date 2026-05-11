@@ -55,20 +55,19 @@ class SettingsPreviewMixin:
             return False
         proc_w, proc_h = _processing_preset_dims(key)
         try:
-            target_w, target_h = self._current_upscale_target_dims()
+            target_w, target_h = self._current_upscale_target_dims(proc_w, proc_h)
         except Exception:
             target_w, target_h = MAX_W, MAX_H
         return _is_upscale_required(proc_w, proc_h, target_w, target_h)
 
     def _sync_upscale_controls(self):
-        """Enable/disable upscale selector based on monitor target."""
+        """Keep the upscale selector valid and editable."""
         if not hasattr(self, "_cmb_upscale") or self._cmb_upscale is None:
             return
-        allow = self._resolution_upscale_allowed()
         self._cmb_upscale.blockSignals(True)
         if self._cmb_upscale.currentText() not in UPSCALER_CHOICES:
             self._cmb_upscale.setCurrentText(DEFAULT_UPSCALER)
-        self._cmb_upscale.setEnabled(bool(allow))
+        self._cmb_upscale.setEnabled(True)
         self._cmb_upscale.blockSignals(False)
 
     def _refresh_resolution_options_for_video(self, path: str):
@@ -333,9 +332,7 @@ class SettingsPreviewMixin:
         if not self._playing:
             return False
         upscale_changed = False
-        if hasattr(self, "_cmb_upscale") and self._resolution_upscale_allowed(
-            self._cmb_res.currentText()
-        ):
+        if hasattr(self, "_cmb_upscale") and self._cmb_upscale is not None:
             upscale_changed = self._cmb_upscale.currentText() != self._active_upscale_mode
         film_grain_changed = False
         if hasattr(self, "_chk_film_grain") and self._chk_film_grain is not None:

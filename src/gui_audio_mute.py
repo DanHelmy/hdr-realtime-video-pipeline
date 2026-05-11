@@ -9,6 +9,16 @@ from PyQt6.QtCore import QTimer
 class AutoMuteMixin:
     """Low-FPS auto-mute policy helpers for MainWindow."""
 
+    def _show_audio_restored_message(self) -> None:
+        if time.perf_counter() < float(
+            getattr(self, "_upscale_status_guard_until", 0.0)
+        ):
+            return
+        refresh_status = getattr(self, "_refresh_playback_scale_status", None)
+        if callable(refresh_status) and refresh_status(force=True):
+            return
+        self.statusBar().showMessage("Audio restored (playback stable).")
+
     def _is_stability_hold_satisfied(self, strict: bool = False) -> bool:
         """Require continuous stable FPS for a minimum hold duration."""
         if not bool(getattr(self, "_fps_is_stable", False)):
@@ -176,7 +186,7 @@ class AutoMuteMixin:
                     now_t + max(0.0, grace_s),
                 )
                 self._start_audio_restore_fade(duration_ms=post_fade_ms)
-                self.statusBar().showMessage("Audio restored (playback stable).")
+                self._show_audio_restored_message()
 
             QTimer.singleShot(
                 max(50, int(first_ms) + int(settle_ms)),
@@ -255,7 +265,7 @@ class AutoMuteMixin:
                 not self._startup_audio_gate_active
                 and not self._pending_playhead_relock_on_unmute
             ):
-                self.statusBar().showMessage("Audio restored (playback stable).")
+                self._show_audio_restored_message()
 
     def _arm_mute_until_fps_recovery(self):
         """Force mute now; unmute only via measured FPS recovery logic."""

@@ -164,6 +164,8 @@ class StateInitMixin:
         self._app_active = True
         self._deferred_mpv_refresh = False
         self._cursor_idle_timer = None
+        self._playback_scale_status_timer = None
+        self._last_playback_scale_status = ""
         self._cursor_idle_enabled = True
         self._cursor_hidden = False
         self._cursor_idle_ms = 1500
