@@ -246,6 +246,15 @@ class MpvPreviewRenderer:
                 return
             output_path.unlink()
 
+        # Offline figure rendering favors correctness over throughput. Reusing a
+        # single rawvideo playback session can leave mpv/D3D11 window screenshots
+        # one frame behind after sequential feed swaps, so restart playback for
+        # every saved render.
+        try:
+            self.widget.stop_playback()
+        except Exception:
+            pass
+        self._active_cfg = None
         self.widget.resize(int(out_w), int(out_h))
         self.widget.show()
         self.widget.raise_()

@@ -10,6 +10,10 @@ __pycache__/
 *.mp4
 *.avi
 *.7z
+docs/images/thesis_mpv_figures
+docs/Draft 2 Skripsi_2210511039_Danendra Helmy Pratama copy.pdf
+docs/images/thesis_mpv_figures_smoke/mpv_preview_manifest.json
+scripts/remake_thesis_pdf_figures.py
 
 # mpv runtime DLL (112 MB — download separately)
 libmpv-2.dll
@@ -72,5 +76,3 @@ third_party/hdrvdp/
 # Keep dependency manifests tracked
 !requirements/
 !requirements/*.txt
-docs/Draft 2 Skripsi_2210511039_Danendra Helmy Pratama copy.pdf
-docs/images/thesis_mpv_figures_smoke/mpv_preview_manifest.json
