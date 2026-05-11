@@ -35,10 +35,10 @@ Core updates include:
   - `PSNR` / `SSIM` run on linear HDR frames
   - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
 - display-side HDR tone mapping (BT.2390) for improved visual presentation, applied consistently across HDR panes when enabled; does not affect objective metrics or exported HDR content
-- hybrid monitor/pane-aware playback upscaling: fullscreen playback stays monitor-led, side-by-side/windowed panes scale against their actual presentation size, and the selected mpv upscale mode remains editable even when inactive
+- pane-aware playback upscaling: mpv upscale quality follows the actual HDR pane size, so normal windowed, side-by-side, fullscreen-with-UI, and hide-UI fullscreen layouts only upscale when the pane is larger than the processed frame
 - FSR playback now uses an RGB `MAIN` mpv shader for the app's RGB48 feed, with a high-quality residual mpv scaler instead of bilinear fallback when FSR's EASU pass does not cover the full target
 - SDR panes now use SDR-specific downscaling (`mitchell`, non-linear) instead of the HDR linear-light downscale path, reducing glow around tiny SDR text in side-by-side/windowed layouts
-- the status bar now keeps the live monitor/pane upscale state visible during playback instead of only reporting it on monitor moves; audio recovery notices yield to that persistent scaling state
+- the status bar now keeps the live pane upscale state visible during playback instead of only reporting it on monitor moves; audio recovery notices yield to that persistent scaling state
 - lightweight high-highlight debanding is enabled for live HDR playback, while heavier sky deblocking/temporal cleanup remains opt-in and does not affect objective metrics, compare snapshots, or benchmark results
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
@@ -353,15 +353,15 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - clean first launches default to `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
   - existing `.gui_prefs.json` settings still win, so local user choices are preserved
 
-- **Hybrid playback upscale**
+- **Pane-aware playback upscale**
   - the `Resolution` control still selects model processing size (`1080p`, `720p`, `540p`, or source-limited fallback)
-  - fullscreen and borderless playback remain monitor-led, so `1080p` can still use `SSimSuperRes`, `FSR`, or `EWA LanczosSharp` on 1440p/4K displays
-  - side-by-side and smaller windowed HDR panes are pane-aware, so CAS/sharpening does not use fullscreen-strength tuning when the video is only drawn into a smaller area
-  - the `Upscale` control is always editable; the selected method is saved as a preference and becomes active whenever the current monitor/pane target is larger than the processed frame
+  - the HDR pane's actual drawable size drives the upscale target, so fullscreen-with-UI and side-by-side do not request full-monitor upscale unless the pane itself fills that space
+  - hide-UI fullscreen naturally becomes monitor-sized because the HDR pane fills the display
+  - the `Upscale` control is always editable; the selected method is saved as a preference and becomes active whenever the current pane target is larger than the processed frame
   - Apply feedback now reports whether the selected upscale is active or only saved as an inactive preference for the current pane size
   - FSR now runs through an RGB `MAIN` shader path for RGB48 playback, and any residual scale after EASU uses the best mpv scaler instead of bilinear
-  - the status bar keeps the current monitor/pane upscale state visible during playback, and audio recovery notices yield to that live scaling status
-  - moving the main window or popped-out HDR view between monitors updates the mpv scale/CAS settings without restarting inference
+  - the status bar keeps the current pane upscale state visible during playback, and audio recovery notices yield to that live scaling status
+  - moving or resizing the main window or popped-out HDR view updates the mpv scale/CAS settings without restarting inference
 
 ### Previous v5.1 Highlights
 
@@ -471,7 +471,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **TensorRT engine cache** | NVIDIA engines are built on demand per model/resolution/mode and reused from `src/models/engines/` |
 | **Clear TensorRT engine cache** | NVIDIA-only tool for deleting selected or all cached `.engine` files |
 | **PyTorch kernel compilation** | AMD can use Triton/torch.compile caches in a clean subprocess; caches are repo-local under `src/models/compile_cache/` and verified before reuse |
-| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback); playback uses **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** through a hybrid monitor/pane-aware target, with fullscreen monitor-led scaling and pane-aware side-by-side/windowed tuning |
+| **Resolution + scaling** | Process at 1080p/720p/540p (or Source fallback); playback uses **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** through a pane-aware target, so the upscale stage follows the HDR pane's actual drawable size |
 | **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
 | **Film grain** | Optional film grain restoration (mpv shader) |
 | **Video export** | Separate export dialog with native resolution/FPS defaults, independent model preset selection, and ProRes 422 HQ output |
@@ -582,15 +582,15 @@ Both SDR and HDR panes are rendered through embedded **mpv** (d3d11):
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
 - SDR and HDR panes intentionally use different downscale defaults: SDR uses non-linear `mitchell` downscaling to avoid small-pane bloom around bright text, while HDR keeps linear-light `catmull_rom` downscaling for the HDR presentation path. Override with `HDRTVNET_MPV_SDR_DSCALE`, `HDRTVNET_MPV_SDR_DSCALE_ANTIRING`, `HDRTVNET_MPV_DSCALE`, and `HDRTVNET_MPV_DSCALE_ANTIRING`.
 
-Playback scaling is hybrid monitor/pane-aware:
+Playback scaling is pane-aware:
 
 - `Resolution` controls model processing size and cache/engine selection, not the final display target.
-- `Upscale` is an always-editable preference for the mpv presentation scaler; it is applied whenever the current HDR monitor/pane target is larger than the processed frame.
-- Fullscreen and borderless playback use the active monitor as the quality target for consistent 1440p/4K presentation.
-- Side-by-side and smaller windowed panes are pane-aware, so compare-style layouts do not keep fullscreen-strength CAS/sharpening when the video is only drawn into a smaller physical area.
+- `Upscale` is an always-editable preference for the mpv presentation scaler; it is applied whenever the current HDR pane target is larger than the processed frame.
+- Fullscreen-with-UI, side-by-side, and windowed playback follow the HDR pane's drawable size instead of assuming the whole monitor is available.
+- Hide-UI fullscreen becomes monitor-sized naturally because the HDR pane fills the display.
 - Compare and benchmark preview panes use the same high-quality mpv scaler family without extra CAS sharpening.
 - FSR is adapted for the RGB48 playback path by running EASU/RCAS on `MAIN` RGB; if FSR only scales partway to the target, mpv finishes the residual scale with the best configured scaler instead of bilinear.
-- Moving the app or a popped-out HDR view between monitors hot-swaps the mpv scale/CAS settings without restarting the model pipeline.
+- Moving or resizing the app or a popped-out HDR view hot-swaps the mpv scale/CAS settings without restarting the model pipeline.
 
 ### HDR Playback Cleanup
 

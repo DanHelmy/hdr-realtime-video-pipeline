@@ -154,7 +154,7 @@ class PlaybackRuntimeMixin:
         )
         if _is_upscale_required(proc_w, proc_h, target_w, target_h):
             return (
-                f"Monitor upscale active: {proc_w}x{proc_h} -> "
+                f"Pane upscale active: {proc_w}x{proc_h} -> "
                 f"{target_w}x{target_h} via {mode_label}"
             )
         output_w = int(getattr(self, "_cur_output_w", proc_w) or proc_w)
@@ -3097,7 +3097,7 @@ class PlaybackRuntimeMixin:
         if _is_upscale_required(pw, ph, scale_target_w, scale_target_h):
             upscale_backend = "mpv GPU" if use_mpv_pipeline else "CPU fallback"
             self.statusBar().showMessage(
-                f"Monitor upscale active: {pw}x{ph} -> "
+                f"Pane upscale active: {pw}x{ph} -> "
                 f"{scale_target_w}x{scale_target_h} via {upscale_choice} "
                 f"({upscale_backend})"
             )

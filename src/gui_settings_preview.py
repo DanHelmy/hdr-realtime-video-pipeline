@@ -307,6 +307,20 @@ class SettingsPreviewMixin:
         if et == QEvent.Type.Resize:
             self._position_ui_overlay()
             self._sync_upscale_controls()
+            try:
+                watched = (
+                    self,
+                    getattr(self, "_disp_hdr_mpv", None),
+                    getattr(self, "_disp_hdr_stack", None),
+                    getattr(self, "_disp_hdr", None),
+                    getattr(self, "_side_hdr_host", None),
+                )
+                if bool(getattr(self, "_playing", False)) and any(
+                    obj is item for item in watched if item is not None
+                ):
+                    self._schedule_window_state_refresh(80, soft_only=True)
+            except Exception:
+                pass
         elif et == QEvent.Type.Move:
             self._sync_upscale_controls()
         if et in (

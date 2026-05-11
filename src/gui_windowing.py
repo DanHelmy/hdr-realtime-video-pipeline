@@ -567,18 +567,6 @@ class WindowingMixin:
             max(2, int(round(float(sh) * scale))),
         )
 
-    @staticmethod
-    def _blend_dims(
-        a: tuple[int, int],
-        b: tuple[int, int],
-        b_weight: float,
-    ) -> tuple[int, int]:
-        w = max(0.0, min(1.0, float(b_weight)))
-        return (
-            max(2, int(round((float(a[0]) * (1.0 - w)) + (float(b[0]) * w)))),
-            max(2, int(round((float(a[1]) * (1.0 - w)) + (float(b[1]) * w)))),
-        )
-
     def _current_hdr_pane_bounds(self) -> tuple[int, int] | None:
         widget = (
             self._disp_hdr_mpv
@@ -614,28 +602,6 @@ class WindowingMixin:
         except Exception:
             return (1920, 1080)
 
-    def _is_hdr_side_by_side_visible(self) -> bool:
-        try:
-            if self._current_video_tab_label() == "Side by Side":
-                return True
-        except Exception:
-            pass
-        try:
-            return (
-                getattr(self, "_side_hdr_host", None) is not None
-                and self._disp_hdr.parentWidget() is self._side_hdr_host
-            )
-        except Exception:
-            return False
-
-    def _is_fullscreenish_video_layout(self) -> bool:
-        try:
-            if bool(getattr(self, "_borderless_full_window", False)):
-                return True
-            return bool(self.windowState() & Qt.WindowState.WindowFullScreen)
-        except Exception:
-            return False
-
     def _current_actual_upscale_target_dims(
         self,
         proc_w: int | None = None,
@@ -657,34 +623,22 @@ class WindowingMixin:
         proc_w: int | None = None,
         proc_h: int | None = None,
     ) -> tuple[int, int]:
-        """Hybrid target: monitor-led, pane-aware for windowed layouts."""
-        monitor_bounds = self._current_monitor_bounds()
-        monitor_target = self._fit_content_to_bounds(
-            monitor_bounds[0],
-            monitor_bounds[1],
-            proc_w,
-            proc_h,
-        )
+        """Presentation target: follow the actual HDR pane size."""
         pane_bounds = self._current_hdr_pane_bounds()
         if pane_bounds is None:
-            return monitor_target
-        pane_target = self._fit_content_to_bounds(
+            monitor_bounds = self._current_monitor_bounds()
+            return self._fit_content_to_bounds(
+                monitor_bounds[0],
+                monitor_bounds[1],
+                proc_w,
+                proc_h,
+            )
+        return self._fit_content_to_bounds(
             pane_bounds[0],
             pane_bounds[1],
             proc_w,
             proc_h,
         )
-        coverage = min(
-            float(pane_target[0]) / max(1.0, float(monitor_target[0])),
-            float(pane_target[1]) / max(1.0, float(monitor_target[1])),
-        )
-        if coverage >= 0.92 or self._is_fullscreenish_video_layout():
-            return monitor_target
-        if self._is_hdr_side_by_side_visible():
-            return pane_target
-
-        pane_weight = max(0.20, min(0.70, (0.88 - coverage) / 0.80))
-        return self._blend_dims(monitor_target, pane_target, pane_weight)
 
     def _disable_active_top_preset_sharpen(
         self,
@@ -717,7 +671,7 @@ class WindowingMixin:
         return not _is_upscale_required(proc_w, proc_h, target_w, target_h)
 
     def _apply_monitor_upscale_settings(self, announce: bool = False) -> bool:
-        """Recompute HDR mpv scaling after moving between monitors."""
+        """Recompute HDR mpv scaling after monitor or pane-size changes."""
         if not self._playing or not getattr(self, "_active_use_mpv", False):
             return False
         if self._disp_hdr_mpv is None or self._last_res is None:
@@ -784,7 +738,7 @@ class WindowingMixin:
         self._active_upscale_mode = str(upscale_choice)
         if announce and _is_upscale_required(proc_w, proc_h, target_w, target_h):
             self.statusBar().showMessage(
-                f"Monitor upscale active: {proc_w}x{proc_h} -> "
+                f"Pane upscale active: {proc_w}x{proc_h} -> "
                 f"{target_w}x{target_h} via {upscale_choice}"
             )
         return True
