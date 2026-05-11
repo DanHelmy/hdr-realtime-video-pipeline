@@ -43,6 +43,7 @@ Core updates include:
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
+- mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants available for reproducible paper comparisons between the standard accuracy path and the stronger movie-benchmark recipe
@@ -591,6 +592,14 @@ Playback scaling is pane-aware:
 - Compare and benchmark preview panes use the same high-quality mpv scaler family without extra CAS sharpening.
 - FSR is adapted for the RGB48 playback path by running EASU/RCAS on `MAIN` RGB; if FSR only scales partway to the target, mpv finishes the residual scale with the best configured scaler instead of bilinear.
 - Moving or resizing the app or a popped-out HDR view hot-swaps the mpv scale/CAS settings without restarting the model pipeline.
+
+Thesis figure screenshots can be rendered from saved benchmark frames through the same embedded mpv preview path:
+
+```powershell
+.\venv\Scripts\python.exe scripts\render_mpv_preview_figures.py --input logs\benchmark_sessions\Thesis --limit 5
+```
+
+The script opens a temporary Qt/libmpv render window, feeds `sdr.png`, `hdr_gt.tiff`, and `hdr_convert.tiff` as raw RGB48 frames, and saves mpv `screenshot-to-file window` PNGs plus an optional side-by-side contact sheet under `docs/images/thesis_mpv_figures/`. It does not use FFmpeg for rendering or tone mapping. Use `--input <frame_dir>` for one exact benchmark frame, `--render-size 1920x1080` to capture a specific pane size, `--scale fsr` or `--scale ssim_superres` to test a presentation scaler, and `--png-depth 16` if you want to keep mpv's high-bit-depth screenshot output instead of thesis/PDF-friendly 8-bit PNGs.
 
 ### HDR Playback Cleanup
 
