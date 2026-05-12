@@ -34,7 +34,7 @@ Core updates include:
 - objective metric domains are now explicit and shared across compare and benchmark:
   - `PSNR` / `SSIM` run on linear HDR frames
   - `DeltaEITP` / `HDR-VDP3` run on a BT.2020/PQ color-managed path
-- display-side HDR tone mapping (BT.2390) for improved visual presentation, applied consistently across HDR panes when enabled; does not affect objective metrics or exported HDR content
+- display-side mpv tone mapping now uses `tone-mapping=spline` with `tone-mapping-param=0.45`, shared across playback, compare, and benchmark previews; it does not affect objective metrics or exported HDR content
 - pane-aware playback upscaling: mpv upscale quality follows the actual HDR pane size, so normal windowed, side-by-side, fullscreen-with-UI, and hide-UI fullscreen layouts only upscale when the pane is larger than the processed frame
 - FSR playback now uses an RGB `MAIN` mpv shader for the app's RGB48 feed, with a high-quality residual mpv scaler instead of bilinear fallback when FSR's EASU pass does not cover the full target
 - SDR panes now use SDR-specific downscaling (`mitchell`, non-linear) instead of the HDR linear-light downscale path, reducing glow around tiny SDR text in side-by-side/windowed layouts
@@ -620,14 +620,14 @@ HDR playback in the GUI uses mpv's display pipeline. When `force_hdr_metadata` i
 
 Tone mapping behavior is **display-side only**:
 
-- By default, mpv (or the OS/display) performs automatic HDR tone mapping based on the connected display.
-- Using `tone_mapping=bt.2390`, a standardized HDR display tone-mapping curve **for visualization purposes only**.
+- The app configures mpv with `tone-mapping=spline` and `tone-mapping-param=0.45` for its display pipeline.
+- That tone-mapping choice is shared across the mpv-backed playback, compare, and benchmark preview panes, and is **for visualization purposes only**.
 
 Key distinctions:
 
 - **Metrics (PSNR, SSIM, DeltaEITP, HDR-VDP3)** are computed **before display** and operate on the signal domain; they are **not affected by tone mapping**.
 - **Exported videos** are encoded as **BT.2020/PQ HDR signals without display-side tone mapping**, preserving the intended HDR luminance range
-- **BT.2390 is only used to improve visual appearance** (e.g., smoother highlight rolloff, reduced perceived banding) during playback.
+- **Spline tone mapping is only used to improve visual appearance** (e.g., smoother highlight rolloff, reduced perceived banding) during playback/preview.
 
 For fair comparison:
 

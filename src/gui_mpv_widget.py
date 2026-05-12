@@ -11,6 +11,9 @@ from PyQt6.QtWidgets import QWidget
 
 from gui_config import LIVE_CAPTURE_MPV_BUFFER_FRAMES
 
+_MPV_TONE_MAPPING = "spline"
+_MPV_TONE_MAPPING_PARAM = 0.45
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -228,6 +231,13 @@ def _without_dither_options(kwargs: dict) -> dict:
 
 def _without_display_quality_options(kwargs: dict) -> dict:
     return _without_dither_options(_without_deband_options(kwargs))
+
+
+def _mpv_tone_mapping_options() -> dict:
+    return {
+        "tone_mapping": _MPV_TONE_MAPPING,
+        "tone_mapping_param": _MPV_TONE_MAPPING_PARAM,
+    }
 
 
 class MpvHDRWidget(QWidget):
@@ -770,6 +780,7 @@ class MpvHDRWidget(QWidget):
             cscale_antiring=str(antiring),
         )
 
+        mpv_kwargs.update(_mpv_tone_mapping_options())
         mpv_kwargs.update(deband_options)
         mpv_kwargs.update(dither_options)
         deband_active = bool(deband_options)
@@ -794,8 +805,6 @@ class MpvHDRWidget(QWidget):
             mpv_kwargs.update(
                 target_colorspace_hint=self._target_colorspace_hint,
                 hdr_compute_peak="yes",
-                tone_mapping="bt.2390",
-                tone_mapping_param=0.8,
                 vf=vf_chain,
             )
 
@@ -1125,8 +1134,8 @@ class MpvHDRWidget(QWidget):
             vf_chain += f",cas={cas_val}"
         try:
             p.command("set", "vf", vf_chain)
-            if self._force_hdr_metadata:
-                p.command("set", "tone-mapping", "bt.2390")
+            p.command("set", "tone-mapping", _MPV_TONE_MAPPING)
+            p.command("set", "tone-mapping-param", str(_MPV_TONE_MAPPING_PARAM))
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["cas_strength"] = float(cas_val)
             return True
