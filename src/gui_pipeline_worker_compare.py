@@ -3,13 +3,35 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from gui_benchmark_runtime import _benchmark_compile_cache_ready
+from gui_config import _select_model_path
 from gui_hdr_io import read_hdr_video_frame_rgb16, tensor_to_bgr_u16
-from gui_media_probe import _crop_gt_frame_to_pair_active_area, _map_video_pair_frame_index
+from gui_media_probe import _map_video_pair_frame_index
 from gui_scaling import _letterbox_bgr
 from gui_objective_metrics import (
     _compute_full_reference_metrics,
     _read_video_frame_at,
 )
+
+
+def _read_hdr_video_frame_rgb16_benchmark_fast(
+    path: str,
+    frame_idx: int,
+) -> tuple[np.ndarray | None, str]:
+    """Use the benchmark first-pass HDR decode policy: fast seek, exact fallback."""
+    idx = max(0, int(frame_idx))
+    rgb16 = read_hdr_video_frame_rgb16(
+        path,
+        idx,
+        prefer_fast_seek=True,
+        fast_seek_pts_guard=False,
+    )
+    if rgb16 is not None:
+        return rgb16, "true_hdr_video_fast"
+    rgb16 = read_hdr_video_frame_rgb16(path, idx, prefer_fast_seek=False)
+    if rgb16 is not None:
+        return rgb16, "true_hdr_video_exact_fallback"
+    return None, "hdr_video_decode_failed"
 
 
 class PipelineWorkerCompareMixin:
@@ -140,10 +162,53 @@ class PipelineWorkerCompareMixin:
             and compare_precision_key
             and compare_precision_key != self._precision_key
         ):
+            compare_load_kwargs = {
+                "compile_model": False,
+                "force_compile": False,
+                "compile_mode": "default",
+            }
+            compare_runtime_note = ""
+            try:
+                compare_model_path = _select_model_path(
+                    compare_precision_key,
+                    self._use_hg,
+                )
+                (
+                    compile_cache_ready,
+                    compile_precision_arg,
+                    compile_pdq_mode,
+                ) = _benchmark_compile_cache_ready(
+                    w=compare_proc_w,
+                    h=compare_proc_h,
+                    precision_key=compare_precision_key,
+                    model_path=compare_model_path,
+                    use_hg=bool(self._use_hg),
+                    predequantize_mode=str(
+                        getattr(self, "_predequantize_mode", "auto")
+                    ),
+                )
+                if compile_cache_ready:
+                    compare_load_kwargs = {
+                        "compile_model": True,
+                        "force_compile": True,
+                        "compile_mode": "auto",
+                    }
+                    compare_runtime_note = (
+                        "Compare runtime: cached max-autotune "
+                        f"({compile_precision_arg}, predequantize={compile_pdq_mode})."
+                    )
+                elif str(compile_precision_arg) != "disabled":
+                    compare_runtime_note = (
+                        "Compare runtime: eager "
+                        "(benchmark compile cache unavailable)."
+                    )
+            except Exception:
+                compare_runtime_note = ""
             if not self._load_model(
                 compare_precision_key,
                 announce_ready=False,
-                compile_model=False,
+                warmup=False,
+                **compare_load_kwargs,
             ):
                 msg = (
                     f"Requested compare precision {compare_precision_key} "
@@ -156,6 +221,8 @@ class PipelineWorkerCompareMixin:
                 )
                 if compare_precision_swapped:
                     self._reset_enhance_history()
+                if compare_runtime_note:
+                    cmp_note = f"{cmp_note} {compare_runtime_note}".strip()
 
         compare_is_current_frame = (cmp_idx == int(frame_idx))
         cmp_source = frame
@@ -186,10 +253,14 @@ class PipelineWorkerCompareMixin:
         if cmp_hdr_algo is None and self._input_is_hdr:
             src_rgb16 = None
             if self._video_path:
-                src_rgb16 = read_hdr_video_frame_rgb16(self._video_path, cmp_seek_idx)
+                src_rgb16, _src_mode = _read_hdr_video_frame_rgb16_benchmark_fast(
+                    self._video_path,
+                    cmp_seek_idx,
+                )
                 if src_rgb16 is None and cmp_seek_idx > 0:
-                    src_rgb16 = read_hdr_video_frame_rgb16(
-                        self._video_path, cmp_seek_idx - 1
+                    src_rgb16, _src_mode = _read_hdr_video_frame_rgb16_benchmark_fast(
+                        self._video_path,
+                        cmp_seek_idx - 1,
                     )
             if src_rgb16 is not None:
                 src_hdr_bgr = np.ascontiguousarray(src_rgb16[:, :, ::-1])
@@ -258,19 +329,24 @@ class PipelineWorkerCompareMixin:
 
         cmp_hdr_gt = None
         gt_hdr_mode_note = "missing 16-bit HDR GT"
-        gt_u8_frame = None  # For fast alignment
 
         # Import fast path utilities
         from gui_hdr_gt_fast_path import _process_hdr_gt_with_fast_path
 
         if compare_gt_path:
             gt_seek_idx = self._compare_gt_frame_index(compare_gt_path, cmp_seek_idx)
-            gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx)
+            gt_rgb16, gt_decode_mode = _read_hdr_video_frame_rgb16_benchmark_fast(
+                compare_gt_path,
+                gt_seek_idx,
+            )
             if gt_rgb16 is None and gt_seek_idx > 0:
-                gt_rgb16 = read_hdr_video_frame_rgb16(compare_gt_path, gt_seek_idx - 1)
+                gt_rgb16, gt_decode_mode = _read_hdr_video_frame_rgb16_benchmark_fast(
+                    compare_gt_path,
+                    gt_seek_idx - 1,
+                )
             if gt_rgb16 is not None:
                 # Use fast path for HDR GT processing
-                cmp_hdr_gt, gt_u8_frame, gt_hdr_mode_note, _ = _process_hdr_gt_with_fast_path(
+                cmp_hdr_gt, _gt_u8_frame, gt_hdr_mode_note, _ = _process_hdr_gt_with_fast_path(
                     gt_rgb16,
                     cmp_sdr,  # Pass SDR frame for alignment
                     output_width=compare_out_w,
@@ -279,6 +355,8 @@ class PipelineWorkerCompareMixin:
                     sdr_video_path=str(self._video_path or ""),
                     gt_video_path=compare_gt_path,
                 )
+                if cmp_hdr_gt is not None:
+                    gt_hdr_mode_note = str(gt_decode_mode or gt_hdr_mode_note)
                 # Fast path is required - no fallback
                 if cmp_hdr_gt is None:
                     msg = "HDR GT fast path failed - no fallback available"
@@ -292,7 +370,7 @@ class PipelineWorkerCompareMixin:
         elif gt_frame is not None:
             if isinstance(gt_frame, np.ndarray) and gt_frame.dtype == np.uint16:
                 # Use fast path for runtime HDR GT frame
-                cmp_hdr_gt, gt_u8_frame, gt_hdr_mode_note, _ = _process_hdr_gt_with_fast_path(
+                cmp_hdr_gt, _gt_u8_frame, gt_hdr_mode_note, _ = _process_hdr_gt_with_fast_path(
                     gt_frame,
                     cmp_sdr,  # Pass SDR frame for alignment
                     output_width=compare_out_w,

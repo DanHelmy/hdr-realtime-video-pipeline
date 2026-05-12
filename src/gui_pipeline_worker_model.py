@@ -66,6 +66,9 @@ class PipelineWorkerModelMixin:
         announce_ready: bool = True,
         *,
         compile_model: bool | None = None,
+        force_compile: bool = False,
+        compile_mode: str | None = None,
+        warmup: bool = True,
     ):
         cfg = PRECISIONS.get(key, {})
         path = _select_model_path(key, self._use_hg)
@@ -133,12 +136,18 @@ class PipelineWorkerModelMixin:
                     use_hg=self._use_hg,
                 )
             else:
+                resolved_compile_mode = (
+                    "auto"
+                    if compile_mode is None and bool(compile_model)
+                    else (compile_mode or "default")
+                )
                 self._processor = HDRTVNetTorch(
                     path,
                     device="auto",
                     precision=cfg["precision"],
                     compile_model=bool(compile_model),
-                    compile_mode="auto",
+                    force_compile=bool(force_compile),
+                    compile_mode=resolved_compile_mode,
                     predequantize=_resolve_predequantize_arg(
                         getattr(self, "_predequantize_mode", "auto")
                     ),
@@ -153,7 +162,7 @@ class PipelineWorkerModelMixin:
                 torch.cuda.empty_cache()
             return False
 
-        if announce_ready:
+        if announce_ready and warmup:
             if getattr(self._processor, "_trt_engine", None) is not None:
                 self.status_message.emit(
                     f"Priming TensorRT runtime for {cw}x{ch} ({key}) ..."
@@ -166,7 +175,8 @@ class PipelineWorkerModelMixin:
                 self.status_message.emit(
                     f"Priming model for {cw}x{ch} ({key}) ..."
                 )
-        self._silent_warmup(self._processor, cw, ch)
+        if warmup:
+            self._silent_warmup(self._processor, cw, ch)
 
         self._precision_key = key
         if announce_ready:
