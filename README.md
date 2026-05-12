@@ -138,7 +138,7 @@ cd hdr-realtime-video-pipeline
 ### 1. Main Workspace
 
 - Tabbed views: `SDR`, `HDR`, `Side by Side`
-- Playback controls, timeline, and live runtime metrics
+- Playback controls, timeline, and live runtime metrics, with hide-UI playback surfacing the playhead, `Show UI`, and metrics overlay only while the cursor is moving
 
 ![Main UI Overview](docs/images/v4-main-ui-overview.png)
 
@@ -358,6 +358,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - the `Resolution` control still selects model processing size (`1080p`, `720p`, `540p`, or source-limited fallback)
   - the HDR pane's actual drawable size drives the upscale target, so fullscreen-with-UI and side-by-side do not request full-monitor upscale unless the pane itself fills that space
   - hide-UI fullscreen naturally becomes monitor-sized because the HDR pane fills the display
+  - while UI is hidden, the playhead, `Show UI`, and performance metrics appear together as a temporary overlay when the cursor moves, then fade back out
   - the `Upscale` control is always editable; the selected method is saved as a preference and becomes active whenever the current pane target is larger than the processed frame
   - Apply feedback now reports whether the selected upscale is active or only saved as an inactive preference for the current pane size
   - FSR now runs through an RGB `MAIN` shader path for RGB48 playback, and any residual scale after EASU uses the best mpv scaler instead of bilinear
@@ -461,7 +462,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision / pre-dequantize changes can redraw the current paused frame without resuming playback |
-| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint size, precision, processing resolution |
+| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint size, precision, processing resolution; in hide-UI playback it joins the temporary cursor-triggered overlay with the playhead and `Show UI` button |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, queued multi-run batches, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
@@ -589,6 +590,7 @@ Playback scaling is pane-aware:
 - `Upscale` is an always-editable preference for the mpv presentation scaler; it is applied whenever the current HDR pane target is larger than the processed frame.
 - Fullscreen-with-UI, side-by-side, and windowed playback follow the HDR pane's drawable size instead of assuming the whole monitor is available.
 - Hide-UI fullscreen becomes monitor-sized naturally because the HDR pane fills the display.
+- In Hide-UI playback, the playhead, `Show UI`, and performance metrics reappear only while the cursor is moving.
 - Compare and benchmark preview panes use the same high-quality mpv scaler family without extra CAS sharpening.
 - FSR is adapted for the RGB48 playback path by running EASU/RCAS on `MAIN` RGB; if FSR only scales partway to the target, mpv finishes the residual scale with the best configured scaler instead of bilinear.
 - Moving or resizing the app or a popped-out HDR view hot-swaps the mpv scale/CAS settings without restarting the model pipeline.

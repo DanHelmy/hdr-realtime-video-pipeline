@@ -89,6 +89,11 @@ class WorkerSlotsMixin:
         size_label = str(m.get("model_size_label") or "Checkpoint")
         self._m["model"].setText(f"{size_label}: {m['model_mb']:.2f} MB")
         self._m["prec"].setText(f"Prec: {m['precision']}")
+        if getattr(self, "_immersive_metrics_overlay", False):
+            try:
+                self._position_immersive_metrics_overlay()
+            except Exception:
+                pass
 
         try:
             self._audio_sync_frame_hint = max(

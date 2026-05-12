@@ -339,6 +339,7 @@ class WindowingMixin:
             self._immersive_saved_spacing = self._root_layout.spacing()
             self._immersive_saved_view_mode = self._cmb_view.currentText()
             self._begin_immersive_timeline_overlay()
+            self._begin_immersive_metrics_overlay()
 
             for w in targets.values():
                 if w is not None and w.isVisible():
@@ -350,6 +351,7 @@ class WindowingMixin:
             return
 
         self._end_immersive_timeline_overlay()
+        self._end_immersive_metrics_overlay()
         for key, w in targets.items():
             want = self._immersive_saved_vis.get(key, True)
             if w is not None:
@@ -385,6 +387,27 @@ class WindowingMixin:
         self._immersive_timeline_overlay = True
         self._position_immersive_timeline_overlay()
 
+    def _begin_immersive_metrics_overlay(self):
+        metrics = getattr(self, "_grp_metrics", None)
+        if metrics is None or getattr(self, "_immersive_metrics_overlay", False):
+            return
+        chk = getattr(self, "_chk_metrics", None)
+        if chk is None or not bool(chk.isChecked()):
+            return
+        parent = metrics.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        index = layout.indexOf(metrics) if layout is not None else -1
+        self._immersive_metrics_parent = parent
+        self._immersive_metrics_layout = layout
+        self._immersive_metrics_index = index
+        if layout is not None:
+            layout.removeWidget(metrics)
+        metrics.setParent(self)
+        metrics.hide()
+        metrics.raise_()
+        self._immersive_metrics_overlay = True
+        self._position_immersive_metrics_overlay()
+
     def _end_immersive_timeline_overlay(self):
         row = self._row3_widget
         if row is None or not getattr(self, "_immersive_timeline_overlay", False):
@@ -409,6 +432,27 @@ class WindowingMixin:
         self._immersive_row3_layout = None
         self._immersive_row3_index = -1
 
+    def _end_immersive_metrics_overlay(self):
+        metrics = getattr(self, "_grp_metrics", None)
+        if metrics is None or not getattr(self, "_immersive_metrics_overlay", False):
+            return
+        layout = getattr(self, "_immersive_metrics_layout", None)
+        parent = getattr(self, "_immersive_metrics_parent", None)
+        index = int(getattr(self, "_immersive_metrics_index", -1))
+        metrics.hide()
+        if parent is not None:
+            metrics.setParent(parent)
+        if layout is not None:
+            if index < 0 or index > layout.count():
+                layout.addWidget(metrics)
+            else:
+                layout.insertWidget(index, metrics)
+        metrics.setVisible(bool(self._immersive_saved_vis.get("metrics", True)))
+        self._immersive_metrics_overlay = False
+        self._immersive_metrics_parent = None
+        self._immersive_metrics_layout = None
+        self._immersive_metrics_index = -1
+
     def _position_immersive_timeline_overlay(self):
         row = self._row3_widget
         if row is None or not getattr(self, "_immersive_timeline_overlay", False):
@@ -422,6 +466,69 @@ class WindowingMixin:
         row.setGeometry(x, y, width, height)
         row.raise_()
 
+    def _immersive_metrics_overlay_width(self) -> int:
+        metrics = getattr(self, "_grp_metrics", None)
+        if metrics is None:
+            return 320
+        layout = metrics.layout()
+        base_width = max(
+            320,
+            int(metrics.minimumSizeHint().width()),
+            int(metrics.sizeHint().width()),
+        )
+        if layout is None:
+            return base_width
+        margins = layout.contentsMargins()
+        spacing = max(0, int(layout.horizontalSpacing()))
+        left_width = 0
+        right_width = 0
+        metric_order = (
+            "fps",
+            "latency",
+            "frame",
+            "res",
+            "gpu",
+            "cpu",
+            "model",
+            "prec",
+        )
+        for idx, key in enumerate(metric_order):
+            lbl = getattr(self, "_m", {}).get(key)
+            if lbl is None:
+                continue
+            hint_w = max(int(lbl.minimumSizeHint().width()), int(lbl.sizeHint().width()))
+            if (idx % 2) == 0:
+                left_width = max(left_width, hint_w)
+            else:
+                right_width = max(right_width, hint_w)
+        content_width = (
+            int(margins.left())
+            + int(margins.right())
+            + left_width
+            + right_width
+            + spacing
+            + 12
+        )
+        return max(base_width, content_width)
+
+    def _position_immersive_metrics_overlay(self):
+        metrics = getattr(self, "_grp_metrics", None)
+        if metrics is None or not getattr(self, "_immersive_metrics_overlay", False):
+            return
+        margin = 16
+        layout = metrics.layout()
+        if layout is not None:
+            layout.activate()
+        metrics.adjustSize()
+        hint = metrics.sizeHint()
+        width = min(
+            self._immersive_metrics_overlay_width(),
+            max(280, self.width() - (margin * 2)),
+        )
+        height = max(hint.height(), metrics.minimumSizeHint().height())
+        metrics.setGeometry(margin, margin, width, height)
+        metrics.raise_()
+
     def _show_immersive_timeline_overlay(self):
         row = self._row3_widget
         if row is None or not getattr(self, "_immersive_timeline_overlay", False):
@@ -429,8 +536,20 @@ class WindowingMixin:
         row.setVisible(True)
         self._position_immersive_timeline_overlay()
 
+    def _show_immersive_metrics_overlay(self):
+        metrics = getattr(self, "_grp_metrics", None)
+        if metrics is None or not getattr(self, "_immersive_metrics_overlay", False):
+            return
+        chk = getattr(self, "_chk_metrics", None)
+        if chk is None or not bool(chk.isChecked()):
+            metrics.hide()
+            return
+        metrics.setVisible(True)
+        self._position_immersive_metrics_overlay()
+
     def _position_ui_overlay(self):
         self._position_immersive_timeline_overlay()
+        self._position_immersive_metrics_overlay()
         if self._ui_overlay_btn is None:
             return
         margin = 16
@@ -447,6 +566,7 @@ class WindowingMixin:
             self._ui_overlay_btn.hide()
             return
         self._show_immersive_timeline_overlay()
+        self._show_immersive_metrics_overlay()
         self._position_ui_overlay()
         self._ui_overlay_btn.show()
         self._ui_overlay_btn.raise_()
@@ -470,6 +590,10 @@ class WindowingMixin:
             self._ui_overlay_btn.hide()
         if getattr(self, "_immersive_timeline_overlay", False) and self._row3_widget is not None:
             self._row3_widget.hide()
+        if getattr(self, "_immersive_metrics_overlay", False):
+            metrics = getattr(self, "_grp_metrics", None)
+            if metrics is not None:
+                metrics.hide()
 
     def _toggle_ui_visibility(self):
         if not self._playing:

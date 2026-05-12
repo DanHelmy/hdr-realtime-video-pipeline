@@ -13,6 +13,11 @@ class LifecycleMixin:
             self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
         except Exception:
             pass
+        if bool(getattr(self, "_ui_hidden", False)):
+            try:
+                self._set_immersive_video_ui(False)
+            except Exception:
+                pass
         if hasattr(self, "_cancel_hdr_ground_truth_validation"):
             self._cancel_hdr_ground_truth_validation(invalidate=True)
         self._playing = False
@@ -39,6 +44,8 @@ class LifecycleMixin:
         self._live_audio_compile_ready = False
         self._live_audio_has_latency_hint = False
         self._ui_hidden = False
+        self.menuBar().setVisible(True)
+        self.statusBar().setVisible(True)
         self._hdr_mpv_screen_sig = None
         self._sdr_mpv_screen_sig = None
         self._screen_hooked_handles.clear()
