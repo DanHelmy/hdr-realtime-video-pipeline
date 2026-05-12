@@ -526,26 +526,28 @@ class UiBuilderMixin:
 
         self._m = {}
         mono = QFont("Consolas", 9)
-        perf_keys = (
-            "fps",
-            "latency",
-            "frame",
-            "res",
-            "gpu",
-            "cpu",
-            "model",
-            "prec",
+        perf_layout = (
+            ("fps", 0, 0, 1, 1),
+            ("latency", 0, 1, 1, 1),
+            ("frame", 1, 0, 1, 1),
+            ("res", 1, 1, 1, 1),
+            ("gpu", 2, 0, 1, 1),
+            ("cpu", 2, 1, 1, 1),
+            ("model", 3, 0, 1, 2),
+            ("prec", 4, 0, 1, 2),
         )
-        for idx, key in enumerate(perf_keys):
+        pl.setColumnStretch(0, 1)
+        pl.setColumnStretch(1, 1)
+        for key, row, col, row_span, col_span in perf_layout:
             lbl = QLabel(f"{key}: —")
             lbl.setFont(mono)
             lbl.setProperty("metricChip", True)
             lbl.setMinimumWidth(0)
             lbl.setSizePolicy(
-                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
                 QSizePolicy.Policy.Preferred,
             )
-            pl.addWidget(lbl, idx // 2, idx % 2)
+            pl.addWidget(lbl, row, col, row_span, col_span)
             self._m[key] = lbl
 
         root.addWidget(self._grp_metrics)

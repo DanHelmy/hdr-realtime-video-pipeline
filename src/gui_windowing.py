@@ -469,10 +469,10 @@ class WindowingMixin:
     def _immersive_metrics_overlay_width(self) -> int:
         metrics = getattr(self, "_grp_metrics", None)
         if metrics is None:
-            return 320
+            return 360
         layout = metrics.layout()
         base_width = max(
-            320,
+            360,
             int(metrics.minimumSizeHint().width()),
             int(metrics.sizeHint().width()),
         )
@@ -480,34 +480,36 @@ class WindowingMixin:
             return base_width
         margins = layout.contentsMargins()
         spacing = max(0, int(layout.horizontalSpacing()))
-        left_width = 0
-        right_width = 0
-        metric_order = (
-            "fps",
-            "latency",
-            "frame",
-            "res",
-            "gpu",
-            "cpu",
-            "model",
-            "prec",
+        paired_rows = (
+            ("fps", "latency"),
+            ("frame", "res"),
+            ("gpu", "cpu"),
         )
-        for idx, key in enumerate(metric_order):
+        full_rows = ("model", "prec")
+
+        def _label_width(key: str) -> int:
             lbl = getattr(self, "_m", {}).get(key)
             if lbl is None:
-                continue
-            hint_w = max(int(lbl.minimumSizeHint().width()), int(lbl.sizeHint().width()))
-            if (idx % 2) == 0:
-                left_width = max(left_width, hint_w)
-            else:
-                right_width = max(right_width, hint_w)
+                return 0
+            text_w = int(lbl.fontMetrics().horizontalAdvance(str(lbl.text() or ""))) + 12
+            return max(
+                int(lbl.minimumSizeHint().width()),
+                int(lbl.sizeHint().width()),
+                text_w,
+            )
+
+        paired_width = 0
+        for left_key, right_key in paired_rows:
+            paired_width = max(
+                paired_width,
+                _label_width(left_key) + spacing + _label_width(right_key),
+            )
+        full_width = max((_label_width(key) for key in full_rows), default=0)
         content_width = (
             int(margins.left())
             + int(margins.right())
-            + left_width
-            + right_width
-            + spacing
-            + 12
+            + max(paired_width, full_width)
+            + 24
         )
         return max(base_width, content_width)
 
@@ -515,19 +517,21 @@ class WindowingMixin:
         metrics = getattr(self, "_grp_metrics", None)
         if metrics is None or not getattr(self, "_immersive_metrics_overlay", False):
             return
-        margin = 16
-        layout = metrics.layout()
-        if layout is not None:
-            layout.activate()
-        metrics.adjustSize()
-        hint = metrics.sizeHint()
-        width = min(
-            self._immersive_metrics_overlay_width(),
-            max(280, self.width() - (margin * 2)),
-        )
-        height = max(hint.height(), metrics.minimumSizeHint().height())
-        metrics.setGeometry(margin, margin, width, height)
-        metrics.raise_()
+        if bool(getattr(self, "_immersive_metrics_positioning", False)):
+            return
+        self._immersive_metrics_positioning = True
+        try:
+            margin = 16
+            hint = metrics.sizeHint()
+            width = min(
+                self._immersive_metrics_overlay_width(),
+                max(280, self.width() - (margin * 2)),
+            )
+            height = max(hint.height(), metrics.minimumSizeHint().height())
+            metrics.setGeometry(margin, margin, width, height)
+            metrics.raise_()
+        finally:
+            self._immersive_metrics_positioning = False
 
     def _show_immersive_timeline_overlay(self):
         row = self._row3_widget

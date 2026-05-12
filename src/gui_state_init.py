@@ -225,6 +225,7 @@ class StateInitMixin:
         self._immersive_metrics_parent = None
         self._immersive_metrics_layout = None
         self._immersive_metrics_index = -1
+        self._immersive_metrics_positioning = False
         self._layout_freeze_depth = 0
         self._saved_window_geometry = None
         self._saved_window_state = Qt.WindowState.WindowNoState
