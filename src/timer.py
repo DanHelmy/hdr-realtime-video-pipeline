@@ -93,7 +93,7 @@ def sleep_until(
     deadline_s: float,
     *,
     coarse_margin_s: float = 0.0020,
-    spin_margin_s: float = 0.0020,
+    spin_margin_s: float = 0.0005,
 ) -> None:
     """Sleep toward a deadline using Windows high-resolution timers."""
     deadline = float(deadline_s)
