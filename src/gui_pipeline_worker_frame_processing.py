@@ -624,7 +624,7 @@ class PipelineWorkerFrameProcessingMixin:
                 display_out = self._apply_hdr_flat_surface_cleanup(
                     prepared_out,
                     model_inp,
-                    quality=os.environ.get("HDRTVNET_PLAYBACK_HDR_CLEANUP", "highlight-high"),
+                    quality=os.environ.get("HDRTVNET_PLAYBACK_HDR_CLEANUP", "off"),
                 )
                 queued_tensor = display_out if display_out is not prepared_out else display_out.clone()
                 if use_cuda:

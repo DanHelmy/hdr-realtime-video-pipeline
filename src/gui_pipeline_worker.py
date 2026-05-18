@@ -41,6 +41,7 @@ _REALTIME_MAX_CATCHUP_SKIP = 6
 _PLAYBACK_SOURCE_PREFETCH = 4
 _PLAYHEAD_UPDATE_STRIDE_PLAYING = 10
 _METRICS_EMIT_INTERVAL_S = 0.20
+_FPS_METRICS_WINDOW_FRAMES = 90
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
 
@@ -580,7 +581,7 @@ class PipelineWorker(
         next_frame_t = time.perf_counter()
         frame_times = deque(maxlen=30)
         model_times = deque(maxlen=30)
-        presented_times = deque(maxlen=30)
+        presented_times = deque(maxlen=_FPS_METRICS_WINDOW_FRAMES)
         metrics_warmup_frames = 0
         frame_idx = 0
         live_video_latency_ms = 0.0

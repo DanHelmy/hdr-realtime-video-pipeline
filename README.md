@@ -39,7 +39,7 @@ Core updates include:
 - FSR playback now uses an RGB `MAIN` mpv shader for the app's RGB48 feed, with a high-quality residual mpv scaler instead of bilinear fallback when FSR's EASU pass does not cover the full target
 - SDR panes now use SDR-specific downscaling (`mitchell`, non-linear) instead of the HDR linear-light downscale path, reducing glow around tiny SDR text in side-by-side/windowed layouts
 - the status bar now keeps the live pane upscale state visible during playback instead of only reporting it on monitor moves; audio recovery notices yield to that persistent scaling state
-- lightweight high-highlight debanding is enabled for live HDR playback, while heavier sky deblocking/temporal cleanup remains opt-in and does not affect objective metrics, compare snapshots, or benchmark results
+- live HDR playback defaults to raw model output; lightweight high-highlight debanding and heavier sky deblocking/temporal cleanup remain opt-in and do not affect objective metrics, compare snapshots, or benchmark results
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
@@ -434,8 +434,9 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - better memory management for large HDR GT video files
 - **Compare pane display transitions are smoother**
   - compare no longer force-recreates mpv surfaces on show/screen-change, reducing visible color-space flashing
-- **HDR playback cleanup is split into cheap default and heavier opt-in modes**
-  - lightweight high-highlight debanding is enabled by default for live mpv playback
+- **HDR playback cleanup is split into raw default and opt-in modes**
+  - live mpv playback defaults to raw model output for clean FPS/artifact A/B testing
+  - lightweight high-highlight debanding remains available as an opt-in playback cleanup profile
   - optional low-resolution sky deblocking can be enabled for square pop-in testing with much lower cost than the full cleaner
   - optional full sky/temporal cleanup remains available for static flat-surface flicker testing while backing off around moving subjects and edges
 - **Live metrics are more thesis-friendly**
@@ -575,7 +576,7 @@ On NVIDIA, PyTorch-specific tuning and kernel-cache tools are hidden because inf
   - experimental max-autotune compile reuse
   - INT8 pre-dequantize override (`Auto` / `Force On` / `Force Off`)
 - On NVIDIA, export uses TensorRT engines and hides PyTorch-specific export tuning controls.
-- Export uses the same lightweight `highlight-high` HDR cleanup profile as playback by default; use `HDRTVNET_EXPORT_HDR_CLEANUP=off|highlight|highlight-high|lite|export` to override it
+- Export uses the lightweight `highlight-high` HDR cleanup profile by default; use `HDRTVNET_EXPORT_HDR_CLEANUP=off|highlight|highlight-high|lite|export` to override it
 - Starting a normal export keeps playback paused/locked for the export run
 - Starting an AMD export with **experimental max-autotune** may trigger the same full **Stop** behavior first so compile/warmup can run cleanly
 - Canceling an export tears down the export model/runtime and releases GPU resources without requiring an app close
@@ -610,16 +611,16 @@ The script opens a temporary Qt/libmpv render window, feeds `sdr.png`, `hdr_gt.t
 
 ### HDR Playback Cleanup
 
-Live HDR playback applies a lightweight high-highlight deband pass by default. It uses a cached static dither pattern only in very bright regions, so it avoids the expensive sky blur and temporal blending path that can reduce FPS when the viewer is large.
+Live HDR playback defaults to raw model output with tensor-side cleanup disabled. This is the best baseline for FPS and artifact A/B testing. If you opt into highlight cleanup, it uses a cached static dither pattern only in very bright regions, avoiding the expensive sky blur and temporal blending path that can reduce FPS when the viewer is large.
 
-- `HDRTVNET_PLAYBACK_HDR_CLEANUP=highlight-high` is the default live playback profile: stronger highlight deband only, no sky deblock, no temporal blend.
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=off` is the default live playback profile and disables all tensor-side playback cleanup.
+- `HDRTVNET_PLAYBACK_HDR_CLEANUP=highlight-high` enables stronger highlight deband only, no sky deblock, no temporal blend.
 - `HDRTVNET_PLAYBACK_HDR_CLEANUP=highlight` uses the same fast path with a slightly lighter deband strength.
 - `HDRTVNET_PLAYBACK_HDR_CLEANUP=lite` enables a low-resolution sky deblock plus highlight deband for square pop-in testing.
 - `HDRTVNET_PLAYBACK_HDR_CLEANUP=high` enables the full masked sky deblock and temporal cleaner for quality experiments.
-- `HDRTVNET_PLAYBACK_HDR_CLEANUP=off` disables all tensor-side playback cleanup.
 - Optional tuning: `HDRTVNET_HIGHLIGHT_DEBAND_STRENGTH`, `HDRTVNET_HIGHLIGHT_DEBAND_START`, `HDRTVNET_HIGHLIGHT_DEBAND_RANGE`, and `HDRTVNET_SKY_LITE_DEBLOCK_STRENGTH`.
 - Compare snapshots, HDR GT, benchmark images, and objective metrics do not use this cleanup path, so thesis accuracy numbers remain measured on the raw model output.
-- ProRes export defaults to the same `highlight-high` profile as browser capture and video playback; set `HDRTVNET_EXPORT_HDR_CLEANUP=off` only when you want raw model output.
+- ProRes export defaults to the `highlight-high` profile; set `HDRTVNET_EXPORT_HDR_CLEANUP=off` only when you want raw model output.
 
 ### Tone Mapping Behavior
 
