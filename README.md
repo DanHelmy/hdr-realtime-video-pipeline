@@ -61,6 +61,7 @@ Core updates include:
 - Chrome Audio Sync extension kept audio-only, with manual start/stop in Chrome
 - Browser Window Capture now observes Chrome compositor frames separately from the low-cost process-FPS budget
 - Browser Window Capture now feeds mpv a steady low-FPS stream and lets mpv repeat frames on display vsync instead of forcing 60 fps pipe writes
+- playback timing now uses Windows high-resolution waitable timers, MMCSS `Playback` scheduling, precise live-feeder deadline polling, and lower-copy mpv named-pipe writes to reduce scheduler-induced frame cadence misses
 - Browser Window Capture waits for the HDR mpv display handoff after cold compile, avoiding the occasional black HDR pane / inactive-HDR startup race
 - cleaner startup logging by filtering harmless Qt DPI-awareness warning spam
 - repo-local PyTorch kernel caches on AMD under `src/models/compile_cache/` so users can see and delete generated kernels
@@ -217,6 +218,9 @@ Browser capture pacing:
 - mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
 - mpv keeps a tiny live jitter buffer so short wake-up or pipe-write stalls repeat a frame instead of creating a visible cadence hole. Default: `HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES=8`.
 - The live mpv feeder allows a tiny bounded refill after a late write so mpv's raw-video pipe does not underflow into visible pauses.
+- Playback, capture, and feeder timing threads opt into Windows high-resolution timers plus MMCSS `Playback` scheduling so frame-deadline wakeups are less likely to slip under CPU load.
+- Once a live feeder has a frame to repeat, it uses precise short-slice polling instead of relying on coarse `Queue.get(timeout=...)` wakeups for presentation deadlines.
+- The mpv named-pipe writer avoids per-chunk `bytes` copies when writing frame buffers, reducing avoidable jitter in the final delivery step.
 - mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
 - Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
 - Static browser windows keep feeding by repeating the latest visible frame at process FPS. If WinRT has no compositor frame yet, a visible-window fallback captures one startup seed frame so playback can start even before the tab video is moving.
@@ -397,6 +401,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - Browser Window Capture now observes Chrome compositor frames separately, then runs HDRTVNet++ only under the low-cost process-FPS budget
   - the direct-window capture path remains the only active browser-video path
   - live browser presentation now uses mpv timed playback (`display-resample`) so frame repeat is handled by the display clock instead of a Python pacing loop
+  - playback timing now uses Windows high-resolution waitable timers, MMCSS `Playback` scheduling, precise live-feeder deadline polling, and lower-copy mpv pipe writes to reduce scheduler-induced frame cadence misses
   - HDR output waits for an explicit mpv display handoff after compile, so cold compile startup no longer races into a black HDR pane with inactive HDR metadata
   - if the Chrome source window disappears unexpectedly, the app now restarts cleanly instead of leaving a dead live source attached
 - **Startup logging is cleaner**
