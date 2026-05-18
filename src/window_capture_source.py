@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import psutil
 
-from timer import sleep_until
+from timer import prepare_playback_timing_thread, sleep_until
 
 try:
     import dxcam
@@ -1224,6 +1224,7 @@ class WindowCaptureSource:
             self._next_delivery_perf = float(now_t) + interval_s
 
     def _reader_loop(self):
+        prepare_playback_timing_thread()
         capture_interval_s = self._capture_interval_s()
         next_capture_t = time.perf_counter()
         while not self._stopped:

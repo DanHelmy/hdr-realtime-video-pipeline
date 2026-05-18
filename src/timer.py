@@ -20,6 +20,7 @@ _WINDOWS_TIMER_MODIFY_STATE = 0x0002
 _WINDOWS_SYNCHRONIZE = 0x00100000
 _WINDOWS_TIMER_ACCESS = _WINDOWS_TIMER_MODIFY_STATE | _WINDOWS_SYNCHRONIZE
 _WINDOWS_STATUS_SUCCESS = 0
+_WINDOWS_AVRT_PRIORITY_CRITICAL = 2
 
 
 class _WindowsWaitableTimer:
@@ -43,6 +44,27 @@ class _WindowsWaitableTimer:
         self.handle = None
 
 
+class _WindowsMmcssRegistration:
+    __slots__ = ("avrt", "handle")
+
+    def __init__(self, avrt, handle):
+        self.avrt = avrt
+        self.handle = handle
+
+    def __bool__(self) -> bool:
+        return bool(self.handle)
+
+    def __del__(self):
+        handle = getattr(self, "handle", None)
+        if not handle:
+            return
+        try:
+            self.avrt.AvRevertMmThreadCharacteristics(handle)
+        except Exception:
+            pass
+        self.handle = None
+
+
 class FPSTimer:
     def __init__(self):
         self.last = time.perf_counter()
@@ -59,11 +81,19 @@ class FPSTimer:
         return self.fps
 
 
+def prepare_playback_timing_thread() -> None:
+    """Opt the current thread into Windows media-timing scheduling."""
+    if os.name != "nt":
+        return
+    _ensure_windows_timer_resolution()
+    _ensure_windows_thread_mmcss()
+
+
 def sleep_until(
     deadline_s: float,
     *,
-    coarse_margin_s: float = 0.0010,
-    spin_margin_s: float = 0.0010,
+    coarse_margin_s: float = 0.0020,
+    spin_margin_s: float = 0.0020,
 ) -> None:
     """Sleep toward a deadline using Windows high-resolution timers."""
     deadline = float(deadline_s)
@@ -128,7 +158,7 @@ def _windows_waitable_timer():
     if bool(getattr(_WINDOWS_TIMER_STATE, "disabled", False)):
         return None
 
-    _ensure_windows_timer_resolution()
+    prepare_playback_timing_thread()
 
     timer = getattr(_WINDOWS_TIMER_STATE, "timer", None)
     if timer:
@@ -180,6 +210,41 @@ def _windows_waitable_timer():
     except Exception:
         _WINDOWS_TIMER_STATE.disabled = True
         return None
+
+
+def _ensure_windows_thread_mmcss() -> None:
+    if os.name != "nt":
+        return
+    if bool(getattr(_WINDOWS_TIMER_STATE, "mmcss_disabled", False)):
+        return
+    if bool(getattr(_WINDOWS_TIMER_STATE, "mmcss", None)):
+        return
+
+    try:
+        avrt = ctypes.WinDLL("avrt", use_last_error=True)
+        avrt.AvSetMmThreadCharacteristicsW.argtypes = [
+            wt.LPCWSTR,
+            ctypes.POINTER(wt.DWORD),
+        ]
+        avrt.AvSetMmThreadCharacteristicsW.restype = wt.HANDLE
+        avrt.AvSetMmThreadPriority.argtypes = [wt.HANDLE, ctypes.c_int]
+        avrt.AvSetMmThreadPriority.restype = wt.BOOL
+        avrt.AvRevertMmThreadCharacteristics.argtypes = [wt.HANDLE]
+        avrt.AvRevertMmThreadCharacteristics.restype = wt.BOOL
+
+        task_index = wt.DWORD(0)
+        handle = avrt.AvSetMmThreadCharacteristicsW(
+            "Playback",
+            ctypes.byref(task_index),
+        )
+        if not handle:
+            _WINDOWS_TIMER_STATE.mmcss_disabled = True
+            return
+
+        avrt.AvSetMmThreadPriority(handle, _WINDOWS_AVRT_PRIORITY_CRITICAL)
+        _WINDOWS_TIMER_STATE.mmcss = _WindowsMmcssRegistration(avrt, handle)
+    except Exception:
+        _WINDOWS_TIMER_STATE.mmcss_disabled = True
 
 
 def _ensure_windows_timer_resolution() -> None:

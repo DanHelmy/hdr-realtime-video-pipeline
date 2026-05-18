@@ -10,10 +10,11 @@ import torch
 
 from gui_config import LIVE_CAPTURE_DISPLAY_FPS
 from gui_mpv_widget import MpvHDRWidget
-from timer import sleep_until
+from timer import prepare_playback_timing_thread, sleep_until
 
 _LIVE_SMOOTH_MAX_QUEUE_WAIT_S = 0.042  # ~1/24 second for better 24fps cadence
 _LIVE_SMOOTH_MAX_CATCHUP_FRAMES = 3  # Allow more catchup for smoother playback
+_LIVE_SMOOTH_QUEUE_POLL_SLICE_S = 0.0010
 _DEFAULT_FEEDER_GPU_RGB48 = "0" if bool(getattr(torch.version, "hip", None)) else "1"
 _FEEDER_GPU_RGB48 = str(
     os.environ.get("HDRTVNET_FEEDER_GPU_RGB48", _DEFAULT_FEEDER_GPU_RGB48)
@@ -37,6 +38,21 @@ def _next_live_present_deadline(
     if next_s < floor_s:
         return floor_s
     return next_s
+
+
+def _queue_get_until(q: _queue.Queue, deadline_s: float, no_item):
+    while True:
+        try:
+            return q.get_nowait()
+        except _queue.Empty:
+            now = time.perf_counter()
+            if now >= deadline_s:
+                return no_item
+            sleep_until(
+                min(float(deadline_s), now + _LIVE_SMOOTH_QUEUE_POLL_SLICE_S),
+                coarse_margin_s=0.00035,
+                spin_margin_s=0.00015,
+            )
 
 
 def _pinned_u16_host_buffer(state: dict, shape: tuple[int, int, int]):
@@ -138,6 +154,7 @@ class PipelineWorkerFeedersMixin:
         live_smooth_cadence: bool,
     ):
         """Drain HDR queue, convert tensors to RGB48LE, and feed mpv."""
+        prepare_playback_timing_thread()
         if live_smooth_cadence:
             no_item = object()
             next_present_t = 0.0
@@ -155,7 +172,14 @@ class PipelineWorkerFeedersMixin:
 
                 item = no_item
                 try:
-                    item = hdr_q.get(timeout=wait_timeout)
+                    if latest_rgb48_bytes is not None and next_present_t > 0.0:
+                        item = _queue_get_until(
+                            hdr_q,
+                            now + wait_timeout,
+                            no_item,
+                        )
+                    else:
+                        item = hdr_q.get(timeout=wait_timeout)
                 except _queue.Empty:
                     item = no_item
 
@@ -265,6 +289,7 @@ class PipelineWorkerFeedersMixin:
         live_smooth_cadence: bool,
     ):
         """Drain SDR queue, convert BGR8 to RGB48LE, and feed mpv."""
+        prepare_playback_timing_thread()
         if live_smooth_cadence:
             no_item = object()
             next_present_t = 0.0
@@ -282,7 +307,14 @@ class PipelineWorkerFeedersMixin:
 
                 item = no_item
                 try:
-                    item = sdr_q.get(timeout=wait_timeout)
+                    if latest_rgb48_bytes is not None and next_present_t > 0.0:
+                        item = _queue_get_until(
+                            sdr_q,
+                            now + wait_timeout,
+                            no_item,
+                        )
+                    else:
+                        item = sdr_q.get(timeout=wait_timeout)
                 except _queue.Empty:
                     item = no_item
 

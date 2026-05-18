@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
 from gui_config import LIVE_CAPTURE_MPV_BUFFER_FRAMES
+from timer import prepare_playback_timing_thread
 
 _MPV_TONE_MAPPING = "spline"
 _MPV_TONE_MAPPING_PARAM = 0.45
@@ -602,13 +603,40 @@ class MpvHDRWidget(QWidget):
         import ctypes
         import ctypes.wintypes as wt
 
+        prepare_playback_timing_thread()
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        py_bytes_as_string = ctypes.pythonapi.PyBytes_AsString
+        py_bytes_as_string.argtypes = [ctypes.py_object]
+        py_bytes_as_string.restype = ctypes.c_void_p
 
         PIPE_ACCESS_OUTBOUND = 0x00000002
         PIPE_TYPE_BYTE = 0x00000000
         PIPE_WAIT = 0x00000000
         INVALID_HANDLE_VALUE = wt.HANDLE(-1).value
         PIPE_BUF = 1 << 22
+        kernel32.WriteFile.argtypes = [
+            wt.HANDLE,
+            ctypes.c_void_p,
+            wt.DWORD,
+            ctypes.POINTER(wt.DWORD),
+            wt.LPVOID,
+        ]
+        kernel32.WriteFile.restype = wt.BOOL
+
+        def _buffer_ptr(item):
+            if isinstance(item, bytes):
+                return py_bytes_as_string(item), len(item), item
+            view = memoryview(item)
+            if not view.c_contiguous:
+                data = bytes(view)
+                return py_bytes_as_string(data), len(data), data
+            view = view.cast("B")
+            try:
+                c_buf = (ctypes.c_ubyte * view.nbytes).from_buffer(view)
+                return ctypes.addressof(c_buf), int(view.nbytes), (view, c_buf)
+            except TypeError:
+                data = bytes(view)
+                return py_bytes_as_string(data), len(data), data
 
         h = kernel32.CreateNamedPipeW(
             pipe_name,
@@ -637,21 +665,25 @@ class MpvHDRWidget(QWidget):
                 continue
             if item is None:
                 break
-            buf = bytes(item) if not isinstance(item, bytes) else item
+            ptr, buf_len, keepalive = _buffer_ptr(item)
+            if not ptr or buf_len <= 0:
+                continue
             off = 0
-            while off < len(buf):
-                chunk = buf[off:off + PIPE_BUF]
+            while off < buf_len:
+                write_len = min(PIPE_BUF, buf_len - off)
+                written.value = 0
                 ok = kernel32.WriteFile(
                     h,
-                    chunk,
-                    len(chunk),
+                    ctypes.c_void_p(ptr + off),
+                    write_len,
                     ctypes.byref(written),
                     None,
                 )
-                if not ok:
+                if not ok or written.value <= 0:
                     shutdown.set()
                     break
                 off += written.value
+            del keepalive
 
         kernel32.FlushFileBuffers(h)
         kernel32.DisconnectNamedPipe(h)
