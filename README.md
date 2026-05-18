@@ -268,7 +268,7 @@ WinRT pacing tuning:
 
 - `HDRTVNET_WINRT_FRAME_POOL_BUFFERS=4` controls the Windows Graphics Capture frame-pool depth. Default: `4`.
 - `HDRTVNET_WINRT_DRAIN_TO_LATEST=0` keeps queued WinRT frames in order for steadier motion cadence. Set to `1` for the older lowest-latency behavior that always jumps to the newest queued frame.
-- Live capture interpolation is currently disabled by default to reduce latency.
+- Live capture interpolation is currently enabled by default.
 
 Important:
 
