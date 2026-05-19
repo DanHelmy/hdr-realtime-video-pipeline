@@ -669,7 +669,7 @@ class MpvHDRWidget(QWidget):
             if not ptr or buf_len <= 0:
                 continue
             off = 0
-            while off < buf_len:
+            while off < buf_len and not shutdown.is_set():
                 write_len = min(PIPE_BUF, buf_len - off)
                 written.value = 0
                 ok = kernel32.WriteFile(
@@ -685,7 +685,11 @@ class MpvHDRWidget(QWidget):
                 off += written.value
             del keepalive
 
-        kernel32.FlushFileBuffers(h)
+        if not shutdown.is_set():
+            try:
+                kernel32.FlushFileBuffers(h)
+            except Exception:
+                pass
         kernel32.DisconnectNamedPipe(h)
         kernel32.CloseHandle(h)
 
@@ -1228,7 +1232,7 @@ class MpvHDRWidget(QWidget):
                 pass
         return None
 
-    def stop_playback(self):
+    def stop_playback(self, wait_timeout: float = 3.0):
         self._shutdown.set()
         q = self._queue
         if q is not None:
@@ -1245,7 +1249,7 @@ class MpvHDRWidget(QWidget):
                 pass
             self._player = None
         if self._feeder is not None:
-            self._feeder.join(timeout=3)
+            self._feeder.join(timeout=max(0.0, float(wait_timeout)))
             self._feeder = None
         self._queue = None
 

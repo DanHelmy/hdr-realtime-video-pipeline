@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
 
 from gui_scaling import BEST_MPV_SCALE, DEFAULT_UPSCALER
 
@@ -177,22 +178,44 @@ class LifecycleMixin:
                 pass
         if self._export_progress_dlg is not None:
             self._export_progress_dlg.close()
-        if self._window_refresh_timer is not None:
-            self._window_refresh_timer.stop()
-        if self._cursor_idle_timer is not None:
-            self._cursor_idle_timer.stop()
+        for timer_name in (
+            "_window_refresh_timer",
+            "_cursor_idle_timer",
+            "_periodic_relock_timer",
+            "_ui_pause_timer",
+            "_audio_fade_timer",
+            "_playback_scale_status_timer",
+            "_ui_overlay_timer",
+            "_precision_swap_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
         self._show_cursor()
-        self._dock_video_pane("sdr")
-        self._dock_video_pane("hdr")
+        for attr in ("_sdr_float_window", "_hdr_float_window"):
+            win = getattr(self, attr, None)
+            if win is not None:
+                try:
+                    win.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.hide()
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+        if self._disp_hdr_mpv is not None:
+            self._disp_hdr_mpv.stop_playback(wait_timeout=0.5)
+        if self._disp_sdr_mpv is not None:
+            self._disp_sdr_mpv.stop_playback(wait_timeout=0.5)
+        self._stop_audio_playback()
         if self._playing:
             self._worker.stop()
             self._worker.wait(10000)
         self._finalize_playback_logging("app closed")
-        if self._disp_hdr_mpv is not None:
-            self._disp_hdr_mpv.stop_playback()
-        if self._disp_sdr_mpv is not None:
-            self._disp_sdr_mpv.stop_playback()
-        self._stop_audio_playback()
         self._set_process_priority(False)
         if self._export_thread is not None:
             self._export_thread.quit()
