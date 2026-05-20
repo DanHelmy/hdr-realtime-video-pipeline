@@ -10,6 +10,7 @@ from models.hdrtvnet_torch import (
     HDRTVNetTorch,
     _IS_NVIDIA,
     tensorrt_engine_path,
+    tensorrt_engine_is_valid,
     tensorrt_mode_name,
 )
 from gui_config import PRECISIONS, _select_model_path
@@ -125,7 +126,16 @@ class PipelineWorkerModelMixin:
                     trt_mode_name,
                 )
                 if announce_ready:
-                    if os.path.isfile(trt_engine):
+                    if tensorrt_engine_is_valid(
+                        trt_engine,
+                        model_path=path,
+                        width=int(cw),
+                        height=int(ch),
+                        precision=cfg["precision"],
+                        mode_name=mode_name,
+                        use_hg=self._use_hg,
+                        predequantize=trt_predeq,
+                    ):
                         self.status_message.emit(
                             f"Loading cached TensorRT engine for {cw}x{ch} ({key}) ..."
                         )

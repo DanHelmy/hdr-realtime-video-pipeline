@@ -24,6 +24,8 @@ from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     cleanup_tensorrt_onnx_after_engine,
     tensorrt_engine_path,
+    tensorrt_engine_is_valid,
+    tensorrt_engine_metadata_path,
     tensorrt_mode_name,
     tensorrt_onnx_path,
 )
@@ -178,15 +180,31 @@ def main() -> int:
         onnx_path = tensorrt_onnx_path(model_path, w, h, mode_name)
         if (args.force or args.force_onnx) and os.path.isfile(engine_path):
             os.remove(engine_path)
+            meta_path = tensorrt_engine_metadata_path(engine_path)
+            if os.path.isfile(meta_path):
+                os.remove(meta_path)
         if args.force_onnx and os.path.isfile(onnx_path):
             os.remove(onnx_path)
-        if os.path.isfile(engine_path):
+        engine_valid = tensorrt_engine_is_valid(
+            engine_path,
+            model_path=model_path,
+            width=w,
+            height=h,
+            precision=precision,
+            mode_name=base_mode_name,
+            use_hg=use_hg,
+            predequantize=predeq,
+            qdq_fusion=args.qdq_fusion,
+            hg_weights=args.hg_weights,
+            verbose=True,
+        )
+        if engine_valid:
             print(f"[tensorrt] cache hit: {engine_path}")
             cleanup_tensorrt_onnx_after_engine(onnx_path, engine_path)
             if args.benchmark_runs <= 0:
                 continue
         print(
-            f"[tensorrt] {'loading' if os.path.isfile(engine_path) else 'building'} "
+            f"[tensorrt] {'loading' if engine_valid else 'building'} "
             f"{args.precision} {'HG' if use_hg else 'no-HG'} engine for {w}x{h}"
         )
         processor = HDRTVNetTensorRT(

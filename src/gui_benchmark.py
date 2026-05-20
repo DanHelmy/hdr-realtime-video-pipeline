@@ -107,6 +107,7 @@ from models.hdrtvnet_torch import (
     HDRTVNetTorch,
     _IS_NVIDIA,
     tensorrt_engine_path,
+    tensorrt_engine_is_valid,
     tensorrt_mode_name,
 )
 
@@ -1544,7 +1545,16 @@ class _BenchmarkWorker(QObject):
                     out_h,
                     trt_mode_name,
                 )
-                if os.path.isfile(engine_path):
+                if tensorrt_engine_is_valid(
+                    engine_path,
+                    model_path=model_path,
+                    width=out_w,
+                    height=out_h,
+                    precision=model_precision,
+                    mode_name=mode_name,
+                    use_hg=bool(cfg.use_hg),
+                    predequantize=trt_predeq,
+                ):
                     self.progress.emit(0, "Loading cached TensorRT engine ...")
                 else:
                     self.progress.emit(

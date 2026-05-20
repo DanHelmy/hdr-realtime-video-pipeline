@@ -50,6 +50,7 @@ from models.hdrtvnet_torch import (
     _IS_NVIDIA,
     _IS_ROCM,
     tensorrt_engine_path,
+    tensorrt_engine_is_valid,
     tensorrt_mode_name,
 )
 from video_source import VideoSource
@@ -831,7 +832,16 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     int(self._config.height),
                     trt_mode_name,
                 )
-                if os.path.isfile(engine_path):
+                if tensorrt_engine_is_valid(
+                    engine_path,
+                    model_path=model_path,
+                    width=int(self._config.width),
+                    height=int(self._config.height),
+                    precision=str(cfg.get("precision") or "fp16"),
+                    mode_name=mode_name,
+                    use_hg=self._config.use_hg,
+                    predequantize=trt_predeq,
+                ):
                     self.progress.emit(0, "Loading cached TensorRT engine ...")
                 else:
                     self.progress.emit(

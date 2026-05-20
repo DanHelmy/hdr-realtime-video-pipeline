@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import os
 import pathlib
@@ -32,6 +34,10 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DEFAULT_HG_WEIGHTS = os.path.join(
     _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
+_TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
+_TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v1"
+_FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
+_TENSORRT_SOURCE_SIGNATURE_CACHE: str | None = None
 
 _HAS_COMPILE = hasattr(torch, "compile")          # PyTorch >= 2.0
 _HAS_CUDA_GRAPHS = hasattr(torch.cuda, "CUDAGraph")  # PyTorch >= 1.10
@@ -1754,6 +1760,294 @@ def _engine_cache_dir() -> str:
     return root
 
 
+def _hash_file(path: str) -> dict[str, object]:
+    p = pathlib.Path(path)
+    try:
+        stat = p.stat()
+    except Exception:
+        return {
+            "name": p.name,
+            "size": -1,
+            "sha256": "missing",
+        }
+    cache_key = (
+        os.path.normcase(str(p.resolve())),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+    cached = _FILE_FINGERPRINT_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    digest = hashlib.sha256()
+    try:
+        with p.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except Exception:
+        fingerprint = {
+            "name": p.name,
+            "size": int(stat.st_size),
+            "sha256": "unreadable",
+        }
+    else:
+        fingerprint = {
+            "name": p.name,
+            "size": int(stat.st_size),
+            "sha256": digest.hexdigest(),
+        }
+    _FILE_FINGERPRINT_CACHE[cache_key] = dict(fingerprint)
+    return fingerprint
+
+
+def _tensorrt_source_signature() -> str:
+    global _TENSORRT_SOURCE_SIGNATURE_CACHE
+    if _TENSORRT_SOURCE_SIGNATURE_CACHE:
+        return _TENSORRT_SOURCE_SIGNATURE_CACHE
+    root = pathlib.Path(_ROOT)
+    digest = hashlib.sha256()
+    digest.update(_TENSORRT_SOURCE_SIGNATURE_VERSION.encode("utf-8"))
+    digest.update(b"\0")
+    models_dir = pathlib.Path(_HERE)
+    generated_dirs = {"__pycache__", "compile_cache", "engines", "onnx"}
+    files: list[pathlib.Path] = []
+    if models_dir.is_dir():
+        for p in sorted(models_dir.rglob("*.py")):
+            try:
+                rel_parts = set(p.relative_to(models_dir).parts)
+            except ValueError:
+                rel_parts = set(p.parts)
+            if rel_parts & generated_dirs:
+                continue
+            files.append(p)
+    for p in files:
+        try:
+            rel = p.relative_to(root).as_posix()
+        except ValueError:
+            rel = p.name
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(p.read_bytes())
+        except Exception:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    _TENSORRT_SOURCE_SIGNATURE_CACHE = digest.hexdigest()
+    return _TENSORRT_SOURCE_SIGNATURE_CACHE
+
+
+def _safe_tensorrt_version(trt_module=None) -> str:
+    try:
+        trt_module = trt_module or __import__("tensorrt")
+        return str(getattr(trt_module, "__version__", "unknown"))
+    except Exception as exc:
+        return f"unavailable:{type(exc).__name__}"
+
+
+def _safe_cuda_driver_version() -> str:
+    try:
+        fn = getattr(torch.cuda, "driver_version", None)
+        if callable(fn):
+            return str(fn())
+    except Exception:
+        pass
+    try:
+        fn = getattr(torch._C, "_cuda_getDriverVersion", None)
+        if callable(fn):
+            return str(fn())
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _cuda_device_fingerprint() -> dict[str, object]:
+    if not torch.cuda.is_available():
+        return {"available": False}
+    try:
+        index = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(index)
+        uuid = getattr(props, "uuid", "")
+        if isinstance(uuid, bytes):
+            uuid = uuid.hex()
+        return {
+            "available": True,
+            "index": int(index),
+            "name": str(getattr(props, "name", "")),
+            "capability": [
+                int(getattr(props, "major", 0)),
+                int(getattr(props, "minor", 0)),
+            ],
+            "total_memory": int(getattr(props, "total_memory", 0)),
+            "multi_processor_count": int(
+                getattr(props, "multi_processor_count", 0)
+            ),
+            "uuid": str(uuid or ""),
+        }
+    except Exception as exc:
+        return {"available": True, "error": type(exc).__name__}
+
+
+def _normalize_tensorrt_qdq_fusion(qdq_fusion: str) -> str:
+    fusion = str(qdq_fusion or "none").strip().lower()
+    if fusion in {"add", "residual-add", "add-inputs"}:
+        return "add"
+    return "none"
+
+
+def tensorrt_engine_metadata_path(engine_path: str) -> str:
+    return f"{engine_path}.json"
+
+
+def _tensorrt_expected_engine_metadata(
+    *,
+    model_path: str,
+    width: int,
+    height: int,
+    precision: str,
+    mode_name: str,
+    engine_mode_name: str,
+    builder_precision: str,
+    use_hg: bool,
+    predequantize_int8: bool,
+    qdq_fusion: str,
+    hg_weights: str | None = None,
+    trt_module=None,
+) -> dict[str, object]:
+    hg_path = hg_weights or _DEFAULT_HG_WEIGHTS
+    aux_streams = _tensorrt_aux_stream_count()
+    return {
+        "schema": _TENSORRT_ENGINE_METADATA_SCHEMA,
+        "source_signature": _tensorrt_source_signature(),
+        "model": _hash_file(model_path),
+        "hg": {
+            "enabled": bool(use_hg),
+            "weights": _hash_file(hg_path) if use_hg else None,
+        },
+        "engine": {
+            "width": int(width),
+            "height": int(height),
+            "precision": str(precision),
+            "builder_precision": str(builder_precision),
+            "mode_name": str(mode_name),
+            "engine_mode_name": str(engine_mode_name),
+            "use_hg": bool(use_hg),
+            "predequantize_int8": bool(predequantize_int8),
+            "qdq_fusion": _normalize_tensorrt_qdq_fusion(qdq_fusion),
+        },
+        "runtime": {
+            "torch": str(getattr(torch, "__version__", "unknown")),
+            "torch_cuda": str(getattr(torch.version, "cuda", None)),
+            "tensorrt": _safe_tensorrt_version(trt_module),
+            "cuda_driver": _safe_cuda_driver_version(),
+            "device": _cuda_device_fingerprint(),
+        },
+        "build": {
+            "builder_optimization_level": _tensorrt_builder_optimization_level(),
+            "workspace_gb": _tensorrt_workspace_gb(),
+            "aux_streams": aux_streams,
+        },
+    }
+
+
+def _first_metadata_mismatch(expected, actual, prefix: str = "") -> str | None:
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return f"{prefix or 'metadata'} type mismatch"
+        for key, expected_value in expected.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            if key not in actual:
+                return f"{child_prefix} missing"
+            mismatch = _first_metadata_mismatch(
+                expected_value,
+                actual.get(key),
+                child_prefix,
+            )
+            if mismatch:
+                return mismatch
+        return None
+    if isinstance(expected, list):
+        if list(actual or []) != expected:
+            return f"{prefix} expected {expected!r}, got {actual!r}"
+        return None
+    if actual != expected:
+        return f"{prefix} expected {expected!r}, got {actual!r}"
+    return None
+
+
+def _tensorrt_engine_validation_error(
+    engine_path: str,
+    expected: dict[str, object],
+) -> str | None:
+    if not engine_path or not os.path.isfile(engine_path):
+        return "engine file missing"
+    meta_path = tensorrt_engine_metadata_path(engine_path)
+    if not os.path.isfile(meta_path):
+        return "metadata sidecar missing"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            actual = json.load(fh)
+    except Exception as exc:
+        return f"metadata unreadable: {exc}"
+    return _first_metadata_mismatch(expected, actual)
+
+
+def tensorrt_engine_is_valid(
+    engine_path: str,
+    *,
+    model_path: str,
+    width: int,
+    height: int,
+    precision: str,
+    mode_name: str,
+    use_hg: bool,
+    predequantize=False,
+    qdq_fusion: str = "none",
+    hg_weights: str | None = None,
+    verbose: bool = False,
+) -> bool:
+    predeq = _resolve_tensorrt_predequantize(precision, predequantize)
+    engine_mode_name = tensorrt_mode_name(
+        precision,
+        mode_name,
+        predequantize=predeq,
+        qdq_fusion=qdq_fusion,
+    )
+    builder_precision = "fp16" if predeq else str(precision)
+    expected = _tensorrt_expected_engine_metadata(
+        model_path=model_path,
+        width=width,
+        height=height,
+        precision=precision,
+        mode_name=mode_name,
+        engine_mode_name=engine_mode_name,
+        builder_precision=builder_precision,
+        use_hg=use_hg,
+        predequantize_int8=predeq,
+        qdq_fusion=qdq_fusion,
+        hg_weights=hg_weights,
+    )
+    reason = _tensorrt_engine_validation_error(engine_path, expected)
+    if reason and verbose:
+        print(f"TensorRT engine cache invalid: {reason} ({engine_path})")
+    return reason is None
+
+
+def _write_tensorrt_engine_metadata(
+    engine_path: str,
+    metadata: dict[str, object],
+) -> None:
+    meta_path = tensorrt_engine_metadata_path(engine_path)
+    payload = dict(metadata)
+    payload["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        pathlib.Path(meta_path).write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"TensorRT engine metadata saved: {meta_path}")
+    except Exception as exc:
+        print(f"TensorRT engine metadata save skipped: {exc}")
+
+
 def _tensorrt_timing_cache_path():
     override = os.environ.get("HDRTVNET_TRT_TIMING_CACHE")
     if override is not None:
@@ -1780,6 +2074,13 @@ def _tensorrt_aux_stream_count():
         return max(0, int(value))
     except Exception:
         return None
+
+
+def _tensorrt_workspace_gb() -> float:
+    try:
+        return float(os.environ.get("HDRTVNET_TRT_WORKSPACE_GB", "4"))
+    except Exception:
+        return 4.0
 
 
 def tensorrt_engine_path(
@@ -2340,6 +2641,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
 
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
+        self._trt_base_mode_name = str(mode_name or precision or "mode")
         self._trt_qdq_fusion = str(qdq_fusion or "none").strip().lower()
         self._trt_predequantize_int8 = _resolve_tensorrt_predequantize(
             precision,
@@ -2350,7 +2652,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         )
         self._engine_mode_name = tensorrt_mode_name(
             precision,
-            mode_name,
+            self._trt_base_mode_name,
             predequantize=self._trt_predequantize_int8,
             qdq_fusion=self._trt_qdq_fusion,
         )
@@ -2407,21 +2709,69 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 "checkpoint as a native FP16 engine"
             )
 
-        if not os.path.isfile(self.engine_path):
-            print(f"TensorRT engine cache miss: {self.engine_path}")
+        self._trt_engine_metadata = self._expected_tensorrt_engine_metadata()
+        engine_validation_error = _tensorrt_engine_validation_error(
+            self.engine_path,
+            self._trt_engine_metadata,
+        )
+        engine_rebuilt = False
+        if engine_validation_error:
+            if os.path.isfile(self.engine_path):
+                print(
+                    "TensorRT engine cache invalid: "
+                    f"{engine_validation_error} ({self.engine_path})"
+                )
+            else:
+                print(f"TensorRT engine cache miss: {self.engine_path}")
             self._build_engine_from_loaded_model()
+            engine_rebuilt = True
         else:
             print(f"TensorRT engine cache hit: {self.engine_path}")
             cleanup_tensorrt_onnx_after_engine(self.onnx_path, self.engine_path)
+
+        try:
+            self._load_engine()
+        except Exception as exc:
+            if engine_rebuilt:
+                raise
+            print(f"TensorRT cached engine load failed; rebuilding: {exc}")
+            self._trt_runtime = None
+            self._trt_engine = None
+            self._trt_context = None
+            self._trt_input_names = []
+            self._trt_output_names = []
+            self._build_engine_from_loaded_model()
+            self._load_engine()
 
         # Runtime must not retain the PyTorch model after the engine exists.
         self.model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        self._load_engine()
         self._compiled = False
         print(f"TensorRT engine : {self.engine_path}")
+
+    def _expected_tensorrt_engine_metadata(self, trt_module=None) -> dict[str, object]:
+        return _tensorrt_expected_engine_metadata(
+            model_path=self.model_path,
+            width=self._engine_width,
+            height=self._engine_height,
+            precision=self.precision,
+            mode_name=str(
+                getattr(
+                    self,
+                    "_trt_base_mode_name",
+                    self._engine_mode_name,
+                )
+            ),
+            engine_mode_name=self._engine_mode_name,
+            builder_precision=self._trt_builder_precision,
+            use_hg=self._use_hg,
+            predequantize_int8=self._trt_predequantize_int8,
+            qdq_fusion=self._trt_qdq_fusion,
+            hg_weights=self._hg_weights,
+            trt_module=trt_module,
+        )
 
     def _build_engine_from_loaded_model(self) -> None:
         try:
@@ -2462,7 +2812,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             raise RuntimeError("ONNX parse failed:\n" + "\n".join(errors))
 
         config = builder.create_builder_config()
-        workspace_gb = float(os.environ.get("HDRTVNET_TRT_WORKSPACE_GB", "4"))
+        workspace_gb = _tensorrt_workspace_gb()
         workspace_bytes = int(max(1.0, workspace_gb) * (1024 ** 3))
         if hasattr(config, "set_memory_pool_limit"):
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
@@ -2507,6 +2857,8 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 raise RuntimeError("TensorRT engine build failed.")
             pathlib.Path(self.engine_path).write_bytes(bytes(engine.serialize()))
         self._save_tensorrt_timing_cache(config, timing_cache_path)
+        self._trt_engine_metadata = self._expected_tensorrt_engine_metadata(trt)
+        _write_tensorrt_engine_metadata(self.engine_path, self._trt_engine_metadata)
 
         # Keep the cache object alive until after build_serialized_network has
         # returned; TensorRT requires it to outlive the build.

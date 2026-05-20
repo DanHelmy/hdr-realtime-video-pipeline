@@ -89,6 +89,7 @@ try:
         _IS_NVIDIA,
         _IS_ROCM,
         tensorrt_engine_path,
+        tensorrt_engine_is_valid,
         tensorrt_mode_name,
     )
 except Exception:
@@ -100,6 +101,9 @@ except Exception:
 
     def tensorrt_engine_path(*a, **kw) -> str:  # type: ignore[misc]
         return ""
+
+    def tensorrt_engine_is_valid(*a, **kw) -> bool:  # type: ignore[misc]
+        return False
 
     def tensorrt_mode_name(*a, **kw) -> str:  # type: ignore[misc]
         return ""
@@ -2879,7 +2883,19 @@ class PlaybackRuntimeMixin:
             )
             trt_engine = tensorrt_engine_path(model_path, pw, ph, trt_engine_mode)
             tensorrt_engine_cache_miss = bool(
-                trt_engine and not os.path.isfile(trt_engine)
+                trt_engine
+                and not tensorrt_engine_is_valid(
+                    trt_engine,
+                    model_path=model_path,
+                    width=pw,
+                    height=ph,
+                    precision=trt_cfg.get("precision", prec_arg),
+                    mode_name=trt_mode,
+                    use_hg=self._chk_hg.isChecked(),
+                    predequantize=_normalize_predequantize_mode(
+                        getattr(self, "_predequantize_mode", "auto")
+                    ),
+                )
             )
         self._autotune_warning_needed = False
         if self._runtime_execution_mode_uses_compile():
@@ -3655,7 +3671,18 @@ class PlaybackRuntimeMixin:
                     ),
                 )
                 trt_engine_path = tensorrt_engine_path(target_model_path, cur_pw, cur_ph, trt_engine_mode)
-                if not os.path.isfile(trt_engine_path):
+                if not tensorrt_engine_is_valid(
+                    trt_engine_path,
+                    model_path=target_model_path,
+                    width=cur_pw,
+                    height=cur_ph,
+                    precision=trt_cfg.get("precision", new_prec),
+                    mode_name=trt_mode,
+                    use_hg=use_hg,
+                    predequantize=_normalize_predequantize_mode(
+                        getattr(self, "_predequantize_mode", "auto")
+                    ),
+                ):
                     self.statusBar().showMessage(
                         f"TensorRT engine for {new_prec} not built at {cur_pw}x{cur_ph}; restarting to build."
                     )
