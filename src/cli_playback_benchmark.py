@@ -59,6 +59,23 @@ _RUN_PRESETS = {
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg.pt"),
         "predequantize": "on",
         "label": "int8_mixed_ptq_predeq",
+        "trt_predequantize": "off",
+        "trt_label": "int8_mixed_ptq_qdq",
+    },
+    "int8-mixed-ptq-trt": {
+        "precision": "int8-mixed",
+        "model": _weight("Ensemble_AGCM_LE_int8_mixed_trt.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg_trt.pt"),
+        "predequantize": "off",
+        "label": "int8_mixed_ptq_trt_qdq",
+    },
+    "int8-mixed-ptq-trt-fuse": {
+        "precision": "int8-mixed",
+        "model": _weight("Ensemble_AGCM_LE_int8_mixed_trt.pt"),
+        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg_trt.pt"),
+        "predequantize": "off",
+        "label": "int8_mixed_ptq_trt_addqdq",
+        "trt_qdq_fusion": "add",
     },
     "int8-full-ptq": {
         "precision": "int8-full",
@@ -66,6 +83,8 @@ _RUN_PRESETS = {
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
         "predequantize": "on",
         "label": "int8_full_ptq_predeq",
+        "trt_predequantize": "off",
+        "trt_label": "int8_full_ptq_qdq",
     },
     "int8-mixed-qat": {
         "precision": "int8-mixed",
@@ -73,6 +92,8 @@ _RUN_PRESETS = {
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
         "predequantize": "on",
         "label": "int8_mixed_qat_predeq",
+        "trt_predequantize": "off",
+        "trt_label": "int8_mixed_qat_qdq",
     },
     "int8-full-qat": {
         "precision": "int8-full",
@@ -80,6 +101,8 @@ _RUN_PRESETS = {
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_nohg.pt"),
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
+        "trt_predequantize": "off",
+        "trt_label": "int8_full_qat_qdq",
     },
     "int8-mixed-qat-film": {
         "precision": "int8-mixed",
@@ -87,6 +110,8 @@ _RUN_PRESETS = {
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt"),
         "predequantize": "on",
         "label": "int8_mixed_qat_film_predeq",
+        "trt_predequantize": "off",
+        "trt_label": "int8_mixed_qat_film_qdq",
     },
     "int8-full-qat-film": {
         "precision": "int8-full",
@@ -94,12 +119,16 @@ _RUN_PRESETS = {
         "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt"),
         "predequantize": "on",
         "label": "int8_full_qat_film_predeq",
+        "trt_predequantize": "off",
+        "trt_label": "int8_full_qat_film_qdq",
     },
 }
 _DEFAULT_RUNS = [
     "fp32",
     "fp16",
     "int8-mixed-ptq",
+    "int8-mixed-ptq-trt",
+    "int8-mixed-ptq-trt-fuse",
     "int8-full-ptq",
     "int8-mixed-qat",
     "int8-full-qat",
@@ -245,6 +274,8 @@ def _make_processor(args, run: dict, width: int, height: int):
             engine_height=int(height),
             mode_name=f"{run['precision']}_{'hg' if args.use_hg else 'nohg'}",
             use_hg=bool(args.use_hg),
+            predequantize=predeq,
+            qdq_fusion=str(run.get("trt_qdq_fusion", "none")),
         )
     return HDRTVNetTorch(
         run["model"],
@@ -659,6 +690,11 @@ def main() -> int:
             preset = dict(_RUN_PRESETS[run_key])
             if (not args.use_hg) and preset.get("model_nohg"):
                 preset["model"] = preset["model_nohg"]
+            if _IS_NVIDIA and str(args.device).lower() != "cpu":
+                preset["predequantize"] = str(
+                    preset.get("trt_predequantize", preset.get("predequantize", "auto"))
+                )
+                preset["label"] = str(preset.get("trt_label", preset.get("label", run_key)))
             if not os.path.isfile(preset["model"]):
                 raise FileNotFoundError(f"Model not found: {preset['model']}")
             print(

@@ -2,6 +2,7 @@ import math
 import os
 import pathlib
 import re
+import sys
 import threading
 import time
 import warnings
@@ -480,6 +481,10 @@ class TRTQDQConv2d(nn.Module):
         x_zero = getattr(w8_mod, "x_zero", None)
         if x_zero is None:
             x_zero = torch.tensor(0.0)
+        self.register_buffer(
+            "x_min",
+            x_zero.detach().float().reshape(()),
+        )
         # Convert the existing asymmetric min/scale form into ONNX affine
         # zero-point form. Clamping keeps the graph valid for uint8 Q/DQ.
         zp = torch.round(-x_zero.detach().float() / self.x_scale).clamp(0, 255)
@@ -490,12 +495,15 @@ class TRTQDQConv2d(nn.Module):
             return x
         scale = self.x_scale.to(device=x.device)
         if self.activation_asymmetric:
-            # TRT GPU requires symmetric INT8 (zero_point=0). Convert the
-            # asymmetric UINT8 calibration by expanding the scale to cover
-            # both sides of the asymmetric float range.
-            zp = self.x_zero_point.float().to(device=x.device)
+            # TensorRT CUDA requires signed INT8 Q/DQ with zero_point=0.
+            # Preserve the calibrated asymmetric range by expanding the
+            # symmetric scale around zero. This is exact only when the range
+            # is zero-centered, but avoids saturation for one-sided ranges.
+            x_min = self.x_min.to(device=x.device)
+            x_max = x_min + scale * 255.0
             sym_scale = torch.clamp(
-                torch.max(zp * scale, (255.0 - zp) * scale) / 127.0, min=1e-8
+                torch.maximum(torch.abs(x_min), torch.abs(x_max)) / 127.0,
+                min=1e-8,
             )
             zp_zero = torch.tensor(0, dtype=torch.int32, device=x.device)
             return torch.fake_quantize_per_tensor_affine(x, sym_scale, zp_zero, -128, 127)
@@ -516,7 +524,7 @@ class TRTQDQConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._quantize_input(x)
-        w = self._quantize_weight().to(dtype=x.dtype)
+        w = self._quantize_weight()
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.conv2d(x, w, bias, self.stride, self.padding,
                         self.dilation, self.groups)
@@ -557,6 +565,10 @@ class TRTQDQLinear(nn.Module):
         x_zero = getattr(w8_mod, "x_zero", None)
         if x_zero is None:
             x_zero = torch.tensor(0.0)
+        self.register_buffer(
+            "x_min",
+            x_zero.detach().float().reshape(()),
+        )
         zp = torch.round(-x_zero.detach().float() / self.x_scale).clamp(0, 255)
         self.register_buffer("x_zero_point", zp.to(torch.int32).reshape(()))
 
@@ -565,12 +577,11 @@ class TRTQDQLinear(nn.Module):
             return x
         scale = self.x_scale.to(device=x.device)
         if self.activation_asymmetric:
-            # TRT GPU requires symmetric INT8 (zero_point=0). Convert the
-            # asymmetric UINT8 calibration by expanding the scale to cover
-            # both sides of the asymmetric float range.
-            zp = self.x_zero_point.float().to(device=x.device)
+            x_min = self.x_min.to(device=x.device)
+            x_max = x_min + scale * 255.0
             sym_scale = torch.clamp(
-                torch.max(zp * scale, (255.0 - zp) * scale) / 127.0, min=1e-8
+                torch.maximum(torch.abs(x_min), torch.abs(x_max)) / 127.0,
+                min=1e-8,
             )
             zp_zero = torch.tensor(0, dtype=torch.int32, device=x.device)
             return torch.fake_quantize_per_tensor_affine(x, sym_scale, zp_zero, -128, 127)
@@ -591,7 +602,7 @@ class TRTQDQLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._quantize_input(x)
-        w = self._quantize_weight().to(dtype=x.dtype)
+        w = self._quantize_weight()
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -1793,22 +1804,67 @@ def tensorrt_onnx_path(
 
 
 def cleanup_tensorrt_onnx_after_engine(onnx_path: str, engine_path: str) -> bool:
-    if not onnx_path or not os.path.isfile(engine_path) or not os.path.isfile(onnx_path):
+    if not onnx_path or not os.path.isfile(engine_path):
         return False
     try:
-        os.remove(onnx_path)
-        print(f"TensorRT ONNX removed after engine ready: {onnx_path}")
-        return True
+        removed = False
+        if os.path.isfile(onnx_path):
+            os.remove(onnx_path)
+            removed = True
+        data_path = f"{onnx_path}.data"
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+            removed = True
+        if removed:
+            print(f"TensorRT ONNX removed after engine ready: {onnx_path}")
+        return removed
     except Exception as exc:
         print(f"TensorRT ONNX cleanup skipped: {exc}")
         return False
 
 
-def tensorrt_mode_name(precision: str, mode: str) -> str:
+def _resolve_tensorrt_predequantize(precision: str, predequantize=False) -> bool:
+    if not str(precision or "").startswith("int8"):
+        return False
+    if isinstance(predequantize, bool):
+        return bool(predequantize)
+    text = str(predequantize or "off").strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    # Auto mirrors the PyTorch path: keep explicit INT8 only on NVIDIA GPUs
+    # with native INT8 tensor cores; otherwise export a native FP16 engine.
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(0)
+            has_int8_tc = props.major > 7 or (props.major == 7 and props.minor >= 5)
+            return not has_int8_tc
+        except Exception:
+            return False
+    return False
+
+
+def tensorrt_mode_name(
+    precision: str,
+    mode: str,
+    predequantize=False,
+    qdq_fusion: str = "none",
+) -> str:
     mode_name = str(mode or precision or "mode")
-    if str(precision).startswith("int8") and "qdq" not in mode_name.lower():
-        qdq_version = "qdqv2" if str(precision).startswith("int8-mixed") else "qdqv1"
+    if str(precision).startswith("int8"):
+        lower = mode_name.lower()
+        if _resolve_tensorrt_predequantize(precision, predequantize):
+            if "predeq" not in lower:
+                mode_name = f"{mode_name}_predeqv1"
+            return mode_name
+        if "qdq" in lower:
+            return mode_name
+        qdq_version = "qdqv6"
         mode_name = f"{mode_name}_{qdq_version}"
+        fusion = str(qdq_fusion or "none").strip().lower()
+        if fusion in {"add", "residual-add", "add-inputs"} and "addqdq" not in lower:
+            mode_name = f"{mode_name}_addqdqv1"
     return mode_name
 
 
@@ -1828,6 +1884,373 @@ class _ONNXExportWrapper(nn.Module):
         return out
 
 
+def _patch_tensorrt_qdq_casts(onnx_path: str) -> None:
+    """Remove Cast nodes that separate Q/DQ from TensorRT INT8 Conv/Gemm patterns."""
+    try:
+        import onnx
+    except Exception as exc:
+        print(f"TensorRT Q/DQ Cast cleanup skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path)
+    except Exception as exc:
+        print(f"TensorRT Q/DQ Cast cleanup skipped: {exc}")
+        return
+
+    graph = model.graph
+    producers = {output: node for node in graph.node for output in node.output}
+
+    consumers = {}
+    for node in graph.node:
+        for index, input_name in enumerate(node.input):
+            consumers.setdefault(input_name, []).append((node, index))
+
+    qdq_to_conv = 0
+    conv_to_qdq = 0
+    removable = set()
+    compute_ops = {"Conv", "Gemm", "MatMul"}
+
+    for node in graph.node:
+        if node.op_type != "Cast" or not node.input or not node.output:
+            continue
+
+        cast_input = node.input[0]
+        cast_output = node.output[0]
+        producer = producers.get(cast_input)
+        node_consumers = list(consumers.get(cast_output, ()))
+
+        rewired = 0
+        if producer is not None and producer.op_type == "DequantizeLinear":
+            for consumer, index in node_consumers:
+                if consumer.op_type in compute_ops:
+                    consumer.input[index] = cast_input
+                    rewired += 1
+                    qdq_to_conv += 1
+        else:
+            for consumer, index in node_consumers:
+                if consumer.op_type == "QuantizeLinear" and index == 0:
+                    consumer.input[index] = cast_input
+                    rewired += 1
+                    conv_to_qdq += 1
+
+        if rewired == len(node_consumers) and rewired:
+            removable.add(node.name or cast_output)
+
+    if removable:
+        kept_nodes = [
+            node for node in graph.node
+            if not (node.op_type == "Cast" and (node.name or node.output[0]) in removable)
+        ]
+        del graph.node[:]
+        graph.node.extend(kept_nodes)
+
+    if qdq_to_conv or conv_to_qdq:
+        data_path = f"{onnx_path}.data"
+        try:
+            if os.path.isfile(data_path):
+                os.remove(data_path)
+        except Exception:
+            pass
+        try:
+            onnx.checker.check_model(model)
+        except Exception as exc:
+            print(f"TensorRT Q/DQ Cast cleanup check warning: {exc}")
+        onnx.save_model(
+            model,
+            onnx_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=os.path.basename(data_path),
+            size_threshold=1024,
+        )
+        print(
+            "TensorRT Q/DQ Cast cleanup: "
+            f"{qdq_to_conv} DQ->compute, {conv_to_qdq} compute->Q Cast(s) removed"
+        )
+
+
+def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
+    """Add Q/DQ on inputs of Add nodes that already feed calibrated Q nodes."""
+    try:
+        import onnx
+    except Exception as exc:
+        print(f"TensorRT Add Q/DQ fusion skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path)
+    except Exception as exc:
+        print(f"TensorRT Add Q/DQ fusion skipped: {exc}")
+        return
+
+    graph = model.graph
+    producers = {output: node for node in graph.node for output in node.output}
+    initializers = {init.name for init in graph.initializer}
+    graph_inputs = {value.name for value in graph.input}
+
+    consumers = {}
+    for node in graph.node:
+        for index, input_name in enumerate(node.input):
+            consumers.setdefault(input_name, []).append((node, index))
+
+    existing_names = {node.name for node in graph.node if node.name}
+    existing_tensors = set()
+    for node in graph.node:
+        existing_tensors.update(node.input)
+        existing_tensors.update(node.output)
+
+    def _unique(base: str, used: set[str]) -> str:
+        safe = re.sub(r"[^0-9A-Za-z_]+", "_", base).strip("_") or "tensor"
+        name = safe
+        index = 1
+        while name in used:
+            name = f"{safe}_{index}"
+            index += 1
+        used.add(name)
+        return name
+
+    def _output_quantizer(add_node) -> object | None:
+        for consumer, index in consumers.get(add_node.output[0], []):
+            if consumer.op_type == "QuantizeLinear" and index == 0:
+                return consumer
+        return None
+
+    patched_adds = 0
+    inserted_qdq = 0
+    new_nodes = []
+
+    for node in graph.node:
+        if node.op_type != "Add":
+            new_nodes.append(node)
+            continue
+
+        output_quant = _output_quantizer(node)
+        if output_quant is None or len(output_quant.input) < 2:
+            new_nodes.append(node)
+            continue
+
+        scale_name = output_quant.input[1]
+        zero_name = output_quant.input[2] if len(output_quant.input) > 2 else ""
+        node_was_patched = False
+
+        for input_index, input_name in enumerate(list(node.input)):
+            producer = producers.get(input_name)
+            if input_name in initializers or input_name in graph_inputs:
+                continue
+            if producer is not None and producer.op_type == "DequantizeLinear":
+                continue
+
+            q_name = _unique(f"{node.name or node.output[0]}_input{input_index}_QuantizeLinear", existing_names)
+            dq_name = _unique(f"{node.name or node.output[0]}_input{input_index}_DequantizeLinear", existing_names)
+            q_out = _unique(f"{node.output[0]}_input{input_index}_q", existing_tensors)
+            dq_out = _unique(f"{node.output[0]}_input{input_index}_dq", existing_tensors)
+            q_inputs = [input_name, scale_name]
+            dq_inputs = [q_out, scale_name]
+            if zero_name:
+                q_inputs.append(zero_name)
+                dq_inputs.append(zero_name)
+
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "QuantizeLinear",
+                    q_inputs,
+                    [q_out],
+                    name=q_name,
+                )
+            )
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "DequantizeLinear",
+                    dq_inputs,
+                    [dq_out],
+                    name=dq_name,
+                )
+            )
+            node.input[input_index] = dq_out
+            inserted_qdq += 1
+            node_was_patched = True
+
+        if node_was_patched:
+            patched_adds += 1
+        new_nodes.append(node)
+
+    if not patched_adds:
+        print("TensorRT Add Q/DQ fusion: no eligible Add nodes found")
+        return
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"TensorRT Add Q/DQ fusion check warning: {exc}")
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(
+        "TensorRT Add Q/DQ fusion: "
+        f"patched {patched_adds} Add node(s), inserted {inserted_qdq} input Q/DQ pair(s)"
+    )
+
+
+def _patch_tensorrt_fp16_constants(onnx_path: str) -> None:
+    """Convert safe FP32 ONNX constants to FP16 for TensorRT mixed INT8/FP16 engines."""
+    try:
+        import onnx
+        from onnx import TensorProto, numpy_helper
+    except Exception as exc:
+        print(f"TensorRT FP16 constant cleanup skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path)
+    except Exception as exc:
+        print(f"TensorRT FP16 constant cleanup skipped: {exc}")
+        return
+
+    graph = model.graph
+    protected = set()
+    graph_io = {value.name for value in graph.input}
+    graph_io.update(value.name for value in graph.output)
+
+    for node in graph.node:
+        if node.op_type in {"QuantizeLinear", "DequantizeLinear"}:
+            # Keep calibration scales and zero-points exactly as exported.
+            protected.update(node.input[1:])
+
+    changed_initializers = 0
+    for initializer in graph.initializer:
+        if (
+            initializer.data_type != TensorProto.FLOAT
+            or initializer.name in protected
+            or initializer.name in graph_io
+        ):
+            continue
+        array = numpy_helper.to_array(initializer)
+        if array.dtype != np.float32:
+            continue
+        fp16_tensor = numpy_helper.from_array(array.astype(np.float16), initializer.name)
+        initializer.CopyFrom(fp16_tensor)
+        changed_initializers += 1
+
+    changed_constants = 0
+    for node in graph.node:
+        if node.op_type != "Constant" or any(output in protected for output in node.output):
+            continue
+        for attr in node.attribute:
+            if attr.name != "value" or not attr.HasField("t"):
+                continue
+            tensor = attr.t
+            if tensor.data_type != TensorProto.FLOAT:
+                continue
+            array = numpy_helper.to_array(tensor)
+            if array.dtype != np.float32:
+                continue
+            attr.t.CopyFrom(numpy_helper.from_array(array.astype(np.float16), tensor.name))
+            changed_constants += 1
+
+    if not (changed_initializers or changed_constants):
+        print("TensorRT FP16 constant cleanup: no safe FP32 constants found")
+        return
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"TensorRT FP16 constant cleanup check warning: {exc}")
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(
+        "TensorRT FP16 constant cleanup: "
+        f"{changed_initializers} initializer(s), {changed_constants} Constant node(s)"
+    )
+
+
+def _patch_tensorrt_fp16_qdq_scales(onnx_path: str) -> None:
+    """Use FP16 Q/DQ scales so explicit-quantization islands stay in FP16."""
+    try:
+        import onnx
+        from onnx import TensorProto, numpy_helper
+    except Exception as exc:
+        print(f"TensorRT FP16 Q/DQ scale cleanup skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path)
+    except Exception as exc:
+        print(f"TensorRT FP16 Q/DQ scale cleanup skipped: {exc}")
+        return
+
+    scale_names = set()
+    for node in model.graph.node:
+        if node.op_type in {"QuantizeLinear", "DequantizeLinear"} and len(node.input) > 1:
+            scale_names.add(node.input[1])
+
+    changed = 0
+    for initializer in model.graph.initializer:
+        if initializer.name not in scale_names or initializer.data_type != TensorProto.FLOAT:
+            continue
+        array = numpy_helper.to_array(initializer)
+        if array.dtype != np.float32:
+            continue
+        initializer.CopyFrom(
+            numpy_helper.from_array(array.astype(np.float16), initializer.name)
+        )
+        changed += 1
+
+    if not changed:
+        print("TensorRT FP16 Q/DQ scale cleanup: no FP32 Q/DQ scales found")
+        return
+
+    for opset in model.opset_import:
+        if not opset.domain and opset.version < 19:
+            opset.version = 19
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"TensorRT FP16 Q/DQ scale cleanup check warning: {exc}")
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(f"TensorRT FP16 Q/DQ scale cleanup: {changed} scale initializer(s)")
+
+
 def _export_tensorrt_onnx_from_model(
     *,
     model: nn.Module,
@@ -1838,10 +2261,14 @@ def _export_tensorrt_onnx_from_model(
     device: torch.device,
     precision: str,
     flat_model: bool,
+    qdq_fusion: str = "none",
 ) -> str:
     if os.path.isfile(onnx_path):
         try:
             os.remove(onnx_path)
+            data_path = f"{onnx_path}.data"
+            if os.path.isfile(data_path):
+                os.remove(data_path)
             print(f"TensorRT stale ONNX removed before export: {onnx_path}")
         except Exception as exc:
             print(f"TensorRT stale ONNX removal skipped: {exc}")
@@ -1857,16 +2284,31 @@ def _export_tensorrt_onnx_from_model(
     cond = torch.zeros((1, 3, cond_h, cond_w), dtype=dtype, device=device)
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     print(f"TensorRT ONNX export: {onnx_path}")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
     with torch.inference_mode():
         torch.onnx.export(
             wrapper,
             (tensor, cond),
             onnx_path,
+            verbose=False,
             input_names=["input", "cond"],
             output_names=["output"],
-            opset_version=18,
+            opset_version=19 if str(precision).startswith("int8") else 18,
             do_constant_folding=True,
         )
+    if str(precision).startswith("int8"):
+        _patch_tensorrt_qdq_casts(onnx_path)
+        fusion = str(qdq_fusion or "none").strip().lower()
+        if fusion in {"add", "residual-add", "add-inputs"}:
+            _patch_tensorrt_add_input_qdq(onnx_path)
+        _patch_tensorrt_fp16_qdq_scales(onnx_path)
+        _patch_tensorrt_fp16_constants(onnx_path)
     return onnx_path
 
 
@@ -1890,13 +2332,28 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         mode_name="fp16",
         hg_weights=None,
         use_hg=True,
+        predequantize=False,
+        qdq_fusion: str = "none",
     ):
         if not _IS_NVIDIA:
             raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
 
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
-        self._engine_mode_name = tensorrt_mode_name(precision, mode_name)
+        self._trt_qdq_fusion = str(qdq_fusion or "none").strip().lower()
+        self._trt_predequantize_int8 = _resolve_tensorrt_predequantize(
+            precision,
+            predequantize,
+        )
+        self._trt_builder_precision = (
+            "fp16" if self._trt_predequantize_int8 else precision
+        )
+        self._engine_mode_name = tensorrt_mode_name(
+            precision,
+            mode_name,
+            predequantize=self._trt_predequantize_int8,
+            qdq_fusion=self._trt_qdq_fusion,
+        )
         self.engine_path = tensorrt_engine_path(
             model_path,
             self._engine_width,
@@ -1934,7 +2391,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             compile_mode="default",
             use_cuda_graphs=False,
             force_channels_last=False,
-            predequantize=False,
+            predequantize=True if self._trt_predequantize_int8 else False,
             hg_weights=hg_weights,
             use_hg=use_hg,
         )
@@ -1944,6 +2401,11 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         self._use_channels_last = False
         if self._trt_use_dedicated_stream:
             self._trt_stream = torch.cuda.Stream()
+        if self._trt_predequantize_int8:
+            print(
+                "TensorRT INT8 pre-dequantize: exporting compressed INT8 "
+                "checkpoint as a native FP16 engine"
+            )
 
         if not os.path.isfile(self.engine_path):
             print(f"TensorRT engine cache miss: {self.engine_path}")
@@ -1980,8 +2442,9 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             height=self._engine_height,
             dtype=self._dtype,
             device=self.device,
-            precision=self.precision,
+            precision=self._trt_builder_precision,
             flat_model=getattr(self, "_is_flat_model", False),
+            qdq_fusion=self._trt_qdq_fusion,
         )
         self._build_engine_from_onnx(onnx_path, trt)
         cleanup_tensorrt_onnx_after_engine(onnx_path, self.engine_path)
@@ -2022,9 +2485,12 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             except Exception as exc:
                 print(f"TensorRT auxiliary streams skipped: {exc}")
 
-        if self.precision != "fp32" and builder.platform_has_fast_fp16:
+        builder_precision = str(
+            getattr(self, "_trt_builder_precision", self.precision)
+        )
+        if builder_precision != "fp32" and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
-        if str(self.precision).startswith("int8") and builder.platform_has_fast_int8:
+        if str(builder_precision).startswith("int8") and builder.platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
 
         timing_cache_path, timing_cache = self._attach_tensorrt_timing_cache(config)

@@ -1532,7 +1532,12 @@ class _BenchmarkWorker(QObject):
             )
             if _IS_NVIDIA:
                 mode_name = f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}"
-                trt_mode_name = tensorrt_mode_name(model_precision, mode_name)
+                trt_predeq = _resolve_predequantize_arg(str(cfg.predequantize_mode))
+                trt_mode_name = tensorrt_mode_name(
+                    model_precision,
+                    mode_name,
+                    predequantize=trt_predeq,
+                )
                 engine_path = tensorrt_engine_path(
                     model_path,
                     out_w,
@@ -1554,6 +1559,7 @@ class _BenchmarkWorker(QObject):
                     engine_height=out_h,
                     mode_name=mode_name,
                     use_hg=bool(cfg.use_hg),
+                    predequantize=trt_predeq,
                 )
                 cfg.runtime_mode = "TensorRT"
             else:
@@ -3442,6 +3448,7 @@ class ModelBenchmarkDialog(QDialog):
         try:
             if _IS_NVIDIA:
                 out_w, out_h = _resolution_dims(resolution_key)
+                trt_predeq = _resolve_predequantize_arg(predequantize_mode)
                 processor = HDRTVNetTensorRT(
                     model_path,
                     device="auto",
@@ -3450,6 +3457,7 @@ class ModelBenchmarkDialog(QDialog):
                     engine_height=out_h,
                     mode_name=f"{precision}_{'hg' if use_hg else 'nohg'}",
                     use_hg=bool(use_hg),
+                    predequantize=trt_predeq,
                 )
             else:
                 out_w, out_h = _resolution_dims(resolution_key)

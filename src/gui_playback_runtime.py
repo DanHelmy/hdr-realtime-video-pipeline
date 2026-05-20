@@ -2873,6 +2873,9 @@ class PlaybackRuntimeMixin:
             trt_engine_mode = tensorrt_mode_name(
                 trt_cfg.get("precision", prec_arg),
                 trt_mode,
+                predequantize=_normalize_predequantize_mode(
+                    getattr(self, "_predequantize_mode", "auto")
+                ),
             )
             trt_engine = tensorrt_engine_path(model_path, pw, ph, trt_engine_mode)
             tensorrt_engine_cache_miss = bool(
@@ -3644,7 +3647,13 @@ class PlaybackRuntimeMixin:
                 use_hg = self._chk_hg.isChecked()
                 trt_cfg = PRECISIONS.get(new_prec, {})
                 trt_mode = f"{new_prec}_{'hg' if use_hg else 'nohg'}"
-                trt_engine_mode = tensorrt_mode_name(trt_cfg.get("precision", new_prec), trt_mode)
+                trt_engine_mode = tensorrt_mode_name(
+                    trt_cfg.get("precision", new_prec),
+                    trt_mode,
+                    predequantize=_normalize_predequantize_mode(
+                        getattr(self, "_predequantize_mode", "auto")
+                    ),
+                )
                 trt_engine_path = tensorrt_engine_path(target_model_path, cur_pw, cur_ph, trt_engine_mode)
                 if not os.path.isfile(trt_engine_path):
                     self.statusBar().showMessage(

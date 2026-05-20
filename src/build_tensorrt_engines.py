@@ -81,6 +81,25 @@ def main() -> int:
         help="Path to HG_weights.pth (overrides default path).",
     )
     parser.add_argument(
+        "--predequantize",
+        default="off",
+        choices=["auto", "on", "off"],
+        help=(
+            "INT8 engine export mode. 'off' builds explicit Q/DQ INT8; "
+            "'on' exports the INT8 checkpoint as a native FP16 engine."
+        ),
+    )
+    parser.add_argument(
+        "--qdq-fusion",
+        default="none",
+        choices=["none", "add"],
+        help=(
+            "Experimental explicit-Q/DQ placement for TensorRT INT8. "
+            "'add' inserts Q/DQ on eligible Add inputs that already feed "
+            "calibrated quantized paths."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Rebuild even when the .engine file already exists.",
@@ -141,9 +160,13 @@ def main() -> int:
     precision, default_model = _PRECISION_MAP[args.precision]
     model_path = os.path.abspath(args.model or default_model)
     use_hg = str(args.use_hg).strip() != "0"
+    predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
+    base_mode_name = f"{args.precision}_{'hg' if use_hg else 'nohg'}"
     mode_name = tensorrt_mode_name(
         precision,
-        f"{args.precision}_{'hg' if use_hg else 'nohg'}",
+        base_mode_name,
+        predequantize=predeq,
+        qdq_fusion=args.qdq_fusion,
     )
 
     if not os.path.isfile(model_path):
@@ -172,9 +195,11 @@ def main() -> int:
             precision=precision,
             engine_width=w,
             engine_height=h,
-            mode_name=mode_name,
+            mode_name=base_mode_name,
             hg_weights=args.hg_weights,
             use_hg=use_hg,
+            predequantize=predeq,
+            qdq_fusion=args.qdq_fusion,
         )
         if args.benchmark_runs > 0:
             import time

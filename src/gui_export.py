@@ -817,9 +817,13 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                 self.progress.emit(0, "Loading export model ...")
             if _IS_NVIDIA:
                 mode_name = f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}"
+                trt_predeq = _resolve_predequantize_arg(
+                    str(self._config.predequantize_mode)
+                )
                 trt_mode_name = tensorrt_mode_name(
                     str(cfg.get("precision") or "fp16"),
                     mode_name,
+                    predequantize=trt_predeq,
                 )
                 engine_path = tensorrt_engine_path(
                     model_path,
@@ -842,6 +846,7 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     engine_height=int(self._config.height),
                     mode_name=mode_name,
                     use_hg=self._config.use_hg,
+                    predequantize=trt_predeq,
                 )
             else:
                 processor = HDRTVNetTorch(

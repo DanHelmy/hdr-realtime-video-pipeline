@@ -327,6 +327,7 @@ def main():
                 mode_name=f"{args.precision}_{'hg' if str(args.use_hg).strip() != '0' else 'nohg'}",
                 hg_weights=args.hg_weights,
                 use_hg=str(args.use_hg).strip() != "0",
+                predequantize=predeq,
             )
         else:
             processor = HDRTVNetTorch(

@@ -110,7 +110,14 @@ class PipelineWorkerModelMixin:
         try:
             if _IS_NVIDIA:
                 mode_name = f"{key}_{'hg' if self._use_hg else 'nohg'}"
-                trt_mode_name = tensorrt_mode_name(cfg["precision"], mode_name)
+                trt_predeq = _resolve_predequantize_arg(
+                    getattr(self, "_predequantize_mode", "auto")
+                )
+                trt_mode_name = tensorrt_mode_name(
+                    cfg["precision"],
+                    mode_name,
+                    predequantize=trt_predeq,
+                )
                 trt_engine = tensorrt_engine_path(
                     path,
                     int(cw),
@@ -134,6 +141,7 @@ class PipelineWorkerModelMixin:
                     engine_height=int(ch),
                     mode_name=mode_name,
                     use_hg=self._use_hg,
+                    predequantize=trt_predeq,
                 )
             else:
                 resolved_compile_mode = (
