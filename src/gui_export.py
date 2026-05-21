@@ -302,6 +302,11 @@ class ExportOptionsDialog(QDialog):
         self._cmb_predequantize.addItem("Auto", "auto")
         self._cmb_predequantize.addItem("Force On", "on")
         self._cmb_predequantize.addItem("Force Off", "off")
+        self._cmb_predequantize.setToolTip(
+            "INT8 only. Auto uses pre-dequantize ON on AMD/ROCm. On NVIDIA, "
+            "Auto uses OFF/QDQ on GPUs with INT8 tensor cores and ON on older "
+            "CUDA GPUs."
+        )
         int8_form.addRow("Pre-dequantize:", self._cmb_predequantize)
         self._lbl_predequant_note = QLabel("")
         self._lbl_predequant_note.setWordWrap(True)
@@ -310,7 +315,6 @@ class ExportOptionsDialog(QDialog):
         advanced_layout.addStretch(1)
         if _IS_NVIDIA:
             perf_group.hide()
-            int8_group.hide()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -547,9 +551,9 @@ class ExportOptionsDialog(QDialog):
         self._cmb_predequantize.setEnabled(is_int8)
         if is_int8:
             self._lbl_predequant_note.setText(
-                "Only affects INT8 presets. `Auto` is the safest default. "
-                "`Force On` can help GPUs that do not benefit from INT8 tensor-core "
-                "style execution. `Force Off` keeps the quantized layers live at runtime."
+                "Only affects INT8 presets. Auto uses pre-dequantize ON on "
+                "AMD/ROCm. On NVIDIA, Auto uses OFF/QDQ on GPUs with INT8 "
+                "tensor cores and ON on older CUDA GPUs."
             )
         else:
             self._lbl_predequant_note.setText(

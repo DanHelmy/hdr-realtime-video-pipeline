@@ -1154,21 +1154,14 @@ class PlaybackRuntimeMixin:
         if mode == "on":
             return "On (force pre-dequantize)"
         if mode == "off":
-            return "Off (keep runtime dequant)"
+            return "Off (keep Q/DQ runtime)"
         return "Auto (recommended)"
 
     def _choose_predequantize_mode(self):
-        if _IS_NVIDIA:
-            QMessageBox.information(
-                self,
-                "TensorRT Runtime",
-                "NVIDIA inference uses TensorRT engines built from the selected model. PyTorch INT8 pre-dequantization controls are hidden.",
-            )
-            return
         options = [
             "Auto (recommended)",
             "On (force pre-dequantize)",
-            "Off (keep runtime dequant)",
+            "Off (keep Q/DQ runtime)",
         ]
         current_label = self._predequantize_mode_label()
         try:
@@ -1176,10 +1169,15 @@ class PlaybackRuntimeMixin:
         except ValueError:
             current_idx = 0
 
+        help_text = (
+            "Choose pre-dequantization mode:\n\n"
+            "Auto uses pre-dequantize ON on AMD/ROCm. On NVIDIA, Auto uses "
+            "OFF/QDQ on GPUs with INT8 tensor cores and ON on older CUDA GPUs."
+        )
         selected, ok = QInputDialog.getItem(
             self,
             "INT8 Pre-dequantization",
-            "Choose pre-dequantization mode:",
+            help_text,
             options,
             current_idx,
             False,
@@ -1248,8 +1246,13 @@ class PlaybackRuntimeMixin:
                 self._pause_for_precision_swap(active_gui_prec)
                 self._worker.request_predequantize_mode(mode)
                 self._schedule_precision_audio_resync()
+                effective_mode = self._effective_predequantize_mode_for_precision(
+                    active_prec_arg,
+                    selected_mode=mode,
+                )
                 self.statusBar().showMessage(
-                    f"Applying pre-dequantization mode: {mode}"
+                    f"Applying pre-dequantization mode: {mode} "
+                    f"(effective {effective_mode})"
                 )
                 return
 

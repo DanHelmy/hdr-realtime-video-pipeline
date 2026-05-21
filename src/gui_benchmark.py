@@ -2548,6 +2548,12 @@ class ModelBenchmarkDialog(QDialog):
         p_mode = str(initial_predequantize_mode or "auto").strip().lower()
         idx = self._cmb_predequantize.findData(p_mode)
         self._cmb_predequantize.setCurrentIndex(idx if idx >= 0 else 0)
+        predequantize_tip = (
+            "INT8 only. Auto uses pre-dequantize ON on AMD/ROCm. On NVIDIA, "
+            "Auto uses OFF/QDQ on GPUs with INT8 tensor cores and ON on older "
+            "CUDA GPUs."
+        )
+        self._cmb_predequantize.setToolTip(predequantize_tip)
 
         self._txt_session_root = QLineEdit()
         self._txt_session_root.setText(self._logs_root)
@@ -2563,10 +2569,8 @@ class ModelBenchmarkDialog(QDialog):
         opt_form.addRow("", self._chk_use_hg)
         opt_form.addRow("Benchmark resolution:", self._cmb_resolution)
         self._lbl_predequantize = QLabel("INT8 pre-dequantize:")
+        self._lbl_predequantize.setToolTip(predequantize_tip)
         opt_form.addRow(self._lbl_predequantize, self._cmb_predequantize)
-        if _IS_NVIDIA:
-            self._lbl_predequantize.hide()
-            self._cmb_predequantize.hide()
         opt_form.addRow("Session logs root:", root_row)
         cfg_layout.addWidget(opt_group)
 
