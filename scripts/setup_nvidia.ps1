@@ -80,6 +80,52 @@ sys.exit(0 if ok else 10)
     }
 }
 
+function Ensure-TensorRTSourceCheckpoints([string]$PythonExe, [string]$RepoRoot) {
+    $converter = Join-Path $RepoRoot "scripts\quantize\make_portable_int8_checkpoint.py"
+    $weightsDir = Join-Path $RepoRoot "src\models\weights"
+    $sourceDir = Join-Path $weightsDir "tensorrt_sources"
+
+    if (-not (Test-Path $converter)) {
+        Write-Warning "TensorRT source checkpoint converter not found: $converter"
+        return
+    }
+    if (-not (Test-Path $weightsDir)) {
+        Write-Warning "Weights directory not found: $weightsDir"
+        return
+    }
+
+    $checkpoints = @(
+        Get-ChildItem -LiteralPath $weightsDir -Filter "Ensemble_AGCM_LE_int8*.pt" -File |
+            Sort-Object Name |
+            ForEach-Object { $_.FullName }
+    )
+    if ($checkpoints.Count -eq 0) {
+        Write-Warning "No compressed INT8 checkpoints found under $weightsDir"
+        return
+    }
+
+    $missing = @()
+    foreach ($checkpoint in $checkpoints) {
+        $target = Join-Path $sourceDir (Split-Path $checkpoint -Leaf)
+        if (-not (Test-Path $target)) {
+            $missing += $target
+        }
+    }
+
+    if ($missing.Count -eq 0) {
+        Write-Host "[setup-nvidia] TensorRT source checkpoints already present."
+        return
+    }
+
+    Write-Step "Generating TensorRT source checkpoints..."
+    Write-Host "[setup-nvidia] Source folder: $sourceDir"
+    Write-Host "[setup-nvidia] These files are generated locally and ignored by git."
+    & $PythonExe $converter @checkpoints --activation-quant symmetric
+    if ($LASTEXITCODE -ne 0) {
+        throw "TensorRT source checkpoint generation failed with exit code $LASTEXITCODE"
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $venvDir = Join-Path $repoRoot "venv"
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
@@ -134,6 +180,8 @@ If playback fails to build an engine:
      Toolkit / TensorRT runtime from NVIDIA, then re-run setup.bat.
 "@
 }
+
+Ensure-TensorRTSourceCheckpoints -PythonExe $venvPython -RepoRoot $repoRoot
 
 Write-Step "Setup complete."
 Write-Host "[setup-nvidia] Python: $pyMm"

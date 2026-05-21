@@ -861,7 +861,7 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, existing quantized checkpoints are still the source files for INT8 modes, but TensorRT export converts W8A8 wrappers into ONNX `QuantizeLinear` / `DequantizeLinear` Q/DQ graphs before engine build. In Mixed INT8, weight-only W8A16 layers are exported as plain FP ops to avoid Q/DQ overhead around layers that cannot run as true activation-quantized INT8. Calibration/scales are embedded before ONNX export, and no runtime calibration table is used. FP32 modes build FP32 TensorRT engines; FP16 modes build FP16 TensorRT engines.
+On NVIDIA, the selected compressed INT8 checkpoint remains the logical model, but TensorRT engine build automatically prefers a same-named portable source under `src/models/weights/tensorrt_sources/` when present. `setup.bat` on NVIDIA generates these source files locally from the compressed checkpoints; they are ignored by git because they are large temporary build inputs. TensorRT export recreates explicit ONNX `QuantizeLinear` / `DequantizeLinear` Q/DQ from the same layer masks and symmetric W8A8 activation scales before engine build; the ONNX file is temporary and the `.engine` is the runtime artifact. In Mixed INT8, weight-only W8A16 layers are exported as plain FP ops to avoid Q/DQ overhead around layers that cannot run as true activation-quantized INT8.
 
 ---
 
@@ -999,6 +999,7 @@ python scripts/quantize/quantize_int8_full.py
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_full.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt` (no-HG)
+    - `src/models/weights/tensorrt_sources/Ensemble_AGCM_LE_int8_full*.pt` (temporary TensorRT source exports)
 
 ### W8A8 (Full INT8) + QAT (HG optional)
 ```bash
@@ -1017,6 +1018,7 @@ python scripts/quantize/quantize_int8_full_qat.py
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt` (no-HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film.pt` (HG, Film)
     - `src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt` (no-HG, Film)
+    - `src/models/weights/tensorrt_sources/Ensemble_AGCM_LE_int8_full_qat*.pt` (temporary TensorRT source exports)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
 ### Mixed W8A8/W8A16/FP16-Sensitive Layers (HG optional)
@@ -1033,6 +1035,7 @@ python scripts/quantize/quantize_int8_mixed.py
   - Outputs:
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt` (HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt` (no-HG)
+    - `src/models/weights/tensorrt_sources/Ensemble_AGCM_LE_int8_mixed*.pt` (temporary TensorRT source exports)
 
 Checkpoint recipe note:
 
@@ -1139,6 +1142,7 @@ python scripts/quantize/quantize_int8_mixed_qat.py
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt` (no-HG)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film.pt` (HG, Film)
     - `src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt` (no-HG, Film)
+    - `src/models/weights/tensorrt_sources/Ensemble_AGCM_LE_int8_mixed_qat*.pt` (temporary TensorRT source exports)
 - Customizable: `--epochs 10 --lr 1e-5` or `--from-scratch`
 
 Recommended FP32-anchored tone-protected QAT refresh:

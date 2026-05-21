@@ -34,8 +34,11 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DEFAULT_HG_WEIGHTS = os.path.join(
     _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
+_TENSORRT_SOURCE_SUBDIR = "tensorrt_sources"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
 _TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v1"
+_PORTABLE_INT8_CHECKPOINT_FORMAT = "portable_fake_quant_v1"
+_PORTABLE_INT8_STATE_FORMAT = "native_fp32"
 _FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
 _TENSORRT_SOURCE_SIGNATURE_CACHE: str | None = None
 
@@ -154,6 +157,17 @@ def _torch_compile_warmup_runs() -> int:
     except Exception:
         value = 2
     return min(10, max(1, value))
+
+
+def _normalize_predequantize_setting(value):
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value or "auto").strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return "auto"
 
 
 _DEFAULT_TORCH_COMPILE_MODE = "max-autotune"
@@ -438,7 +452,8 @@ def _predequantize_model(model: nn.Module,
                 setattr(parent, parts[-1],
                         _predequantize_linear(module, compute_dtype))
             converted += 1
-    print(f"  Pre-dequantized {converted} INT8 layers -> native FP16 "
+    dtype_name = "FP16" if compute_dtype == torch.float16 else "FP32"
+    print(f"  Pre-dequantized {converted} INT8 layers -> native {dtype_name} "
           f"(no runtime dequant overhead)")
     return model
 
@@ -926,6 +941,90 @@ def calibrate_w8a8(model: nn.Module, calibration_inputs: list,
     print(f"  Calibrated {calibrated} layers "
           f"({asym_count} asymmetric, {sym_count} symmetric)")
 
+
+def _is_portable_int8_checkpoint(checkpoint: dict) -> bool:
+    """Return True for backend-neutral checkpoints with native FP state."""
+    if not isinstance(checkpoint, dict):
+        return False
+    if checkpoint.get("checkpoint_format") == _PORTABLE_INT8_CHECKPOINT_FORMAT:
+        return True
+    return checkpoint.get("state_format") == _PORTABLE_INT8_STATE_FORMAT
+
+
+def _scalar_float(value, default: float | None = None) -> float | None:
+    """Read a scalar from Python, NumPy, or torch values without keeping tensors."""
+    if value is None:
+        return default
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return default
+            return float(value.detach().float().reshape(-1)[0].item())
+        return float(value)
+    except Exception:
+        return default
+
+
+def _activation_qparams_from_checkpoint(checkpoint: dict) -> dict[str, dict[str, float]]:
+    """Normalize portable activation qparams to {layer: {scale, zero}}."""
+    normalized: dict[str, dict[str, float]] = {}
+    raw_qparams = checkpoint.get("activation_qparams") or {}
+    if isinstance(raw_qparams, dict):
+        for name, entry in raw_qparams.items():
+            if isinstance(entry, dict):
+                scale = _scalar_float(entry.get("scale"))
+                zero = _scalar_float(entry.get("zero"), 0.0)
+            else:
+                scale = _scalar_float(entry)
+                zero = 0.0
+            if scale is not None and math.isfinite(scale) and scale > 0.0:
+                normalized[str(name)] = {
+                    "scale": max(float(scale), 1e-8),
+                    "zero": 0.0 if zero is None else float(zero),
+                }
+
+    raw_scales = checkpoint.get("activation_scales") or {}
+    raw_zeros = checkpoint.get("activation_zero_points") or {}
+    if isinstance(raw_scales, dict):
+        for name, value in raw_scales.items():
+            if str(name) in normalized:
+                continue
+            scale = _scalar_float(value)
+            if scale is None or not math.isfinite(scale) or scale <= 0.0:
+                continue
+            zero = 0.0
+            if isinstance(raw_zeros, dict):
+                zero = _scalar_float(raw_zeros.get(name), 0.0) or 0.0
+            normalized[str(name)] = {
+                "scale": max(float(scale), 1e-8),
+                "zero": float(zero),
+            }
+    return normalized
+
+
+def _apply_portable_activation_qparams(model: nn.Module, checkpoint: dict) -> None:
+    """Apply calibrated activation qparams after recreating W8A8 modules."""
+    qparams = _activation_qparams_from_checkpoint(checkpoint)
+    if not qparams:
+        return
+
+    expected = 0
+    applied = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, (W8A8Conv2d, W8A8Linear)):
+            continue
+        expected += 1
+        entry = qparams.get(name)
+        if not entry:
+            continue
+        module.x_scale.fill_(float(entry["scale"]))
+        if hasattr(module, "x_zero"):
+            module.x_zero.fill_(float(entry.get("zero", 0.0)))
+        applied += 1
+    if expected:
+        print(f"  Applied portable activation scales: {applied}/{expected}")
+
+
 def _get_gpu_info() -> str:
     """Return GPU name string, or empty if unavailable."""
     if not torch.cuda.is_available():
@@ -934,6 +1033,30 @@ def _get_gpu_info() -> str:
         return torch.cuda.get_device_name(0)
     except Exception:
         return ""
+
+
+def tensorrt_source_checkpoint_path(model_path: str) -> str:
+    """Resolve an INT8 runtime checkpoint to its portable TensorRT source.
+
+    The app selects compressed INT8 checkpoints for PyTorch/AMD. NVIDIA uses
+    the same logical selection, but engine build should prefer a matching
+    backend-neutral checkpoint under ``weights/tensorrt_sources`` when present.
+    """
+    if not model_path:
+        return model_path
+    try:
+        path = os.path.abspath(os.path.expanduser(str(model_path)))
+        directory, name = os.path.split(path)
+        if not name.lower().endswith(".pt") or "_int8_" not in name.lower():
+            return path
+        if os.path.basename(directory).lower() == _TENSORRT_SOURCE_SUBDIR:
+            return path
+        candidate = os.path.join(directory, _TENSORRT_SOURCE_SUBDIR, name)
+        if os.path.isfile(candidate):
+            return candidate
+        return path
+    except Exception:
+        return model_path
 
 
 class HDRTVNetTorch:
@@ -977,7 +1100,7 @@ class HDRTVNetTorch:
         self._use_hg = bool(use_hg)
         self._is_flat_model = False  # True for old-style FX quantized models
         self._is_w8_model = False    # True for GPU W8 weight-only INT8
-        self._predequantize = predequantize  # "auto", True, or False
+        self._predequantize = _normalize_predequantize_setting(predequantize)
         self._compile_mode = None
         self._assume_aligned_shapes = None
         self._assume_aligned_log_key = None
@@ -1199,6 +1322,7 @@ class HDRTVNetTorch:
         self._dtype = compute_dtype
         quant_type = checkpoint.get("quantization", "w8_weight_only")
         state_dict = checkpoint.get("state_dict", {})
+        portable_checkpoint = _is_portable_int8_checkpoint(checkpoint)
         try:
             sd_numel = sum(v.numel() for v in state_dict.values() if hasattr(v, "numel"))
         except Exception:
@@ -1254,6 +1378,9 @@ class HDRTVNetTorch:
                     "Regenerate a full-size no-HG INT8 checkpoint for fair speed."
                 )
 
+        if portable_checkpoint:
+            model.load_state_dict(state_dict, strict=True)
+
         # Replace Conv2d / Linear with correct quantized equivalents
         if quant_type == "w8a8_mixed":
             w8a8_layers = checkpoint.get("w8a8_layers", None)
@@ -1281,8 +1408,12 @@ class HDRTVNetTorch:
                 f"Unknown quantization type '{quant_type}' in checkpoint.\n"
                 "  Supported: w8a8_full, w8a8_mixed")
 
-        # Load the quantized state_dict
-        model.load_state_dict(state_dict, strict=True)
+        if portable_checkpoint:
+            _apply_portable_activation_qparams(model, checkpoint)
+            print("Loaded portable INT8 checkpoint base (native FP state + quant metadata)")
+        else:
+            # Load the quantized wrapper state_dict from legacy runtime checkpoints.
+            model.load_state_dict(state_dict, strict=True)
         # Cast ALL remaining layers (InstanceNorm, etc.) to compute_dtype.
         # On ROCm, InstanceNorm in FP32 triggers broken MIOpen JIT compilation.
         # On CUDA, this is a harmless optimization (avoids unnecessary casts).
@@ -1317,8 +1448,9 @@ class HDRTVNetTorch:
                 quant_type, quant_type)
             if quant_type == "w8a8_mixed" and checkpoint.get("fp16_layers"):
                 label = "Mixed W8A8/W8A16/FP16"
-            print(f"Loaded {label} INT8 checkpoint ' pre-dequantized to FP16 "
-                  f"(compressed storage, native FP16 speed)")
+            dtype_name = "FP16" if compute_dtype == torch.float16 else "FP32"
+            print(f"Loaded {label} INT8 checkpoint ' pre-dequantized to {dtype_name} "
+                  f"(compressed storage, native {dtype_name} speed)")
         else:
             self._is_w8_model = True
             label = {"w8a8_full": "W8A8", "w8a8_mixed": "Mixed W8A8/W8A16"}.get(
@@ -1761,6 +1893,7 @@ def _engine_cache_dir() -> str:
 
 
 def _hash_file(path: str) -> dict[str, object]:
+    path = tensorrt_source_checkpoint_path(path)
     p = pathlib.Path(path)
     try:
         stat = p.stat()
@@ -1912,6 +2045,7 @@ def _tensorrt_expected_engine_metadata(
     hg_weights: str | None = None,
     trt_module=None,
 ) -> dict[str, object]:
+    model_path = tensorrt_source_checkpoint_path(model_path)
     hg_path = hg_weights or _DEFAULT_HG_WEIGHTS
     aux_streams = _tensorrt_aux_stream_count()
     return {
@@ -2089,6 +2223,7 @@ def tensorrt_engine_path(
     height: int,
     mode: str,
 ) -> str:
+    model_path = tensorrt_source_checkpoint_path(model_path)
     model_name = _sanitize_engine_token(pathlib.Path(model_path).stem)
     resolution = f"{int(width)}x{int(height)}"
     mode_name = _sanitize_engine_token(mode)
@@ -2101,6 +2236,7 @@ def tensorrt_onnx_path(
     height: int,
     mode: str,
 ) -> str:
+    model_path = tensorrt_source_checkpoint_path(model_path)
     return os.path.splitext(tensorrt_engine_path(model_path, width, height, mode))[0] + ".onnx"
 
 
@@ -2639,6 +2775,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         if not _IS_NVIDIA:
             raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
 
+        model_path = tensorrt_source_checkpoint_path(model_path)
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
         self._trt_base_mode_name = str(mode_name or precision or "mode")

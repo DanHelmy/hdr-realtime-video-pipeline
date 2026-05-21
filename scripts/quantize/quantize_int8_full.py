@@ -21,6 +21,7 @@ import glob
 import os
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -154,6 +155,13 @@ def main():
                             "Ensemble_AGCM_LE_int8_full.pt",
                         ),
                         help="Output path for quantized checkpoint")
+    parser.add_argument("--export-tensorrt-source", default="1", choices=["1", "0"],
+                        help="Also export a portable TensorRT source checkpoint")
+    parser.add_argument("--tensorrt-source-dir", default=None,
+                        help="Directory for portable TensorRT source checkpoints")
+    parser.add_argument("--tensorrt-source-activation-quant",
+                        default="symmetric", choices=["symmetric", "source"],
+                        help="Activation qparams for TensorRT source export")
     parser.add_argument("--precision", default="fp16", choices=["fp16", "fp32"],
                         help="Compute precision for runtime dequantization")
     parser.add_argument("--save-fp16", action="store_true",
@@ -290,6 +298,25 @@ def main():
         },
     }
     torch.save(save_data, args.output)
+    if str(args.export_tensorrt_source).strip() != "0":
+        from make_portable_int8_checkpoint import (
+            convert_checkpoint,
+            default_tensorrt_source_path,
+        )
+
+        trt_source_dir = (
+            Path(args.tensorrt_source_dir)
+            if args.tensorrt_source_dir else None
+        )
+        trt_source_path = default_tensorrt_source_path(
+            Path(args.output),
+            trt_source_dir,
+        )
+        convert_checkpoint(
+            Path(args.output),
+            trt_source_path,
+            activation_quant=args.tensorrt_source_activation_quant,
+        )
 
     orig_bytes = os.path.getsize(args.model)
     orig_label = "base model"

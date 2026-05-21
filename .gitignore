@@ -31,6 +31,7 @@ logs/
 src/models/compile_cache/
 src/models/engines/
 src/models/onnx/
+src/models/weights/tensorrt_sources/
 *.engine
 
 # Benchmark scripts (development only, not part of pipeline)

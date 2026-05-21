@@ -29,6 +29,7 @@ import os
 import random
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -1571,6 +1572,13 @@ def main():
                             "Ensemble_AGCM_LE_int8_mixed_qat.pt",
                         ),
                         help="Output path for QAT-finetuned checkpoint")
+    parser.add_argument("--export-tensorrt-source", default="1", choices=["1", "0"],
+                        help="Also export a portable TensorRT source checkpoint")
+    parser.add_argument("--tensorrt-source-dir", default=None,
+                        help="Directory for portable TensorRT source checkpoints")
+    parser.add_argument("--tensorrt-source-activation-quant",
+                        default="symmetric", choices=["symmetric", "source"],
+                        help="Activation qparams for TensorRT source export")
     parser.add_argument(
         "--sdr-dir",
         default=os.path.join(_REPO_ROOT, "dataset", "train_sdr"),
@@ -2108,6 +2116,25 @@ def main():
     if use_asym:
         save_data["activation_quant"] = "asymmetric"
     torch.save(save_data, args.output)
+    if str(args.export_tensorrt_source).strip() != "0":
+        from make_portable_int8_checkpoint import (
+            convert_checkpoint,
+            default_tensorrt_source_path,
+        )
+
+        trt_source_dir = (
+            Path(args.tensorrt_source_dir)
+            if args.tensorrt_source_dir else None
+        )
+        trt_source_path = default_tensorrt_source_path(
+            Path(args.output),
+            trt_source_dir,
+        )
+        convert_checkpoint(
+            Path(args.output),
+            trt_source_path,
+            activation_quant=args.tensorrt_source_activation_quant,
+        )
 
     orig_kb = os.path.getsize(args.fp32_model) / 1024
     quant_kb = os.path.getsize(args.output) / 1024

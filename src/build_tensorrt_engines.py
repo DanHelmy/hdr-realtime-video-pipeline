@@ -36,10 +36,26 @@ def _weight(name: str) -> str:
 
 
 _PRECISION_MAP = {
-    "fp16": ("fp16", _weight("Ensemble_AGCM_LE.pth")),
-    "fp32": ("fp32", _weight("Ensemble_AGCM_LE.pth")),
-    "int8-mixed": ("int8-mixed", _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt")),
-    "int8-full": ("int8-full", _weight("Ensemble_AGCM_LE_int8_full.pt")),
+    "fp16": (
+        "fp16",
+        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("Ensemble_AGCM_LE.pth"),
+    ),
+    "fp32": (
+        "fp32",
+        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("Ensemble_AGCM_LE.pth"),
+    ),
+    "int8-mixed": (
+        "int8-mixed",
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+    ),
+    "int8-full": (
+        "int8-full",
+        _weight("Ensemble_AGCM_LE_int8_full.pt"),
+        _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+    ),
 }
 
 
@@ -159,9 +175,10 @@ def main() -> int:
     if args.aux_streams is not None:
         os.environ["HDRTVNET_TRT_AUX_STREAMS"] = str(max(0, args.aux_streams))
 
-    precision, default_model = _PRECISION_MAP[args.precision]
-    model_path = os.path.abspath(args.model or default_model)
     use_hg = str(args.use_hg).strip() != "0"
+    precision, default_hg_model, default_nohg_model = _PRECISION_MAP[args.precision]
+    default_model = default_hg_model if use_hg else default_nohg_model
+    model_path = os.path.abspath(args.model or default_model)
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
     base_mode_name = f"{args.precision}_{'hg' if use_hg else 'nohg'}"
     mode_name = tensorrt_mode_name(

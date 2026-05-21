@@ -109,12 +109,28 @@ def _weight(name):
     return os.path.join(_HERE, "models", "weights", name)
 
 
-# Precision -> (precision_str, default_model_path)
+# Precision -> (precision_str, default_hg_model_path, default_nohg_model_path)
 _PRECISION_MAP = {
-    "fp16": ("fp16", _weight("Ensemble_AGCM_LE.pth")),
-    "fp32": ("fp32", _weight("Ensemble_AGCM_LE.pth")),
-    "int8-mixed": ("int8-mixed", _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt")),
-    "int8-full": ("int8-full", _weight("Ensemble_AGCM_LE_int8_full.pt")),
+    "fp16": (
+        "fp16",
+        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("Ensemble_AGCM_LE.pth"),
+    ),
+    "fp32": (
+        "fp32",
+        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("Ensemble_AGCM_LE.pth"),
+    ),
+    "int8-mixed": (
+        "int8-mixed",
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+    ),
+    "int8-full": (
+        "int8-full",
+        _weight("Ensemble_AGCM_LE_int8_full.pt"),
+        _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+    ),
 }
 
 
@@ -604,7 +620,9 @@ def main():
         print("[compile] Cache cleared.")
 
     # Resolve model path
-    prec_str, default_model = _PRECISION_MAP[args.precision]
+    use_hg = str(args.use_hg).strip() != "0"
+    prec_str, default_hg_model, default_nohg_model = _PRECISION_MAP[args.precision]
+    default_model = default_hg_model if use_hg else default_nohg_model
     model_path = args.model or default_model
     if not os.path.isfile(model_path):
         print(f"ERROR: Model weights not found: {model_path}", file=sys.stderr)
@@ -631,7 +649,7 @@ def main():
         compile_mode=str(args.compile_mode),
         predequantize=predeq,
         hg_weights=args.hg_weights,
-        use_hg=str(args.use_hg).strip() != "0",
+        use_hg=use_hg,
         warmup_passes=0,
     )
 
@@ -676,7 +694,7 @@ def main():
             h,
             args.precision,
             model_path=model_path,
-            use_hg=str(args.use_hg).strip() != "0",
+            use_hg=use_hg,
             predequantize_mode=effective_marker_mode,
             compile_mode=effective_compile_mode,
             memory_format=effective_memory_format,
@@ -720,7 +738,7 @@ def main():
                 h,
                 args.precision,
                 model_path=model_path,
-                use_hg=str(args.use_hg).strip() != "0",
+                use_hg=use_hg,
                 predequantize_mode=effective_marker_mode,
                 compile_mode=effective_compile_mode,
                 memory_format=effective_memory_format,
