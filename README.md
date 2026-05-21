@@ -884,8 +884,14 @@ python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGC
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
 python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
+python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film.pt
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film.pt
 python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt --use-hg 0
 python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt --use-hg 0
+python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt --use-hg 0
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt --use-hg 0
+python src/main.py --precision int8-full --model src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt --use-hg 0
+python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt --use-hg 0
 
 # Headless benchmark
 python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing

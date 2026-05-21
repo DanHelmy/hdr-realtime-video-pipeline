@@ -2833,6 +2833,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             predequantize=True if self._trt_predequantize_int8 else False,
             hg_weights=hg_weights,
             use_hg=use_hg,
+            warmup_passes=0,
         )
 
         # TensorRT bindings use dense NCHW buffers; keep preprocessing and
@@ -2922,6 +2923,10 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         if self.model is None:
             raise RuntimeError("Cannot build TensorRT engine without a loaded PyTorch model.")
 
+        self._configure_assume_aligned_shapes(
+            self._engine_width,
+            self._engine_height,
+        )
         onnx_path = _export_tensorrt_onnx_from_model(
             model=self.model,
             onnx_path=self.onnx_path,
