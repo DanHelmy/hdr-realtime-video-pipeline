@@ -14,6 +14,7 @@ docs/images/thesis_mpv_figures
 docs/Draft 2 Skripsi_2210511039_Danendra Helmy Pratama copy.pdf
 docs/images/thesis_mpv_figures_smoke/
 docs/images/application_screenshots
+docs/images/chapter3_diagrams
 scripts/remake_thesis_pdf_figures.py
 
 # mpv runtime DLL (112 MB — download separately)

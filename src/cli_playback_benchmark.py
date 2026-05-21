@@ -262,6 +262,14 @@ def _mark_cache(processor, width: int, height: int, args, run: dict) -> None:
         print(f"WARNING: could not write compile marker: {exc}", flush=True)
 
 
+def _runtime_artifact_size_mb(processor, run: dict) -> float:
+    if isinstance(processor, HDRTVNetTensorRT):
+        engine_path = str(getattr(processor, "engine_path", "") or "")
+        if engine_path and os.path.isfile(engine_path):
+            return os.path.getsize(engine_path) / (1024 * 1024)
+    return os.path.getsize(run["model"]) / (1024 * 1024)
+
+
 def _make_processor(args, run: dict, width: int, height: int):
     predeq_text = str(run.get("predequantize", "auto"))
     predeq = {"auto": "auto", "on": True, "off": False}[predeq_text]
@@ -445,7 +453,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
 
     process = psutil.Process(os.getpid())
     use_cuda = torch.cuda.is_available() and str(args.device).lower() != "cpu"
-    model_size_mb = os.path.getsize(run["model"]) / (1024 * 1024)
+    model_size_mb = _runtime_artifact_size_mb(processor, run)
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     started_t = time.perf_counter()
 

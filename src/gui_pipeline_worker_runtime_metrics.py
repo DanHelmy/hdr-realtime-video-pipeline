@@ -5,6 +5,7 @@ import time
 import torch
 
 from gui_config import _select_model_path
+from models.hdrtvnet_torch import _IS_NVIDIA
 
 
 class PipelineWorkerRuntimeMetricsMixin:
@@ -72,19 +73,37 @@ class PipelineWorkerRuntimeMetricsMixin:
             prec_label = "Bypass (HDR input)"
             model_size_label = "Checkpoint"
         else:
+            engine_path = ""
+            engine_size_token = 0
+            if _IS_NVIDIA:
+                engine_path = str(
+                    getattr(getattr(self, "_processor", None), "engine_path", "") or ""
+                )
+                if engine_path and os.path.isfile(engine_path):
+                    try:
+                        engine_size_token = int(os.path.getsize(engine_path))
+                    except OSError:
+                        engine_size_token = 0
             cache_key = (
                 str(self._precision_key),
                 bool(self._use_hg),
+                int(proc_w),
+                int(proc_h),
+                engine_path if _IS_NVIDIA else "",
+                engine_size_token if _IS_NVIDIA else 0,
             )
             model_size_label = "Checkpoint"
             if getattr(self, "_metrics_model_size_key", None) != cache_key:
                 model_mb = 0.0
                 cached_label = "Checkpoint"
-                model_path = _select_model_path(self._precision_key, self._use_hg)
-                model_mb = os.path.getsize(model_path) / (1024 * 1024)
-                if self._use_hg and self._precision_key in ("FP16", "FP32"):
-                    if os.path.isfile(hg_weights_path):
-                        model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
+                if _IS_NVIDIA and engine_path and os.path.isfile(engine_path):
+                    model_mb = os.path.getsize(engine_path) / (1024 * 1024)
+                else:
+                    model_path = _select_model_path(self._precision_key, self._use_hg)
+                    model_mb = os.path.getsize(model_path) / (1024 * 1024)
+                    if self._use_hg and self._precision_key in ("FP16", "FP32"):
+                        if os.path.isfile(hg_weights_path):
+                            model_mb += os.path.getsize(hg_weights_path) / (1024 * 1024)
                 self._metrics_model_size_key = cache_key
                 self._metrics_model_size_mb = model_mb
                 self._metrics_model_size_label = cached_label

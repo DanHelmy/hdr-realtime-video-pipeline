@@ -1566,7 +1566,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | Different model/resolution/mode | Build a new `.engine` once |
 | Build/load failure | Log and inform user; no NVIDIA PyTorch fallback |
 | Manual clear | `Tools -> Clear TensorRT Engine Cache ...` |
-| Live size metric | GUI shows `Checkpoint: ... MB` from the selected `.pt` / `.pth` checkpoint on NVIDIA and AMD |
+| Live size metric | GUI and playback logs keep the `Checkpoint: ... MB` metric label; NVIDIA reports the active cached `.engine` size, while AMD/CPU report the selected `.pt` / `.pth` checkpoint size |
 
 Manual engine prebuild:
 
