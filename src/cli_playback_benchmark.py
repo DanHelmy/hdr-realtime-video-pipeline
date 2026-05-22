@@ -47,11 +47,13 @@ _RUN_PRESETS = {
         "precision": "fp16",
         "model": _weight("Ensemble_AGCM_LE.pth"),
         "label": "fp16",
+        "gui_key": "FP16",
     },
     "fp32": {
         "precision": "fp32",
         "model": _weight("Ensemble_AGCM_LE.pth"),
         "label": "fp32",
+        "gui_key": "FP32",
     },
     "int8-mixed-ptq": {
         "precision": "int8-mixed",
@@ -61,21 +63,7 @@ _RUN_PRESETS = {
         "label": "int8_mixed_ptq_predeq",
         "trt_predequantize": "off",
         "trt_label": "int8_mixed_ptq_qdq",
-    },
-    "int8-mixed-ptq-trt": {
-        "precision": "int8-mixed",
-        "model": _weight("Ensemble_AGCM_LE_int8_mixed_trt.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg_trt.pt"),
-        "predequantize": "off",
-        "label": "int8_mixed_ptq_trt_qdq",
-    },
-    "int8-mixed-ptq-trt-fuse": {
-        "precision": "int8-mixed",
-        "model": _weight("Ensemble_AGCM_LE_int8_mixed_trt.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg_trt.pt"),
-        "predequantize": "off",
-        "label": "int8_mixed_ptq_trt_addqdq",
-        "trt_qdq_fusion": "add",
+        "gui_key": "INT8 Mixed (PTQ)",
     },
     "int8-full-ptq": {
         "precision": "int8-full",
@@ -85,6 +73,7 @@ _RUN_PRESETS = {
         "label": "int8_full_ptq_predeq",
         "trt_predequantize": "off",
         "trt_label": "int8_full_ptq_qdq",
+        "gui_key": "INT8 Full (PTQ)",
     },
     "int8-mixed-qat": {
         "precision": "int8-mixed",
@@ -94,6 +83,7 @@ _RUN_PRESETS = {
         "label": "int8_mixed_qat_predeq",
         "trt_predequantize": "off",
         "trt_label": "int8_mixed_qat_qdq",
+        "gui_key": "INT8 Mixed (QAT)",
     },
     "int8-full-qat": {
         "precision": "int8-full",
@@ -103,6 +93,7 @@ _RUN_PRESETS = {
         "label": "int8_full_qat_predeq",
         "trt_predequantize": "off",
         "trt_label": "int8_full_qat_qdq",
+        "gui_key": "INT8 Full (QAT)",
     },
     "int8-mixed-qat-film": {
         "precision": "int8-mixed",
@@ -112,6 +103,7 @@ _RUN_PRESETS = {
         "label": "int8_mixed_qat_film_predeq",
         "trt_predequantize": "off",
         "trt_label": "int8_mixed_qat_film_qdq",
+        "gui_key": "INT8 Mixed (QAT) (Film)",
     },
     "int8-full-qat-film": {
         "precision": "int8-full",
@@ -121,14 +113,13 @@ _RUN_PRESETS = {
         "label": "int8_full_qat_film_predeq",
         "trt_predequantize": "off",
         "trt_label": "int8_full_qat_film_qdq",
+        "gui_key": "INT8 Full (QAT) (Film)",
     },
 }
 _DEFAULT_RUNS = [
     "fp32",
     "fp16",
     "int8-mixed-ptq",
-    "int8-mixed-ptq-trt",
-    "int8-mixed-ptq-trt-fuse",
     "int8-full-ptq",
     "int8-mixed-qat",
     "int8-full-qat",
@@ -280,10 +271,9 @@ def _make_processor(args, run: dict, width: int, height: int):
             precision=run["precision"],
             engine_width=int(width),
             engine_height=int(height),
-            mode_name=f"{run['precision']}_{'hg' if args.use_hg else 'nohg'}",
+            mode_name=f"{run.get('gui_key', run['precision'])}_{'hg' if args.use_hg else 'nohg'}",
             use_hg=bool(args.use_hg),
             predequantize=predeq,
-            qdq_fusion=str(run.get("trt_qdq_fusion", "none")),
         )
     return HDRTVNetTorch(
         run["model"],

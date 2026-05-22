@@ -29,6 +29,7 @@ from models.hdrtvnet_torch import (
     tensorrt_mode_name,
     tensorrt_onnx_path,
 )
+from gui_config import PRECISIONS, _select_model_path
 
 
 def _weight(name: str) -> str:
@@ -57,6 +58,17 @@ _PRECISION_MAP = {
         _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
     ),
 }
+
+
+def _gui_precision_key_for_model(precision: str, model_path: str, use_hg: bool) -> str | None:
+    target = os.path.abspath(os.path.normcase(model_path))
+    for key, cfg in PRECISIONS.items():
+        if str(cfg.get("precision", "")).strip().lower() != str(precision).strip().lower():
+            continue
+        candidate = _select_model_path(key, use_hg)
+        if os.path.abspath(os.path.normcase(candidate)) == target:
+            return key
+    return None
 
 
 def _parse_resolution(text: str) -> tuple[int, int]:
@@ -180,7 +192,8 @@ def main() -> int:
     default_model = default_hg_model if use_hg else default_nohg_model
     model_path = os.path.abspath(args.model or default_model)
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
-    base_mode_name = f"{args.precision}_{'hg' if use_hg else 'nohg'}"
+    gui_precision_key = _gui_precision_key_for_model(precision, model_path, use_hg)
+    base_mode_name = f"{gui_precision_key or args.precision}_{'hg' if use_hg else 'nohg'}"
     mode_name = tensorrt_mode_name(
         precision,
         base_mode_name,
