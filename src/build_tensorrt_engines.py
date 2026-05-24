@@ -121,10 +121,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--qdq-fusion",
-        default="none",
-        choices=["none", "add"],
+        default="auto",
+        choices=["auto", "none", "add"],
         help=(
             "Experimental explicit-Q/DQ placement for TensorRT INT8. "
+            "Default: auto (add for INT8, none otherwise). "
             "'add' inserts Q/DQ on eligible Add inputs that already feed "
             "calibrated quantized paths."
         ),
@@ -138,6 +139,11 @@ def main() -> int:
         "--force-onnx",
         action="store_true",
         help="Remove any stale .onnx before rebuilding.",
+    )
+    parser.add_argument(
+        "--keep-onnx",
+        action="store_true",
+        help="Keep the exported ONNX beside the TensorRT engine for inspection.",
     )
     parser.add_argument(
         "--opt-level",
@@ -186,6 +192,8 @@ def main() -> int:
         os.environ["HDRTVNET_TRT_TIMING_CACHE"] = str(args.timing_cache)
     if args.aux_streams is not None:
         os.environ["HDRTVNET_TRT_AUX_STREAMS"] = str(max(0, args.aux_streams))
+    if args.keep_onnx:
+        os.environ["HDRTVNET_TRT_KEEP_ONNX"] = "1"
 
     use_hg = str(args.use_hg).strip() != "0"
     precision, default_hg_model, default_nohg_model = _PRECISION_MAP[args.precision]

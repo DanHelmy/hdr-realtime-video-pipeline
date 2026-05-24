@@ -62,7 +62,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_ptq_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_mixed_ptq_qdq",
+        "trt_qdq_fusion": "add",
+        "trt_label": "int8_mixed_ptq_addqdq",
         "gui_key": "INT8 Mixed (PTQ)",
     },
     "int8-full-ptq": {
@@ -72,7 +73,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_ptq_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_full_ptq_qdq",
+        "trt_qdq_fusion": "add",
+        "trt_label": "int8_full_ptq_addqdq",
         "gui_key": "INT8 Full (PTQ)",
     },
     "int8-mixed-qat": {
@@ -82,7 +84,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_qat_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_mixed_qat_qdq",
+        "trt_qdq_fusion": "add",
+        "trt_label": "int8_mixed_qat_addqdq",
         "gui_key": "INT8 Mixed (QAT)",
     },
     "int8-full-qat": {
@@ -92,7 +95,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_full_qat_qdq",
+        "trt_qdq_fusion": "add",
+        "trt_label": "int8_full_qat_addqdq",
         "gui_key": "INT8 Full (QAT)",
     },
     "int8-mixed-qat-film": {
@@ -102,7 +106,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_qat_film_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_mixed_qat_film_qdq",
+        "trt_qdq_fusion": "add",
+        "trt_label": "int8_mixed_qat_film_addqdq",
         "gui_key": "INT8 Mixed (QAT) (Film)",
     },
     "int8-full-qat-film": {
@@ -112,7 +117,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_film_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_full_qat_film_qdq",
+        "trt_qdq_fusion": "add",
+        "trt_label": "int8_full_qat_film_addqdq",
         "gui_key": "INT8 Full (QAT) (Film)",
     },
 }
@@ -274,6 +280,7 @@ def _make_processor(args, run: dict, width: int, height: int):
             mode_name=f"{run.get('gui_key', run['precision'])}_{'hg' if args.use_hg else 'nohg'}",
             use_hg=bool(args.use_hg),
             predequantize=predeq,
+            qdq_fusion=str(run.get("qdq_fusion", run.get("trt_qdq_fusion", "auto"))),
         )
     return HDRTVNetTorch(
         run["model"],
@@ -691,6 +698,9 @@ def main() -> int:
             if _IS_NVIDIA and str(args.device).lower() != "cpu":
                 preset["predequantize"] = str(
                     preset.get("trt_predequantize", preset.get("predequantize", "auto"))
+                )
+                preset["qdq_fusion"] = str(
+                    preset.get("trt_qdq_fusion", preset.get("qdq_fusion", "auto"))
                 )
                 preset["label"] = str(preset.get("trt_label", preset.get("label", run_key)))
             if not os.path.isfile(preset["model"]):

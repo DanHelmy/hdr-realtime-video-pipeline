@@ -173,6 +173,8 @@ class WorkerSlotsMixin:
         self.statusBar().showMessage(text)
         if self._compile_dlg is not None:
             self._compile_dlg.set_status(text)
+            if hasattr(self._compile_dlg, "append_log"):
+                self._compile_dlg.append_log(text)
         if self._precision_swap_pending is not None and text.startswith("Ready"):
             ready_key = str(text)
             for prefix in ("Ready — ", "Ready - ", "Ready â€” "):

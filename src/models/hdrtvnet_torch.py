@@ -2026,6 +2026,13 @@ def _normalize_tensorrt_qdq_fusion(qdq_fusion: str) -> str:
     return "none"
 
 
+def _resolve_tensorrt_qdq_fusion(precision: str, qdq_fusion: str = "auto") -> str:
+    fusion = str(qdq_fusion or "auto").strip().lower()
+    if fusion in {"", "auto", "default"}:
+        return "add" if str(precision).startswith("int8") else "none"
+    return _normalize_tensorrt_qdq_fusion(fusion)
+
+
 def tensorrt_engine_metadata_path(engine_path: str) -> str:
     return f"{engine_path}.json"
 
@@ -2065,7 +2072,7 @@ def _tensorrt_expected_engine_metadata(
             "engine_mode_name": str(engine_mode_name),
             "use_hg": bool(use_hg),
             "predequantize_int8": bool(predequantize_int8),
-            "qdq_fusion": _normalize_tensorrt_qdq_fusion(qdq_fusion),
+            "qdq_fusion": _resolve_tensorrt_qdq_fusion(precision, qdq_fusion),
         },
         "runtime": {
             "torch": str(getattr(torch, "__version__", "unknown")),
@@ -2134,11 +2141,12 @@ def tensorrt_engine_is_valid(
     mode_name: str,
     use_hg: bool,
     predequantize=False,
-    qdq_fusion: str = "none",
+    qdq_fusion: str = "auto",
     hg_weights: str | None = None,
     verbose: bool = False,
 ) -> bool:
     predeq = _resolve_tensorrt_predequantize(precision, predequantize)
+    qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
     engine_mode_name = tensorrt_mode_name(
         precision,
         mode_name,
@@ -2243,6 +2251,9 @@ def tensorrt_onnx_path(
 def cleanup_tensorrt_onnx_after_engine(onnx_path: str, engine_path: str) -> bool:
     if not onnx_path or not os.path.isfile(engine_path):
         return False
+    if _env_bool("HDRTVNET_TRT_KEEP_ONNX", False):
+        print(f"TensorRT ONNX kept for inspection: {onnx_path}")
+        return False
     try:
         removed = False
         if os.path.isfile(onnx_path):
@@ -2286,7 +2297,7 @@ def tensorrt_mode_name(
     precision: str,
     mode: str,
     predequantize=False,
-    qdq_fusion: str = "none",
+    qdq_fusion: str = "auto",
 ) -> str:
     mode_name = str(mode or precision or "mode")
     if str(precision).startswith("int8"):
@@ -2299,8 +2310,8 @@ def tensorrt_mode_name(
             return mode_name
         qdq_version = "qdqv6"
         mode_name = f"{mode_name}_{qdq_version}"
-        fusion = str(qdq_fusion or "none").strip().lower()
-        if fusion in {"add", "residual-add", "add-inputs"} and "addqdq" not in lower:
+        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+        if fusion == "add" and "addqdq" not in lower:
             mode_name = f"{mode_name}_addqdqv1"
     return mode_name
 
@@ -2698,7 +2709,7 @@ def _export_tensorrt_onnx_from_model(
     device: torch.device,
     precision: str,
     flat_model: bool,
-    qdq_fusion: str = "none",
+    qdq_fusion: str = "auto",
 ) -> str:
     if os.path.isfile(onnx_path):
         try:
@@ -2741,8 +2752,8 @@ def _export_tensorrt_onnx_from_model(
         )
     if str(precision).startswith("int8"):
         _patch_tensorrt_qdq_casts(onnx_path)
-        fusion = str(qdq_fusion or "none").strip().lower()
-        if fusion in {"add", "residual-add", "add-inputs"}:
+        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+        if fusion == "add":
             _patch_tensorrt_add_input_qdq(onnx_path)
         _patch_tensorrt_fp16_qdq_scales(onnx_path)
         _patch_tensorrt_fp16_constants(onnx_path)
@@ -2770,7 +2781,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         hg_weights=None,
         use_hg=True,
         predequantize=False,
-        qdq_fusion: str = "none",
+        qdq_fusion: str = "auto",
     ):
         if not _IS_NVIDIA:
             raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
@@ -2779,7 +2790,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
         self._trt_base_mode_name = str(mode_name or precision or "mode")
-        self._trt_qdq_fusion = str(qdq_fusion or "none").strip().lower()
+        self._trt_qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
         self._trt_predequantize_int8 = _resolve_tensorrt_predequantize(
             precision,
             predequantize,
@@ -2976,6 +2987,13 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 print(f"TensorRT max auxiliary streams: {aux_streams}")
             except Exception as exc:
                 print(f"TensorRT auxiliary streams skipped: {exc}")
+
+        if hasattr(config, "profiling_verbosity") and hasattr(trt, "ProfilingVerbosity"):
+            try:
+                config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+                print("TensorRT profiling verbosity: detailed")
+            except Exception as exc:
+                print(f"TensorRT profiling verbosity skipped: {exc}")
 
         builder_precision = str(
             getattr(self, "_trt_builder_precision", self.precision)

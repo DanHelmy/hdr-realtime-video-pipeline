@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from gui_config import PRECISIONS, _available_precision_keys, _select_model_path
 from gui_media_probe import _probe_hdr_input, _probe_video_timing_info
+from gui_output_capture import capture_output_to_gui
 from gui_pipeline_worker_frame_processing import PipelineWorkerFrameProcessingMixin
 from gui_pipeline_worker_model import PipelineWorkerModelMixin, _resolve_predequantize_arg
 from gui_scaling import _letterbox_bgr
@@ -852,16 +853,20 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                         0,
                         "Building TensorRT engine for this export. First run can take a few minutes ...",
                     )
-                processor = HDRTVNetTensorRT(
-                    model_path,
-                    device="auto",
-                    precision=str(cfg.get("precision") or "fp16"),
-                    engine_width=int(self._config.width),
-                    engine_height=int(self._config.height),
-                    mode_name=mode_name,
-                    use_hg=self._config.use_hg,
-                    predequantize=trt_predeq,
-                )
+                def _emit_trt_line(line: str):
+                    self.progress.emit(0, line)
+
+                with capture_output_to_gui(_emit_trt_line):
+                    processor = HDRTVNetTensorRT(
+                        model_path,
+                        device="auto",
+                        precision=str(cfg.get("precision") or "fp16"),
+                        engine_width=int(self._config.width),
+                        engine_height=int(self._config.height),
+                        mode_name=mode_name,
+                        use_hg=self._config.use_hg,
+                        predequantize=trt_predeq,
+                    )
             else:
                 processor = HDRTVNetTorch(
                     model_path,
