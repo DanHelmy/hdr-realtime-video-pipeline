@@ -145,7 +145,7 @@ def main() -> int:
         default=None,
         choices=range(0, 6),
         metavar="0..5",
-        help="TensorRT builder optimization level. Default: project setting/env, normally 5.",
+        help="TensorRT builder optimization level. Default: project setting/env, normally 4.",
     )
     parser.add_argument(
         "--workspace-gb",

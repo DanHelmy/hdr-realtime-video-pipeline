@@ -2194,9 +2194,9 @@ def _tensorrt_timing_cache_path():
 
 def _tensorrt_builder_optimization_level() -> int:
     try:
-        value = int(os.environ.get("HDRTVNET_TRT_BUILDER_OPT_LEVEL", "5"))
+        value = int(os.environ.get("HDRTVNET_TRT_BUILDER_OPT_LEVEL", "4"))
     except Exception:
-        value = 5
+        value = 4
     return min(5, max(0, value))
 
 
