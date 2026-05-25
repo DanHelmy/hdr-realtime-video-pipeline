@@ -1,6 +1,7 @@
 -r requirements-common.txt
 --index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.org/simple
+--extra-index-url https://pypi.nvidia.com/
 
 torch==2.9.1
 torchvision==0.24.1
@@ -9,5 +10,6 @@ torchaudio==2.9.1
 onnx>=1.16
 onnxscript>=0.1.0
 requests>=2.32
-tensorrt_cu12_bindings>=10.0
-tensorrt_cu12_libs>=10.0
+tensorrt_cu12==10.16.1.11
+tensorrt_cu12_bindings==10.16.1.11
+tensorrt_cu12_libs==10.16.1.11

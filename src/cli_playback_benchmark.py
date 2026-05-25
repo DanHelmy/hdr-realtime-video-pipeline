@@ -7,9 +7,14 @@ import math
 import os
 import pathlib
 import re
+import sys
 import time
 from collections import deque
 from datetime import datetime
+
+if os.name == "nt" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from windows_runtime import (
     configure_rocm_sdk_environment,

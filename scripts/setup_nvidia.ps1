@@ -12,6 +12,152 @@ function Write-Step([string]$Message) {
     Write-Host "[setup-nvidia] $Message"
 }
 
+$TensorRTCu12Version = "10.16.1.11"
+$TensorRTCu12LibsWheel = "tensorrt_cu12_libs-$TensorRTCu12Version-py3-none-win_amd64.whl"
+$TensorRTCu12LibsUrl = "https://pypi.nvidia.com/tensorrt-cu12-libs/$TensorRTCu12LibsWheel"
+$TensorRTCu12LibsSha256 = "ed0d4536f1322aa2f76da54feb3f9bd2d14d89e4325cef02165a98f3a2c1a493"
+$TensorRTCu12LibsSize = 2206065494
+$TorchCu126Version = "2.9.1+cu126"
+$TorchCu126Wheel = "torch-2.9.1+cu126-cp312-cp312-win_amd64.whl"
+$TorchCu126Url = "https://download-r2.pytorch.org/whl/cu126/torch-2.9.1%2Bcu126-cp312-cp312-win_amd64.whl"
+$TorchCu126Sha256 = "f2f1c68c7957ed8b6b56fc450482eb3fa53947fb74838b03834a1760451cf60f"
+$TorchCu126Size = 2584508946
+
+function Get-FileSha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-InstalledPythonPackageVersion([string]$PythonExe, [string]$PackageName) {
+    $code = @"
+import importlib.metadata as metadata
+import sys
+
+try:
+    print(metadata.version(sys.argv[1]))
+except metadata.PackageNotFoundError:
+    sys.exit(1)
+"@
+    $version = & $PythonExe -c $code $PackageName 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $null
+    }
+    return $version.Trim()
+}
+
+function Install-TensorRTCu12LibsWheel([string]$PythonExe) {
+    $installedVersion = Get-InstalledPythonPackageVersion -PythonExe $PythonExe -PackageName "tensorrt_cu12_libs"
+    if ($installedVersion -eq $TensorRTCu12Version) {
+        Write-Host "[setup-nvidia] TensorRT CUDA 12 libraries already installed ($installedVersion)."
+        return
+    }
+
+    $cacheBase = $env:LOCALAPPDATA
+    if (-not $cacheBase) {
+        $cacheBase = $env:TEMP
+    }
+    $wheelDir = Join-Path $cacheBase "hdr-realtime-video-pipeline\wheels"
+    $wheelPath = Join-Path $wheelDir $TensorRTCu12LibsWheel
+    New-Item -ItemType Directory -Force -Path $wheelDir | Out-Null
+
+    $needsDownload = $true
+    if (Test-Path $wheelPath) {
+        $file = Get-Item -LiteralPath $wheelPath
+        if ($file.Length -eq $TensorRTCu12LibsSize -and (Get-FileSha256 $wheelPath) -eq $TensorRTCu12LibsSha256) {
+            $needsDownload = $false
+            Write-Host "[setup-nvidia] Reusing cached TensorRT CUDA 12 libraries wheel."
+        } elseif ($file.Length -gt $TensorRTCu12LibsSize) {
+            Remove-Item -LiteralPath $wheelPath -Force
+        }
+    }
+
+    if ($needsDownload) {
+        Write-Step "Downloading TensorRT CUDA 12 libraries..."
+        Write-Host "[setup-nvidia] Source: $TensorRTCu12LibsUrl"
+        Write-Host "[setup-nvidia] Cache: $wheelPath"
+
+        if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+            & curl.exe -L --fail --retry 5 --retry-delay 2 --continue-at - --output $wheelPath $TensorRTCu12LibsUrl
+            if ($LASTEXITCODE -ne 0) {
+                throw "TensorRT CUDA 12 libraries download failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            Invoke-WebRequest -Uri $TensorRTCu12LibsUrl -OutFile $wheelPath
+        }
+
+        $file = Get-Item -LiteralPath $wheelPath
+        if ($file.Length -ne $TensorRTCu12LibsSize) {
+            throw "TensorRT CUDA 12 libraries download has unexpected size: $($file.Length) bytes"
+        }
+        $hash = Get-FileSha256 $wheelPath
+        if ($hash -ne $TensorRTCu12LibsSha256) {
+            throw "TensorRT CUDA 12 libraries download hash mismatch: $hash"
+        }
+    }
+
+    Write-Step "Installing TensorRT CUDA 12 libraries..."
+    & $PythonExe -m pip install --no-deps $wheelPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "TensorRT CUDA 12 libraries wheel install failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Install-TorchCu126Wheel([string]$PythonExe) {
+    $installedVersion = Get-InstalledPythonPackageVersion -PythonExe $PythonExe -PackageName "torch"
+    if ($installedVersion -eq $TorchCu126Version) {
+        Write-Host "[setup-nvidia] PyTorch CUDA 12.6 wheel already installed ($installedVersion)."
+        return
+    }
+
+    $cacheBase = $env:LOCALAPPDATA
+    if (-not $cacheBase) {
+        $cacheBase = $env:TEMP
+    }
+    $wheelDir = Join-Path $cacheBase "hdr-realtime-video-pipeline\wheels"
+    $wheelPath = Join-Path $wheelDir $TorchCu126Wheel
+    New-Item -ItemType Directory -Force -Path $wheelDir | Out-Null
+
+    $needsDownload = $true
+    if (Test-Path $wheelPath) {
+        $file = Get-Item -LiteralPath $wheelPath
+        if ($file.Length -eq $TorchCu126Size -and (Get-FileSha256 $wheelPath) -eq $TorchCu126Sha256) {
+            $needsDownload = $false
+            Write-Host "[setup-nvidia] Reusing cached PyTorch CUDA 12.6 wheel."
+        } elseif ($file.Length -gt $TorchCu126Size) {
+            Remove-Item -LiteralPath $wheelPath -Force
+        }
+    }
+
+    if ($needsDownload) {
+        Write-Step "Downloading PyTorch CUDA 12.6 wheel..."
+        Write-Host "[setup-nvidia] Source: $TorchCu126Url"
+        Write-Host "[setup-nvidia] Cache: $wheelPath"
+
+        if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+            & curl.exe -L --fail --retry 5 --retry-delay 2 --continue-at - --output $wheelPath $TorchCu126Url
+            if ($LASTEXITCODE -ne 0) {
+                throw "PyTorch CUDA 12.6 wheel download failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            Invoke-WebRequest -Uri $TorchCu126Url -OutFile $wheelPath
+        }
+
+        $file = Get-Item -LiteralPath $wheelPath
+        if ($file.Length -ne $TorchCu126Size) {
+            throw "PyTorch CUDA 12.6 wheel download has unexpected size: $($file.Length) bytes"
+        }
+        $hash = Get-FileSha256 $wheelPath
+        if ($hash -ne $TorchCu126Sha256) {
+            throw "PyTorch CUDA 12.6 wheel download hash mismatch: $hash"
+        }
+    }
+
+    Write-Step "Installing PyTorch CUDA 12.6 wheel..."
+    & $PythonExe -m pip install --no-deps $wheelPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyTorch CUDA 12.6 wheel install failed with exit code $LASTEXITCODE"
+    }
+}
+
 function Test-NvidiaTensorRTRuntime([string]$PythonExe) {
     $checkScript = @'
 import ctypes
@@ -161,6 +307,8 @@ Write-Step "Installing NVIDIA dependencies..."
 if (-not $SkipPipUpgrade) {
     & $venvPython -m pip install --upgrade pip setuptools wheel
 }
+Install-TensorRTCu12LibsWheel -PythonExe $venvPython
+Install-TorchCu126Wheel -PythonExe $venvPython
 & $venvPython -m pip install --prefer-binary -r $reqFile
 
 Write-Step "Checking NVIDIA TensorRT runtime..."
