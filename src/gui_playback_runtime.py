@@ -2299,6 +2299,8 @@ class PlaybackRuntimeMixin:
             self._export_progress_dlg.setValue(max(0, min(100, int(percent))))
         elif self._export_compile_dlg is not None:
             self._export_compile_dlg.set_status(message)
+            if hasattr(self._export_compile_dlg, "append_log"):
+                self._export_compile_dlg.append_log(message)
         self.statusBar().showMessage(message)
 
     def _on_export_finished(self, output_path: str):

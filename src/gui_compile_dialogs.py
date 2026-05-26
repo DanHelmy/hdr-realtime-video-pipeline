@@ -103,7 +103,8 @@ class _CompileDialog(QDialog):
         super().__init__(None)
         self._owner_widget = parent
         self.setWindowTitle("Compiling Kernels")
-        self.setFixedSize(520, 180)
+        self.setMinimumSize(520, 180)
+        self.resize(520, 180)
         configure_independent_window(self, minimize=False, maximize=False, close=False)
 
         layout = QVBoxLayout(self)
@@ -133,6 +134,12 @@ class _CompileDialog(QDialog):
         self._lbl_status.setWordWrap(True)
         self._lbl_status.setProperty("accentText", True)
         layout.addWidget(self._lbl_status)
+
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont("Consolas", 9))
+        self._log.setVisible(False)
+        layout.addWidget(self._log, 1)
 
     def set_message(self, *, window_title: str, title: str, detail: str):
         self.setWindowTitle(window_title)
@@ -171,6 +178,17 @@ class _CompileDialog(QDialog):
 
     def set_status(self, text: str):
         self._lbl_status.setText(text)
+
+    def append_log(self, text: str):
+        line = str(text or "").strip()
+        if not line:
+            return
+        if not self._log.isVisible():
+            self._log.setVisible(True)
+            self.resize(max(self.width(), 680), max(self.height(), 380))
+        self._log.append(line)
+        sb = self._log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
 
 class _PrecompileOptionsDialog(QDialog):

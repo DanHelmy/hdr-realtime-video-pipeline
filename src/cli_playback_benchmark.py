@@ -7,9 +7,14 @@ import math
 import os
 import pathlib
 import re
+import sys
 import time
 from collections import deque
 from datetime import datetime
+
+if os.name == "nt" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from windows_runtime import (
     configure_rocm_sdk_environment,
@@ -62,7 +67,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_ptq_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_mixed_ptq_qdq",
+        "trt_qdq_fusion": "auto",
+        "trt_label": "int8_mixed_ptq_trt_qdq",
         "gui_key": "INT8 Mixed (PTQ)",
     },
     "int8-full-ptq": {
@@ -72,7 +78,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_ptq_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_full_ptq_qdq",
+        "trt_qdq_fusion": "auto",
+        "trt_label": "int8_full_ptq_trt_qdq",
         "gui_key": "INT8 Full (PTQ)",
     },
     "int8-mixed-qat": {
@@ -82,7 +89,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_qat_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_mixed_qat_qdq",
+        "trt_qdq_fusion": "auto",
+        "trt_label": "int8_mixed_qat_trt_qdq",
         "gui_key": "INT8 Mixed (QAT)",
     },
     "int8-full-qat": {
@@ -92,7 +100,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_full_qat_qdq",
+        "trt_qdq_fusion": "auto",
+        "trt_label": "int8_full_qat_trt_qdq",
         "gui_key": "INT8 Full (QAT)",
     },
     "int8-mixed-qat-film": {
@@ -102,7 +111,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_qat_film_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_mixed_qat_film_qdq",
+        "trt_qdq_fusion": "auto",
+        "trt_label": "int8_mixed_qat_film_trt_qdq",
         "gui_key": "INT8 Mixed (QAT) (Film)",
     },
     "int8-full-qat-film": {
@@ -112,7 +122,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_film_predeq",
         "trt_predequantize": "off",
-        "trt_label": "int8_full_qat_film_qdq",
+        "trt_qdq_fusion": "auto",
+        "trt_label": "int8_full_qat_film_trt_qdq",
         "gui_key": "INT8 Full (QAT) (Film)",
     },
 }
@@ -699,7 +710,11 @@ def main() -> int:
                 preset["predequantize"] = str(
                     preset.get("trt_predequantize", preset.get("predequantize", "auto"))
                 )
+                preset["qdq_fusion"] = str(args.trt_qdq_fusion)
                 preset["label"] = str(preset.get("trt_label", preset.get("label", run_key)))
+                if str(args.trt_qdq_fusion) != "auto":
+                    fusion_label = str(args.trt_qdq_fusion).replace("-", "")
+                    preset["label"] = f"{preset['label']}_{fusion_label}"
             if not os.path.isfile(preset["model"]):
                 raise FileNotFoundError(f"Model not found: {preset['model']}")
             print(

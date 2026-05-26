@@ -14,6 +14,7 @@ from models.hdrtvnet_torch import (
     tensorrt_mode_name,
 )
 from gui_config import PRECISIONS, _select_model_path
+from gui_output_capture import capture_output_to_gui
 
 
 def _resolve_predequantize_arg(mode: str):
@@ -143,16 +144,17 @@ class PipelineWorkerModelMixin:
                         self.status_message.emit(
                             f"Building TensorRT engine for {cw}x{ch} ({key}) ..."
                         )
-                self._processor = HDRTVNetTensorRT(
-                    path,
-                    device="auto",
-                    precision=cfg["precision"],
-                    engine_width=int(cw),
-                    engine_height=int(ch),
-                    mode_name=mode_name,
-                    use_hg=self._use_hg,
-                    predequantize=trt_predeq,
-                )
+                with capture_output_to_gui(self.status_message.emit):
+                    self._processor = HDRTVNetTensorRT(
+                        path,
+                        device="auto",
+                        precision=cfg["precision"],
+                        engine_width=int(cw),
+                        engine_height=int(ch),
+                        mode_name=mode_name,
+                        use_hg=self._use_hg,
+                        predequantize=trt_predeq,
+                    )
             else:
                 resolved_compile_mode = (
                     "auto"

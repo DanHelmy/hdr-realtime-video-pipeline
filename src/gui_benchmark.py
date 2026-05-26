@@ -87,6 +87,7 @@ from gui_benchmark_runtime import (
     _benchmark_compile_cache_ready,
     _normalize_benchmark_predequantize_mode,
 )
+from gui_output_capture import capture_output_to_gui
 from gui_pipeline_worker_model import _resolve_predequantize_arg
 from gui_mpv_widget import MpvHDRWidget
 from gui_scaling import (
@@ -1561,16 +1562,20 @@ class _BenchmarkWorker(QObject):
                         0,
                         "Building TensorRT engine for benchmark. First run can take a few minutes ...",
                     )
-                processor = HDRTVNetTensorRT(
-                    model_path,
-                    device="auto",
-                    precision=model_precision,
-                    engine_width=out_w,
-                    engine_height=out_h,
-                    mode_name=mode_name,
-                    use_hg=bool(cfg.use_hg),
-                    predequantize=trt_predeq,
-                )
+                def _emit_trt_line(line: str):
+                    self.progress.emit(0, line)
+
+                with capture_output_to_gui(_emit_trt_line):
+                    processor = HDRTVNetTensorRT(
+                        model_path,
+                        device="auto",
+                        precision=model_precision,
+                        engine_width=out_w,
+                        engine_height=out_h,
+                        mode_name=mode_name,
+                        use_hg=bool(cfg.use_hg),
+                        predequantize=trt_predeq,
+                    )
                 cfg.runtime_mode = "TensorRT"
             else:
                 processor = HDRTVNetTorch(
@@ -3463,16 +3468,17 @@ class ModelBenchmarkDialog(QDialog):
             if _IS_NVIDIA:
                 out_w, out_h = _resolution_dims(resolution_key)
                 trt_predeq = _resolve_predequantize_arg(predequantize_mode)
-                processor = HDRTVNetTensorRT(
-                    model_path,
-                    device="auto",
-                    precision=model_precision,
-                    engine_width=out_w,
-                    engine_height=out_h,
-                    mode_name=f"{precision}_{'hg' if use_hg else 'nohg'}",
-                    use_hg=bool(use_hg),
-                    predequantize=trt_predeq,
-                )
+                with capture_output_to_gui(lambda _line: None):
+                    processor = HDRTVNetTensorRT(
+                        model_path,
+                        device="auto",
+                        precision=model_precision,
+                        engine_width=out_w,
+                        engine_height=out_h,
+                        mode_name=f"{precision}_{'hg' if use_hg else 'nohg'}",
+                        use_hg=bool(use_hg),
+                        predequantize=trt_predeq,
+                    )
             else:
                 out_w, out_h = _resolution_dims(resolution_key)
                 compile_ready, _compile_arg, _compile_pdq = _benchmark_compile_cache_ready(

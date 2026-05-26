@@ -37,6 +37,7 @@ _DEFAULT_HG_WEIGHTS = os.path.join(
 _TENSORRT_SOURCE_SUBDIR = "tensorrt_sources"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
 _TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v2"
+_TENSORRT_DEFAULT_INT8_FP_EXPORT_PREFIXES: tuple[str, ...] = ()
 _PORTABLE_INT8_CHECKPOINT_FORMAT = "portable_fake_quant_v1"
 _PORTABLE_INT8_STATE_FORMAT = "native_fp32"
 _FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
@@ -638,7 +639,10 @@ class TRTFloatConv2d(nn.Module):
         self.dilation = w8_mod.dilation
         self.groups = w8_mod.groups
 
-        scale = w8_mod.scale.detach().float()
+        scale = getattr(w8_mod, "scale", None)
+        if scale is None:
+            scale = w8_mod.w_scale
+        scale = scale.detach().float()
         weight = w8_mod.weight_int8.detach().float() * scale.view(-1, 1, 1, 1)
         self.weight = nn.Parameter(weight, requires_grad=False)
         if w8_mod.bias is not None:
@@ -659,7 +663,10 @@ class TRTFloatLinear(nn.Module):
 
     def __init__(self, w8_mod):
         super().__init__()
-        scale = w8_mod.scale.detach().float()
+        scale = getattr(w8_mod, "scale", None)
+        if scale is None:
+            scale = w8_mod.w_scale
+        scale = scale.detach().float()
         weight = w8_mod.weight_int8.detach().float() * scale.view(-1, 1)
         self.weight = nn.Parameter(weight, requires_grad=False)
         if w8_mod.bias is not None:
@@ -693,10 +700,51 @@ def _patch_adaptive_avgpool_for_trt(model: nn.Module) -> None:
             _patch_adaptive_avgpool_for_trt(child)
 
 
+def _tensorrt_fp_export_prefixes(
+    default: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    raw = os.environ.get("HDRTVNET_TRT_FP_EXPORT_PREFIXES")
+    if raw is None:
+        return tuple(default)
+    if raw.strip().lower() in {"", "0", "false", "no", "none", "off"}:
+        return ()
+    prefixes = []
+    for item in raw.split(","):
+        prefix = item.strip().strip(".")
+        if prefix:
+            prefixes.append(prefix)
+    return tuple(dict.fromkeys(prefixes))
+
+
+def _tensorrt_int8_fp_export_prefixes() -> tuple[str, ...]:
+    return _tensorrt_fp_export_prefixes(
+        _TENSORRT_DEFAULT_INT8_FP_EXPORT_PREFIXES
+    )
+
+
+def _tensorrt_module_matches_prefix(name: str,
+                                    prefixes: tuple[str, ...]) -> bool:
+    return any(name == prefix or name.startswith(f"{prefix}.")
+               for prefix in prefixes)
+
+
+def _tensorrt_fp_export_policy_suffix() -> str:
+    prefixes = _tensorrt_int8_fp_export_prefixes()
+    if not prefixes:
+        return ""
+    labels = []
+    for prefix in prefixes:
+        label = re.sub(r"[^a-z0-9]+", "", prefix.lower())
+        labels.append(label or "module")
+    return f"_fp{'-'.join(labels)}v1"
+
+
 def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
     """Replace W8/W8A8 runtime wrappers with TensorRT-friendly Q/DQ modules."""
     converted_w8a8 = 0
     converted_w8_fp = 0
+    forced_w8a8_fp = 0
+    fp_prefixes = _tensorrt_int8_fp_export_prefixes()
     for name, module in list(model.named_modules()):
         if not isinstance(module, (W8Conv2d, W8A8Conv2d, W8Linear, W8A8Linear)):
             continue
@@ -704,19 +752,25 @@ def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
         parent = model
         for p in parts[:-1]:
             parent = getattr(parent, p)
-        quantize_activation = isinstance(module, (W8A8Conv2d, W8A8Linear))
+        force_fp_export = _tensorrt_module_matches_prefix(name, fp_prefixes)
+        quantize_activation = (
+            isinstance(module, (W8A8Conv2d, W8A8Linear)) and
+            not force_fp_export
+        )
         if quantize_activation and isinstance(module, W8A8Conv2d):
             replacement = TRTQDQConv2d(module, quantize_activation)
             converted_w8a8 += 1
         elif quantize_activation and isinstance(module, W8A8Linear):
             replacement = TRTQDQLinear(module, quantize_activation)
             converted_w8a8 += 1
-        elif isinstance(module, W8Conv2d):
+        elif isinstance(module, (W8Conv2d, W8A8Conv2d)):
             replacement = TRTFloatConv2d(module)
             converted_w8_fp += 1
+            forced_w8a8_fp += int(force_fp_export)
         else:
             replacement = TRTFloatLinear(module)
             converted_w8_fp += 1
+            forced_w8a8_fp += int(force_fp_export)
         setattr(parent, parts[-1], replacement)
     if converted_w8a8 or converted_w8_fp:
         print(
@@ -724,6 +778,12 @@ def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
             f"{converted_w8a8} W8A8 layers, "
             f"{converted_w8_fp} W8A16 layers exported as FP"
         )
+        if fp_prefixes:
+            print(
+                "TensorRT Q/DQ export policy: "
+                f"FP prefixes={list(fp_prefixes)}, "
+                f"forced W8A8 FP layers={forced_w8a8_fp}"
+            )
     return model
 
 
@@ -2089,6 +2149,10 @@ def _tensorrt_expected_engine_metadata(
             "use_hg": bool(use_hg),
             "predequantize_int8": bool(predequantize_int8),
             "qdq_fusion": _resolve_tensorrt_qdq_fusion(precision, qdq_fusion),
+            "fp_export_prefixes": (
+                list(_tensorrt_int8_fp_export_prefixes())
+                if str(precision).startswith("int8") else []
+            ),
         },
         "runtime": {
             "torch": str(getattr(torch, "__version__", "unknown")),
@@ -2162,6 +2226,7 @@ def tensorrt_engine_is_valid(
     verbose: bool = False,
 ) -> bool:
     predeq = _resolve_tensorrt_predequantize(precision, predequantize)
+    qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
     engine_mode_name = tensorrt_mode_name(
         precision,
         mode_name,
@@ -2266,6 +2331,9 @@ def tensorrt_onnx_path(
 def cleanup_tensorrt_onnx_after_engine(onnx_path: str, engine_path: str) -> bool:
     if not onnx_path or not os.path.isfile(engine_path):
         return False
+    if _env_bool("HDRTVNET_TRT_KEEP_ONNX", False):
+        print(f"TensorRT ONNX kept for inspection: {onnx_path}")
+        return False
     try:
         removed = False
         if os.path.isfile(onnx_path):
@@ -2327,6 +2395,9 @@ def tensorrt_mode_name(
             mode_name = f"{mode_name}_addqdqv1"
         elif fusion == "add-mul" and "addmulqdq" not in lower:
             mode_name = f"{mode_name}_addmulqdqv1"
+        fp_suffix = _tensorrt_fp_export_policy_suffix()
+        if fp_suffix and fp_suffix not in mode_name.lower():
+            mode_name = f"{mode_name}{fp_suffix}"
     return mode_name
 
 
@@ -2579,6 +2650,153 @@ def _patch_tensorrt_elementwise_input_qdq(
 
 def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
     _patch_tensorrt_elementwise_input_qdq(onnx_path, ("Add",))
+
+
+def _patch_tensorrt_mul_input_qdq(onnx_path: str) -> None:
+    """Add Q/DQ on Mul inputs that feed already-calibrated Q/DQ regions."""
+    try:
+        import onnx
+    except Exception as exc:
+        print(f"TensorRT Mul Q/DQ fusion skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path)
+    except Exception as exc:
+        print(f"TensorRT Mul Q/DQ fusion skipped: {exc}")
+        return
+
+    graph = model.graph
+    producers = {output: node for node in graph.node for output in node.output}
+    initializers = {init.name for init in graph.initializer}
+    graph_inputs = {value.name for value in graph.input}
+
+    consumers = {}
+    for node in graph.node:
+        for index, input_name in enumerate(node.input):
+            consumers.setdefault(input_name, []).append((node, index))
+
+    existing_names = {node.name for node in graph.node if node.name}
+    existing_tensors = set()
+    for node in graph.node:
+        existing_tensors.update(node.input)
+        existing_tensors.update(node.output)
+
+    def _unique(base: str, used: set[str]) -> str:
+        safe = re.sub(r"[^0-9A-Za-z_]+", "_", base).strip("_") or "tensor"
+        name = safe
+        index = 1
+        while name in used:
+            name = f"{safe}_{index}"
+            index += 1
+        used.add(name)
+        return name
+
+    def _output_quantizer(node) -> object | None:
+        for consumer, index in consumers.get(node.output[0], []):
+            if consumer.op_type == "QuantizeLinear" and index == 0:
+                return consumer
+        return None
+
+    def _mul_quantizer(node) -> object | None:
+        direct = _output_quantizer(node)
+        if direct is not None:
+            return direct
+        for consumer, _index in consumers.get(node.output[0], []):
+            if consumer.op_type == "Add":
+                add_quant = _output_quantizer(consumer)
+                if add_quant is not None:
+                    return add_quant
+        return None
+
+    patched_muls = 0
+    inserted_qdq = 0
+    new_nodes = []
+
+    for node in graph.node:
+        if node.op_type != "Mul":
+            new_nodes.append(node)
+            continue
+
+        output_quant = _mul_quantizer(node)
+        if output_quant is None or len(output_quant.input) < 2:
+            new_nodes.append(node)
+            continue
+
+        scale_name = output_quant.input[1]
+        zero_name = output_quant.input[2] if len(output_quant.input) > 2 else ""
+        node_was_patched = False
+
+        for input_index, input_name in enumerate(list(node.input)):
+            producer = producers.get(input_name)
+            if input_name in initializers or input_name in graph_inputs:
+                continue
+            if producer is not None and producer.op_type == "DequantizeLinear":
+                continue
+
+            q_name = _unique(f"{node.name or node.output[0]}_input{input_index}_QuantizeLinear", existing_names)
+            dq_name = _unique(f"{node.name or node.output[0]}_input{input_index}_DequantizeLinear", existing_names)
+            q_out = _unique(f"{node.output[0]}_input{input_index}_q", existing_tensors)
+            dq_out = _unique(f"{node.output[0]}_input{input_index}_dq", existing_tensors)
+            q_inputs = [input_name, scale_name]
+            dq_inputs = [q_out, scale_name]
+            if zero_name:
+                q_inputs.append(zero_name)
+                dq_inputs.append(zero_name)
+
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "QuantizeLinear",
+                    q_inputs,
+                    [q_out],
+                    name=q_name,
+                )
+            )
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "DequantizeLinear",
+                    dq_inputs,
+                    [dq_out],
+                    name=dq_name,
+                )
+            )
+            node.input[input_index] = dq_out
+            inserted_qdq += 1
+            node_was_patched = True
+
+        if node_was_patched:
+            patched_muls += 1
+        new_nodes.append(node)
+
+    if not patched_muls:
+        print("TensorRT Mul Q/DQ fusion: no eligible Mul nodes found")
+        return
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"TensorRT Mul Q/DQ fusion check warning: {exc}")
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(
+        "TensorRT Mul Q/DQ fusion: "
+        f"patched {patched_muls} Mul node(s), inserted {inserted_qdq} input Q/DQ pair(s)"
+    )
 
 
 def _patch_tensorrt_fp16_constants(onnx_path: str) -> None:
@@ -3028,6 +3246,13 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 print(f"TensorRT max auxiliary streams: {aux_streams}")
             except Exception as exc:
                 print(f"TensorRT auxiliary streams skipped: {exc}")
+
+        if hasattr(config, "profiling_verbosity") and hasattr(trt, "ProfilingVerbosity"):
+            try:
+                config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+                print("TensorRT profiling verbosity: detailed")
+            except Exception as exc:
+                print(f"TensorRT profiling verbosity skipped: {exc}")
 
         builder_precision = str(
             getattr(self, "_trt_builder_precision", self.precision)
