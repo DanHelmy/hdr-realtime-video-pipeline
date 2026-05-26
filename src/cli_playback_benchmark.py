@@ -274,6 +274,7 @@ def _make_processor(args, run: dict, width: int, height: int):
             mode_name=f"{run.get('gui_key', run['precision'])}_{'hg' if args.use_hg else 'nohg'}",
             use_hg=bool(args.use_hg),
             predequantize=predeq,
+            qdq_fusion=args.trt_qdq_fusion,
         )
     return HDRTVNetTorch(
         run["model"],
@@ -659,6 +660,12 @@ def parse_args():
         help="Display backend used with --display. Defaults to mpv, matching the GUI HDR path.",
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument(
+        "--trt-qdq-fusion",
+        default="auto",
+        choices=["auto", "none", "add", "add-mul", "elementwise"],
+        help="TensorRT INT8 Q/DQ fusion mode. Default: auto.",
+    )
     parser.add_argument(
         "--out-root",
         default=str(_ROOT / "logs" / "playback_sessions"),

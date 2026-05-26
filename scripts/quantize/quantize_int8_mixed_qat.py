@@ -1577,8 +1577,9 @@ def main():
     parser.add_argument("--tensorrt-source-dir", default=None,
                         help="Directory for portable TensorRT source checkpoints")
     parser.add_argument("--tensorrt-source-activation-quant",
-                        default="symmetric", choices=["symmetric", "source"],
-                        help="Activation qparams for TensorRT source export")
+                        default="source", choices=["symmetric", "source"],
+                        help=("Activation qparams for TensorRT source export. "
+                              "Default preserves PT checkpoint parity."))
     parser.add_argument(
         "--sdr-dir",
         default=os.path.join(_REPO_ROOT, "dataset", "train_sdr"),
@@ -2134,6 +2135,7 @@ def main():
             Path(args.output),
             trt_source_path,
             activation_quant=args.tensorrt_source_activation_quant,
+            target_backend="tensorrt",
         )
 
     orig_kb = os.path.getsize(args.fp32_model) / 1024

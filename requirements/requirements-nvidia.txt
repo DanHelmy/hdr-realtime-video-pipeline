@@ -8,6 +8,7 @@ torchaudio==2.9.1
 
 onnx>=1.16
 onnxscript>=0.1.0
+onnxruntime>=1.20
 huggingface_hub>=0.24
 requests>=2.32
 tensorrt_cu12_bindings>=10.0

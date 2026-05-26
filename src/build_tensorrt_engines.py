@@ -52,10 +52,40 @@ _PRECISION_MAP = {
         _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
         _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
     ),
+    "int8-mixed-ptq": (
+        "int8-mixed",
+        _weight("Ensemble_AGCM_LE_int8_mixed.pt"),
+        _weight("Ensemble_AGCM_LE_int8_mixed_nohg.pt"),
+    ),
+    "int8-mixed-qat": (
+        "int8-mixed",
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+    ),
+    "int8-mixed-qat-film": (
+        "int8-mixed",
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat_film.pt"),
+        _weight("Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt"),
+    ),
     "int8-full": (
         "int8-full",
         _weight("Ensemble_AGCM_LE_int8_full.pt"),
         _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+    ),
+    "int8-full-ptq": (
+        "int8-full",
+        _weight("Ensemble_AGCM_LE_int8_full.pt"),
+        _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+    ),
+    "int8-full-qat": (
+        "int8-full",
+        _weight("Ensemble_AGCM_LE_int8_full_qat.pt"),
+        _weight("Ensemble_AGCM_LE_int8_full_qat_nohg.pt"),
+    ),
+    "int8-full-qat-film": (
+        "int8-full",
+        _weight("Ensemble_AGCM_LE_int8_full_qat_film.pt"),
+        _weight("Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt"),
     ),
 }
 
@@ -121,12 +151,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--qdq-fusion",
-        default="none",
-        choices=["none", "add"],
+        default="auto",
+        choices=["auto", "none", "add", "add-mul", "elementwise"],
         help=(
             "Experimental explicit-Q/DQ placement for TensorRT INT8. "
+            "Default: auto (mixed INT8 uses add-mul; full INT8 uses none). "
             "'add' inserts Q/DQ on eligible Add inputs that already feed "
-            "calibrated quantized paths."
+            "calibrated quantized paths; 'add-mul' also patches Mul inputs."
         ),
     )
     parser.add_argument(
@@ -138,6 +169,11 @@ def main() -> int:
         "--force-onnx",
         action="store_true",
         help="Remove any stale .onnx before rebuilding.",
+    )
+    parser.add_argument(
+        "--keep-onnx",
+        action="store_true",
+        help="Keep the exported ONNX next to the engine for inspection.",
     )
     parser.add_argument(
         "--opt-level",
@@ -248,6 +284,7 @@ def main() -> int:
             use_hg=use_hg,
             predequantize=predeq,
             qdq_fusion=args.qdq_fusion,
+            keep_onnx=args.keep_onnx,
         )
         if args.benchmark_runs > 0:
             import time

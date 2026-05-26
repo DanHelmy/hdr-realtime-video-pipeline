@@ -551,8 +551,9 @@ def main():
     parser.add_argument("--tensorrt-source-dir", default=None,
                         help="Directory for portable TensorRT source checkpoints")
     parser.add_argument("--tensorrt-source-activation-quant",
-                        default="symmetric", choices=["symmetric", "source"],
-                        help="Activation qparams for TensorRT source export")
+                        default="source", choices=["symmetric", "source"],
+                        help=("Activation qparams for TensorRT source export. "
+                              "Default preserves PT checkpoint parity."))
     parser.add_argument("--precision", default="fp16", choices=["fp16", "fp32"],
                         help="Compute precision for runtime dequantization")
     parser.add_argument("--save-fp16", action="store_true",
@@ -984,6 +985,7 @@ def main():
             Path(args.output),
             trt_source_path,
             activation_quant=args.tensorrt_source_activation_quant,
+            target_backend="tensorrt",
         )
 
     orig_bytes = os.path.getsize(args.model)

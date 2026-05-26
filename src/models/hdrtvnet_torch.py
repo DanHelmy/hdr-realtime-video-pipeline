@@ -36,7 +36,7 @@ _DEFAULT_HG_WEIGHTS = os.path.join(
 )
 _TENSORRT_SOURCE_SUBDIR = "tensorrt_sources"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
-_TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v1"
+_TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v2"
 _PORTABLE_INT8_CHECKPOINT_FORMAT = "portable_fake_quant_v1"
 _PORTABLE_INT8_STATE_FORMAT = "native_fp32"
 _FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
@@ -2020,9 +2020,32 @@ def _cuda_device_fingerprint() -> dict[str, object]:
 
 
 def _normalize_tensorrt_qdq_fusion(qdq_fusion: str) -> str:
-    fusion = str(qdq_fusion or "none").strip().lower()
+    fusion = str(qdq_fusion or "auto").strip().lower()
+    if fusion in {"auto", "default", "smart"}:
+        return "auto"
     if fusion in {"add", "residual-add", "add-inputs"}:
         return "add"
+    if fusion in {
+        "add-mul",
+        "addmul",
+        "elementwise",
+        "elementwise-inputs",
+        "mul",
+        "all",
+    }:
+        return "add-mul"
+    return "none"
+
+
+def _resolve_tensorrt_qdq_fusion(precision: str, qdq_fusion: str) -> str:
+    fusion = _normalize_tensorrt_qdq_fusion(qdq_fusion)
+    if fusion != "auto":
+        return fusion
+    # Full INT8 already has Q/DQ around almost every compute op. Forcing extra
+    # Q/DQ on residual inputs changes full-QAT numerics badly. Mixed INT8 still
+    # benefits from the topology hint because only selected layers are W8A8.
+    if str(precision or "").startswith("int8-mixed"):
+        return "add-mul"
     return "none"
 
 
@@ -2065,7 +2088,7 @@ def _tensorrt_expected_engine_metadata(
             "engine_mode_name": str(engine_mode_name),
             "use_hg": bool(use_hg),
             "predequantize_int8": bool(predequantize_int8),
-            "qdq_fusion": _normalize_tensorrt_qdq_fusion(qdq_fusion),
+            "qdq_fusion": _resolve_tensorrt_qdq_fusion(precision, qdq_fusion),
         },
         "runtime": {
             "torch": str(getattr(torch, "__version__", "unknown")),
@@ -2134,7 +2157,7 @@ def tensorrt_engine_is_valid(
     mode_name: str,
     use_hg: bool,
     predequantize=False,
-    qdq_fusion: str = "none",
+    qdq_fusion: str = "auto",
     hg_weights: str | None = None,
     verbose: bool = False,
 ) -> bool:
@@ -2286,7 +2309,7 @@ def tensorrt_mode_name(
     precision: str,
     mode: str,
     predequantize=False,
-    qdq_fusion: str = "none",
+    qdq_fusion: str = "auto",
 ) -> str:
     mode_name = str(mode or precision or "mode")
     if str(precision).startswith("int8"):
@@ -2297,11 +2320,13 @@ def tensorrt_mode_name(
             return mode_name
         if "qdq" in lower:
             return mode_name
-        qdq_version = "qdqv6"
+        qdq_version = "qdqv7"
         mode_name = f"{mode_name}_{qdq_version}"
-        fusion = str(qdq_fusion or "none").strip().lower()
-        if fusion in {"add", "residual-add", "add-inputs"} and "addqdq" not in lower:
+        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+        if fusion == "add" and "addqdq" not in lower:
             mode_name = f"{mode_name}_addqdqv1"
+        elif fusion == "add-mul" and "addmulqdq" not in lower:
+            mode_name = f"{mode_name}_addmulqdqv1"
     return mode_name
 
 
@@ -2407,21 +2432,25 @@ def _patch_tensorrt_qdq_casts(onnx_path: str) -> None:
         )
 
 
-def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
-    """Add Q/DQ on inputs of Add nodes that already feed calibrated Q nodes."""
+def _patch_tensorrt_elementwise_input_qdq(
+    onnx_path: str,
+    op_types: tuple[str, ...] = ("Add", "Mul"),
+) -> None:
+    """Add Q/DQ on elementwise inputs that already feed calibrated Q nodes."""
     try:
         import onnx
     except Exception as exc:
-        print(f"TensorRT Add Q/DQ fusion skipped: onnx import failed ({exc})")
+        print(f"TensorRT elementwise Q/DQ fusion skipped: onnx import failed ({exc})")
         return
 
     try:
         model = onnx.load(onnx_path)
     except Exception as exc:
-        print(f"TensorRT Add Q/DQ fusion skipped: {exc}")
+        print(f"TensorRT elementwise Q/DQ fusion skipped: {exc}")
         return
 
     graph = model.graph
+    enabled_ops = {str(op) for op in op_types if str(op)}
     producers = {output: node for node in graph.node for output in node.output}
     initializers = {init.name for init in graph.initializer}
     graph_inputs = {value.name for value in graph.input}
@@ -2447,18 +2476,18 @@ def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
         used.add(name)
         return name
 
-    def _output_quantizer(add_node) -> object | None:
-        for consumer, index in consumers.get(add_node.output[0], []):
+    def _output_quantizer(elementwise_node) -> object | None:
+        for consumer, index in consumers.get(elementwise_node.output[0], []):
             if consumer.op_type == "QuantizeLinear" and index == 0:
                 return consumer
         return None
 
-    patched_adds = 0
+    patched_by_op = {op: 0 for op in enabled_ops}
     inserted_qdq = 0
     new_nodes = []
 
     for node in graph.node:
-        if node.op_type != "Add":
+        if node.op_type not in enabled_ops:
             new_nodes.append(node)
             continue
 
@@ -2509,11 +2538,13 @@ def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
             node_was_patched = True
 
         if node_was_patched:
-            patched_adds += 1
+            patched_by_op[node.op_type] = patched_by_op.get(node.op_type, 0) + 1
         new_nodes.append(node)
 
-    if not patched_adds:
-        print("TensorRT Add Q/DQ fusion: no eligible Add nodes found")
+    patched_total = sum(patched_by_op.values())
+    label = "+".join(sorted(enabled_ops)) or "elementwise"
+    if not patched_total:
+        print(f"TensorRT {label} Q/DQ fusion: no eligible nodes found")
         return
 
     del graph.node[:]
@@ -2528,7 +2559,7 @@ def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
     try:
         onnx.checker.check_model(model)
     except Exception as exc:
-        print(f"TensorRT Add Q/DQ fusion check warning: {exc}")
+        print(f"TensorRT {label} Q/DQ fusion check warning: {exc}")
     onnx.save_model(
         model,
         onnx_path,
@@ -2537,10 +2568,17 @@ def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
         location=os.path.basename(data_path),
         size_threshold=1024,
     )
-    print(
-        "TensorRT Add Q/DQ fusion: "
-        f"patched {patched_adds} Add node(s), inserted {inserted_qdq} input Q/DQ pair(s)"
+    patched_summary = ", ".join(
+        f"{op}={count}" for op, count in sorted(patched_by_op.items()) if count
     )
+    print(
+        f"TensorRT {label} Q/DQ fusion: "
+        f"patched {patched_summary}, inserted {inserted_qdq} input Q/DQ pair(s)"
+    )
+
+
+def _patch_tensorrt_add_input_qdq(onnx_path: str) -> None:
+    _patch_tensorrt_elementwise_input_qdq(onnx_path, ("Add",))
 
 
 def _patch_tensorrt_fp16_constants(onnx_path: str) -> None:
@@ -2698,7 +2736,7 @@ def _export_tensorrt_onnx_from_model(
     device: torch.device,
     precision: str,
     flat_model: bool,
-    qdq_fusion: str = "none",
+    qdq_fusion: str = "auto",
 ) -> str:
     if os.path.isfile(onnx_path):
         try:
@@ -2741,11 +2779,19 @@ def _export_tensorrt_onnx_from_model(
         )
     if str(precision).startswith("int8"):
         _patch_tensorrt_qdq_casts(onnx_path)
-        fusion = str(qdq_fusion or "none").strip().lower()
-        if fusion in {"add", "residual-add", "add-inputs"}:
+        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+        if fusion == "add":
             _patch_tensorrt_add_input_qdq(onnx_path)
-        _patch_tensorrt_fp16_qdq_scales(onnx_path)
-        _patch_tensorrt_fp16_constants(onnx_path)
+        elif fusion == "add-mul":
+            _patch_tensorrt_elementwise_input_qdq(onnx_path, ("Add", "Mul"))
+        if dtype == torch.float16:
+            _patch_tensorrt_fp16_qdq_scales(onnx_path)
+            _patch_tensorrt_fp16_constants(onnx_path)
+        else:
+            print(
+                "TensorRT FP16 ONNX cleanup skipped: "
+                f"export dtype is {dtype}, keeping FP32 graph valid for validation"
+            )
     return onnx_path
 
 
@@ -2770,7 +2816,8 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         hg_weights=None,
         use_hg=True,
         predequantize=False,
-        qdq_fusion: str = "none",
+        qdq_fusion: str = "auto",
+        keep_onnx: bool = False,
     ):
         if not _IS_NVIDIA:
             raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
@@ -2779,7 +2826,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
         self._trt_base_mode_name = str(mode_name or precision or "mode")
-        self._trt_qdq_fusion = str(qdq_fusion or "none").strip().lower()
+        self._trt_qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
         self._trt_predequantize_int8 = _resolve_tensorrt_predequantize(
             precision,
             predequantize,
@@ -2807,6 +2854,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         )
         self._trt_runtime = None
         self._trt_engine = None
+        self._trt_keep_onnx = bool(keep_onnx)
         self._trt_context = None
         self._trt_input_names = []
         self._trt_output_names = []
@@ -2865,7 +2913,8 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             engine_rebuilt = True
         else:
             print(f"TensorRT engine cache hit: {self.engine_path}")
-            cleanup_tensorrt_onnx_after_engine(self.onnx_path, self.engine_path)
+            if not self._trt_keep_onnx:
+                cleanup_tensorrt_onnx_after_engine(self.onnx_path, self.engine_path)
 
         try:
             self._load_engine()
@@ -2939,7 +2988,10 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             qdq_fusion=self._trt_qdq_fusion,
         )
         self._build_engine_from_onnx(onnx_path, trt)
-        cleanup_tensorrt_onnx_after_engine(onnx_path, self.engine_path)
+        if self._trt_keep_onnx:
+            print(f"TensorRT ONNX kept for inspection: {onnx_path}")
+        else:
+            cleanup_tensorrt_onnx_after_engine(onnx_path, self.engine_path)
 
     def _build_engine_from_onnx(self, onnx_path: str, trt) -> None:
         logger = trt.Logger(trt.Logger.INFO)

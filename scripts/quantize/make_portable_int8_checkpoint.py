@@ -18,6 +18,8 @@ modules from the same neutral base.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import sys
 from pathlib import Path
@@ -172,6 +174,7 @@ def convert_checkpoint(
     output_path: Path,
     *,
     activation_quant: str,
+    target_backend: str = "portable",
 ) -> None:
     checkpoint = torch.load(input_path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
@@ -188,8 +191,12 @@ def convert_checkpoint(
 
     model = _materialize_runtime_model(checkpoint)
     qparams = _collect_activation_qparams(model, activation_quant)
-    _predequantize_model(model, torch.float32)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _predequantize_model(model, torch.float32)
     native_state = _native_fp32_state_dict(model)
+    backend = str(target_backend or "portable").strip().lower()
+    if backend not in {"portable", "tensorrt"}:
+        raise ValueError(f"Unsupported target backend: {target_backend}")
 
     skip_keys = {
         "state_dict",
@@ -200,6 +207,9 @@ def convert_checkpoint(
         "activation_zero_points",
         "backend_neutral",
         "portable_source_checkpoint",
+        "portable_recipe",
+        "target_backend",
+        "tensorrt_source_checkpoint",
     }
     save_data = {k: v for k, v in checkpoint.items() if k not in skip_keys}
     save_data.update(
@@ -208,6 +218,8 @@ def convert_checkpoint(
             "checkpoint_format": _PORTABLE_INT8_CHECKPOINT_FORMAT,
             "state_format": _PORTABLE_INT8_STATE_FORMAT,
             "backend_neutral": True,
+            "target_backend": backend,
+            "tensorrt_source_checkpoint": backend == "tensorrt",
             "activation_quant": target_activation_quant,
             "activation_qparams": qparams,
             "source_activation_quant": source_activation_quant,
@@ -217,7 +229,11 @@ def convert_checkpoint(
                 "fp_state": "native_fp32",
                 "w8a8_activation_qparams": target_activation_quant,
                 "w8_weights": "recreated_from_native_state_at_load",
-                "tensorrt": "explicit_qdq_from_same_masks_and_qparams",
+                "tensorrt": (
+                    "explicit_signed_qdq_from_same_masks_and_qparams"
+                    if backend == "tensorrt"
+                    else "explicit_qdq_from_same_masks_and_qparams"
+                ),
             },
         }
     )
@@ -229,9 +245,14 @@ def convert_checkpoint(
         for value in native_state.values()
         if torch.is_tensor(value) and value.dtype == torch.int8
     )
-    print(f"Saved portable checkpoint: {output_path}")
+    if backend == "tensorrt":
+        print(f"Saved TensorRT source checkpoint: {output_path}")
+    else:
+        print(f"Saved portable checkpoint: {output_path}")
     print(f"  source activation quant : {source_activation_quant}")
     print(f"  target activation quant : {target_activation_quant}")
+    print(f"  target backend          : {backend}")
+    print("  materialized state      : native FP32 source weights")
     print(f"  activation qparams      : {len(qparams)}")
     print(f"  native state tensors    : {len(native_state)} (int8={int8_tensors})")
 
@@ -254,9 +275,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--activation-quant",
-        default="symmetric",
+        default="source",
         choices=["symmetric", "source"],
-        help="Use symmetric TensorRT-friendly activations or preserve source mode.",
+        help=(
+            "Activation qparams to store. Default 'source' preserves PyTorch "
+            "checkpoint parity; TensorRT export still emits signed Q/DQ."
+        ),
+    )
+    parser.add_argument(
+        "--target-backend",
+        default="portable",
+        choices=["portable", "tensorrt"],
+        help="Mark outputs as generic portable checkpoints or TensorRT source checkpoints.",
     )
     args = parser.parse_args()
 
@@ -277,6 +307,7 @@ def main() -> int:
             input_path,
             output_path,
             activation_quant=args.activation_quant,
+            target_backend=args.target_backend,
         )
 
     return 0
