@@ -10,6 +10,17 @@ from gui_config import SOURCE_MODE_WINDOW, _normalize_source_mode
 class WorkerSlotsMixin:
     """Worker/mpv signal handlers and live metrics UI updates."""
 
+    @staticmethod
+    def _precision_from_ready_status(text: str) -> str:
+        ready_key = str(text or "").strip()
+        for prefix in ("Ready — ", "Ready - ", "Ready â€” "):
+            if ready_key.startswith(prefix):
+                ready_key = ready_key.split(prefix, 1)[-1].strip()
+                break
+        ready_key = ready_key.split("@", 1)[0].strip()
+        ready_key = ready_key.split("[", 1)[0].strip()
+        return ready_key
+
     def _on_mpv_notice(self, text: str):
         note = str(text or "").strip()
         if not note:
@@ -176,12 +187,7 @@ class WorkerSlotsMixin:
             if hasattr(self._compile_dlg, "append_log"):
                 self._compile_dlg.append_log(text)
         if self._precision_swap_pending is not None and text.startswith("Ready"):
-            ready_key = str(text)
-            for prefix in ("Ready — ", "Ready - ", "Ready â€” "):
-                if ready_key.startswith(prefix):
-                    ready_key = ready_key.split(prefix, 1)[-1].strip()
-                    break
-            ready_prec = ready_key.split("@", 1)[0].strip()
+            ready_prec = self._precision_from_ready_status(text)
             pending_prec = str(self._precision_swap_pending).split("[", 1)[0].strip()
             if ready_prec == pending_prec:
                 self._resume_after_precision_swap()
