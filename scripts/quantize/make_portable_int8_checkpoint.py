@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import os
 import sys
@@ -42,10 +43,12 @@ from models.hdrtvnet_torch import (
     W8A8Linear,
     _PORTABLE_INT8_CHECKPOINT_FORMAT,
     _PORTABLE_INT8_STATE_FORMAT,
+    _TENSORRT_SOURCE_CHECKPOINT_SCHEMA,
     _predequantize_model,
     _quantize_model_mixed,
     _quantize_model_mixed_v2,
     _quantize_model_w8a8,
+    _tensorrt_source_signature,
 )
 
 
@@ -169,6 +172,19 @@ def default_tensorrt_source_path(
     return directory / f"{input_path.stem}{suffix}{input_path.suffix}"
 
 
+def _file_fingerprint(path: Path) -> dict[str, object]:
+    stat = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "name": path.name,
+        "size": int(stat.st_size),
+        "sha256": digest.hexdigest(),
+    }
+
+
 def convert_checkpoint(
     input_path: Path,
     output_path: Path,
@@ -210,6 +226,10 @@ def convert_checkpoint(
         "portable_recipe",
         "target_backend",
         "tensorrt_source_checkpoint",
+        "tensorrt_source_schema",
+        "tensorrt_source_signature",
+        "tensorrt_source_runtime_checkpoint",
+        "tensorrt_source_activation_quant_policy",
     }
     save_data = {k: v for k, v in checkpoint.items() if k not in skip_keys}
     save_data.update(
@@ -220,6 +240,18 @@ def convert_checkpoint(
             "backend_neutral": True,
             "target_backend": backend,
             "tensorrt_source_checkpoint": backend == "tensorrt",
+            "tensorrt_source_schema": (
+                _TENSORRT_SOURCE_CHECKPOINT_SCHEMA if backend == "tensorrt" else None
+            ),
+            "tensorrt_source_signature": (
+                _tensorrt_source_signature() if backend == "tensorrt" else None
+            ),
+            "tensorrt_source_runtime_checkpoint": (
+                _file_fingerprint(input_path) if backend == "tensorrt" else None
+            ),
+            "tensorrt_source_activation_quant_policy": (
+                activation_quant if backend == "tensorrt" else None
+            ),
             "activation_quant": target_activation_quant,
             "activation_qparams": qparams,
             "source_activation_quant": source_activation_quant,

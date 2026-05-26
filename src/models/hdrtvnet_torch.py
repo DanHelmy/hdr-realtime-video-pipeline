@@ -37,6 +37,7 @@ _DEFAULT_HG_WEIGHTS = os.path.join(
 _TENSORRT_SOURCE_SUBDIR = "tensorrt_sources"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
 _TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v2"
+_TENSORRT_SOURCE_CHECKPOINT_SCHEMA = "hdrtvnet_tensorrt_source_v1"
 _TENSORRT_DEFAULT_INT8_FP_EXPORT_PREFIXES: tuple[str, ...] = ()
 _PORTABLE_INT8_CHECKPOINT_FORMAT = "portable_fake_quant_v1"
 _PORTABLE_INT8_STATE_FORMAT = "native_fp32"
@@ -1095,26 +1096,189 @@ def _get_gpu_info() -> str:
         return ""
 
 
+def _is_int8_checkpoint_path(path: str) -> bool:
+    try:
+        name = os.path.basename(str(path)).lower()
+    except Exception:
+        return False
+    return name.endswith(".pt") and "_int8_" in name
+
+
+def _is_tensorrt_source_path(path: str) -> bool:
+    try:
+        directory = os.path.basename(os.path.dirname(os.path.abspath(str(path))))
+    except Exception:
+        return False
+    return directory.lower() == _TENSORRT_SOURCE_SUBDIR
+
+
+def _tensorrt_source_candidate_path(model_path: str) -> str:
+    path = os.path.abspath(os.path.expanduser(str(model_path)))
+    directory, name = os.path.split(path)
+    return os.path.join(directory, _TENSORRT_SOURCE_SUBDIR, name)
+
+
+def _hash_file_raw(path: str) -> dict[str, object]:
+    p = pathlib.Path(path)
+    try:
+        stat = p.stat()
+    except Exception:
+        return {
+            "name": p.name,
+            "size": -1,
+            "sha256": "missing",
+        }
+    cache_key = (
+        os.path.normcase(str(p.resolve())),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+    cached = _FILE_FINGERPRINT_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    digest = hashlib.sha256()
+    try:
+        with p.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except Exception:
+        fingerprint = {
+            "name": p.name,
+            "size": int(stat.st_size),
+            "sha256": "unreadable",
+        }
+    else:
+        fingerprint = {
+            "name": p.name,
+            "size": int(stat.st_size),
+            "sha256": digest.hexdigest(),
+        }
+    _FILE_FINGERPRINT_CACHE[cache_key] = dict(fingerprint)
+    return fingerprint
+
+
+def _fingerprint_matches(actual, expected) -> bool:
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    for key in ("name", "size", "sha256"):
+        if actual.get(key) != expected.get(key):
+            return False
+    return True
+
+
+def tensorrt_source_checkpoint_validation_error(
+    source_path: str,
+    runtime_checkpoint_path: str | None = None,
+) -> str | None:
+    """Return why a TensorRT source checkpoint is stale/incompatible."""
+    source = os.path.abspath(os.path.expanduser(str(source_path)))
+    if not os.path.isfile(source):
+        return "missing"
+    try:
+        checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return f"unreadable: {exc}"
+    if not isinstance(checkpoint, dict):
+        return "not a checkpoint dictionary"
+    if checkpoint.get("checkpoint_format") != _PORTABLE_INT8_CHECKPOINT_FORMAT:
+        return "not a portable checkpoint"
+    if checkpoint.get("state_format") != _PORTABLE_INT8_STATE_FORMAT:
+        return "not a native-FP32 portable checkpoint"
+    if checkpoint.get("target_backend") != "tensorrt":
+        return "target_backend is not tensorrt"
+    if checkpoint.get("tensorrt_source_checkpoint") is not True:
+        return "not marked as a TensorRT source checkpoint"
+    if checkpoint.get("tensorrt_source_schema") != _TENSORRT_SOURCE_CHECKPOINT_SCHEMA:
+        return "TensorRT source schema mismatch"
+    expected_signature = _tensorrt_source_signature()
+    if checkpoint.get("tensorrt_source_signature") != expected_signature:
+        return "TensorRT source signature mismatch"
+    if checkpoint.get("activation_quant") != checkpoint.get("source_activation_quant"):
+        return "activation qparams do not preserve source checkpoint policy"
+    if checkpoint.get("tensorrt_source_activation_quant_policy") != "source":
+        return "TensorRT source activation policy mismatch"
+    if runtime_checkpoint_path:
+        expected = _hash_file_raw(runtime_checkpoint_path)
+        actual = checkpoint.get("tensorrt_source_runtime_checkpoint")
+        if not _fingerprint_matches(actual, expected):
+            return "runtime checkpoint fingerprint mismatch"
+    return None
+
+
+def _regenerate_tensorrt_source_checkpoint(
+    runtime_checkpoint_path: str,
+    source_path: str,
+) -> None:
+    quantize_dir = pathlib.Path(_ROOT) / "scripts" / "quantize"
+    if not quantize_dir.is_dir():
+        raise FileNotFoundError(f"TensorRT source generator missing: {quantize_dir}")
+    inserted = False
+    quantize_dir_text = str(quantize_dir)
+    if quantize_dir_text not in sys.path:
+        sys.path.insert(0, quantize_dir_text)
+        inserted = True
+    try:
+        from make_portable_int8_checkpoint import convert_checkpoint
+
+        convert_checkpoint(
+            pathlib.Path(runtime_checkpoint_path),
+            pathlib.Path(source_path),
+            activation_quant="source",
+            target_backend="tensorrt",
+        )
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(quantize_dir_text)
+            except ValueError:
+                pass
+        _FILE_FINGERPRINT_CACHE.clear()
+
+
 def tensorrt_source_checkpoint_path(model_path: str) -> str:
-    """Resolve an INT8 runtime checkpoint to its portable TensorRT source.
+    """Resolve an INT8 runtime checkpoint to a current TensorRT source.
 
     The app selects compressed INT8 checkpoints for PyTorch/AMD. NVIDIA uses
-    the same logical selection, but engine build should prefer a matching
-    backend-neutral checkpoint under ``weights/tensorrt_sources`` when present.
+    the same logical selection, but engine build must prefer a matching current
+    backend-neutral checkpoint under ``weights/tensorrt_sources``. Stale source
+    checkpoints are regenerated from the tracked runtime checkpoint when
+    possible, and rejected when no source runtime checkpoint is available.
     """
     if not model_path:
         return model_path
     try:
         path = os.path.abspath(os.path.expanduser(str(model_path)))
-        directory, name = os.path.split(path)
-        if not name.lower().endswith(".pt") or "_int8_" not in name.lower():
+        if not _is_int8_checkpoint_path(path):
             return path
-        if os.path.basename(directory).lower() == _TENSORRT_SOURCE_SUBDIR:
+        if _is_tensorrt_source_path(path):
+            reason = tensorrt_source_checkpoint_validation_error(path)
+            if reason:
+                raise RuntimeError(
+                    "TensorRT source checkpoint is stale or incompatible: "
+                    f"{path} ({reason}). Regenerate from the tracked INT8 "
+                    "checkpoint with scripts\\quantize\\make_tensorrt_source_checkpoints.py."
+                )
             return path
-        candidate = os.path.join(directory, _TENSORRT_SOURCE_SUBDIR, name)
-        if os.path.isfile(candidate):
+        candidate = _tensorrt_source_candidate_path(path)
+        reason = tensorrt_source_checkpoint_validation_error(candidate, path)
+        if reason is None:
             return candidate
+        if os.path.isfile(path):
+            print(
+                "TensorRT source checkpoint refresh: "
+                f"{os.path.basename(candidate)} ({reason})"
+            )
+            _regenerate_tensorrt_source_checkpoint(path, candidate)
+            reason = tensorrt_source_checkpoint_validation_error(candidate, path)
+            if reason is None:
+                return candidate
+            raise RuntimeError(
+                "Regenerated TensorRT source checkpoint is still invalid: "
+                f"{candidate} ({reason})"
+            )
         return path
+    except RuntimeError:
+        raise
     except Exception:
         return model_path
 
@@ -1954,42 +2118,7 @@ def _engine_cache_dir() -> str:
 
 def _hash_file(path: str) -> dict[str, object]:
     path = tensorrt_source_checkpoint_path(path)
-    p = pathlib.Path(path)
-    try:
-        stat = p.stat()
-    except Exception:
-        return {
-            "name": p.name,
-            "size": -1,
-            "sha256": "missing",
-        }
-    cache_key = (
-        os.path.normcase(str(p.resolve())),
-        int(stat.st_size),
-        int(stat.st_mtime_ns),
-    )
-    cached = _FILE_FINGERPRINT_CACHE.get(cache_key)
-    if cached is not None:
-        return dict(cached)
-    digest = hashlib.sha256()
-    try:
-        with p.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except Exception:
-        fingerprint = {
-            "name": p.name,
-            "size": int(stat.st_size),
-            "sha256": "unreadable",
-        }
-    else:
-        fingerprint = {
-            "name": p.name,
-            "size": int(stat.st_size),
-            "sha256": digest.hexdigest(),
-        }
-    _FILE_FINGERPRINT_CACHE[cache_key] = dict(fingerprint)
-    return fingerprint
+    return _hash_file_raw(path)
 
 
 def _tensorrt_source_signature() -> str:

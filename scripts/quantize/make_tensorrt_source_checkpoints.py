@@ -17,6 +17,7 @@ from make_portable_int8_checkpoint import (
     convert_checkpoint,
     default_tensorrt_source_path,
 )
+from models.hdrtvnet_torch import tensorrt_source_checkpoint_validation_error
 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -90,6 +91,16 @@ def main() -> int:
         action="store_true",
         help="Print what would be generated without writing files.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate even when the existing TensorRT source is current.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only check whether TensorRT source checkpoints are current.",
+    )
     args = parser.parse_args()
 
     inputs = [p.resolve() for p in args.checkpoints] if args.checkpoints else _default_inputs()
@@ -98,13 +109,23 @@ def main() -> int:
 
     output_dir = args.output_dir.resolve()
     print(f"TensorRT source output: {output_dir}")
+    stale = []
     for input_path in inputs:
         if not input_path.is_file():
             raise FileNotFoundError(input_path)
         output_path = default_tensorrt_source_path(input_path, output_dir)
-        if args.dry_run:
-            print(f"[dry-run] {input_path} -> {output_path}")
+        reason = tensorrt_source_checkpoint_validation_error(output_path, str(input_path))
+        if reason is None and not args.force:
+            print(f"[ok] {output_path.name} is current")
             continue
+        if args.check:
+            stale.append((input_path, output_path, reason or "forced"))
+            print(f"[stale] {output_path.name}: {reason or 'forced'}")
+            continue
+        if args.dry_run:
+            print(f"[dry-run] {input_path} -> {output_path} ({reason or 'forced'})")
+            continue
+        print(f"[generate] {input_path.name} -> {output_path.name} ({reason or 'forced'})")
         convert_checkpoint(
             input_path,
             output_path,
@@ -113,6 +134,11 @@ def main() -> int:
         )
         print("  " + _summarize(output_path))
 
+    if args.check and stale:
+        print(f"TensorRT source check failed: {len(stale)} stale/missing file(s)")
+        return 1
+    if args.check:
+        print("TensorRT source check passed")
     return 0
 
 

@@ -227,12 +227,12 @@ sys.exit(0 if ok else 10)
 }
 
 function Ensure-TensorRTSourceCheckpoints([string]$PythonExe, [string]$RepoRoot) {
-    $converter = Join-Path $RepoRoot "scripts\quantize\make_portable_int8_checkpoint.py"
+    $generator = Join-Path $RepoRoot "scripts\quantize\make_tensorrt_source_checkpoints.py"
     $weightsDir = Join-Path $RepoRoot "src\models\weights"
     $sourceDir = Join-Path $weightsDir "tensorrt_sources"
 
-    if (-not (Test-Path $converter)) {
-        Write-Warning "TensorRT source checkpoint converter not found: $converter"
+    if (-not (Test-Path $generator)) {
+        Write-Warning "TensorRT source checkpoint generator not found: $generator"
         return
     }
     if (-not (Test-Path $weightsDir)) {
@@ -250,25 +250,12 @@ function Ensure-TensorRTSourceCheckpoints([string]$PythonExe, [string]$RepoRoot)
         return
     }
 
-    $missing = @()
-    foreach ($checkpoint in $checkpoints) {
-        $target = Join-Path $sourceDir (Split-Path $checkpoint -Leaf)
-        if (-not (Test-Path $target)) {
-            $missing += $target
-        }
-    }
-
-    if ($missing.Count -eq 0) {
-        Write-Host "[setup-nvidia] TensorRT source checkpoints already present."
-        return
-    }
-
-    Write-Step "Generating TensorRT source checkpoints..."
+    Write-Step "Checking TensorRT source checkpoints..."
     Write-Host "[setup-nvidia] Source folder: $sourceDir"
-    Write-Host "[setup-nvidia] These files are generated locally and ignored by git."
-    & $PythonExe $converter @checkpoints --activation-quant symmetric
+    Write-Host "[setup-nvidia] Stale or missing files will be regenerated locally."
+    & $PythonExe $generator @checkpoints --activation-quant source
     if ($LASTEXITCODE -ne 0) {
-        throw "TensorRT source checkpoint generation failed with exit code $LASTEXITCODE"
+        throw "TensorRT source checkpoint check/generation failed with exit code $LASTEXITCODE"
     }
 }
 

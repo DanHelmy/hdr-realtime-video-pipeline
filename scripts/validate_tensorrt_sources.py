@@ -34,6 +34,7 @@ from models.hdrtvnet_torch import (  # noqa: E402
     HDRTVNetTorch,
     _export_tensorrt_onnx_from_model,
     _resolve_tensorrt_qdq_fusion,
+    tensorrt_source_checkpoint_validation_error,
 )
 
 
@@ -315,8 +316,13 @@ def _validate_one(
     use_hg = bool(original_ckpt.get("architecture", {}).get("use_hg", True))
     precision = _precision_from_name(checkpoint)
 
+    source_validation_error = tensorrt_source_checkpoint_validation_error(
+        str(source),
+        str(checkpoint),
+    )
     metadata_ok = (
-        source_ckpt.get("target_backend") == "tensorrt"
+        source_validation_error is None
+        and source_ckpt.get("target_backend") == "tensorrt"
         and source_ckpt.get("tensorrt_source_checkpoint") is True
         and source_ckpt.get("checkpoint_format") == "portable_fake_quant_v1"
         and source_ckpt.get("state_format") == "native_fp32"
@@ -359,6 +365,7 @@ def _validate_one(
         "precision": precision,
         "use_hg": bool(use_hg),
         "metadata_ok": bool(metadata_ok),
+        "metadata_error": source_validation_error or "",
         "activation_quant": source_ckpt.get("activation_quant"),
         "source_activation_quant": source_ckpt.get("source_activation_quant"),
         **counts,
