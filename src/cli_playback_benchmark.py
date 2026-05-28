@@ -217,6 +217,40 @@ def _fmt_stats(label: str, stats: dict | None, suffix: str = "") -> str:
     )
 
 
+def _tensorrt_device_memory_mb(processor) -> float | None:
+    if not isinstance(processor, HDRTVNetTensorRT):
+        return None
+
+    def _read_size(obj) -> float | None:
+        if obj is None:
+            return None
+        for attr in ("device_memory_size", "device_memory_size_v2"):
+            if not hasattr(obj, attr):
+                continue
+            try:
+                value = getattr(obj, attr)
+                size = value() if callable(value) else value
+            except Exception:
+                continue
+            if isinstance(size, (int, float)) and size > 0:
+                return float(size)
+        if hasattr(obj, "get_device_memory_size"):
+            try:
+                size = obj.get_device_memory_size()
+            except Exception:
+                return None
+            if isinstance(size, (int, float)) and size > 0:
+                return float(size)
+        return None
+
+    size_bytes = _read_size(getattr(processor, "_trt_context", None))
+    if size_bytes is None:
+        size_bytes = _read_size(getattr(processor, "_trt_engine", None))
+    if size_bytes is None:
+        return None
+    return size_bytes / (1024.0 * 1024.0)
+
+
 def _resize_frame(frame, width: int, height: int):
     if frame.shape[1] == int(width) and frame.shape[0] == int(height):
         return frame
@@ -465,6 +499,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
     process = psutil.Process(os.getpid())
     use_cuda = torch.cuda.is_available() and str(args.device).lower() != "cpu"
     model_size_mb = _runtime_artifact_size_mb(processor, run)
+    trt_device_mb = _tensorrt_device_memory_mb(processor)
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     started_t = time.perf_counter()
 
@@ -532,10 +567,13 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                     one_percent_low = 0.0
                 gpu_mb = 0.0
                 if use_cuda:
-                    try:
-                        gpu_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-                    except Exception:
-                        gpu_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                    if trt_device_mb is not None:
+                        gpu_mb = trt_device_mb
+                    else:
+                        try:
+                            gpu_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+                        except Exception:
+                            gpu_mb = torch.cuda.memory_allocated() / (1024 * 1024)
                 sample = {
                     "elapsed_s": round(max(0.0, time.perf_counter() - started_t), 3),
                     "logged_at_local": datetime.now().astimezone().isoformat(timespec="seconds"),
