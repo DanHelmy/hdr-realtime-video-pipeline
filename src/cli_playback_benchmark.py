@@ -67,8 +67,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_ptq_predeq",
         "trt_predequantize": "off",
-        "trt_qdq_fusion": "auto",
-        "trt_label": "int8_mixed_ptq_trt_qdq",
+        "trt_qdq_fusion": "native",
+        "trt_label": "int8_mixed_ptq_trt_native",
         "gui_key": "INT8 Mixed (PTQ)",
     },
     "int8-full-ptq": {
@@ -78,8 +78,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_ptq_predeq",
         "trt_predequantize": "off",
-        "trt_qdq_fusion": "auto",
-        "trt_label": "int8_full_ptq_trt_qdq",
+        "trt_qdq_fusion": "native",
+        "trt_label": "int8_full_ptq_trt_native",
         "gui_key": "INT8 Full (PTQ)",
     },
     "int8-mixed-qat": {
@@ -89,8 +89,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_qat_predeq",
         "trt_predequantize": "off",
-        "trt_qdq_fusion": "auto",
-        "trt_label": "int8_mixed_qat_trt_qdq",
+        "trt_qdq_fusion": "native",
+        "trt_label": "int8_mixed_qat_trt_native",
         "gui_key": "INT8 Mixed (QAT)",
     },
     "int8-full-qat": {
@@ -100,8 +100,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
         "trt_predequantize": "off",
-        "trt_qdq_fusion": "auto",
-        "trt_label": "int8_full_qat_trt_qdq",
+        "trt_qdq_fusion": "native",
+        "trt_label": "int8_full_qat_trt_native",
         "gui_key": "INT8 Full (QAT)",
     },
     "int8-mixed-qat-film": {
@@ -111,8 +111,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_mixed_qat_film_predeq",
         "trt_predequantize": "off",
-        "trt_qdq_fusion": "auto",
-        "trt_label": "int8_mixed_qat_film_trt_qdq",
+        "trt_qdq_fusion": "native",
+        "trt_label": "int8_mixed_qat_film_trt_native",
         "gui_key": "INT8 Mixed (QAT) (Film)",
     },
     "int8-full-qat-film": {
@@ -122,8 +122,8 @@ _RUN_PRESETS = {
         "predequantize": "on",
         "label": "int8_full_qat_film_predeq",
         "trt_predequantize": "off",
-        "trt_qdq_fusion": "auto",
-        "trt_label": "int8_full_qat_film_trt_qdq",
+        "trt_qdq_fusion": "native",
+        "trt_label": "int8_full_qat_film_trt_native",
         "gui_key": "INT8 Full (QAT) (Film)",
     },
 }
@@ -183,7 +183,7 @@ def _parse_resolution(text: str) -> tuple[int, int]:
 def _slug(text: str) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip())
     value = value.strip("._-")
-    return (value or "session")[:80]
+    return (value or "session")[:32]
 
 
 def _stats(samples: list[dict], key: str) -> dict | None:
@@ -286,6 +286,9 @@ def _make_processor(args, run: dict, width: int, height: int):
             use_hg=bool(args.use_hg),
             predequantize=predeq,
             qdq_fusion=args.trt_qdq_fusion,
+            calibration_dataset=args.trt_calibration_dataset,
+            calibration_video=args.video,
+            calibration_frames=args.trt_calibration_frames,
         )
     return HDRTVNetTorch(
         run["model"],
@@ -311,6 +314,7 @@ def _write_runtime_csv(path: pathlib.Path, samples: list[dict]) -> None:
                 seen.add(key)
                 extras.append(key)
     fields = _CSV_FIELDS + sorted(extras)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -673,9 +677,26 @@ def parse_args():
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument(
         "--trt-qdq-fusion",
-        default="auto",
-        choices=["auto", "none", "add", "add-mul", "elementwise"],
-        help="TensorRT INT8 Q/DQ fusion mode. Default: auto.",
+        default="native",
+        choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
+        help=(
+            "TensorRT INT8 mode. 'native' uses plain ONNX layers plus TensorRT "
+            "PTQ calibration; other values use explicit Q/DQ. Default: native."
+        ),
+    )
+    parser.add_argument(
+        "--trt-calibration-dataset",
+        default=None,
+        help=(
+            "Directory/image/manifest of SDR input frames for TensorRT native "
+            "INT8 calibration. Defaults to the benchmark video."
+        ),
+    )
+    parser.add_argument(
+        "--trt-calibration-frames",
+        type=int,
+        default=64,
+        help="Frame count for TensorRT native INT8 calibration. Default: 64.",
     )
     parser.add_argument(
         "--out-root",
@@ -712,7 +733,7 @@ def main() -> int:
                 )
                 preset["qdq_fusion"] = str(args.trt_qdq_fusion)
                 preset["label"] = str(preset.get("trt_label", preset.get("label", run_key)))
-                if str(args.trt_qdq_fusion) != "auto":
+                if str(args.trt_qdq_fusion) not in {"auto", "native"}:
                     fusion_label = str(args.trt_qdq_fusion).replace("-", "")
                     preset["label"] = f"{preset['label']}_{fusion_label}"
             if not os.path.isfile(preset["model"]):

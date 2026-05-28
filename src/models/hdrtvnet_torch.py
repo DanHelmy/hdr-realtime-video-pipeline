@@ -743,6 +743,7 @@ def _tensorrt_fp_export_policy_suffix() -> str:
 def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
     """Replace W8/W8A8 runtime wrappers with TensorRT-friendly Q/DQ modules."""
     converted_w8a8 = 0
+    converted_w8a16 = 0
     converted_w8_fp = 0
     forced_w8a8_fp = 0
     fp_prefixes = _tensorrt_int8_fp_export_prefixes()
@@ -764,20 +765,27 @@ def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
         elif quantize_activation and isinstance(module, W8A8Linear):
             replacement = TRTQDQLinear(module, quantize_activation)
             converted_w8a8 += 1
-        elif isinstance(module, (W8Conv2d, W8A8Conv2d)):
+        elif force_fp_export and isinstance(module, (W8Conv2d, W8A8Conv2d)):
             replacement = TRTFloatConv2d(module)
             converted_w8_fp += 1
-            forced_w8a8_fp += int(force_fp_export)
-        else:
+            forced_w8a8_fp += int(isinstance(module, W8A8Conv2d))
+        elif force_fp_export:
             replacement = TRTFloatLinear(module)
             converted_w8_fp += 1
-            forced_w8a8_fp += int(force_fp_export)
+            forced_w8a8_fp += int(isinstance(module, W8A8Linear))
+        elif isinstance(module, (W8Conv2d, W8A8Conv2d)):
+            replacement = TRTQDQConv2d(module, quantize_activation=False)
+            converted_w8a16 += 1
+        else:
+            replacement = TRTQDQLinear(module, quantize_activation=False)
+            converted_w8a16 += 1
         setattr(parent, parts[-1], replacement)
-    if converted_w8a8 or converted_w8_fp:
+    if converted_w8a8 or converted_w8a16 or converted_w8_fp:
         print(
             "TensorRT Q/DQ export: "
             f"{converted_w8a8} W8A8 layers, "
-            f"{converted_w8_fp} W8A16 layers exported as FP"
+            f"{converted_w8a16} W8A16 layers exported as weight Q/DQ, "
+            f"{converted_w8_fp} layer(s) exported as FP"
         )
         if fp_prefixes:
             print(
@@ -785,6 +793,33 @@ def _convert_model_to_tensorrt_qdq(model: nn.Module) -> nn.Module:
                 f"FP prefixes={list(fp_prefixes)}, "
                 f"forced W8A8 FP layers={forced_w8a8_fp}"
             )
+    return model
+
+
+def _convert_model_to_tensorrt_native_layers(model: nn.Module) -> nn.Module:
+    """Replace W8/W8A8 wrappers with plain layers for TensorRT native INT8 PTQ."""
+    converted_conv = 0
+    converted_linear = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, (W8Conv2d, W8A8Conv2d, W8Linear, W8A8Linear)):
+            continue
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        if isinstance(module, (W8Conv2d, W8A8Conv2d)):
+            replacement = TRTFloatConv2d(module)
+            converted_conv += 1
+        else:
+            replacement = TRTFloatLinear(module)
+            converted_linear += 1
+        setattr(parent, parts[-1], replacement)
+    if converted_conv or converted_linear:
+        print(
+            "TensorRT native INT8 export: "
+            f"{converted_conv} Conv and {converted_linear} Linear W8 layer(s) "
+            "exported as plain ONNX layers for TensorRT calibration"
+        )
     return model
 
 
@@ -2210,6 +2245,18 @@ def _cuda_device_fingerprint() -> dict[str, object]:
 
 def _normalize_tensorrt_qdq_fusion(qdq_fusion: str) -> str:
     fusion = str(qdq_fusion or "auto").strip().lower()
+    if fusion in {
+        "native",
+        "native-int8",
+        "native_int8",
+        "implicit",
+        "implicit-int8",
+        "implicit_int8",
+        "calibrated",
+        "calibration",
+        "ptq",
+    }:
+        return "native"
     if fusion in {"auto", "default", "smart"}:
         return "auto"
     if fusion in {"add", "residual-add", "add-inputs"}:
@@ -2228,6 +2275,8 @@ def _normalize_tensorrt_qdq_fusion(qdq_fusion: str) -> str:
 
 def _resolve_tensorrt_qdq_fusion(precision: str, qdq_fusion: str) -> str:
     fusion = _normalize_tensorrt_qdq_fusion(qdq_fusion)
+    if fusion == "native":
+        return "native"
     if fusion != "auto":
         return fusion
     # Full INT8 already has Q/DQ around almost every compute op. Forcing extra
@@ -2260,6 +2309,7 @@ def _tensorrt_expected_engine_metadata(
     model_path = tensorrt_source_checkpoint_path(model_path)
     hg_path = hg_weights or _DEFAULT_HG_WEIGHTS
     aux_streams = _tensorrt_aux_stream_count()
+    resolved_qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
     return {
         "schema": _TENSORRT_ENGINE_METADATA_SCHEMA,
         "source_signature": _tensorrt_source_signature(),
@@ -2277,10 +2327,13 @@ def _tensorrt_expected_engine_metadata(
             "engine_mode_name": str(engine_mode_name),
             "use_hg": bool(use_hg),
             "predequantize_int8": bool(predequantize_int8),
-            "qdq_fusion": _resolve_tensorrt_qdq_fusion(precision, qdq_fusion),
+            "qdq_fusion": resolved_qdq_fusion,
             "fp_export_prefixes": (
                 list(_tensorrt_int8_fp_export_prefixes())
-                if str(precision).startswith("int8") else []
+                if (
+                    str(precision).startswith("int8")
+                    and resolved_qdq_fusion != "native"
+                ) else []
             ),
         },
         "runtime": {
@@ -2515,11 +2568,15 @@ def tensorrt_mode_name(
             if "predeq" not in lower:
                 mode_name = f"{mode_name}_predeqv1"
             return mode_name
+        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+        if fusion == "native":
+            if "nativeint8" not in lower and "implicitint8" not in lower:
+                mode_name = f"{mode_name}_nativeint8v1"
+            return mode_name
         if "qdq" in lower:
             return mode_name
         qdq_version = "qdqv7"
         mode_name = f"{mode_name}_{qdq_version}"
-        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
         if fusion == "add" and "addqdq" not in lower:
             mode_name = f"{mode_name}_addqdqv1"
         elif fusion == "add-mul" and "addmulqdq" not in lower:
@@ -3096,8 +3153,14 @@ def _export_tensorrt_onnx_from_model(
             print(f"TensorRT stale ONNX removal skipped: {exc}")
 
     export_model = getattr(model, "_orig_mod", model).eval()
-    if str(precision).startswith("int8"):
-        export_model = _convert_model_to_tensorrt_qdq(export_model).eval()
+    int8_export = str(precision).startswith("int8")
+    fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    native_int8_export = int8_export and fusion == "native"
+    if int8_export:
+        if native_int8_export:
+            export_model = _convert_model_to_tensorrt_native_layers(export_model).eval()
+        else:
+            export_model = _convert_model_to_tensorrt_qdq(export_model).eval()
     _patch_adaptive_avgpool_for_trt(export_model)
     wrapper = _ONNXExportWrapper(export_model, flat_model=flat_model).eval()
     h, w = int(height), int(width)
@@ -3121,12 +3184,13 @@ def _export_tensorrt_onnx_from_model(
             verbose=False,
             input_names=["input", "cond"],
             output_names=["output"],
-            opset_version=19 if str(precision).startswith("int8") else 18,
+            opset_version=19 if (int8_export and not native_int8_export) else 18,
             do_constant_folding=True,
         )
-    if str(precision).startswith("int8"):
+    if int8_export and native_int8_export:
+        print("TensorRT native INT8 export: Q/DQ graph patches skipped")
+    elif int8_export:
         _patch_tensorrt_qdq_casts(onnx_path)
-        fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
         if fusion == "add":
             _patch_tensorrt_add_input_qdq(onnx_path)
         elif fusion == "add-mul":
@@ -3142,14 +3206,300 @@ def _export_tensorrt_onnx_from_model(
     return onnx_path
 
 
+def _resolve_tensorrt_calibration_frames(value=None) -> int:
+    if value is None:
+        value = os.environ.get("HDRTVNET_TRT_CALIBRATION_FRAMES", "64")
+    try:
+        frames = int(value)
+    except Exception:
+        frames = 64
+    return min(512, max(1, frames))
+
+
+def _tensorrt_calibration_cache_path(engine_path: str, override: str | None = None) -> str:
+    path = str(override or "").strip()
+    if path:
+        return os.path.abspath(os.path.expanduser(path))
+    return os.path.splitext(str(engine_path))[0] + ".calib"
+
+
+def _tensorrt_calibration_cond(tensor: torch.Tensor) -> torch.Tensor:
+    try:
+        cond = F.interpolate(
+            tensor,
+            scale_factor=0.25,
+            mode="bicubic",
+            align_corners=False,
+            recompute_scale_factor=False,
+            antialias=True,
+        )
+    except TypeError:
+        cond = F.interpolate(
+            tensor,
+            scale_factor=0.25,
+            mode="bicubic",
+            align_corners=False,
+            recompute_scale_factor=False,
+        )
+    return cond.contiguous()
+
+
+def _tensorrt_frame_to_calibration_batch(
+    frame_bgr,
+    *,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    import cv2
+
+    if frame_bgr.shape[1] != int(width) or frame_bgr.shape[0] != int(height):
+        frame_bgr = cv2.resize(
+            frame_bgr,
+            (int(width), int(height)),
+            interpolation=cv2.INTER_AREA,
+        )
+    frame_bgr = np.ascontiguousarray(frame_bgr)
+    raw = torch.from_numpy(frame_bgr).to(device=device)
+    tensor = (
+        raw.flip(2)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(dtype=dtype)
+        .mul(1.0 / 255.0)
+        .contiguous()
+    )
+    return {
+        "input": tensor,
+        "cond": _tensorrt_calibration_cond(tensor),
+    }
+
+
+def _tensorrt_calibration_image_paths(dataset_path: str) -> list[pathlib.Path]:
+    root = pathlib.Path(str(dataset_path)).expanduser()
+    if root.is_file() and root.suffix.lower() in {".txt", ".lst", ".csv"}:
+        base_dir = root.parent
+        paths = []
+        for raw_line in root.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip().strip('"')
+            if not line or line.startswith("#"):
+                continue
+            candidate = pathlib.Path(line).expanduser()
+            if not candidate.is_absolute():
+                candidate = base_dir / candidate
+            if candidate.is_file():
+                paths.append(candidate)
+        return paths
+    if root.is_file():
+        return [root]
+    if not root.is_dir():
+        raise FileNotFoundError(f"TensorRT calibration dataset not found: {dataset_path}")
+    suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in suffixes)
+
+
+def _load_tensorrt_dataset_calibration_batches(
+    *,
+    dataset_path: str,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    frame_count: int,
+) -> list[dict[str, torch.Tensor]]:
+    import cv2
+
+    paths = _tensorrt_calibration_image_paths(dataset_path)
+    if not paths:
+        raise RuntimeError(f"No calibration images found under: {dataset_path}")
+    count = min(len(paths), _resolve_tensorrt_calibration_frames(frame_count))
+    if len(paths) > count:
+        indices = np.linspace(0, len(paths) - 1, count, dtype=np.int64)
+        selected = [paths[int(i)] for i in indices]
+    else:
+        selected = paths
+
+    batches: list[dict[str, torch.Tensor]] = []
+    with torch.inference_mode():
+        for path in selected:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            batches.append(
+                _tensorrt_frame_to_calibration_batch(
+                    frame,
+                    width=width,
+                    height=height,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+    if not batches:
+        raise RuntimeError(f"No readable calibration images found under: {dataset_path}")
+    print(
+        "TensorRT native INT8 calibration: "
+        f"loaded {len(batches)} image(s) from {dataset_path}"
+    )
+    return batches
+
+
+def _load_tensorrt_video_calibration_batches(
+    *,
+    video_path: str,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    frame_count: int,
+) -> list[dict[str, torch.Tensor]]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open TensorRT calibration video: {video_path}")
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        count = _resolve_tensorrt_calibration_frames(frame_count)
+        if total > 1:
+            positions = np.linspace(0, max(0, total - 1), count, dtype=np.int64)
+            positions = [int(v) for v in positions]
+        else:
+            positions = list(range(count))
+
+        batches: list[dict[str, torch.Tensor]] = []
+        with torch.inference_mode():
+            for pos in positions:
+                if total > 1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                batches.append(
+                    _tensorrt_frame_to_calibration_batch(
+                        frame,
+                        width=width,
+                        height=height,
+                        dtype=dtype,
+                        device=device,
+                    )
+                )
+        if not batches:
+            raise RuntimeError(f"No calibration frames decoded from: {video_path}")
+        print(
+            "TensorRT native INT8 calibration: "
+            f"loaded {len(batches)} frame(s) from {video_path}"
+        )
+        return batches
+    finally:
+        cap.release()
+
+
+def _synthetic_tensorrt_calibration_batches(
+    *,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    frame_count: int,
+) -> list[dict[str, torch.Tensor]]:
+    count = _resolve_tensorrt_calibration_frames(frame_count)
+    batches: list[dict[str, torch.Tensor]] = []
+    h, w = int(height), int(width)
+    with torch.inference_mode():
+        ramp_x = torch.linspace(0.0, 1.0, w, dtype=dtype, device=device)
+        ramp_x = ramp_x.view(1, 1, 1, w).expand(1, 3, h, w)
+        ramp_y = torch.linspace(0.0, 1.0, h, dtype=dtype, device=device)
+        ramp_y = ramp_y.view(1, 1, h, 1).expand(1, 3, h, w)
+        for idx in range(count):
+            mix = float(idx % 8) / 7.0 if count > 1 else 0.5
+            tensor = (ramp_x * mix + ramp_y * (1.0 - mix)).contiguous()
+            batches.append(
+                {
+                    "input": tensor,
+                    "cond": _tensorrt_calibration_cond(tensor),
+                }
+            )
+    print(
+        "TensorRT native INT8 calibration: "
+        f"using {len(batches)} synthetic frame(s)"
+    )
+    return batches
+
+
+def _make_tensorrt_int8_calibrator(
+    trt,
+    *,
+    cache_path: str,
+    batches: list[dict[str, torch.Tensor]],
+):
+    base_cls = getattr(trt, "IInt8EntropyCalibrator2", None)
+    if base_cls is None:
+        base_cls = getattr(trt, "IInt8MinMaxCalibrator", None)
+    if base_cls is None:
+        raise RuntimeError("TensorRT INT8 calibrator API is unavailable.")
+
+    class _Calibrator(base_cls):
+        def __init__(self, calibration_cache: str, calibration_batches):
+            base_cls.__init__(self)
+            self._cache_path = calibration_cache
+            self._batches = list(calibration_batches)
+            self._index = 0
+
+        def get_batch_size(self):
+            return 1
+
+        def get_batch(self, names):
+            if self._index >= len(self._batches):
+                return None
+            batch = self._batches[self._index]
+            self._index += 1
+            ordered = []
+            fallback = ("input", "cond")
+            for idx, name in enumerate(names):
+                key = str(name)
+                tensor = batch.get(key)
+                if tensor is None and idx < len(fallback):
+                    tensor = batch.get(fallback[idx])
+                if tensor is None:
+                    raise RuntimeError(
+                        f"TensorRT calibration input not found: {key}"
+                    )
+                ordered.append(int(tensor.data_ptr()))
+            return ordered
+
+        def read_calibration_cache(self):
+            try:
+                if self._cache_path and os.path.isfile(self._cache_path):
+                    print(
+                        "TensorRT native INT8 calibration cache loaded: "
+                        f"{self._cache_path}"
+                    )
+                    return pathlib.Path(self._cache_path).read_bytes()
+            except Exception as exc:
+                print(f"TensorRT calibration cache read skipped: {exc}")
+            return None
+
+        def write_calibration_cache(self, cache):
+            if not self._cache_path:
+                return
+            try:
+                path = pathlib.Path(self._cache_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(bytes(cache))
+                print(f"TensorRT native INT8 calibration cache saved: {path}")
+            except Exception as exc:
+                print(f"TensorRT calibration cache write skipped: {exc}")
+
+    return _Calibrator(cache_path, batches)
+
+
 class HDRTVNetTensorRT(HDRTVNetTorch):
     """TensorRT runtime with PyTorch preprocessing/postprocessing parity.
 
     Engines are built lazily for the selected model/resolution/mode and then
-    reused from disk. INT8 checkpoints are loaded from the existing quantized
-    files, then their W8/W8A8 wrappers are converted to ONNX Q/DQ export
-    modules so TensorRT receives an explicit-quantization graph. No TensorRT
-    runtime calibration is performed.
+    reused from disk. INT8 checkpoints can be exported either as native ONNX
+    layers with TensorRT PTQ calibration or as explicit Q/DQ graphs.
     """
 
     def __init__(
@@ -3163,8 +3513,12 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         hg_weights=None,
         use_hg=True,
         predequantize=False,
-        qdq_fusion: str = "auto",
+        qdq_fusion: str = "native",
         keep_onnx: bool = False,
+        calibration_dataset: str | None = None,
+        calibration_video: str | None = None,
+        calibration_frames: int | None = None,
+        calibration_cache: str | None = None,
     ):
         if not _IS_NVIDIA:
             raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
@@ -3202,6 +3556,22 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         self._trt_runtime = None
         self._trt_engine = None
         self._trt_keep_onnx = bool(keep_onnx)
+        self._trt_calibration_dataset = (
+            calibration_dataset
+            or os.environ.get("HDRTVNET_TRT_CALIBRATION_DATASET")
+            or os.environ.get("HDRTVNET_TRT_CALIBRATION_DIR")
+        )
+        self._trt_calibration_video = (
+            calibration_video
+            or os.environ.get("HDRTVNET_TRT_CALIBRATION_VIDEO")
+        )
+        self._trt_calibration_frames = _resolve_tensorrt_calibration_frames(
+            calibration_frames
+        )
+        self._trt_calibration_cache = calibration_cache or os.environ.get(
+            "HDRTVNET_TRT_CALIBRATION_CACHE"
+        )
+        self._trt_int8_calibrator = None
         self._trt_context = None
         self._trt_input_names = []
         self._trt_output_names = []
@@ -3386,10 +3756,64 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         builder_precision = str(
             getattr(self, "_trt_builder_precision", self.precision)
         )
+        native_int8 = (
+            builder_precision.startswith("int8")
+            and self._trt_qdq_fusion == "native"
+        )
         if builder_precision != "fp32" and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
         if str(builder_precision).startswith("int8") and builder.platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
+            if native_int8:
+                cache_path = _tensorrt_calibration_cache_path(
+                    self.engine_path,
+                    self._trt_calibration_cache,
+                )
+                if self._trt_calibration_dataset:
+                    batches = _load_tensorrt_dataset_calibration_batches(
+                        dataset_path=self._trt_calibration_dataset,
+                        width=self._engine_width,
+                        height=self._engine_height,
+                        dtype=self._dtype,
+                        device=self.device,
+                        frame_count=self._trt_calibration_frames,
+                    )
+                elif self._trt_calibration_video and os.path.isfile(
+                    self._trt_calibration_video
+                ):
+                    batches = _load_tensorrt_video_calibration_batches(
+                        video_path=self._trt_calibration_video,
+                        width=self._engine_width,
+                        height=self._engine_height,
+                        dtype=self._dtype,
+                        device=self.device,
+                        frame_count=self._trt_calibration_frames,
+                    )
+                elif os.path.isfile(cache_path):
+                    batches = []
+                else:
+                    if self._trt_calibration_video:
+                        print(
+                            "TensorRT calibration video missing; "
+                            f"falling back to synthetic data: {self._trt_calibration_video}"
+                        )
+                    batches = _synthetic_tensorrt_calibration_batches(
+                        width=self._engine_width,
+                        height=self._engine_height,
+                        dtype=self._dtype,
+                        device=self.device,
+                        frame_count=self._trt_calibration_frames,
+                    )
+                self._trt_int8_calibrator = _make_tensorrt_int8_calibrator(
+                    trt,
+                    cache_path=cache_path,
+                    batches=batches,
+                )
+                config.int8_calibrator = self._trt_int8_calibrator
+                print(
+                    "TensorRT native INT8 calibration cache: "
+                    f"{cache_path}"
+                )
 
         timing_cache_path, timing_cache = self._attach_tensorrt_timing_cache(config)
 

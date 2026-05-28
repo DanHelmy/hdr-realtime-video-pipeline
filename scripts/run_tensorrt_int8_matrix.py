@@ -1,8 +1,8 @@
 """Run the TensorRT INT8 readiness matrix on a NVIDIA machine.
 
-This script intentionally builds explicit Q/DQ INT8 engines with
-predequantization off. It also validates/checks ONNX and TensorRT artifacts so
-speedups cannot hide broken quality or FP16 predequantized engines.
+This script builds TensorRT INT8 engines with predequantization off. The
+default INT8 path is native TensorRT PTQ calibration, so ONNX artifacts do not
+contain explicit Q/DQ nodes.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE.pth",
         "model_nohg": "Ensemble_AGCM_LE.pth",
         "cli_run": "fp16",
+        "gui_key": "FP16",
     },
     "int8-mixed-ptq": {
         "builder_precision": "int8-mixed-ptq",
@@ -45,6 +46,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE_int8_mixed.pt",
         "model_nohg": "Ensemble_AGCM_LE_int8_mixed_nohg.pt",
         "cli_run": "int8-mixed-ptq",
+        "gui_key": "INT8 Mixed (PTQ)",
     },
     "int8-mixed-qat": {
         "builder_precision": "int8-mixed-qat",
@@ -52,6 +54,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE_int8_mixed_qat.pt",
         "model_nohg": "Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt",
         "cli_run": "int8-mixed-qat",
+        "gui_key": "INT8 Mixed (QAT)",
     },
     "int8-mixed-qat-film": {
         "builder_precision": "int8-mixed-qat-film",
@@ -59,6 +62,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE_int8_mixed_qat_film.pt",
         "model_nohg": "Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt",
         "cli_run": "int8-mixed-qat-film",
+        "gui_key": "INT8 Mixed (QAT) (Film)",
     },
     "int8-full-ptq": {
         "builder_precision": "int8-full-ptq",
@@ -66,6 +70,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE_int8_full.pt",
         "model_nohg": "Ensemble_AGCM_LE_int8_full_nohg.pt",
         "cli_run": "int8-full-ptq",
+        "gui_key": "INT8 Full (PTQ)",
     },
     "int8-full-qat": {
         "builder_precision": "int8-full-qat",
@@ -73,6 +78,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE_int8_full_qat.pt",
         "model_nohg": "Ensemble_AGCM_LE_int8_full_qat_nohg.pt",
         "cli_run": "int8-full-qat",
+        "gui_key": "INT8 Full (QAT)",
     },
     "int8-full-qat-film": {
         "builder_precision": "int8-full-qat-film",
@@ -80,6 +86,7 @@ _VARIANTS = {
         "model": "Ensemble_AGCM_LE_int8_full_qat_film.pt",
         "model_nohg": "Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt",
         "cli_run": "int8-full-qat-film",
+        "gui_key": "INT8 Full (QAT) (Film)",
     },
 }
 
@@ -128,9 +135,7 @@ def _paths_for(variant: str, use_hg: bool, resolution: tuple[int, int], qdq_fusi
     cfg = _VARIANTS[variant]
     model_path = _model_path(variant, use_hg)
     runtime_precision = str(cfg["runtime_precision"])
-    base_mode = f"{variant}_{'hg' if use_hg else 'nohg'}"
-    if variant == "fp16":
-        base_mode = f"fp16_{'hg' if use_hg else 'nohg'}"
+    base_mode = f"{cfg['gui_key']}_{'hg' if use_hg else 'nohg'}"
     mode = tensorrt_mode_name(
         runtime_precision,
         base_mode,
@@ -158,22 +163,42 @@ def main() -> int:
         nargs="+",
         default=[
             "fp16",
-            "int8-mixed-qat",
-            "int8-mixed-qat-film",
-            "int8-full-qat",
-            "int8-full-qat-film",
+            "int8-mixed-ptq",
+            "int8-full-ptq",
         ],
         choices=tuple(_VARIANTS.keys()),
     )
     parser.add_argument("--use-hg", nargs="+", default=["0"], choices=["0", "1"])
     parser.add_argument("--video", default=None, help="Optional video for CLI playback benchmark.")
+    parser.add_argument(
+        "--calibration-dataset",
+        default=None,
+        help=(
+            "Directory/image/manifest of SDR input frames for TensorRT native "
+            "INT8 calibration. Takes priority over --video for engine builds."
+        ),
+    )
     parser.add_argument("--duration-s", type=float, default=90.0)
     parser.add_argument("--warmup-frames", type=int, default=60)
     parser.add_argument("--benchmark-runs", type=int, default=30, help="Dummy build-script benchmark runs.")
     parser.add_argument("--benchmark-warmup", type=int, default=5)
     parser.add_argument("--opt-level", type=int, default=5, choices=range(0, 6))
     parser.add_argument("--workspace-gb", type=float, default=4.0)
-    parser.add_argument("--qdq-fusion", default="auto")
+    parser.add_argument(
+        "--qdq-fusion",
+        default="native",
+        choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
+        help=(
+            "TensorRT INT8 mode. 'native' uses plain ONNX layers plus TensorRT "
+            "PTQ calibration; other values use explicit Q/DQ. Default: native."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-frames",
+        type=int,
+        default=64,
+        help="Frame count for TensorRT native INT8 calibration. Default: 64.",
+    )
     parser.add_argument("--force", action="store_true", help="Force rebuild engines.")
     parser.add_argument("--skip-source-validation", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
@@ -191,13 +216,17 @@ def main() -> int:
 
     rows: list[dict[str, object]] = []
 
-    if not args.skip_source_validation:
+    if not args.skip_source_validation and str(args.qdq_fusion) == "native":
+        print("[matrix] source Q/DQ validation skipped for native TensorRT INT8")
+    elif not args.skip_source_validation:
         code = _run(
             [
                 sys.executable,
                 "scripts/validate_tensorrt_sources.py",
                 "--resolution",
                 "256x256",
+                "--qdq-fusion",
+                str(args.qdq_fusion),
                 "--output-dir",
                 str(out_dir / "source_validation"),
             ],
@@ -246,6 +275,20 @@ def main() -> int:
                     str(max(0, args.benchmark_warmup)),
                     "--keep-onnx",
                 ]
+                if str(args.qdq_fusion) == "native" and args.calibration_dataset:
+                    cmd += [
+                        "--calibration-dataset",
+                        str(args.calibration_dataset),
+                        "--calibration-frames",
+                        str(max(1, args.calibration_frames)),
+                    ]
+                elif str(args.qdq_fusion) == "native" and args.video:
+                    cmd += [
+                        "--calibration-video",
+                        str(args.video),
+                        "--calibration-frames",
+                        str(max(1, args.calibration_frames)),
+                    ]
                 if args.force:
                     cmd.append("--force")
                     cmd.append("--force-onnx")
@@ -306,9 +349,13 @@ def main() -> int:
                     str(args.warmup_frames),
                     "--trt-qdq-fusion",
                     args.qdq_fusion,
+                    "--trt-calibration-frames",
+                    str(max(1, args.calibration_frames)),
                     "--out-root",
                     str(out_dir / "playback"),
                 ]
+                if args.calibration_dataset:
+                    cmd += ["--trt-calibration-dataset", str(args.calibration_dataset)]
                 _run(
                     cmd,
                     cwd=_ROOT,

@@ -145,20 +145,45 @@ def main() -> int:
         default="off",
         choices=["auto", "on", "off"],
         help=(
-            "INT8 engine export mode. 'off' builds explicit Q/DQ INT8; "
+            "INT8 pre-dequantization mode. Keep 'off' for native/QDQ INT8; "
             "'on' exports the INT8 checkpoint as a native FP16 engine."
         ),
     )
     parser.add_argument(
         "--qdq-fusion",
-        default="auto",
-        choices=["auto", "none", "add", "add-mul", "elementwise"],
+        default="native",
+        choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
         help=(
-            "Experimental explicit-Q/DQ placement for TensorRT INT8. "
-            "Default: auto (mixed INT8 uses add-mul; full INT8 uses none). "
+            "TensorRT INT8 export mode. 'native' exports plain ONNX layers "
+            "and uses TensorRT PTQ calibration. Other values use explicit "
+            "Q/DQ placement. Default: native. "
             "'add' inserts Q/DQ on eligible Add inputs that already feed "
             "calibrated quantized paths; 'add-mul' also patches Mul inputs."
         ),
+    )
+    parser.add_argument(
+        "--calibration-dataset",
+        default=None,
+        help=(
+            "Directory/image/manifest of SDR input frames for TensorRT native "
+            "INT8 calibration. Takes priority over --calibration-video."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-video",
+        default=None,
+        help="Video used for TensorRT native INT8 calibration.",
+    )
+    parser.add_argument(
+        "--calibration-frames",
+        type=int,
+        default=None,
+        help="Number of frames for TensorRT native INT8 calibration. Default: 64.",
+    )
+    parser.add_argument(
+        "--calibration-cache",
+        default=None,
+        help="TensorRT native INT8 calibration cache path.",
     )
     parser.add_argument(
         "--force",
@@ -287,6 +312,10 @@ def main() -> int:
             predequantize=predeq,
             qdq_fusion=args.qdq_fusion,
             keep_onnx=args.keep_onnx,
+            calibration_dataset=args.calibration_dataset,
+            calibration_video=args.calibration_video,
+            calibration_frames=args.calibration_frames,
+            calibration_cache=args.calibration_cache,
         )
         if args.benchmark_runs > 0:
             import time
