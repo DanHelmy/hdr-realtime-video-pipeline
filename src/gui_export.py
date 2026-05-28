@@ -53,6 +53,7 @@ from models.hdrtvnet_torch import (
     tensorrt_engine_path,
     tensorrt_engine_is_valid,
     tensorrt_mode_name,
+    tensorrt_prebuilt_calibration_cache_path,
 )
 from video_source import VideoSource
 
@@ -830,6 +831,18 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     str(cfg.get("precision") or "fp16"),
                     mode_name,
                     predequantize=trt_predeq,
+                    qdq_fusion="native",
+                )
+                trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                    model_path,
+                    int(self._config.width),
+                    int(self._config.height),
+                    str(cfg.get("precision") or "fp16"),
+                    mode_name,
+                    use_hg=self._config.use_hg,
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    require_exists=True,
                 )
                 engine_path = tensorrt_engine_path(
                     model_path,
@@ -846,6 +859,8 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     mode_name=mode_name,
                     use_hg=self._config.use_hg,
                     predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    calibration_cache=trt_calibration_cache,
                 ):
                     self.progress.emit(0, "Loading cached TensorRT engine ...")
                 else:
@@ -866,6 +881,8 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                         mode_name=mode_name,
                         use_hg=self._config.use_hg,
                         predequantize=trt_predeq,
+                        qdq_fusion="native",
+                        calibration_cache=trt_calibration_cache,
                     )
             else:
                 processor = HDRTVNetTorch(

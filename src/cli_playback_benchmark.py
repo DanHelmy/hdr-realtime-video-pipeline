@@ -39,7 +39,12 @@ import torch
 
 from cli_display import CliDisplaySink
 from gui_compile_cache import _mark_compiled
-from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
+from models.hdrtvnet_torch import (
+    HDRTVNetTensorRT,
+    HDRTVNetTorch,
+    _IS_NVIDIA,
+    tensorrt_prebuilt_calibration_cache_path,
+)
 from video_source import VideoSource
 
 
@@ -310,24 +315,42 @@ def _make_processor(args, run: dict, width: int, height: int):
     predeq_text = str(run.get("predequantize", "auto"))
     predeq = {"auto": "auto", "on": True, "off": False}[predeq_text]
     if _IS_NVIDIA and str(args.device).lower() != "cpu":
+        mode_name = f"{run.get('gui_key', run['precision'])}_{'hg' if args.use_hg else 'nohg'}"
+        calibration_cache = args.trt_calibration_cache
+        if (
+            not calibration_cache
+            and not args.trt_calibration_dataset
+            and str(args.trt_qdq_fusion) == "native"
+        ):
+            calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                run["model"],
+                int(width),
+                int(height),
+                run["precision"],
+                mode_name,
+                use_hg=bool(args.use_hg),
+                predequantize=predeq,
+                qdq_fusion=args.trt_qdq_fusion,
+                require_exists=True,
+            )
         return HDRTVNetTensorRT(
             run["model"],
             device=args.device,
             precision=run["precision"],
             engine_width=int(width),
             engine_height=int(height),
-            mode_name=f"{run.get('gui_key', run['precision'])}_{'hg' if args.use_hg else 'nohg'}",
+            mode_name=mode_name,
             use_hg=bool(args.use_hg),
             predequantize=predeq,
             qdq_fusion=args.trt_qdq_fusion,
             calibration_dataset=args.trt_calibration_dataset,
             calibration_video=(
                 None
-                if args.trt_calibration_dataset or args.trt_calibration_cache
+                if args.trt_calibration_dataset or calibration_cache
                 else args.video
             ),
             calibration_frames=args.trt_calibration_frames,
-            calibration_cache=args.trt_calibration_cache,
+            calibration_cache=calibration_cache,
         )
     return HDRTVNetTorch(
         run["model"],
@@ -744,7 +767,10 @@ def parse_args():
         "--trt-calibration-frames",
         type=int,
         default=64,
-        help="Frame count for TensorRT native INT8 calibration. Default: 64.",
+        help=(
+            "Frame/image count for TensorRT native INT8 calibration. "
+            "Default: 64. Use 0 for all dataset/video frames."
+        ),
     )
     parser.add_argument(
         "--out-root",

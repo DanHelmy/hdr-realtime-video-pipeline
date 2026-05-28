@@ -866,6 +866,17 @@ On NVIDIA, the selected compressed INT8 checkpoint remains the logical model, bu
 
 For native INT8 calibration, use SDR/source inputs that match deployment content, not HDR targets. The CLI and matrix tools accept `--trt-calibration-dataset` / `--calibration-dataset` for image directories, single images, or text manifests, plus `--trt-calibration-cache` / `--calibration-cache` for a prebuilt TensorRT cache. If no cache or dataset is provided, CLI playback can calibrate from the current video for first-time local engine builds; release/deployment runs should use the dataset-built cache.
 
+Prebuilt GUI calibration caches live under `src/models/tensorrt_calibration/`. The runtime looks for a `.calib` file whose stem matches the TensorRT engine stem, so every checkpoint/resolution/HG combination can have its own cache. GUI playback, export, benchmark, and preview use these files automatically on NVIDIA; AMD ignores them. To generate the full GUI matrix on an NVIDIA machine:
+
+```powershell
+py scripts/build_tensorrt_calibration_caches.py `
+  --calibration-dataset dataset/train_sdr `
+  --calibration-frames 0 `
+  --force
+```
+
+This builds the 36 INT8 GUI cache files: 6 INT8 presets x 3 GUI resolutions x HG on/off. `--calibration-frames 0` means all available calibration images/frames; use a positive number such as `256` for a faster representative subset. Rebuild or delete cached `.engine` files whenever replacing `.calib` files; engine metadata fingerprints the calibration cache contents so changed caches invalidate stale engines automatically.
+
 ---
 
 ## CLI Mode
@@ -1556,7 +1567,7 @@ python src/main.py --precision int8-mixed --model src/models/weights/Ensemble_AG
 | Engine/cache behavior | On-demand `.engine` build + cached load | `torch.compile` cache when enabled | N/A |
 | torch.compile | Not used | Auto (Windows: needs HIP SDK) | Not supported |
 | FP16 inference | ✅ | ✅ | Fallback to FP32 |
-| INT8 quantization | Existing quantized checkpoints exported through TensorRT; W8A8 uses explicit Q/DQ, Mixed W8A16 exports as FP ops, no runtime calibration | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
+| INT8 quantization | Existing quantized checkpoints exported through TensorRT native INT8 with prebuilt `.calib` support; explicit Q/DQ remains available for experiments | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
 | CUDA graphs | Not used | ✅ | N/A |
 | channels_last | Not used in TensorRT engine runtime | Opt-in on AMD PyTorch | N/A |
 

@@ -12,6 +12,7 @@ from models.hdrtvnet_torch import (
     tensorrt_engine_path,
     tensorrt_engine_is_valid,
     tensorrt_mode_name,
+    tensorrt_prebuilt_calibration_cache_path,
 )
 from gui_config import PRECISIONS, _select_model_path
 from gui_output_capture import capture_output_to_gui
@@ -119,6 +120,18 @@ class PipelineWorkerModelMixin:
                     cfg["precision"],
                     mode_name,
                     predequantize=trt_predeq,
+                    qdq_fusion="native",
+                )
+                trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                    path,
+                    int(cw),
+                    int(ch),
+                    cfg["precision"],
+                    mode_name,
+                    use_hg=self._use_hg,
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    require_exists=True,
                 )
                 trt_engine = tensorrt_engine_path(
                     path,
@@ -136,6 +149,8 @@ class PipelineWorkerModelMixin:
                         mode_name=mode_name,
                         use_hg=self._use_hg,
                         predequantize=trt_predeq,
+                        qdq_fusion="native",
+                        calibration_cache=trt_calibration_cache,
                     ):
                         self.status_message.emit(
                             f"Loading cached TensorRT engine for {cw}x{ch} ({key}) ..."
@@ -154,6 +169,8 @@ class PipelineWorkerModelMixin:
                         mode_name=mode_name,
                         use_hg=self._use_hg,
                         predequantize=trt_predeq,
+                        qdq_fusion="native",
+                        calibration_cache=trt_calibration_cache,
                     )
             else:
                 resolved_compile_mode = (

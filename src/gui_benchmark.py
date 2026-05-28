@@ -110,6 +110,7 @@ from models.hdrtvnet_torch import (
     tensorrt_engine_path,
     tensorrt_engine_is_valid,
     tensorrt_mode_name,
+    tensorrt_prebuilt_calibration_cache_path,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr"}
@@ -1539,6 +1540,18 @@ class _BenchmarkWorker(QObject):
                     model_precision,
                     mode_name,
                     predequantize=trt_predeq,
+                    qdq_fusion="native",
+                )
+                trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                    model_path,
+                    out_w,
+                    out_h,
+                    model_precision,
+                    mode_name,
+                    use_hg=bool(cfg.use_hg),
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    require_exists=True,
                 )
                 engine_path = tensorrt_engine_path(
                     model_path,
@@ -1555,6 +1568,8 @@ class _BenchmarkWorker(QObject):
                     mode_name=mode_name,
                     use_hg=bool(cfg.use_hg),
                     predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    calibration_cache=trt_calibration_cache,
                 ):
                     self.progress.emit(0, "Loading cached TensorRT engine ...")
                 else:
@@ -1575,6 +1590,8 @@ class _BenchmarkWorker(QObject):
                         mode_name=mode_name,
                         use_hg=bool(cfg.use_hg),
                         predequantize=trt_predeq,
+                        qdq_fusion="native",
+                        calibration_cache=trt_calibration_cache,
                     )
                 cfg.runtime_mode = "TensorRT"
             else:
@@ -3468,6 +3485,18 @@ class ModelBenchmarkDialog(QDialog):
             if _IS_NVIDIA:
                 out_w, out_h = _resolution_dims(resolution_key)
                 trt_predeq = _resolve_predequantize_arg(predequantize_mode)
+                mode_name = f"{precision}_{'hg' if use_hg else 'nohg'}"
+                trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                    model_path,
+                    out_w,
+                    out_h,
+                    model_precision,
+                    mode_name,
+                    use_hg=bool(use_hg),
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    require_exists=True,
+                )
                 with capture_output_to_gui(lambda _line: None):
                     processor = HDRTVNetTensorRT(
                         model_path,
@@ -3475,9 +3504,11 @@ class ModelBenchmarkDialog(QDialog):
                         precision=model_precision,
                         engine_width=out_w,
                         engine_height=out_h,
-                        mode_name=f"{precision}_{'hg' if use_hg else 'nohg'}",
+                        mode_name=mode_name,
                         use_hg=bool(use_hg),
                         predequantize=trt_predeq,
+                        qdq_fusion="native",
+                        calibration_cache=trt_calibration_cache,
                     )
             else:
                 out_w, out_h = _resolution_dims(resolution_key)

@@ -35,6 +35,7 @@ _DEFAULT_HG_WEIGHTS = os.path.join(
     _ROOT, "src", "models", "weights", "HG_weights.pth"
 )
 _TENSORRT_SOURCE_SUBDIR = "tensorrt_sources"
+_TENSORRT_CALIBRATION_SUBDIR = "tensorrt_calibration"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
 _TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v2"
 _TENSORRT_SOURCE_CHECKPOINT_SCHEMA = "hdrtvnet_tensorrt_source_v1"
@@ -2151,6 +2152,16 @@ def _engine_cache_dir() -> str:
     return root
 
 
+def _tensorrt_calibration_dir(create: bool = False) -> str:
+    root = os.environ.get(
+        "HDRTVNET_TRT_PREBUILT_CALIBRATION_DIR",
+        os.path.join(_ROOT, "src", "models", _TENSORRT_CALIBRATION_SUBDIR),
+    )
+    if create:
+        os.makedirs(root, exist_ok=True)
+    return root
+
+
 def _hash_file(path: str) -> dict[str, object]:
     path = tensorrt_source_checkpoint_path(path)
     return _hash_file_raw(path)
@@ -2435,6 +2446,21 @@ def tensorrt_engine_is_valid(
 ) -> bool:
     predeq = _resolve_tensorrt_predequantize(precision, predequantize)
     qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    calibration_dataset, calibration_video, calibration_cache, _ = (
+        _resolve_tensorrt_calibration_sources(
+            model_path=model_path,
+            width=width,
+            height=height,
+            precision=precision,
+            mode_name=mode_name,
+            use_hg=use_hg,
+            predequantize=predeq,
+            qdq_fusion=qdq_fusion,
+            calibration_dataset=calibration_dataset,
+            calibration_video=calibration_video,
+            calibration_cache=calibration_cache,
+        )
+    )
     engine_mode_name = tensorrt_mode_name(
         precision,
         mode_name,
@@ -2541,13 +2567,20 @@ def _tensorrt_calibration_fingerprint(
 
     frames = _resolve_tensorrt_calibration_frames(calibration_frames)
     cache = str(calibration_cache or "").strip() or None
+    cache_entry = None
+    if cache:
+        cache_path = os.path.abspath(os.path.expanduser(cache))
+        cache_entry = {
+            "path": cache_path,
+            "file": _hash_file_raw(cache_path),
+        }
     if calibration_dataset:
         path = os.path.abspath(os.path.expanduser(str(calibration_dataset)))
         entry: dict[str, object] = {
             "kind": "dataset",
             "path": path,
             "frames": frames,
-            "cache": os.path.abspath(os.path.expanduser(cache)) if cache else None,
+            "cache": cache_entry,
         }
         try:
             paths = _tensorrt_calibration_image_paths(path)
@@ -2580,14 +2613,20 @@ def _tensorrt_calibration_fingerprint(
             "kind": "video",
             "path": path,
             "frames": frames,
-            "cache": os.path.abspath(os.path.expanduser(cache)) if cache else None,
+            "cache": cache_entry,
             "fingerprint": _hash_file_raw(path) if os.path.isfile(path) else None,
+        }
+
+    if cache_entry is not None:
+        return {
+            "kind": "cache",
+            "cache": cache_entry,
         }
 
     return {
         "kind": "synthetic",
         "frames": frames,
-        "cache": os.path.abspath(os.path.expanduser(cache)) if cache else None,
+        "cache": None,
     }
 
 
@@ -2752,6 +2791,92 @@ def tensorrt_mode_name(
         if fp_suffix and fp_suffix not in mode_name.lower():
             mode_name = f"{mode_name}{fp_suffix}"
     return mode_name
+
+
+def tensorrt_prebuilt_calibration_cache_path(
+    model_path: str,
+    width: int,
+    height: int,
+    precision: str,
+    mode_name: str,
+    *,
+    use_hg: bool,
+    predequantize=False,
+    qdq_fusion: str = "native",
+    calibration_dir: str | None = None,
+    require_exists: bool = True,
+) -> str | None:
+    """Return the shipped TensorRT native-INT8 calibration cache path.
+
+    The filename mirrors the engine stem so each checkpoint/resolution/mode
+    combination can have its own cache without a separate manifest.
+    """
+    if not str(precision or "").startswith("int8"):
+        return None
+    predeq = _resolve_tensorrt_predequantize(precision, predequantize)
+    if predeq:
+        return None
+    resolved_qdq = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    if resolved_qdq != "native":
+        return None
+
+    mode = tensorrt_mode_name(
+        precision,
+        mode_name,
+        predequantize=predeq,
+        qdq_fusion=resolved_qdq,
+    )
+    model_name = _sanitize_engine_token(pathlib.Path(str(model_path)).stem)
+    resolution = f"{int(width)}x{int(height)}"
+    mode_token = _sanitize_engine_token(mode)
+    calib_name = f"{model_name}_{resolution}_{mode_token}.calib"
+    root = (
+        os.path.abspath(os.path.expanduser(str(calibration_dir)))
+        if calibration_dir
+        else _tensorrt_calibration_dir(create=not require_exists)
+    )
+    path = os.path.join(root, calib_name)
+    if require_exists and not os.path.isfile(path):
+        return None
+    return path
+
+
+def _resolve_tensorrt_calibration_sources(
+    *,
+    model_path: str,
+    width: int,
+    height: int,
+    precision: str,
+    mode_name: str,
+    use_hg: bool,
+    predequantize=False,
+    qdq_fusion: str = "native",
+    calibration_dataset: str | None = None,
+    calibration_video: str | None = None,
+    calibration_cache: str | None = None,
+) -> tuple[str | None, str | None, str | None, bool]:
+    dataset = (
+        calibration_dataset
+        or os.environ.get("HDRTVNET_TRT_CALIBRATION_DATASET")
+        or os.environ.get("HDRTVNET_TRT_CALIBRATION_DIR")
+    )
+    video = calibration_video or os.environ.get("HDRTVNET_TRT_CALIBRATION_VIDEO")
+    cache = calibration_cache or os.environ.get("HDRTVNET_TRT_CALIBRATION_CACHE")
+    used_prebuilt = False
+    if not dataset and not video and not cache:
+        cache = tensorrt_prebuilt_calibration_cache_path(
+            model_path,
+            int(width),
+            int(height),
+            precision,
+            mode_name,
+            use_hg=use_hg,
+            predequantize=predequantize,
+            qdq_fusion=qdq_fusion,
+            require_exists=True,
+        )
+        used_prebuilt = bool(cache)
+    return dataset, video, cache, used_prebuilt
 
 
 class _ONNXExportWrapper(nn.Module):
@@ -3380,7 +3505,8 @@ def _resolve_tensorrt_calibration_frames(value=None) -> int:
         frames = int(value)
     except Exception:
         frames = 64
-    return min(512, max(1, frames))
+    # 0 means "all available" for dataset/video calibration inputs.
+    return max(0, frames)
 
 
 def _tensorrt_calibration_cache_path(engine_path: str, override: str | None = None) -> str:
@@ -3480,7 +3606,8 @@ def _load_tensorrt_dataset_calibration_batches(
     paths = _tensorrt_calibration_image_paths(dataset_path)
     if not paths:
         raise RuntimeError(f"No calibration images found under: {dataset_path}")
-    count = min(len(paths), _resolve_tensorrt_calibration_frames(frame_count))
+    requested = _resolve_tensorrt_calibration_frames(frame_count)
+    count = len(paths) if requested <= 0 else min(len(paths), requested)
     if len(paths) > count:
         indices = np.linspace(0, len(paths) - 1, count, dtype=np.int64)
         selected = [paths[int(i)] for i in indices]
@@ -3527,30 +3654,46 @@ def _load_tensorrt_video_calibration_batches(
         raise RuntimeError(f"Cannot open TensorRT calibration video: {video_path}")
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        count = _resolve_tensorrt_calibration_frames(frame_count)
+        requested = _resolve_tensorrt_calibration_frames(frame_count)
         if total > 1:
+            count = total if requested <= 0 else requested
             positions = np.linspace(0, max(0, total - 1), count, dtype=np.int64)
             positions = [int(v) for v in positions]
         else:
-            positions = list(range(count))
+            positions = None if requested <= 0 else list(range(requested))
 
         batches: list[dict[str, torch.Tensor]] = []
         with torch.inference_mode():
-            for pos in positions:
-                if total > 1:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    continue
-                batches.append(
-                    _tensorrt_frame_to_calibration_batch(
-                        frame,
-                        width=width,
-                        height=height,
-                        dtype=dtype,
-                        device=device,
+            if positions is None:
+                while True:
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
+                    batches.append(
+                        _tensorrt_frame_to_calibration_batch(
+                            frame,
+                            width=width,
+                            height=height,
+                            dtype=dtype,
+                            device=device,
+                        )
                     )
-                )
+            else:
+                for pos in positions:
+                    if total > 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        continue
+                    batches.append(
+                        _tensorrt_frame_to_calibration_batch(
+                            frame,
+                            width=width,
+                            height=height,
+                            dtype=dtype,
+                            device=device,
+                        )
+                    )
         if not batches:
             raise RuntimeError(f"No calibration frames decoded from: {video_path}")
         print(
@@ -3570,7 +3713,7 @@ def _synthetic_tensorrt_calibration_batches(
     device: torch.device,
     frame_count: int,
 ) -> list[dict[str, torch.Tensor]]:
-    count = _resolve_tensorrt_calibration_frames(frame_count)
+    count = max(1, _resolve_tensorrt_calibration_frames(frame_count))
     batches: list[dict[str, torch.Tensor]] = []
     h, w = int(height), int(width)
     with torch.inference_mode():
@@ -3723,20 +3866,26 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         self._trt_runtime = None
         self._trt_engine = None
         self._trt_keep_onnx = bool(keep_onnx)
-        self._trt_calibration_dataset = (
-            calibration_dataset
-            or os.environ.get("HDRTVNET_TRT_CALIBRATION_DATASET")
-            or os.environ.get("HDRTVNET_TRT_CALIBRATION_DIR")
-        )
-        self._trt_calibration_video = (
-            calibration_video
-            or os.environ.get("HDRTVNET_TRT_CALIBRATION_VIDEO")
+        (
+            self._trt_calibration_dataset,
+            self._trt_calibration_video,
+            self._trt_calibration_cache,
+            self._trt_used_prebuilt_calibration_cache,
+        ) = _resolve_tensorrt_calibration_sources(
+            model_path=model_path,
+            width=self._engine_width,
+            height=self._engine_height,
+            precision=precision,
+            mode_name=self._trt_base_mode_name,
+            use_hg=use_hg,
+            predequantize=self._trt_predequantize_int8,
+            qdq_fusion=self._trt_qdq_fusion,
+            calibration_dataset=calibration_dataset,
+            calibration_video=calibration_video,
+            calibration_cache=calibration_cache,
         )
         self._trt_calibration_frames = _resolve_tensorrt_calibration_frames(
             calibration_frames
-        )
-        self._trt_calibration_cache = calibration_cache or os.environ.get(
-            "HDRTVNET_TRT_CALIBRATION_CACHE"
         )
         self._trt_int8_calibrator = None
         self._trt_context = None
@@ -3777,6 +3926,11 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             print(
                 "TensorRT INT8 pre-dequantize: exporting compressed INT8 "
                 "checkpoint as a native FP16 engine"
+            )
+        if getattr(self, "_trt_used_prebuilt_calibration_cache", False):
+            print(
+                "TensorRT prebuilt INT8 calibration cache: "
+                f"{self._trt_calibration_cache}"
             )
 
         self._trt_engine_metadata = self._expected_tensorrt_engine_metadata()

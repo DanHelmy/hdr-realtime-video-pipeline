@@ -35,7 +35,12 @@ import torch
 from collections import deque
 from cli_display import CliDisplaySink
 from video_source import VideoSource
-from models.hdrtvnet_torch import HDRTVNetTensorRT, HDRTVNetTorch, _IS_NVIDIA
+from models.hdrtvnet_torch import (
+    HDRTVNetTensorRT,
+    HDRTVNetTorch,
+    _IS_NVIDIA,
+    tensorrt_prebuilt_calibration_cache_path,
+)
 
 VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
 MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
@@ -248,7 +253,10 @@ def parse_args():
         "--trt-calibration-frames",
         type=int,
         default=64,
-        help="Frame count for TensorRT native INT8 calibration. Default: 64.",
+        help=(
+            "Frame/image count for TensorRT native INT8 calibration. "
+            "Default: 64. Use 0 for all dataset/video frames."
+        ),
     )
     parser.add_argument(
         "--fast-cond-resize",
@@ -362,24 +370,38 @@ def main():
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
     try:
         if _IS_NVIDIA and str(args.device).lower() != "cpu":
+            mode_name = f"{args.precision}_{'hg' if str(args.use_hg).strip() != '0' else 'nohg'}"
+            auto_calibration_cache = args.trt_calibration_cache
+            if not auto_calibration_cache and not args.trt_calibration_dataset:
+                auto_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                    args.model,
+                    _proc_w,
+                    _proc_h,
+                    args.precision,
+                    mode_name,
+                    use_hg=str(args.use_hg).strip() != "0",
+                    predequantize=predeq,
+                    qdq_fusion="native",
+                    require_exists=True,
+                )
             processor = HDRTVNetTensorRT(
                 args.model,
                 device=args.device,
                 precision=args.precision,
                 engine_width=_proc_w,
                 engine_height=_proc_h,
-                mode_name=f"{args.precision}_{'hg' if str(args.use_hg).strip() != '0' else 'nohg'}",
+                mode_name=mode_name,
                 hg_weights=args.hg_weights,
                 use_hg=str(args.use_hg).strip() != "0",
                 predequantize=predeq,
                 calibration_dataset=args.trt_calibration_dataset,
                 calibration_video=(
                     None
-                    if args.trt_calibration_dataset or args.trt_calibration_cache
+                    if args.trt_calibration_dataset or auto_calibration_cache
                     else args.video
                 ),
                 calibration_frames=args.trt_calibration_frames,
-                calibration_cache=args.trt_calibration_cache,
+                calibration_cache=auto_calibration_cache,
             )
         else:
             processor = HDRTVNetTorch(

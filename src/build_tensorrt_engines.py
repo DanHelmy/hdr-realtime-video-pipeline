@@ -28,6 +28,7 @@ from models.hdrtvnet_torch import (
     tensorrt_engine_metadata_path,
     tensorrt_mode_name,
     tensorrt_onnx_path,
+    tensorrt_prebuilt_calibration_cache_path,
 )
 from gui_config import PRECISIONS, _select_model_path
 
@@ -178,7 +179,10 @@ def main() -> int:
         "--calibration-frames",
         type=int,
         default=None,
-        help="Number of frames for TensorRT native INT8 calibration. Default: 64.",
+        help=(
+            "Number of frames/images for TensorRT native INT8 calibration. "
+            "Default: 64. Use 0 for all dataset/video frames."
+        ),
     )
     parser.add_argument(
         "--calibration-cache",
@@ -269,6 +273,29 @@ def main() -> int:
         return 2
 
     for w, h in args.resolutions:
+        calibration_cache = args.calibration_cache
+        if (
+            not calibration_cache
+            and not args.calibration_dataset
+            and not args.calibration_video
+            and str(args.qdq_fusion) == "native"
+        ):
+            calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                model_path,
+                w,
+                h,
+                precision,
+                base_mode_name,
+                use_hg=use_hg,
+                predequantize=predeq,
+                qdq_fusion=args.qdq_fusion,
+                require_exists=True,
+            )
+            if calibration_cache:
+                print(
+                    "[tensorrt] using prebuilt calibration cache: "
+                    f"{calibration_cache}"
+                )
         engine_path = tensorrt_engine_path(model_path, w, h, mode_name)
         onnx_path = tensorrt_onnx_path(model_path, w, h, mode_name)
         if (args.force or args.force_onnx) and os.path.isfile(engine_path):
@@ -292,7 +319,7 @@ def main() -> int:
             calibration_dataset=args.calibration_dataset,
             calibration_video=args.calibration_video,
             calibration_frames=args.calibration_frames,
-            calibration_cache=args.calibration_cache,
+            calibration_cache=calibration_cache,
             verbose=True,
         )
         if engine_valid:
@@ -319,7 +346,7 @@ def main() -> int:
             calibration_dataset=args.calibration_dataset,
             calibration_video=args.calibration_video,
             calibration_frames=args.calibration_frames,
-            calibration_cache=args.calibration_cache,
+            calibration_cache=calibration_cache,
         )
         if args.benchmark_runs > 0:
             import time
