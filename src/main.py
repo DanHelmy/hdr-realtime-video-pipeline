@@ -1,5 +1,6 @@
 import os
 import argparse
+import sys
 import time
 import cv2
 
@@ -231,6 +232,25 @@ def parse_args():
              "'on' forces pre-dequantization, 'off' keeps INT8 runtime dequant."
     )
     parser.add_argument(
+        "--trt-calibration-dataset",
+        default=None,
+        help=(
+            "Directory/image/manifest of SDR input frames for TensorRT native "
+            "INT8 calibration. Takes priority over the current video."
+        ),
+    )
+    parser.add_argument(
+        "--trt-calibration-cache",
+        default=None,
+        help="TensorRT native INT8 calibration cache path.",
+    )
+    parser.add_argument(
+        "--trt-calibration-frames",
+        type=int,
+        default=64,
+        help="Frame count for TensorRT native INT8 calibration. Default: 64.",
+    )
+    parser.add_argument(
         "--fast-cond-resize",
         action="store_true",
         help=(
@@ -301,6 +321,30 @@ def build_timing_report(
 
 def main():
     args = parse_args()
+    precision_explicit = any(
+        item == "--precision" or item.startswith("--precision=")
+        for item in sys.argv[1:]
+    )
+    model_explicit = any(
+        item == "--model" or item.startswith("--model=")
+        for item in sys.argv[1:]
+    )
+    use_hg_explicit = any(
+        item == "--use-hg" or item.startswith("--use-hg=")
+        for item in sys.argv[1:]
+    )
+    if _IS_NVIDIA and str(args.device).lower() != "cpu":
+        if not precision_explicit and str(args.precision).lower() == "auto":
+            args.precision = "int8-mixed"
+        if not use_hg_explicit:
+            args.use_hg = "0"
+        if not model_explicit and os.path.normcase(os.path.normpath(args.model)) == os.path.normcase(os.path.normpath(MODEL_PATH)):
+            qat_name = (
+                "Ensemble_AGCM_LE_int8_mixed_qat.pt"
+                if str(args.use_hg).strip() != "0"
+                else "Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"
+            )
+            args.model = os.path.join("src", "models", "weights", qat_name)
 
     source = VideoSource(args.video, prefetch=args.prefetch)
 
@@ -328,6 +372,14 @@ def main():
                 hg_weights=args.hg_weights,
                 use_hg=str(args.use_hg).strip() != "0",
                 predequantize=predeq,
+                calibration_dataset=args.trt_calibration_dataset,
+                calibration_video=(
+                    None
+                    if args.trt_calibration_dataset or args.trt_calibration_cache
+                    else args.video
+                ),
+                calibration_frames=args.trt_calibration_frames,
+                calibration_cache=args.trt_calibration_cache,
             )
         else:
             processor = HDRTVNetTorch(

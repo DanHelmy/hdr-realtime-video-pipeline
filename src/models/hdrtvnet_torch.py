@@ -2304,13 +2304,17 @@ def _tensorrt_expected_engine_metadata(
     predequantize_int8: bool,
     qdq_fusion: str,
     hg_weights: str | None = None,
+    calibration_dataset: str | None = None,
+    calibration_video: str | None = None,
+    calibration_frames: int | None = None,
+    calibration_cache: str | None = None,
     trt_module=None,
 ) -> dict[str, object]:
     model_path = tensorrt_source_checkpoint_path(model_path)
     hg_path = hg_weights or _DEFAULT_HG_WEIGHTS
     aux_streams = _tensorrt_aux_stream_count()
     resolved_qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
-    return {
+    metadata = {
         "schema": _TENSORRT_ENGINE_METADATA_SCHEMA,
         "source_signature": _tensorrt_source_signature(),
         "model": _hash_file(model_path),
@@ -2349,6 +2353,24 @@ def _tensorrt_expected_engine_metadata(
             "aux_streams": aux_streams,
         },
     }
+    if resolved_qdq_fusion == "native" and str(precision).startswith("int8"):
+        metadata["build"]["native_int8_prefer_constraints"] = (
+            _tensorrt_native_int8_prefer_constraints()
+        )
+        metadata["build"]["native_int8_obey_constraints"] = (
+            _tensorrt_native_int8_obey_constraints()
+        )
+    calibration = _tensorrt_calibration_fingerprint(
+        precision=precision,
+        qdq_fusion=resolved_qdq_fusion,
+        calibration_dataset=calibration_dataset,
+        calibration_video=calibration_video,
+        calibration_frames=calibration_frames,
+        calibration_cache=calibration_cache,
+    )
+    if calibration is not None:
+        metadata["calibration"] = calibration
+    return metadata
 
 
 def _first_metadata_mismatch(expected, actual, prefix: str = "") -> str | None:
@@ -2405,6 +2427,10 @@ def tensorrt_engine_is_valid(
     predequantize=False,
     qdq_fusion: str = "auto",
     hg_weights: str | None = None,
+    calibration_dataset: str | None = None,
+    calibration_video: str | None = None,
+    calibration_frames: int | None = None,
+    calibration_cache: str | None = None,
     verbose: bool = False,
 ) -> bool:
     predeq = _resolve_tensorrt_predequantize(precision, predequantize)
@@ -2428,6 +2454,10 @@ def tensorrt_engine_is_valid(
         predequantize_int8=predeq,
         qdq_fusion=qdq_fusion,
         hg_weights=hg_weights,
+        calibration_dataset=calibration_dataset,
+        calibration_video=calibration_video,
+        calibration_frames=calibration_frames,
+        calibration_cache=calibration_cache,
     )
     reason = _tensorrt_engine_validation_error(engine_path, expected)
     if reason and verbose:
@@ -2485,6 +2515,143 @@ def _tensorrt_workspace_gb() -> float:
         return float(os.environ.get("HDRTVNET_TRT_WORKSPACE_GB", "4"))
     except Exception:
         return 4.0
+
+
+def _tensorrt_native_int8_obey_constraints() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_OBEY", False)
+
+
+def _tensorrt_native_int8_prefer_constraints() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_PREFER_CONSTRAINTS", False)
+
+
+def _tensorrt_calibration_fingerprint(
+    *,
+    precision: str,
+    qdq_fusion: str,
+    calibration_dataset: str | None = None,
+    calibration_video: str | None = None,
+    calibration_frames: int | None = None,
+    calibration_cache: str | None = None,
+) -> dict[str, object] | None:
+    if not str(precision or "").startswith("int8"):
+        return None
+    if _resolve_tensorrt_qdq_fusion(precision, qdq_fusion) != "native":
+        return None
+
+    frames = _resolve_tensorrt_calibration_frames(calibration_frames)
+    cache = str(calibration_cache or "").strip() or None
+    if calibration_dataset:
+        path = os.path.abspath(os.path.expanduser(str(calibration_dataset)))
+        entry: dict[str, object] = {
+            "kind": "dataset",
+            "path": path,
+            "frames": frames,
+            "cache": os.path.abspath(os.path.expanduser(cache)) if cache else None,
+        }
+        try:
+            paths = _tensorrt_calibration_image_paths(path)
+            digest = hashlib.sha256()
+            root = pathlib.Path(path)
+            for item in paths:
+                try:
+                    rel = item.resolve().relative_to(root.resolve()).as_posix()
+                except Exception:
+                    rel = str(item.resolve())
+                try:
+                    stat = item.stat()
+                    digest.update(rel.encode("utf-8", errors="replace"))
+                    digest.update(b"\0")
+                    digest.update(str(int(stat.st_size)).encode("ascii"))
+                    digest.update(b"\0")
+                    digest.update(str(int(stat.st_mtime_ns)).encode("ascii"))
+                    digest.update(b"\0")
+                except Exception:
+                    digest.update(rel.encode("utf-8", errors="replace"))
+                    digest.update(b"\0missing\0")
+            entry.update({"items": len(paths), "fingerprint": digest.hexdigest()})
+        except Exception as exc:
+            entry.update({"items": None, "fingerprint_error": type(exc).__name__})
+        return entry
+
+    if calibration_video:
+        path = os.path.abspath(os.path.expanduser(str(calibration_video)))
+        return {
+            "kind": "video",
+            "path": path,
+            "frames": frames,
+            "cache": os.path.abspath(os.path.expanduser(cache)) if cache else None,
+            "fingerprint": _hash_file_raw(path) if os.path.isfile(path) else None,
+        }
+
+    return {
+        "kind": "synthetic",
+        "frames": frames,
+        "cache": os.path.abspath(os.path.expanduser(cache)) if cache else None,
+    }
+
+
+def _prefer_tensorrt_native_int8_layers(network, trt) -> None:
+    """Ask TensorRT to keep native PTQ compute layers in INT8 where supported."""
+    try:
+        output_names = {
+            network.get_output(i).name
+            for i in range(int(network.num_outputs))
+            if network.get_output(i) is not None
+        }
+    except Exception:
+        output_names = set()
+
+    preferred_types = {
+        "ACTIVATION",
+        "CONCATENATION",
+        "CONVOLUTION",
+        "DECONVOLUTION",
+        "ELEMENTWISE",
+        "FULLY_CONNECTED",
+        "MATRIX_MULTIPLY",
+        "POOLING",
+        "REDUCE",
+        "SCALE",
+        "UNARY",
+    }
+    constrained_layers = 0
+    constrained_outputs = 0
+    skipped_layers = 0
+    try:
+        layer_count = int(network.num_layers)
+    except Exception:
+        layer_count = 0
+    for index in range(layer_count):
+        layer = network.get_layer(index)
+        layer_type = str(getattr(layer, "type", "")).split(".")[-1]
+        if layer_type not in preferred_types:
+            skipped_layers += 1
+            continue
+        try:
+            layer.precision = trt.int8
+            constrained_layers += 1
+        except Exception:
+            skipped_layers += 1
+            continue
+        try:
+            output_count = int(layer.num_outputs)
+        except Exception:
+            output_count = 0
+        for output_index in range(output_count):
+            try:
+                tensor = layer.get_output(output_index)
+                if tensor is None or tensor.name in output_names:
+                    continue
+                layer.set_output_type(output_index, trt.int8)
+                constrained_outputs += 1
+            except Exception:
+                continue
+    print(
+        "TensorRT native INT8 constraints: "
+        f"{constrained_layers} layer(s), {constrained_outputs} output tensor(s), "
+        f"skipped {skipped_layers}"
+    )
 
 
 def tensorrt_engine_path(
@@ -3674,6 +3841,10 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             predequantize_int8=self._trt_predequantize_int8,
             qdq_fusion=self._trt_qdq_fusion,
             hg_weights=self._hg_weights,
+            calibration_dataset=getattr(self, "_trt_calibration_dataset", None),
+            calibration_video=getattr(self, "_trt_calibration_video", None),
+            calibration_frames=getattr(self, "_trt_calibration_frames", None),
+            calibration_cache=getattr(self, "_trt_calibration_cache", None),
             trt_module=trt_module,
         )
 
@@ -3765,6 +3936,37 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         if str(builder_precision).startswith("int8") and builder.platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
             if native_int8:
+                quant_flag = getattr(
+                    getattr(trt, "QuantizationFlag", object),
+                    "CALIBRATE_BEFORE_FUSION",
+                    None,
+                )
+                if quant_flag is not None and hasattr(config, "set_quantization_flag"):
+                    try:
+                        config.set_quantization_flag(quant_flag)
+                        print("TensorRT native INT8 calibration: before fusion")
+                    except Exception as exc:
+                        print(f"TensorRT native INT8 calibration flag skipped: {exc}")
+                prefer_constraints = _tensorrt_native_int8_prefer_constraints()
+                obey_constraints = _tensorrt_native_int8_obey_constraints()
+                if prefer_constraints or obey_constraints:
+                    _prefer_tensorrt_native_int8_layers(network, trt)
+                    prefer_flag = getattr(
+                        trt.BuilderFlag,
+                        "PREFER_PRECISION_CONSTRAINTS",
+                        None,
+                    )
+                    obey_flag = getattr(
+                        trt.BuilderFlag,
+                        "OBEY_PRECISION_CONSTRAINTS",
+                        None,
+                    )
+                    if obey_constraints and obey_flag is not None:
+                        config.set_flag(obey_flag)
+                        print("TensorRT native INT8 constraints: obey")
+                    elif prefer_flag is not None:
+                        config.set_flag(prefer_flag)
+                        print("TensorRT native INT8 constraints: prefer")
                 cache_path = _tensorrt_calibration_cache_path(
                     self.engine_path,
                     self._trt_calibration_cache,

@@ -287,8 +287,13 @@ def _make_processor(args, run: dict, width: int, height: int):
             predequantize=predeq,
             qdq_fusion=args.trt_qdq_fusion,
             calibration_dataset=args.trt_calibration_dataset,
-            calibration_video=args.video,
+            calibration_video=(
+                None
+                if args.trt_calibration_dataset or args.trt_calibration_cache
+                else args.video
+            ),
             calibration_frames=args.trt_calibration_frames,
+            calibration_cache=args.trt_calibration_cache,
         )
     return HDRTVNetTorch(
         run["model"],
@@ -691,6 +696,11 @@ def parse_args():
             "Directory/image/manifest of SDR input frames for TensorRT native "
             "INT8 calibration. Defaults to the benchmark video."
         ),
+    )
+    parser.add_argument(
+        "--trt-calibration-cache",
+        default=None,
+        help="TensorRT native INT8 calibration cache path.",
     )
     parser.add_argument(
         "--trt-calibration-frames",

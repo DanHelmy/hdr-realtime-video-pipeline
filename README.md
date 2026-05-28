@@ -46,6 +46,7 @@ Core updates include:
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for broad usability: `INT8 Mixed (QAT)`, `720p`, `SSimSuperRes`, and HG off
+- NVIDIA runtime now defaults to the optimized TensorRT native INT8 path for QAT no-HG models when CUDA is available, avoiding explicit Q/DQ export overhead and using calibration caches for native INT8 dynamic ranges
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants available for reproducible paper comparisons between the standard accuracy path and the stronger movie-benchmark recipe
 - HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
 - optimized GT sync algorithm with improved frame scanning and alignment detection
@@ -824,7 +825,7 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 - Pre-allocated GPU tensor buffers (zero per-frame allocation)
 - Pinned (page-locked) host memory for async H2D/D2H DMA transfers
 - `torch.inference_mode()` throughout
-- NVIDIA TensorRT engines built on demand and cached per model/resolution/mode
+- NVIDIA TensorRT engines built on demand and cached per model/resolution/mode, with native INT8 calibration-cache support to avoid explicit Q/DQ runtime overhead
 - AMD PyTorch tensors use contiguous memory format by default, with channels-last available as an opt-in test
 - Async video prefetch queue
 - mpv fast path: skips GPU→CPU postprocess when mpv handles HDR display
@@ -861,7 +862,9 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, the selected compressed INT8 checkpoint remains the logical model, but TensorRT engine build automatically prefers a same-named portable source under `src/models/weights/tensorrt_sources/` when present. `setup.bat` on NVIDIA generates these source files locally from the compressed checkpoints; they are ignored by git because they are large temporary build inputs. TensorRT export recreates explicit ONNX `QuantizeLinear` / `DequantizeLinear` Q/DQ from the same layer masks and symmetric W8A8 activation scales before engine build; the ONNX file is temporary and the `.engine` is the runtime artifact. In Mixed INT8, weight-only W8A16 layers are exported as plain FP ops to avoid Q/DQ overhead around layers that cannot run as true activation-quantized INT8.
+On NVIDIA, the selected compressed INT8 checkpoint remains the logical model, but TensorRT engine build automatically prefers a same-named portable source under `src/models/weights/tensorrt_sources/` when present. `setup.bat` on NVIDIA generates these source files locally from the compressed checkpoints; they are ignored by git because they are large temporary build inputs. The default TensorRT INT8 export is now **native**: QAT/PTQ W8 layers are emitted as plain ONNX Conv/Gemm layers, TensorRT receives native INT8 calibration ranges from a cache or SDR/source-frame calibration batches, and the `.engine` is the runtime artifact. This avoids explicit ONNX `QuantizeLinear` / `DequantizeLinear` graphs, pre-dequantization, and hand-authored FP islands; TensorRT may still choose Half/Float tactics internally for unsupported tensors.
+
+For native INT8 calibration, use SDR/source inputs that match deployment content, not HDR targets. The CLI and matrix tools accept `--trt-calibration-dataset` / `--calibration-dataset` for image directories, single images, or text manifests, plus `--trt-calibration-cache` / `--calibration-cache` for a prebuilt TensorRT cache. If no cache or dataset is provided, CLI playback can calibrate from the current video for first-time local engine builds; release/deployment runs should use the dataset-built cache.
 
 ---
 

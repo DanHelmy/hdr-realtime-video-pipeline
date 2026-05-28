@@ -124,16 +124,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--precision",
-        default="fp16",
+        default="int8-mixed-qat",
         choices=tuple(_PRECISION_MAP.keys()),
-        help="Model precision/mode to build.",
+        help="Model precision/mode to build. Default: int8-mixed-qat.",
     )
     parser.add_argument("--model", default=None, help="Override model path.")
     parser.add_argument(
         "--use-hg",
-        default="1",
+        default="0",
         choices=["1", "0"],
-        help="Enable HG refinement (1/0). Default: 1",
+        help="Enable HG refinement (1/0). Default: 0",
     )
     parser.add_argument(
         "--hg-weights",
@@ -289,6 +289,10 @@ def main() -> int:
             predequantize=predeq,
             qdq_fusion=args.qdq_fusion,
             hg_weights=args.hg_weights,
+            calibration_dataset=args.calibration_dataset,
+            calibration_video=args.calibration_video,
+            calibration_frames=args.calibration_frames,
+            calibration_cache=args.calibration_cache,
             verbose=True,
         )
         if engine_valid:

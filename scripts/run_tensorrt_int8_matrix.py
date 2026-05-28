@@ -32,6 +32,14 @@ from models.hdrtvnet_torch import (  # noqa: E402
 
 
 _VARIANTS = {
+    "fp32": {
+        "builder_precision": "fp32",
+        "runtime_precision": "fp32",
+        "model": "Ensemble_AGCM_LE.pth",
+        "model_nohg": "Ensemble_AGCM_LE.pth",
+        "cli_run": "fp32",
+        "gui_key": "FP32",
+    },
     "fp16": {
         "builder_precision": "fp16",
         "runtime_precision": "fp16",
@@ -162,9 +170,14 @@ def main() -> int:
         "--variants",
         nargs="+",
         default=[
+            "fp32",
             "fp16",
             "int8-mixed-ptq",
             "int8-full-ptq",
+            "int8-mixed-qat",
+            "int8-full-qat",
+            "int8-mixed-qat-film",
+            "int8-full-qat-film",
         ],
         choices=tuple(_VARIANTS.keys()),
     )
@@ -177,6 +190,11 @@ def main() -> int:
             "Directory/image/manifest of SDR input frames for TensorRT native "
             "INT8 calibration. Takes priority over --video for engine builds."
         ),
+    )
+    parser.add_argument(
+        "--calibration-cache",
+        default=None,
+        help="TensorRT native INT8 calibration cache path.",
     )
     parser.add_argument("--duration-s", type=float, default=90.0)
     parser.add_argument("--warmup-frames", type=int, default=60)
@@ -282,6 +300,13 @@ def main() -> int:
                         "--calibration-frames",
                         str(max(1, args.calibration_frames)),
                     ]
+                elif str(args.qdq_fusion) == "native" and args.calibration_cache:
+                    cmd += [
+                        "--calibration-cache",
+                        str(args.calibration_cache),
+                        "--calibration-frames",
+                        str(max(1, args.calibration_frames)),
+                    ]
                 elif str(args.qdq_fusion) == "native" and args.video:
                     cmd += [
                         "--calibration-video",
@@ -321,6 +346,7 @@ def main() -> int:
                     str(_VARIANTS[variant]["cli_run"])
                     for variant in args.variants
                     if str(_VARIANTS[variant]["cli_run"]) in {
+                        "fp32",
                         "fp16",
                         "int8-mixed-ptq",
                         "int8-mixed-qat",
@@ -356,6 +382,8 @@ def main() -> int:
                 ]
                 if args.calibration_dataset:
                     cmd += ["--trt-calibration-dataset", str(args.calibration_dataset)]
+                if args.calibration_cache:
+                    cmd += ["--trt-calibration-cache", str(args.calibration_cache)]
                 _run(
                     cmd,
                     cwd=_ROOT,
