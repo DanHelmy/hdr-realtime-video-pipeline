@@ -182,13 +182,20 @@ def main() -> int:
         choices=tuple(_VARIANTS.keys()),
     )
     parser.add_argument("--use-hg", nargs="+", default=["0"], choices=["0", "1"])
-    parser.add_argument("--video", default=None, help="Optional video for CLI playback benchmark.")
+    parser.add_argument(
+        "--video",
+        default=None,
+        help=(
+            "Optional video for CLI playback benchmark. Engine builds use a "
+            "prebuilt .calib by default unless calibration inputs are provided."
+        ),
+    )
     parser.add_argument(
         "--calibration-dataset",
         default=None,
         help=(
             "Directory/image/manifest of SDR input frames for TensorRT native "
-            "INT8 calibration. Takes priority over --video for engine builds."
+            "INT8 calibration. Takes priority over prebuilt .calib files."
         ),
     )
     parser.add_argument(
@@ -215,7 +222,15 @@ def main() -> int:
         "--calibration-frames",
         type=int,
         default=64,
-        help="Frame count for TensorRT native INT8 calibration. Default: 64.",
+        help="Frame count for TensorRT native INT8 calibration. Default: 64. Use 0 for all.",
+    )
+    parser.add_argument(
+        "--calibrate-from-video",
+        action="store_true",
+        help=(
+            "Use --video as the TensorRT calibration source when no dataset/cache "
+            "is provided. By default, --video is only used for playback benchmark."
+        ),
     )
     parser.add_argument("--force", action="store_true", help="Force rebuild engines.")
     parser.add_argument("--skip-source-validation", action="store_true")
@@ -298,21 +313,25 @@ def main() -> int:
                         "--calibration-dataset",
                         str(args.calibration_dataset),
                         "--calibration-frames",
-                        str(max(1, args.calibration_frames)),
+                        str(args.calibration_frames),
                     ]
                 elif str(args.qdq_fusion) == "native" and args.calibration_cache:
                     cmd += [
                         "--calibration-cache",
                         str(args.calibration_cache),
                         "--calibration-frames",
-                        str(max(1, args.calibration_frames)),
+                        str(args.calibration_frames),
                     ]
-                elif str(args.qdq_fusion) == "native" and args.video:
+                elif (
+                    str(args.qdq_fusion) == "native"
+                    and args.video
+                    and args.calibrate_from_video
+                ):
                     cmd += [
                         "--calibration-video",
                         str(args.video),
                         "--calibration-frames",
-                        str(max(1, args.calibration_frames)),
+                        str(args.calibration_frames),
                     ]
                 if args.force:
                     cmd.append("--force")
@@ -376,7 +395,7 @@ def main() -> int:
                     "--trt-qdq-fusion",
                     args.qdq_fusion,
                     "--trt-calibration-frames",
-                    str(max(1, args.calibration_frames)),
+                    str(args.calibration_frames),
                     "--out-root",
                     str(out_dir / "playback"),
                 ]

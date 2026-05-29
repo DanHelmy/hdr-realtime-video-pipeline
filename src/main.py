@@ -394,6 +394,7 @@ def main():
                 hg_weights=args.hg_weights,
                 use_hg=str(args.use_hg).strip() != "0",
                 predequantize=predeq,
+                qdq_fusion="native",
                 calibration_dataset=args.trt_calibration_dataset,
                 calibration_video=(
                     None

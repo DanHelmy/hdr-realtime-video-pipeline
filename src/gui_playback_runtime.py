@@ -91,6 +91,7 @@ try:
         tensorrt_engine_path,
         tensorrt_engine_is_valid,
         tensorrt_mode_name,
+        tensorrt_prebuilt_calibration_cache_path,
     )
 except Exception:
     _HAS_COMPILE = False
@@ -107,6 +108,9 @@ except Exception:
 
     def tensorrt_mode_name(*a, **kw) -> str:  # type: ignore[misc]
         return ""
+
+    def tensorrt_prebuilt_calibration_cache_path(*a, **kw):  # type: ignore[misc]
+        return None
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -2879,12 +2883,26 @@ class PlaybackRuntimeMixin:
         if _IS_NVIDIA:
             trt_cfg = PRECISIONS.get(gui_prec, {})
             trt_mode = f"{gui_prec}_{'hg' if self._chk_hg.isChecked() else 'nohg'}"
+            trt_precision = trt_cfg.get("precision", prec_arg)
+            trt_predeq = _normalize_predequantize_mode(
+                getattr(self, "_predequantize_mode", "auto")
+            )
             trt_engine_mode = tensorrt_mode_name(
-                trt_cfg.get("precision", prec_arg),
+                trt_precision,
                 trt_mode,
-                predequantize=_normalize_predequantize_mode(
-                    getattr(self, "_predequantize_mode", "auto")
-                ),
+                predequantize=trt_predeq,
+                qdq_fusion="native",
+            )
+            trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                model_path,
+                pw,
+                ph,
+                trt_precision,
+                trt_mode,
+                use_hg=self._chk_hg.isChecked(),
+                predequantize=trt_predeq,
+                qdq_fusion="native",
+                require_exists=True,
             )
             trt_engine = tensorrt_engine_path(model_path, pw, ph, trt_engine_mode)
             tensorrt_engine_cache_miss = bool(
@@ -2894,12 +2912,12 @@ class PlaybackRuntimeMixin:
                     model_path=model_path,
                     width=pw,
                     height=ph,
-                    precision=trt_cfg.get("precision", prec_arg),
+                    precision=trt_precision,
                     mode_name=trt_mode,
                     use_hg=self._chk_hg.isChecked(),
-                    predequantize=_normalize_predequantize_mode(
-                        getattr(self, "_predequantize_mode", "auto")
-                    ),
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    calibration_cache=trt_calibration_cache,
                 )
             )
         self._autotune_warning_needed = False
@@ -3668,12 +3686,26 @@ class PlaybackRuntimeMixin:
                 use_hg = self._chk_hg.isChecked()
                 trt_cfg = PRECISIONS.get(new_prec, {})
                 trt_mode = f"{new_prec}_{'hg' if use_hg else 'nohg'}"
+                trt_precision = trt_cfg.get("precision", new_prec)
+                trt_predeq = _normalize_predequantize_mode(
+                    getattr(self, "_predequantize_mode", "auto")
+                )
                 trt_engine_mode = tensorrt_mode_name(
-                    trt_cfg.get("precision", new_prec),
+                    trt_precision,
                     trt_mode,
-                    predequantize=_normalize_predequantize_mode(
-                        getattr(self, "_predequantize_mode", "auto")
-                    ),
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                )
+                trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+                    target_model_path,
+                    cur_pw,
+                    cur_ph,
+                    trt_precision,
+                    trt_mode,
+                    use_hg=use_hg,
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    require_exists=True,
                 )
                 trt_engine_path = tensorrt_engine_path(target_model_path, cur_pw, cur_ph, trt_engine_mode)
                 if not tensorrt_engine_is_valid(
@@ -3681,12 +3713,12 @@ class PlaybackRuntimeMixin:
                     model_path=target_model_path,
                     width=cur_pw,
                     height=cur_ph,
-                    precision=trt_cfg.get("precision", new_prec),
+                    precision=trt_precision,
                     mode_name=trt_mode,
                     use_hg=use_hg,
-                    predequantize=_normalize_predequantize_mode(
-                        getattr(self, "_predequantize_mode", "auto")
-                    ),
+                    predequantize=trt_predeq,
+                    qdq_fusion="native",
+                    calibration_cache=trt_calibration_cache,
                 ):
                     self.statusBar().showMessage(
                         f"TensorRT engine for {new_prec} not built at {cur_pw}x{cur_ph}; restarting to build."
