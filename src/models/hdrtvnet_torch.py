@@ -3592,7 +3592,200 @@ def _tensorrt_calibration_image_paths(dataset_path: str) -> list[pathlib.Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in suffixes)
 
 
-def _load_tensorrt_dataset_calibration_batches(
+class _TensorRTCalibrationSource:
+    def next_batch(self) -> dict[str, torch.Tensor] | None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _TensorRTListCalibrationSource(_TensorRTCalibrationSource):
+    def __init__(self, batches: list[dict[str, torch.Tensor]]):
+        self._batches = list(batches)
+        self._index = 0
+
+    def next_batch(self) -> dict[str, torch.Tensor] | None:
+        if self._index >= len(self._batches):
+            return None
+        batch = self._batches[self._index]
+        self._index += 1
+        return batch
+
+
+class _TensorRTDatasetCalibrationSource(_TensorRTCalibrationSource):
+    def __init__(
+        self,
+        *,
+        dataset_path: str,
+        width: int,
+        height: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        frame_count: int,
+    ):
+        paths = _tensorrt_calibration_image_paths(dataset_path)
+        if not paths:
+            raise RuntimeError(f"No calibration images found under: {dataset_path}")
+        requested = _resolve_tensorrt_calibration_frames(frame_count)
+        count = len(paths) if requested <= 0 else min(len(paths), requested)
+        if len(paths) > count:
+            indices = np.linspace(0, len(paths) - 1, count, dtype=np.int64)
+            self._paths = [paths[int(i)] for i in indices]
+        else:
+            self._paths = paths
+        self._dataset_path = dataset_path
+        self._width = int(width)
+        self._height = int(height)
+        self._dtype = dtype
+        self._device = device
+        self._index = 0
+        print(
+            "TensorRT native INT8 calibration: "
+            f"streaming {len(self._paths)} image(s) from {dataset_path}"
+        )
+
+    def next_batch(self) -> dict[str, torch.Tensor] | None:
+        import cv2
+
+        with torch.inference_mode():
+            while self._index < len(self._paths):
+                path = self._paths[self._index]
+                self._index += 1
+                frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                return _tensorrt_frame_to_calibration_batch(
+                    frame,
+                    width=self._width,
+                    height=self._height,
+                    dtype=self._dtype,
+                    device=self._device,
+                )
+        return None
+
+
+class _TensorRTVideoCalibrationSource(_TensorRTCalibrationSource):
+    def __init__(
+        self,
+        *,
+        video_path: str,
+        width: int,
+        height: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        frame_count: int,
+    ):
+        import cv2
+
+        self._cv2 = cv2
+        self._cap = cv2.VideoCapture(str(video_path))
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Cannot open TensorRT calibration video: {video_path}")
+        self._video_path = video_path
+        self._width = int(width)
+        self._height = int(height)
+        self._dtype = dtype
+        self._device = device
+        self._total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        requested = _resolve_tensorrt_calibration_frames(frame_count)
+        if self._total > 1 and requested > 0:
+            count = min(self._total, requested)
+            self._positions = [
+                int(v)
+                for v in np.linspace(0, max(0, self._total - 1), count, dtype=np.int64)
+            ]
+            label_count = len(self._positions)
+        elif self._total <= 1 and requested > 0:
+            self._positions = list(range(requested))
+            label_count = len(self._positions)
+        else:
+            self._positions = None
+            label_count = self._total if self._total > 0 else "all available"
+        self._index = 0
+        print(
+            "TensorRT native INT8 calibration: "
+            f"streaming {label_count} frame(s) from {video_path}"
+        )
+
+    def close(self) -> None:
+        cap = getattr(self, "_cap", None)
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            self._cap = None
+
+    def next_batch(self) -> dict[str, torch.Tensor] | None:
+        cap = getattr(self, "_cap", None)
+        if cap is None:
+            return None
+        with torch.inference_mode():
+            while True:
+                if self._positions is None:
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        self.close()
+                        return None
+                else:
+                    if self._index >= len(self._positions):
+                        self.close()
+                        return None
+                    pos = int(self._positions[self._index])
+                    self._index += 1
+                    if self._total > 1:
+                        cap.set(self._cv2.CAP_PROP_POS_FRAMES, pos)
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        continue
+                return _tensorrt_frame_to_calibration_batch(
+                    frame,
+                    width=self._width,
+                    height=self._height,
+                    dtype=self._dtype,
+                    device=self._device,
+                )
+
+
+class _TensorRTSyntheticCalibrationSource(_TensorRTCalibrationSource):
+    def __init__(
+        self,
+        *,
+        width: int,
+        height: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        frame_count: int,
+    ):
+        self._count = max(1, _resolve_tensorrt_calibration_frames(frame_count))
+        self._index = 0
+        h, w = int(height), int(width)
+        with torch.inference_mode():
+            self._ramp_x = torch.linspace(0.0, 1.0, w, dtype=dtype, device=device)
+            self._ramp_x = self._ramp_x.view(1, 1, 1, w).expand(1, 3, h, w)
+            self._ramp_y = torch.linspace(0.0, 1.0, h, dtype=dtype, device=device)
+            self._ramp_y = self._ramp_y.view(1, 1, h, 1).expand(1, 3, h, w)
+        print(
+            "TensorRT native INT8 calibration: "
+            f"using {self._count} synthetic frame(s)"
+        )
+
+    def next_batch(self) -> dict[str, torch.Tensor] | None:
+        if self._index >= self._count:
+            return None
+        idx = self._index
+        self._index += 1
+        with torch.inference_mode():
+            mix = float(idx % 8) / 7.0 if self._count > 1 else 0.5
+            tensor = (self._ramp_x * mix + self._ramp_y * (1.0 - mix)).contiguous()
+            return {
+                "input": tensor,
+                "cond": _tensorrt_calibration_cond(tensor),
+            }
+
+
+def _make_tensorrt_dataset_calibration_source(
     *,
     dataset_path: str,
     width: int,
@@ -3600,45 +3793,18 @@ def _load_tensorrt_dataset_calibration_batches(
     dtype: torch.dtype,
     device: torch.device,
     frame_count: int,
-) -> list[dict[str, torch.Tensor]]:
-    import cv2
-
-    paths = _tensorrt_calibration_image_paths(dataset_path)
-    if not paths:
-        raise RuntimeError(f"No calibration images found under: {dataset_path}")
-    requested = _resolve_tensorrt_calibration_frames(frame_count)
-    count = len(paths) if requested <= 0 else min(len(paths), requested)
-    if len(paths) > count:
-        indices = np.linspace(0, len(paths) - 1, count, dtype=np.int64)
-        selected = [paths[int(i)] for i in indices]
-    else:
-        selected = paths
-
-    batches: list[dict[str, torch.Tensor]] = []
-    with torch.inference_mode():
-        for path in selected:
-            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if frame is None:
-                continue
-            batches.append(
-                _tensorrt_frame_to_calibration_batch(
-                    frame,
-                    width=width,
-                    height=height,
-                    dtype=dtype,
-                    device=device,
-                )
-            )
-    if not batches:
-        raise RuntimeError(f"No readable calibration images found under: {dataset_path}")
-    print(
-        "TensorRT native INT8 calibration: "
-        f"loaded {len(batches)} image(s) from {dataset_path}"
+) -> _TensorRTCalibrationSource:
+    return _TensorRTDatasetCalibrationSource(
+        dataset_path=dataset_path,
+        width=width,
+        height=height,
+        dtype=dtype,
+        device=device,
+        frame_count=frame_count,
     )
-    return batches
 
 
-def _load_tensorrt_video_calibration_batches(
+def _make_tensorrt_video_calibration_source(
     *,
     video_path: str,
     width: int,
@@ -3646,102 +3812,39 @@ def _load_tensorrt_video_calibration_batches(
     dtype: torch.dtype,
     device: torch.device,
     frame_count: int,
-) -> list[dict[str, torch.Tensor]]:
-    import cv2
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open TensorRT calibration video: {video_path}")
-    try:
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        requested = _resolve_tensorrt_calibration_frames(frame_count)
-        if total > 1:
-            count = total if requested <= 0 else requested
-            positions = np.linspace(0, max(0, total - 1), count, dtype=np.int64)
-            positions = [int(v) for v in positions]
-        else:
-            positions = None if requested <= 0 else list(range(requested))
-
-        batches: list[dict[str, torch.Tensor]] = []
-        with torch.inference_mode():
-            if positions is None:
-                while True:
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
-                        break
-                    batches.append(
-                        _tensorrt_frame_to_calibration_batch(
-                            frame,
-                            width=width,
-                            height=height,
-                            dtype=dtype,
-                            device=device,
-                        )
-                    )
-            else:
-                for pos in positions:
-                    if total > 1:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
-                        continue
-                    batches.append(
-                        _tensorrt_frame_to_calibration_batch(
-                            frame,
-                            width=width,
-                            height=height,
-                            dtype=dtype,
-                            device=device,
-                        )
-                    )
-        if not batches:
-            raise RuntimeError(f"No calibration frames decoded from: {video_path}")
-        print(
-            "TensorRT native INT8 calibration: "
-            f"loaded {len(batches)} frame(s) from {video_path}"
-        )
-        return batches
-    finally:
-        cap.release()
+) -> _TensorRTCalibrationSource:
+    return _TensorRTVideoCalibrationSource(
+        video_path=video_path,
+        width=width,
+        height=height,
+        dtype=dtype,
+        device=device,
+        frame_count=frame_count,
+    )
 
 
-def _synthetic_tensorrt_calibration_batches(
+def _make_synthetic_tensorrt_calibration_source(
     *,
     width: int,
     height: int,
     dtype: torch.dtype,
     device: torch.device,
     frame_count: int,
-) -> list[dict[str, torch.Tensor]]:
-    count = max(1, _resolve_tensorrt_calibration_frames(frame_count))
-    batches: list[dict[str, torch.Tensor]] = []
-    h, w = int(height), int(width)
-    with torch.inference_mode():
-        ramp_x = torch.linspace(0.0, 1.0, w, dtype=dtype, device=device)
-        ramp_x = ramp_x.view(1, 1, 1, w).expand(1, 3, h, w)
-        ramp_y = torch.linspace(0.0, 1.0, h, dtype=dtype, device=device)
-        ramp_y = ramp_y.view(1, 1, h, 1).expand(1, 3, h, w)
-        for idx in range(count):
-            mix = float(idx % 8) / 7.0 if count > 1 else 0.5
-            tensor = (ramp_x * mix + ramp_y * (1.0 - mix)).contiguous()
-            batches.append(
-                {
-                    "input": tensor,
-                    "cond": _tensorrt_calibration_cond(tensor),
-                }
-            )
-    print(
-        "TensorRT native INT8 calibration: "
-        f"using {len(batches)} synthetic frame(s)"
+) -> _TensorRTCalibrationSource:
+    return _TensorRTSyntheticCalibrationSource(
+        width=width,
+        height=height,
+        dtype=dtype,
+        device=device,
+        frame_count=frame_count,
     )
-    return batches
 
 
 def _make_tensorrt_int8_calibrator(
     trt,
     *,
     cache_path: str,
-    batches: list[dict[str, torch.Tensor]],
+    calibration_source: _TensorRTCalibrationSource | None,
 ):
     base_cls = getattr(trt, "IInt8EntropyCalibrator2", None)
     if base_cls is None:
@@ -3750,20 +3853,27 @@ def _make_tensorrt_int8_calibrator(
         raise RuntimeError("TensorRT INT8 calibrator API is unavailable.")
 
     class _Calibrator(base_cls):
-        def __init__(self, calibration_cache: str, calibration_batches):
+        def __init__(
+            self,
+            calibration_cache: str,
+            source: _TensorRTCalibrationSource | None,
+        ):
             base_cls.__init__(self)
             self._cache_path = calibration_cache
-            self._batches = list(calibration_batches)
-            self._index = 0
+            self._source = source
+            self._active_batch = None
 
         def get_batch_size(self):
             return 1
 
         def get_batch(self, names):
-            if self._index >= len(self._batches):
+            if self._source is None:
                 return None
-            batch = self._batches[self._index]
-            self._index += 1
+            batch = self._source.next_batch()
+            if batch is None:
+                self._source.close()
+                return None
+            self._active_batch = batch
             ordered = []
             fallback = ("input", "cond")
             for idx, name in enumerate(names):
@@ -3777,6 +3887,13 @@ def _make_tensorrt_int8_calibrator(
                     )
                 ordered.append(int(tensor.data_ptr()))
             return ordered
+
+        def __del__(self):
+            try:
+                if self._source is not None:
+                    self._source.close()
+            except Exception:
+                pass
 
         def read_calibration_cache(self):
             try:
@@ -3801,7 +3918,7 @@ def _make_tensorrt_int8_calibrator(
             except Exception as exc:
                 print(f"TensorRT calibration cache write skipped: {exc}")
 
-    return _Calibrator(cache_path, batches)
+    return _Calibrator(cache_path, calibration_source)
 
 
 class HDRTVNetTensorRT(HDRTVNetTorch):
@@ -4126,7 +4243,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     self._trt_calibration_cache,
                 )
                 if self._trt_calibration_dataset:
-                    batches = _load_tensorrt_dataset_calibration_batches(
+                    calibration_source = _make_tensorrt_dataset_calibration_source(
                         dataset_path=self._trt_calibration_dataset,
                         width=self._engine_width,
                         height=self._engine_height,
@@ -4137,7 +4254,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 elif self._trt_calibration_video and os.path.isfile(
                     self._trt_calibration_video
                 ):
-                    batches = _load_tensorrt_video_calibration_batches(
+                    calibration_source = _make_tensorrt_video_calibration_source(
                         video_path=self._trt_calibration_video,
                         width=self._engine_width,
                         height=self._engine_height,
@@ -4146,14 +4263,14 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                         frame_count=self._trt_calibration_frames,
                     )
                 elif os.path.isfile(cache_path):
-                    batches = []
+                    calibration_source = None
                 else:
                     if self._trt_calibration_video:
                         print(
                             "TensorRT calibration video missing; "
                             f"falling back to synthetic data: {self._trt_calibration_video}"
                         )
-                    batches = _synthetic_tensorrt_calibration_batches(
+                    calibration_source = _make_synthetic_tensorrt_calibration_source(
                         width=self._engine_width,
                         height=self._engine_height,
                         dtype=self._dtype,
@@ -4163,7 +4280,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 self._trt_int8_calibrator = _make_tensorrt_int8_calibrator(
                     trt,
                     cache_path=cache_path,
-                    batches=batches,
+                    calibration_source=calibration_source,
                 )
                 config.int8_calibrator = self._trt_int8_calibrator
                 print(
