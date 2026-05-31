@@ -9,6 +9,7 @@ automatically by GUI playback/export/benchmark.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import pathlib
 import sys
@@ -48,6 +49,14 @@ def _remove_file(path: str) -> None:
             os.remove(path)
     except OSError as exc:
         print(f"[calib] warning: could not remove {path}: {exc}", flush=True)
+
+
+def _discard_temporary_engine(engine_path: str, onnx_path: str, keep_onnx: bool) -> None:
+    _remove_file(engine_path)
+    _remove_file(tensorrt_engine_metadata_path(engine_path))
+    if not keep_onnx:
+        _remove_file(onnx_path)
+        _remove_file(f"{onnx_path}.data")
 
 
 def _int8_precision_keys() -> list[str]:
@@ -110,6 +119,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not os.environ.get("HDRTVNET_TRT_WORKSPACE_GB"):
+        os.environ["HDRTVNET_TRT_WORKSPACE_GB"] = "2"
+        print("[calib] TensorRT calibration workspace default: 2 GiB", flush=True)
+    else:
+        print(
+            "[calib] TensorRT calibration workspace: "
+            f"{os.environ['HDRTVNET_TRT_WORKSPACE_GB']} GiB",
+            flush=True,
+        )
     dataset = os.path.abspath(os.path.expanduser(args.calibration_dataset))
     if not os.path.exists(dataset):
         raise FileNotFoundError(f"Calibration dataset not found: {dataset}")
@@ -213,12 +231,20 @@ def main() -> int:
                         calibration_cache=cache_path,
                     )
                     del processor
+                    gc.collect()
                 except Exception as exc:
                     print(f"[calib] FAILED: {exc}", flush=True)
+                    _discard_temporary_engine(engine_path, onnx_path, args.keep_onnx)
                     failures += 1
                     continue
 
                 if os.path.isfile(cache_path):
+                    _discard_temporary_engine(engine_path, onnx_path, args.keep_onnx)
+                    print(
+                        "[calib] discarded temporary calibration engine; "
+                        "runtime/build tools will rebuild engines with their normal workspace",
+                        flush=True,
+                    )
                     built += 1
                 else:
                     print(f"[calib] FAILED: cache was not written: {cache_path}", flush=True)
