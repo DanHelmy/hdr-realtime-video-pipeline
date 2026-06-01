@@ -43,6 +43,7 @@ _TENSORRT_DEFAULT_INT8_FP_EXPORT_PREFIXES: tuple[str, ...] = ()
 _PORTABLE_INT8_CHECKPOINT_FORMAT = "portable_fake_quant_v1"
 _PORTABLE_INT8_STATE_FORMAT = "native_fp32"
 _FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
+_TENSORRT_CALIBRATION_IMAGE_SCORE_CACHE: dict[tuple[str, int, int], tuple[float, int]] = {}
 _TENSORRT_SOURCE_SIGNATURE_CACHE: str | None = None
 
 _HAS_COMPILE = hasattr(torch, "compile")          # PyTorch >= 2.0
@@ -3592,6 +3593,138 @@ def _tensorrt_calibration_image_paths(dataset_path: str) -> list[pathlib.Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in suffixes)
 
 
+def _tensorrt_calibration_image_score(path: pathlib.Path) -> tuple[float, int] | None:
+    try:
+        resolved = path.resolve()
+        stat = resolved.stat()
+        cache_key = (
+            os.path.normcase(str(resolved)),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        )
+    except Exception:
+        return None
+    cached = _TENSORRT_CALIBRATION_IMAGE_SCORE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        import cv2
+
+        frame = cv2.imread(str(resolved), cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        max_dim = max(int(h), int(w))
+        if max_dim > 320:
+            scale = 320.0 / float(max_dim)
+            frame = cv2.resize(
+                frame,
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        y = ycrcb[:, :, 0].astype(np.float32) * (1.0 / 255.0)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1].astype(np.float32) * (1.0 / 255.0)
+
+        mean_y = float(np.mean(y))
+        std_y = float(np.std(y))
+        p01, p99 = np.percentile(y, [1.0, 99.0])
+        dynamic = float(max(0.0, p99 - p01))
+        highlight = float(np.mean(y >= 0.90))
+        shadow = float(np.mean(y <= 0.08))
+        sat_mean = float(np.mean(sat))
+
+        hist = np.histogram(y, bins=64, range=(0.0, 1.0))[0].astype(np.float32)
+        hist_sum = float(hist.sum())
+        if hist_sum > 0.0:
+            prob = hist / hist_sum
+            prob = prob[prob > 0.0]
+            entropy = float(-(prob * np.log2(prob)).sum() / math.log2(64.0))
+        else:
+            entropy = 0.0
+
+        exposure_balance = 1.0 - min(1.0, abs(mean_y - 0.50) * 2.0)
+        highlight_score = min(highlight / 0.08, 1.0)
+        shadow_score = min(shadow / 0.08, 1.0)
+        lap = cv2.Laplacian(y, cv2.CV_32F)
+        edge_score = min(float(np.var(lap)) / 0.015, 1.0)
+
+        score = (
+            dynamic * 3.0
+            + std_y * 2.0
+            + entropy * 2.0
+            + sat_mean * 1.0
+            + exposure_balance * 0.75
+            + highlight_score * 0.6
+            + shadow_score * 0.6
+            + edge_score * 0.4
+        )
+        bucket = int(np.clip(math.floor(mean_y * 8.0), 0, 7))
+    except Exception:
+        return None
+
+    result = (float(score), int(bucket))
+    _TENSORRT_CALIBRATION_IMAGE_SCORE_CACHE[cache_key] = result
+    return result
+
+
+def _select_tensorrt_calibration_image_paths(
+    paths: list[pathlib.Path],
+    count: int,
+) -> tuple[list[pathlib.Path], str]:
+    if count <= 0 or len(paths) <= count:
+        return list(paths), "all"
+
+    scored: list[tuple[float, int, int, pathlib.Path]] = []
+    for index, path in enumerate(paths):
+        score_bucket = _tensorrt_calibration_image_score(path)
+        if score_bucket is None:
+            continue
+        score, bucket = score_bucket
+        scored.append((float(score), int(bucket), int(index), path))
+
+    if len(scored) < count:
+        indices = np.linspace(0, len(paths) - 1, count, dtype=np.int64)
+        return [paths[int(i)] for i in indices], "uniform-fallback"
+
+    ranked = sorted(scored, key=lambda item: (-item[0], item[2]))
+    buckets: dict[int, list[tuple[float, int, int, pathlib.Path]]] = {
+        bucket: [] for bucket in range(8)
+    }
+    for item in ranked:
+        buckets[item[1]].append(item)
+
+    selected: dict[int, tuple[float, int, int, pathlib.Path]] = {}
+    base_quota = count // 8
+    remainder = count % 8
+    bucket_order = sorted(
+        range(8),
+        key=lambda bucket: (
+            -len(buckets[bucket]),
+            -buckets[bucket][0][0] if buckets[bucket] else float("-inf"),
+            bucket,
+        ),
+    )
+    quotas = {bucket: base_quota for bucket in range(8)}
+    for bucket in bucket_order[:remainder]:
+        quotas[bucket] += 1
+
+    for bucket in range(8):
+        for item in buckets[bucket][:quotas[bucket]]:
+            selected[item[2]] = item
+
+    if len(selected) < count:
+        for item in ranked:
+            selected.setdefault(item[2], item)
+            if len(selected) >= count:
+                break
+
+    selected_items = sorted(selected.values(), key=lambda item: item[2])
+    return [item[3] for item in selected_items[:count]], "content-ranked"
+
+
 class _TensorRTCalibrationSource:
     def next_batch(self) -> dict[str, torch.Tensor] | None:
         return None
@@ -3629,11 +3762,10 @@ class _TensorRTDatasetCalibrationSource(_TensorRTCalibrationSource):
             raise RuntimeError(f"No calibration images found under: {dataset_path}")
         requested = _resolve_tensorrt_calibration_frames(frame_count)
         count = len(paths) if requested <= 0 else min(len(paths), requested)
-        if len(paths) > count:
-            indices = np.linspace(0, len(paths) - 1, count, dtype=np.int64)
-            self._paths = [paths[int(i)] for i in indices]
-        else:
-            self._paths = paths
+        self._paths, selection_mode = _select_tensorrt_calibration_image_paths(
+            paths,
+            count,
+        )
         self._dataset_path = dataset_path
         self._width = int(width)
         self._height = int(height)
@@ -3642,7 +3774,8 @@ class _TensorRTDatasetCalibrationSource(_TensorRTCalibrationSource):
         self._index = 0
         print(
             "TensorRT native INT8 calibration: "
-            f"streaming {len(self._paths)} image(s) from {dataset_path}"
+            f"streaming {len(self._paths)} image(s) from {dataset_path} "
+            f"({selection_mode} selection)"
         )
 
     def next_batch(self) -> dict[str, torch.Tensor] | None:

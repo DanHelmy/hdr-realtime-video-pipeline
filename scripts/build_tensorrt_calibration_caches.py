@@ -79,7 +79,10 @@ def parse_args() -> argparse.Namespace:
         "--calibration-frames",
         type=int,
         default=256,
-        help="Images sampled from the calibration dataset. Default: 256. Use 0 for all.",
+        help=(
+            "Images selected from the calibration dataset. Default: 256. "
+            "Use 0 for all. Positive values use deterministic content-ranked selection."
+        ),
     )
     parser.add_argument(
         "--precision-key",

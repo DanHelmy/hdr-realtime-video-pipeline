@@ -875,7 +875,7 @@ py scripts/build_tensorrt_calibration_caches.py `
   --force
 ```
 
-This builds the 36 INT8 GUI cache files: 6 INT8 presets x 3 GUI resolutions x HG on/off. `--calibration-frames 0` means all available calibration images/frames; use a positive number such as `256` for a faster representative subset. Rebuild or delete cached `.engine` files whenever replacing `.calib` files; engine metadata fingerprints the calibration cache contents so changed caches invalidate stale engines automatically.
+This builds the 36 INT8 GUI cache files: 6 INT8 presets x 3 GUI resolutions x HG on/off. `--calibration-frames 0` means all available calibration images/frames; positive values such as `256` use deterministic content-ranked image selection for a faster representative subset. Rebuild or delete cached `.engine` files whenever replacing `.calib` files; engine metadata fingerprints the calibration cache contents so changed caches invalidate stale engines automatically.
 
 ---
 
