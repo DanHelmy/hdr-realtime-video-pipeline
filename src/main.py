@@ -45,8 +45,8 @@ from models.hdrtvnet_torch import (
 VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
 MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
 
-TARGET_WIDTH = 1920
-TARGET_HEIGHT = 1080
+TARGET_WIDTH = 1280
+TARGET_HEIGHT = 720
 
 # Pre-allocated letterbox canvas to avoid allocation every frame
 _letterbox_canvas = None

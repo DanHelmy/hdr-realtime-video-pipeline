@@ -146,7 +146,7 @@ def main() -> int:
         default="off",
         choices=["auto", "on", "off"],
         help=(
-            "INT8 pre-dequantization mode. Keep 'off' for native/QDQ INT8; "
+            "INT8 pre-dequantization mode. Keep 'off' for native TensorRT INT8; "
             "'on' exports the INT8 checkpoint as a native FP16 engine."
         ),
     )
@@ -216,7 +216,7 @@ def main() -> int:
         "--workspace-gb",
         type=float,
         default=None,
-        help="TensorRT builder workspace in GiB. Default: project setting/env, normally 4.",
+        help="TensorRT builder workspace cap in GiB. Default: no explicit cap.",
     )
     parser.add_argument(
         "--timing-cache",

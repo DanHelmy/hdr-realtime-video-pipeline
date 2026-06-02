@@ -28,6 +28,8 @@ ensure_windows_supported("HDRTVNet++ TensorRT calibration cache builder")
 from gui_config import MAX_H, MAX_W, PRECISIONS, RESOLUTION_SCALES, _select_model_path
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
+    build_tensorrt_native_int8_speed_calibration_cache,
+    build_tensorrt_w8a8_qparam_calibration_cache,
     tensorrt_engine_metadata_path,
     tensorrt_engine_path,
     tensorrt_mode_name,
@@ -73,15 +75,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calibration-dataset",
         default=str(_ROOT / "dataset" / "train_sdr"),
-        help="SDR image directory/manifest used to build calibration caches.",
+        help=(
+            "SDR image directory/manifest used with --strategy pytorch-stats "
+            "or --strategy tensorrt-dataset."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-video",
+        default=None,
+        help=(
+            "Optional SDR/source video used with --strategy pytorch-stats. "
+            "Takes priority over --calibration-dataset for measured ranges."
+        ),
     )
     parser.add_argument(
         "--calibration-frames",
         type=int,
-        default=256,
+        default=64,
         help=(
-            "Images selected from the calibration dataset. Default: 256. "
+            "Images/frames selected for measured calibration. Default: 64. "
             "Use 0 for all. Positive values use deterministic content-ranked selection."
+        ),
+    )
+    parser.add_argument(
+        "--strategy",
+        default="pytorch-stats",
+        choices=["pytorch-stats", "w8a8-qparams", "tensorrt-dataset"],
+        help=(
+            "Calibration cache strategy. Default: pytorch-stats, which writes "
+            "native TensorRT speed caches from quantized PyTorch runtime ranges "
+            "without Q/DQ. w8a8-qparams is a conservative small fallback; "
+            "tensorrt-dataset runs TensorRT's calibrator."
         ),
     )
     parser.add_argument(
@@ -122,18 +146,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not os.environ.get("HDRTVNET_TRT_WORKSPACE_GB"):
-        os.environ["HDRTVNET_TRT_WORKSPACE_GB"] = "2"
-        print("[calib] TensorRT calibration workspace default: 2 GiB", flush=True)
-    else:
-        print(
-            "[calib] TensorRT calibration workspace: "
-            f"{os.environ['HDRTVNET_TRT_WORKSPACE_GB']} GiB",
-            flush=True,
-        )
+    if args.strategy == "tensorrt-dataset":
+        if not os.environ.get("HDRTVNET_TRT_WORKSPACE_GB"):
+            os.environ["HDRTVNET_TRT_WORKSPACE_GB"] = "2"
+            print("[calib] TensorRT calibration workspace default: 2 GiB", flush=True)
+        else:
+            print(
+                "[calib] TensorRT calibration workspace: "
+                f"{os.environ['HDRTVNET_TRT_WORKSPACE_GB']} GiB",
+                flush=True,
+            )
     dataset = os.path.abspath(os.path.expanduser(args.calibration_dataset))
-    if not os.path.exists(dataset):
+    video = (
+        os.path.abspath(os.path.expanduser(args.calibration_video))
+        if args.calibration_video
+        else None
+    )
+    if args.strategy in {"pytorch-stats", "tensorrt-dataset"} and not video and not os.path.exists(dataset):
         raise FileNotFoundError(f"Calibration dataset not found: {dataset}")
+    if args.strategy == "pytorch-stats" and video and not os.path.isfile(video):
+        raise FileNotFoundError(f"Calibration video not found: {video}")
 
     precision_keys = args.precision_key or _int8_precision_keys()
     resolutions = args.resolution or list(RESOLUTION_SCALES.keys())
@@ -143,7 +175,11 @@ def main() -> int:
         hg_states = [args.hg == "on"]
 
     total = len(precision_keys) * len(resolutions) * len(hg_states)
-    print(f"[calib] Dataset: {dataset}", flush=True)
+    print(f"[calib] Strategy: {args.strategy}", flush=True)
+    if args.strategy == "pytorch-stats" and video:
+        print(f"[calib] Video: {video}", flush=True)
+    elif args.strategy in {"pytorch-stats", "tensorrt-dataset"}:
+        print(f"[calib] Dataset: {dataset}", flush=True)
     print(f"[calib] Matrix: {total} cache file(s)", flush=True)
 
     failures = 0
@@ -190,6 +226,66 @@ def main() -> int:
                     continue
                 if os.path.isfile(cache_path) and not args.force:
                     skipped += 1
+                    continue
+
+                if args.strategy == "pytorch-stats":
+                    try:
+                        result = build_tensorrt_native_int8_speed_calibration_cache(
+                            model_path,
+                            width,
+                            height,
+                            model_precision,
+                            mode_name,
+                            use_hg=use_hg,
+                            cache_path=cache_path,
+                            predequantize=False,
+                            qdq_fusion="native",
+                            keep_onnx=args.keep_onnx,
+                            force_onnx=args.force,
+                            calibration_dataset=None if video else dataset,
+                            calibration_video=video,
+                            calibration_frames=args.calibration_frames,
+                            protect_agcm=True,
+                        )
+                        print(
+                            "[calib] wrote speed cache: "
+                            f"{result['conv_count']} Conv, "
+                            f"{result['range_count']} tensor range(s), "
+                            f"frames={result['frames']}, "
+                            f"protected={result['protected_count']}",
+                            flush=True,
+                        )
+                        built += 1
+                    except Exception as exc:
+                        print(f"[calib] FAILED: {exc}", flush=True)
+                        failures += 1
+                    continue
+
+                if args.strategy == "w8a8-qparams":
+                    try:
+                        result = build_tensorrt_w8a8_qparam_calibration_cache(
+                            model_path,
+                            width,
+                            height,
+                            model_precision,
+                            mode_name,
+                            use_hg=use_hg,
+                            cache_path=cache_path,
+                            predequantize=False,
+                            qdq_fusion="native",
+                            keep_onnx=args.keep_onnx,
+                            force_onnx=args.force,
+                        )
+                        print(
+                            "[calib] wrote qparam cache: "
+                            f"{result['w8a8_conv_count']} W8A8 Conv, "
+                            f"{result['range_count']} tensor range(s)",
+                            flush=True,
+                        )
+                        built += 1
+                    except Exception as exc:
+                        print(f"[calib] FAILED: {exc}", flush=True)
+                        failures += 1
                     continue
 
                 engine_mode = tensorrt_mode_name(

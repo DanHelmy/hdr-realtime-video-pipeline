@@ -208,7 +208,12 @@ def main() -> int:
     parser.add_argument("--benchmark-runs", type=int, default=30, help="Dummy build-script benchmark runs.")
     parser.add_argument("--benchmark-warmup", type=int, default=5)
     parser.add_argument("--opt-level", type=int, default=5, choices=range(0, 6))
-    parser.add_argument("--workspace-gb", type=float, default=4.0)
+    parser.add_argument(
+        "--workspace-gb",
+        type=float,
+        default=None,
+        help="TensorRT builder workspace cap in GiB. Default: no explicit cap.",
+    )
     parser.add_argument(
         "--qdq-fusion",
         default="native",
@@ -245,7 +250,8 @@ def main() -> int:
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
     env["HDRTVNET_TRT_BUILDER_OPT_LEVEL"] = str(args.opt_level)
-    env["HDRTVNET_TRT_WORKSPACE_GB"] = str(max(1.0, args.workspace_gb))
+    if args.workspace_gb is not None:
+        env["HDRTVNET_TRT_WORKSPACE_GB"] = str(max(1.0, args.workspace_gb))
 
     rows: list[dict[str, object]] = []
 
@@ -300,14 +306,14 @@ def main() -> int:
                     args.qdq_fusion,
                     "--opt-level",
                     str(args.opt_level),
-                    "--workspace-gb",
-                    str(args.workspace_gb),
                     "--benchmark-runs",
                     str(max(0, args.benchmark_runs)),
                     "--benchmark-warmup",
                     str(max(0, args.benchmark_warmup)),
                     "--keep-onnx",
                 ]
+                if args.workspace_gb is not None:
+                    cmd += ["--workspace-gb", str(args.workspace_gb)]
                 if str(args.qdq_fusion) == "native" and args.calibration_dataset:
                     cmd += [
                         "--calibration-dataset",

@@ -4,6 +4,7 @@ import math
 import os
 import pathlib
 import re
+import struct
 import sys
 import threading
 import time
@@ -2361,6 +2362,7 @@ def _tensorrt_expected_engine_metadata(
         },
         "build": {
             "builder_optimization_level": _tensorrt_builder_optimization_level(),
+            "fp16_enabled": _tensorrt_fp16_enabled(),
             "workspace_gb": _tensorrt_workspace_gb(),
             "aux_streams": aux_streams,
         },
@@ -2537,11 +2539,31 @@ def _tensorrt_aux_stream_count():
         return None
 
 
-def _tensorrt_workspace_gb() -> float:
+def _tensorrt_workspace_gb() -> float | None:
+    value = os.environ.get("HDRTVNET_TRT_WORKSPACE_GB")
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).strip().lower()
+    if text in {"0", "none", "unlimited", "default", "auto"}:
+        return None
     try:
-        return float(os.environ.get("HDRTVNET_TRT_WORKSPACE_GB", "4"))
+        parsed = float(text)
     except Exception:
-        return 4.0
+        return None
+    if parsed <= 0.0:
+        return None
+    return parsed
+
+
+def _tensorrt_fp16_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_FP16", True)
+
+
+def _tensorrt_calibrator_algorithm() -> str:
+    text = str(os.environ.get("HDRTVNET_TRT_CALIBRATOR", "entropy")).strip().lower()
+    if text in {"minmax", "min-max", "min_max"}:
+        return "minmax"
+    return "entropy"
 
 
 def _tensorrt_native_int8_obey_constraints() -> bool:
@@ -2550,6 +2572,45 @@ def _tensorrt_native_int8_obey_constraints() -> bool:
 
 def _tensorrt_native_int8_prefer_constraints() -> bool:
     return _env_bool("HDRTVNET_TRT_NATIVE_INT8_PREFER_CONSTRAINTS", False)
+
+
+def _tensorrt_auto_qparam_calibration_cache() -> bool:
+    return _env_bool("HDRTVNET_TRT_AUTO_QPARAM_CALIBRATION_CACHE", True)
+
+
+def _tensorrt_calibration_cache_header(algorithm: str | None = None) -> str:
+    algorithm = str(algorithm or _tensorrt_calibrator_algorithm()).strip().lower()
+    try:
+        import tensorrt as trt
+
+        parts = str(getattr(trt, "__version__", "")).split(".")
+        nums = [int(re.sub(r"\D.*$", "", p) or "0") for p in parts[:3]]
+        while len(nums) < 3:
+            nums.append(0)
+        version_token = f"{nums[0]}{nums[1]:02d}{nums[2]:02d}"
+    except Exception:
+        version_token = "101601"
+    if algorithm == "minmax":
+        return f"TRT-{version_token}-MinMaxCalibration"
+    return f"TRT-{version_token}-EntropyCalibration2"
+
+
+def _read_tensorrt_calibration_cache_tensor_names(cache_path: str | None) -> set[str]:
+    path = str(cache_path or "").strip()
+    if not path:
+        return set()
+    try:
+        text = pathlib.Path(path).read_text(encoding="ascii", errors="replace")
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for line in text.splitlines()[1:]:
+        if ":" not in line:
+            continue
+        name = line.split(":", 1)[0].strip()
+        if name:
+            names.add(name)
+    return names
 
 
 def _tensorrt_calibration_fingerprint(
@@ -2567,6 +2628,7 @@ def _tensorrt_calibration_fingerprint(
         return None
 
     frames = _resolve_tensorrt_calibration_frames(calibration_frames)
+    algorithm = _tensorrt_calibrator_algorithm()
     cache = str(calibration_cache or "").strip() or None
     cache_entry = None
     if cache:
@@ -2581,6 +2643,7 @@ def _tensorrt_calibration_fingerprint(
             "kind": "dataset",
             "path": path,
             "frames": frames,
+            "algorithm": algorithm,
             "cache": cache_entry,
         }
         try:
@@ -2614,6 +2677,7 @@ def _tensorrt_calibration_fingerprint(
             "kind": "video",
             "path": path,
             "frames": frames,
+            "algorithm": algorithm,
             "cache": cache_entry,
             "fingerprint": _hash_file_raw(path) if os.path.isfile(path) else None,
         }
@@ -2627,12 +2691,17 @@ def _tensorrt_calibration_fingerprint(
     return {
         "kind": "synthetic",
         "frames": frames,
+        "algorithm": algorithm,
         "cache": None,
     }
 
 
-def _prefer_tensorrt_native_int8_layers(network, trt) -> None:
-    """Ask TensorRT to keep native PTQ compute layers in INT8 where supported."""
+def _prefer_tensorrt_native_int8_layers(
+    network,
+    trt,
+    calibrated_tensors: set[str] | None = None,
+) -> None:
+    """Ask TensorRT to keep calibrated native PTQ compute layers in INT8."""
     try:
         output_names = {
             network.get_output(i).name
@@ -2642,22 +2711,21 @@ def _prefer_tensorrt_native_int8_layers(network, trt) -> None:
     except Exception:
         output_names = set()
 
+    calibrated_tensors = set(calibrated_tensors or ())
+    if not calibrated_tensors:
+        print("TensorRT native INT8 constraints: skipped (no calibrated tensor names)")
+        return
+
     preferred_types = {
-        "ACTIVATION",
-        "CONCATENATION",
         "CONVOLUTION",
         "DECONVOLUTION",
-        "ELEMENTWISE",
         "FULLY_CONNECTED",
         "MATRIX_MULTIPLY",
-        "POOLING",
-        "REDUCE",
-        "SCALE",
-        "UNARY",
     }
     constrained_layers = 0
     constrained_outputs = 0
     skipped_layers = 0
+    skipped_unscaled = 0
     try:
         layer_count = int(network.num_layers)
     except Exception:
@@ -2667,6 +2735,30 @@ def _prefer_tensorrt_native_int8_layers(network, trt) -> None:
         layer_type = str(getattr(layer, "type", "")).split(".")[-1]
         if layer_type not in preferred_types:
             skipped_layers += 1
+            continue
+        try:
+            input_names = [
+                layer.get_input(input_index).name
+                for input_index in range(int(layer.num_inputs))
+                if layer.get_input(input_index) is not None
+            ]
+            layer_output_names = [
+                layer.get_output(output_index).name
+                for output_index in range(int(layer.num_outputs))
+                if layer.get_output(output_index) is not None
+            ]
+        except Exception:
+            skipped_layers += 1
+            continue
+        data_inputs = [
+            name for name in input_names
+            if name and not name.startswith("model.") and not name.startswith("_to_copy")
+        ]
+        if not layer_output_names or not all(name in calibrated_tensors for name in layer_output_names):
+            skipped_unscaled += 1
+            continue
+        if data_inputs and not all(name in calibrated_tensors for name in data_inputs):
+            skipped_unscaled += 1
             continue
         try:
             layer.precision = trt.int8
@@ -2690,7 +2782,7 @@ def _prefer_tensorrt_native_int8_layers(network, trt) -> None:
     print(
         "TensorRT native INT8 constraints: "
         f"{constrained_layers} layer(s), {constrained_outputs} output tensor(s), "
-        f"skipped {skipped_layers}"
+        f"skipped {skipped_layers}, unscaled {skipped_unscaled}"
     )
 
 
@@ -2838,6 +2930,28 @@ def tensorrt_prebuilt_calibration_cache_path(
     )
     path = os.path.join(root, calib_name)
     if require_exists and not os.path.isfile(path):
+        if _tensorrt_auto_qparam_calibration_cache():
+            try:
+                build_tensorrt_w8a8_qparam_calibration_cache(
+                    model_path,
+                    width,
+                    height,
+                    precision,
+                    mode_name,
+                    use_hg=use_hg,
+                    cache_path=path,
+                    predequantize=False,
+                    qdq_fusion="native",
+                    keep_onnx=False,
+                    force_onnx=False,
+                )
+            except Exception as exc:
+                print(
+                    "TensorRT native qparam calibration cache generation skipped: "
+                    f"{exc}"
+                )
+        if os.path.isfile(path):
+            return path
         return None
     return path
 
@@ -2878,6 +2992,779 @@ def _resolve_tensorrt_calibration_sources(
         )
         used_prebuilt = bool(cache)
     return dataset, video, cache, used_prebuilt
+
+
+def _tensorrt_w8_module_weight(module: nn.Module) -> np.ndarray | None:
+    if isinstance(module, W8A8Conv2d):
+        scale = module.w_scale.detach().float().cpu().view(-1, 1, 1, 1)
+        return (module.weight_int8.detach().float().cpu() * scale).numpy()
+    if isinstance(module, W8Conv2d):
+        scale = module.scale.detach().float().cpu().view(-1, 1, 1, 1)
+        return (module.weight_int8.detach().float().cpu() * scale).numpy()
+    if isinstance(module, nn.Conv2d):
+        return module.weight.detach().float().cpu().numpy()
+    return None
+
+
+def _tensorrt_w8a8_activation_range(module: nn.Module) -> float | None:
+    if not isinstance(module, (W8A8Conv2d, W8A8Linear)):
+        return None
+    scale = float(module.x_scale.detach().float().cpu().reshape(()))
+    if bool(getattr(module, "is_asymmetric", False)):
+        zero = getattr(module, "x_zero", torch.tensor(0.0))
+        low = float(zero.detach().float().cpu().reshape(()))
+        high = low + scale * 255.0
+        return max(abs(low), abs(high), 1e-5)
+    return max(abs(scale * 127.0), 1e-5)
+
+
+def _onnx_initializer_array(model, tensor_name: str):
+    try:
+        from onnx import numpy_helper
+    except Exception:
+        return None
+
+    initializers = {init.name: init for init in model.graph.initializer}
+    producers = {output: node for node in model.graph.node for output in node.output}
+
+    def _array(name: str):
+        init = initializers.get(name)
+        if init is not None:
+            return numpy_helper.to_array(init)
+        node = producers.get(name)
+        if node is None:
+            return None
+        if node.op_type == "Cast" and node.input:
+            return _array(node.input[0])
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.name == "value" and attr.HasField("t"):
+                    return numpy_helper.to_array(attr.t)
+        return None
+
+    return _array(tensor_name)
+
+
+def _write_tensorrt_calibration_cache(
+    cache_path: str,
+    ranges: dict[str, float],
+    *,
+    algorithm: str | None = None,
+) -> None:
+    if not ranges:
+        raise RuntimeError("No TensorRT calibration ranges were generated.")
+    path = pathlib.Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [_tensorrt_calibration_cache_header(algorithm)]
+    for name in sorted(ranges):
+        value = max(float(ranges[name]), 1e-8)
+        lines.append(f"{name}: {struct.pack('>f', value).hex()}")
+    path.write_text("\n".join(lines), encoding="ascii")
+
+
+def _tensorrt_initializer_ranges(onnx_model) -> dict[str, float]:
+    try:
+        from onnx import numpy_helper
+    except Exception:
+        return {}
+    ranges: dict[str, float] = {}
+    for initializer in getattr(onnx_model.graph, "initializer", []):
+        try:
+            array = numpy_helper.to_array(initializer).astype(np.float32, copy=False)
+            value = float(np.max(np.abs(array))) if array.size else 1.0
+        except Exception:
+            value = 1.0
+        value = max(value, 1e-5)
+        ranges[initializer.name] = value
+        ranges[f"{initializer.name}_output"] = value
+    return ranges
+
+
+def _tensorrt_all_graph_tensor_ranges(
+    onnx_model,
+    *,
+    default_range: float,
+) -> dict[str, float]:
+    value = max(float(default_range), 1e-5)
+    ranges: dict[str, float] = {}
+    for collection in (
+        getattr(onnx_model.graph, "input", []),
+        getattr(onnx_model.graph, "output", []),
+        getattr(onnx_model.graph, "value_info", []),
+    ):
+        for item in collection:
+            name = str(getattr(item, "name", "") or "")
+            if name:
+                ranges[name] = value
+    for node in getattr(onnx_model.graph, "node", []):
+        for name in list(node.input) + list(node.output):
+            if name:
+                ranges.setdefault(str(name), value)
+    ranges.update(_tensorrt_initializer_ranges(onnx_model))
+    ranges["input"] = max(float(ranges.get("input", value)), 1.0)
+    ranges["cond"] = max(float(ranges.get("cond", value)), 1.0)
+    ranges["output"] = max(float(ranges.get("output", value)), 1.0)
+    return ranges
+
+
+def _tensorrt_collect_runtime_module_ranges(
+    processor: "HDRTVNetTorch",
+    *,
+    width: int,
+    height: int,
+    calibration_dataset: str | None,
+    calibration_video: str | None,
+    calibration_frames: int | None,
+) -> tuple[dict[str, float], int]:
+    module_ranges: dict[str, float] = {}
+    hook_types = (
+        W8Conv2d,
+        W8A8Conv2d,
+        W8Linear,
+        W8A8Linear,
+        nn.Conv2d,
+        nn.Linear,
+        nn.ReLU,
+        nn.LeakyReLU,
+        nn.PixelShuffle,
+        nn.InstanceNorm2d,
+        nn.AvgPool2d,
+        nn.AdaptiveAvgPool2d,
+    )
+    handles = []
+
+    def _record(name: str, output) -> None:
+        if isinstance(output, (tuple, list)):
+            if not output:
+                return
+            output = output[0]
+        if not isinstance(output, torch.Tensor):
+            return
+        try:
+            value = float(output.detach().float().abs().amax().cpu().item())
+        except Exception:
+            return
+        if math.isfinite(value):
+            module_ranges[name] = max(float(module_ranges.get(name, 0.0)), value, 1e-5)
+
+    for name, module in processor.model.named_modules():
+        if isinstance(module, hook_types):
+            handles.append(module.register_forward_hook(lambda _m, _i, o, n=name: _record(n, o)))
+
+    source: _TensorRTCalibrationSource | None = None
+    try:
+        frames = _resolve_tensorrt_calibration_frames(calibration_frames)
+        if calibration_dataset:
+            source = _make_tensorrt_dataset_calibration_source(
+                dataset_path=calibration_dataset,
+                width=width,
+                height=height,
+                dtype=processor._dtype,
+                device=processor.device,
+                frame_count=frames,
+            )
+        elif calibration_video:
+            source = _make_tensorrt_video_calibration_source(
+                video_path=calibration_video,
+                width=width,
+                height=height,
+                dtype=processor._dtype,
+                device=processor.device,
+                frame_count=frames,
+            )
+        else:
+            source = _make_synthetic_tensorrt_calibration_source(
+                width=width,
+                height=height,
+                dtype=processor._dtype,
+                device=processor.device,
+                frame_count=max(8, frames),
+            )
+
+        seen = 0
+        with torch.inference_mode():
+            while True:
+                batch = source.next_batch()
+                if batch is None:
+                    break
+                tensor = batch.get("input")
+                cond = batch.get("cond")
+                if tensor is None or cond is None:
+                    continue
+                if getattr(processor, "_is_flat_model", False):
+                    processor.model(tensor, cond)
+                else:
+                    processor.model((tensor, cond))
+                seen += 1
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(processor.device)
+        return module_ranges, seen
+    finally:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+
+
+def _tensorrt_weight_module_entries(processor: "HDRTVNetTorch") -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for name, module in processor.model.named_modules():
+        weight = _tensorrt_w8_module_weight(module)
+        if weight is None:
+            continue
+        entries.append(
+            {
+                "name": name,
+                "module": module,
+                "weight": weight,
+                "range": _tensorrt_w8a8_activation_range(module),
+            }
+        )
+    return entries
+
+
+def _tensorrt_map_conv_nodes_to_modules(
+    onnx_model,
+    modules: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[str]]:
+    conv_nodes = [node for node in onnx_model.graph.node if node.op_type == "Conv"]
+    used_modules: set[int] = set()
+    mappings: list[dict[str, object]] = []
+    failures: list[str] = []
+
+    for node in conv_nodes:
+        if len(node.input) < 2:
+            failures.append(f"{node.name or node.output[0]}: missing weight input")
+            continue
+        onnx_weight = _onnx_initializer_array(onnx_model, node.input[1])
+        if onnx_weight is None:
+            failures.append(f"{node.name or node.output[0]}: unresolved weight tensor")
+            continue
+        weight = onnx_weight.astype(np.float32, copy=False)
+        best: tuple[float, int, dict[str, object]] | None = None
+        for index, entry in enumerate(modules):
+            if index in used_modules:
+                continue
+            candidate = entry["weight"]
+            if candidate.shape != weight.shape:
+                continue
+            diff = float(np.max(np.abs(weight - candidate)))
+            if best is None or diff < best[0]:
+                best = (diff, index, entry)
+        if best is None or best[0] > 1e-2:
+            label = node.name or (node.output[0] if node.output else "<conv>")
+            failures.append(f"{label}: no checkpoint weight match")
+            continue
+        diff, index, entry = best
+        used_modules.add(index)
+        mappings.append(
+            {
+                "node": node,
+                "node_name": node.name or (node.output[0] if node.output else "<conv>"),
+                "input": node.input[0] if node.input else "",
+                "output": node.output[0] if node.output else "",
+                "weight": node.input[1] if len(node.input) > 1 else "",
+                "bias": node.input[2] if len(node.input) > 2 else "",
+                "module": str(entry["name"]),
+                "module_entry": entry,
+                "weight_max_abs_diff": diff,
+            }
+        )
+    return mappings, failures
+
+
+def _tensorrt_propagate_calibration_ranges(
+    onnx_model,
+    ranges: dict[str, float],
+    *,
+    passes: int = 4,
+    cap: float = 1024.0,
+) -> None:
+    alias_ops = {
+        "Relu",
+        "LeakyRelu",
+        "Identity",
+        "Cast",
+        "Transpose",
+        "Reshape",
+        "Squeeze",
+        "Unsqueeze",
+        "DepthToSpace",
+        "AveragePool",
+        "GlobalAveragePool",
+        "ReduceMean",
+        "Slice",
+        "Gather",
+    }
+    for _ in range(max(1, int(passes))):
+        changed = False
+        for node in onnx_model.graph.node:
+            outputs = [name for name in node.output if name]
+            if not outputs:
+                continue
+            input_values = [
+                float(ranges[name])
+                for name in node.input
+                if name and name in ranges and math.isfinite(float(ranges[name]))
+            ]
+            if not input_values:
+                continue
+            op = str(node.op_type)
+            if op in alias_ops:
+                value = max(input_values)
+            elif op in {"Sigmoid", "Tanh"}:
+                value = 1.0
+            elif op in {"Add", "Sub", "Sum", "Concat"}:
+                value = sum(input_values)
+            elif op == "Mul":
+                if len(input_values) >= 2:
+                    value = input_values[0]
+                    for item in input_values[1:]:
+                        value *= item
+                else:
+                    value = input_values[0]
+            elif op == "Div":
+                value = input_values[0]
+            elif op == "Clip":
+                value = input_values[0]
+            else:
+                continue
+            value = min(max(float(value), 1e-5), float(cap))
+            for output in outputs:
+                if value > float(ranges.get(output, 0.0)) + 1e-8:
+                    ranges[output] = value
+                    changed = True
+        if not changed:
+            break
+
+
+def _tensorrt_agcm_protected_tensors(onnx_model) -> set[str]:
+    producers = {
+        output: node
+        for node in onnx_model.graph.node
+        for output in node.output
+        if output
+    }
+    protected: set[str] = set()
+
+    def _protect_ancestors(name: str) -> None:
+        if not name or name in protected or name in {"input", "cond"}:
+            return
+        protected.add(name)
+        node = producers.get(name)
+        if node is None:
+            return
+        for item in list(node.input) + list(node.output):
+            if item and item not in {"input", "cond"}:
+                _protect_ancestors(item)
+
+    # In the native no-HG export, add_5 is the AGCM output handed to LE.  Leaving
+    # that ancestor path uncalibrated keeps TensorRT in FP16 for the conditioning
+    # branch while allowing the LE trunk to use contiguous native INT8 tactics.
+    for boundary in ("add_5",):
+        if boundary in producers:
+            _protect_ancestors(boundary)
+
+    agcm_patterns = (
+        "model.AGCM",
+        "node_linear",
+        "linear",
+        "view",
+        "ONNXTRT_unsqueezeTensor",
+        "instance_norm",
+    )
+    for name in list(producers):
+        if name not in {"input", "cond"} and any(name.startswith(p) for p in agcm_patterns):
+            _protect_ancestors(name)
+    for initializer in getattr(onnx_model.graph, "initializer", []):
+        name = str(getattr(initializer, "name", "") or "")
+        if name.startswith("model.AGCM"):
+            protected.add(name)
+            protected.add(f"{name}_output")
+    return protected - {"input", "cond"}
+
+
+def build_tensorrt_native_int8_speed_calibration_cache(
+    model_path: str,
+    width: int,
+    height: int,
+    precision: str,
+    mode_name: str,
+    *,
+    use_hg: bool,
+    cache_path: str | None = None,
+    predequantize=False,
+    qdq_fusion: str = "native",
+    device: str = "auto",
+    hg_weights: str | None = None,
+    keep_onnx: bool = False,
+    force_onnx: bool = True,
+    calibration_dataset: str | None = None,
+    calibration_video: str | None = None,
+    calibration_frames: int | None = 64,
+    default_range: float = 1.0,
+    protect_agcm: bool = True,
+) -> dict[str, object]:
+    """Build the fast native TensorRT INT8 cache from PyTorch runtime ranges.
+
+    The cache is still TensorRT implicit/native INT8, not Q/DQ.  Runtime ranges
+    are measured from the quantized PyTorch checkpoint, ONNX coverage is filled
+    broadly enough for TensorRT to form INT8 tactic regions, and the AGCM
+    conditioning branch is intentionally left uncalibrated for visual parity.
+    """
+    if not str(precision or "").startswith("int8"):
+        raise ValueError("Native INT8 speed caches require an INT8 precision.")
+    predeq = _resolve_tensorrt_predequantize(precision, predequantize)
+    if predeq:
+        raise ValueError("Native INT8 speed caches require predequantize=off.")
+    resolved_qdq = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    if resolved_qdq != "native":
+        raise ValueError("Native INT8 speed caches are native TensorRT only.")
+
+    model_path = tensorrt_source_checkpoint_path(model_path)
+    cache_path = cache_path or tensorrt_prebuilt_calibration_cache_path(
+        model_path,
+        width,
+        height,
+        precision,
+        mode_name,
+        use_hg=use_hg,
+        predequantize=False,
+        qdq_fusion="native",
+        require_exists=False,
+    )
+    if not cache_path:
+        raise RuntimeError("Could not resolve TensorRT calibration cache path.")
+
+    engine_mode = tensorrt_mode_name(
+        precision,
+        mode_name,
+        predequantize=False,
+        qdq_fusion="native",
+    )
+    onnx_path = tensorrt_onnx_path(model_path, width, height, engine_mode)
+    if force_onnx:
+        for candidate in (onnx_path, f"{onnx_path}.data"):
+            try:
+                if os.path.isfile(candidate):
+                    os.remove(candidate)
+            except OSError:
+                pass
+
+    processor = HDRTVNetTorch(
+        model_path,
+        device=device,
+        precision=precision,
+        compile_model=False,
+        predequantize=False,
+        hg_weights=hg_weights,
+        use_hg=use_hg,
+        warmup_passes=0,
+    )
+    processor._configure_assume_aligned_shapes(width, height)
+    module_entries = _tensorrt_weight_module_entries(processor)
+    module_ranges, frame_count = _tensorrt_collect_runtime_module_ranges(
+        processor,
+        width=width,
+        height=height,
+        calibration_dataset=calibration_dataset,
+        calibration_video=calibration_video,
+        calibration_frames=calibration_frames,
+    )
+
+    _export_tensorrt_onnx_from_model(
+        model=processor.model,
+        onnx_path=onnx_path,
+        width=width,
+        height=height,
+        dtype=processor._dtype,
+        device=processor.device,
+        precision=precision,
+        flat_model=getattr(processor, "_is_flat_model", False),
+        qdq_fusion="native",
+    )
+
+    try:
+        import onnx
+    except Exception as exc:
+        raise RuntimeError("onnx is required to build native INT8 speed caches.") from exc
+    onnx_model = onnx.load(onnx_path, load_external_data=True)
+    ranges = _tensorrt_all_graph_tensor_ranges(
+        onnx_model,
+        default_range=max(float(default_range), 1e-5),
+    )
+    mappings, failures = _tensorrt_map_conv_nodes_to_modules(onnx_model, module_entries)
+    if failures:
+        sample = "\n".join(f"  - {item}" for item in failures[:8])
+        raise RuntimeError(
+            "Could not map every TensorRT Conv node to checkpoint weights:\n"
+            f"{sample}"
+        )
+
+    mapped = 0
+    for item in mappings:
+        module_name = str(item["module"])
+        output_range = float(module_ranges.get(module_name, 0.0))
+        entry = item["module_entry"]
+        qparam_range = entry.get("range") if isinstance(entry, dict) else None
+        if output_range <= 0.0 and qparam_range is not None:
+            output_range = float(qparam_range)
+        if output_range <= 0.0:
+            output_range = max(float(default_range), 1e-5)
+        input_name = str(item.get("input") or "")
+        output_name = str(item.get("output") or "")
+        weight_name = str(item.get("weight") or "")
+        bias_name = str(item.get("bias") or "")
+        if input_name:
+            ranges[input_name] = max(float(ranges.get(input_name, 0.0)), 1.0)
+        if output_name:
+            ranges[output_name] = max(float(ranges.get(output_name, 0.0)), output_range)
+        if weight_name:
+            weight_range = _onnx_initializer_array(onnx_model, weight_name)
+            if weight_range is not None:
+                weight_value = float(np.max(np.abs(weight_range.astype(np.float32, copy=False))))
+                ranges[weight_name] = max(weight_value, 1e-5)
+                ranges[f"{weight_name}_output"] = max(weight_value, 1e-5)
+        if bias_name:
+            bias_array = _onnx_initializer_array(onnx_model, bias_name)
+            if bias_array is not None:
+                bias_value = float(np.max(np.abs(bias_array.astype(np.float32, copy=False))))
+                ranges[bias_name] = max(bias_value, 1e-5)
+                ranges[f"{bias_name}_output"] = max(bias_value, 1e-5)
+        mapped += 1
+
+    _tensorrt_propagate_calibration_ranges(onnx_model, ranges)
+    protected_count = 0
+    if protect_agcm:
+        protected = _tensorrt_agcm_protected_tensors(onnx_model)
+        protected_count = len(protected)
+        for name in protected:
+            ranges.pop(name, None)
+
+    _write_tensorrt_calibration_cache(cache_path, ranges)
+    if not keep_onnx:
+        cleanup_tensorrt_onnx_after_engine(onnx_path, cache_path)
+
+    processor.model = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(
+        "TensorRT native INT8 speed calibration cache: "
+        f"{cache_path} ({frame_count} frame(s), {mapped} Conv, "
+        f"{len(ranges)} tensor range(s), protected={protected_count})"
+    )
+    return {
+        "cache_path": os.path.abspath(cache_path),
+        "range_count": len(ranges),
+        "conv_count": mapped,
+        "frames": int(frame_count),
+        "protected_count": int(protected_count),
+        "onnx_path": os.path.abspath(onnx_path),
+        "mappings": [
+            {
+                "node": str(item.get("node_name") or ""),
+                "input": str(item.get("input") or ""),
+                "output": str(item.get("output") or ""),
+                "module": str(item.get("module") or ""),
+                "weight_max_abs_diff": float(item.get("weight_max_abs_diff") or 0.0),
+            }
+            for item in mappings
+        ],
+    }
+
+
+def build_tensorrt_w8a8_qparam_calibration_cache(
+    model_path: str,
+    width: int,
+    height: int,
+    precision: str,
+    mode_name: str,
+    *,
+    use_hg: bool,
+    cache_path: str | None = None,
+    predequantize=False,
+    qdq_fusion: str = "native",
+    device: str = "auto",
+    hg_weights: str | None = None,
+    keep_onnx: bool = False,
+    force_onnx: bool = True,
+    output_range_floor: float = 1.0,
+) -> dict[str, object]:
+    """Build a native TensorRT INT8 cache from checkpoint W8A8 qparams.
+
+    This does not add Q/DQ nodes.  It exports the native TensorRT ONNX graph,
+    matches each ONNX Conv weight tensor back to its checkpoint module, and
+    writes ranges only for real W8A8 activation tensors.  W8A16/FP layers are
+    left without activation ranges so TensorRT can keep them as native FP
+    tactics instead of manufacturing unrelated INT8 islands.
+    """
+    if not str(precision or "").startswith("int8"):
+        raise ValueError("W8A8 qparam calibration caches require an INT8 precision.")
+    predeq = _resolve_tensorrt_predequantize(precision, predequantize)
+    if predeq:
+        raise ValueError("W8A8 qparam calibration caches require predequantize=off.")
+    resolved_qdq = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    if resolved_qdq != "native":
+        raise ValueError("W8A8 qparam calibration caches are native TensorRT only.")
+
+    model_path = tensorrt_source_checkpoint_path(model_path)
+    cache_path = cache_path or tensorrt_prebuilt_calibration_cache_path(
+        model_path,
+        width,
+        height,
+        precision,
+        mode_name,
+        use_hg=use_hg,
+        predequantize=False,
+        qdq_fusion="native",
+        require_exists=False,
+    )
+    if not cache_path:
+        raise RuntimeError("Could not resolve TensorRT calibration cache path.")
+
+    engine_mode = tensorrt_mode_name(
+        precision,
+        mode_name,
+        predequantize=False,
+        qdq_fusion="native",
+    )
+    onnx_path = tensorrt_onnx_path(model_path, width, height, engine_mode)
+    if force_onnx:
+        _remove_candidates = [onnx_path, f"{onnx_path}.data"]
+        for candidate in _remove_candidates:
+            try:
+                if os.path.isfile(candidate):
+                    os.remove(candidate)
+            except OSError:
+                pass
+
+    processor = HDRTVNetTorch(
+        model_path,
+        device=device,
+        precision=precision,
+        compile_model=False,
+        predequantize=False,
+        hg_weights=hg_weights,
+        use_hg=use_hg,
+        warmup_passes=0,
+    )
+    processor._configure_assume_aligned_shapes(width, height)
+    modules = []
+    for name, module in processor.model.named_modules():
+        weight = _tensorrt_w8_module_weight(module)
+        if weight is not None:
+            modules.append(
+                {
+                    "name": name,
+                    "module": module,
+                    "weight": weight,
+                    "range": _tensorrt_w8a8_activation_range(module),
+                }
+            )
+
+    _export_tensorrt_onnx_from_model(
+        model=processor.model,
+        onnx_path=onnx_path,
+        width=width,
+        height=height,
+        dtype=processor._dtype,
+        device=processor.device,
+        precision=precision,
+        flat_model=getattr(processor, "_is_flat_model", False),
+        qdq_fusion="native",
+    )
+
+    try:
+        import onnx
+    except Exception as exc:
+        raise RuntimeError("onnx is required to build W8A8 qparam caches.") from exc
+    onnx_model = onnx.load(onnx_path, load_external_data=True)
+    conv_nodes = [node for node in onnx_model.graph.node if node.op_type == "Conv"]
+    used_modules: set[int] = set()
+    ranges: dict[str, float] = {"input": 1.0, "cond": 1.0}
+    mappings: list[dict[str, object]] = []
+    failures: list[str] = []
+
+    for node in conv_nodes:
+        if len(node.input) < 2:
+            failures.append(f"{node.name or node.output[0]}: missing weight input")
+            continue
+        onnx_weight = _onnx_initializer_array(onnx_model, node.input[1])
+        if onnx_weight is None:
+            failures.append(f"{node.name or node.output[0]}: unresolved weight tensor")
+            continue
+        weight = onnx_weight.astype(np.float32, copy=False)
+        best: tuple[float, int, dict[str, object]] | None = None
+        for index, entry in enumerate(modules):
+            if index in used_modules:
+                continue
+            candidate = entry["weight"]
+            if candidate.shape != weight.shape:
+                continue
+            diff = float(np.max(np.abs(weight - candidate)))
+            if best is None or diff < best[0]:
+                best = (diff, index, entry)
+        if best is None or best[0] > 1e-2:
+            label = node.name or (node.output[0] if node.output else "<conv>")
+            failures.append(f"{label}: no checkpoint weight match")
+            continue
+        diff, index, entry = best
+        used_modules.add(index)
+        activation_range = entry.get("range")
+        if activation_range is None:
+            continue
+        value = float(activation_range)
+        input_name = node.input[0]
+        output_name = node.output[0]
+        ranges[input_name] = max(float(ranges.get(input_name, 0.0)), value)
+        ranges[output_name] = max(
+            float(ranges.get(output_name, 0.0)),
+            max(float(output_range_floor), value),
+        )
+        mappings.append(
+            {
+                "node": node.name or output_name,
+                "input": input_name,
+                "output": output_name,
+                "module": str(entry["name"]),
+                "range": value,
+                "weight_max_abs_diff": diff,
+            }
+        )
+
+    if failures:
+        sample = "\n".join(f"  - {item}" for item in failures[:8])
+        raise RuntimeError(
+            "Could not map every TensorRT Conv node to checkpoint weights:\n"
+            f"{sample}"
+        )
+    if not mappings:
+        raise RuntimeError("No W8A8 Conv modules were found for TensorRT calibration.")
+
+    _write_tensorrt_calibration_cache(cache_path, ranges)
+    if not keep_onnx:
+        cleanup_tensorrt_onnx_after_engine(onnx_path, cache_path)
+
+    processor.model = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(
+        "TensorRT native W8A8 qparam calibration cache: "
+        f"{cache_path} ({len(mappings)} W8A8 Conv, {len(ranges)} tensor range(s))"
+    )
+    return {
+        "cache_path": os.path.abspath(cache_path),
+        "range_count": len(ranges),
+        "w8a8_conv_count": len(mappings),
+        "onnx_path": os.path.abspath(onnx_path),
+        "mappings": mappings,
+    }
 
 
 class _ONNXExportWrapper(nn.Module):
@@ -3979,11 +4866,20 @@ def _make_tensorrt_int8_calibrator(
     cache_path: str,
     calibration_source: _TensorRTCalibrationSource | None,
 ):
-    base_cls = getattr(trt, "IInt8EntropyCalibrator2", None)
-    if base_cls is None:
+    algorithm = _tensorrt_calibrator_algorithm()
+    if algorithm == "minmax":
         base_cls = getattr(trt, "IInt8MinMaxCalibrator", None)
+        if base_cls is None:
+            base_cls = getattr(trt, "IInt8EntropyCalibrator2", None)
+            algorithm = "entropy"
+    else:
+        base_cls = getattr(trt, "IInt8EntropyCalibrator2", None)
+        if base_cls is None:
+            base_cls = getattr(trt, "IInt8MinMaxCalibrator", None)
+            algorithm = "minmax"
     if base_cls is None:
         raise RuntimeError("TensorRT INT8 calibrator API is unavailable.")
+    print(f"TensorRT native INT8 calibrator: {algorithm}")
 
     class _Calibrator(base_cls):
         def __init__(
@@ -4299,11 +5195,15 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
 
         config = builder.create_builder_config()
         workspace_gb = _tensorrt_workspace_gb()
-        workspace_bytes = int(max(1.0, workspace_gb) * (1024 ** 3))
-        if hasattr(config, "set_memory_pool_limit"):
-            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
+        if workspace_gb is not None:
+            workspace_bytes = int(max(1.0, workspace_gb) * (1024 ** 3))
+            if hasattr(config, "set_memory_pool_limit"):
+                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
+            else:
+                config.max_workspace_size = workspace_bytes
+            print(f"TensorRT workspace limit: {workspace_gb:g} GiB")
         else:
-            config.max_workspace_size = workspace_bytes
+            print("TensorRT workspace limit: TensorRT default")
 
         opt_level = _tensorrt_builder_optimization_level()
         if hasattr(config, "builder_optimization_level"):
@@ -4335,11 +5235,22 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             builder_precision.startswith("int8")
             and self._trt_qdq_fusion == "native"
         )
-        if builder_precision != "fp32" and builder.platform_has_fast_fp16:
+        if (
+            builder_precision != "fp32"
+            and builder.platform_has_fast_fp16
+            and _tensorrt_fp16_enabled()
+        ):
             config.set_flag(trt.BuilderFlag.FP16)
         if str(builder_precision).startswith("int8") and builder.platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
             if native_int8:
+                cache_path = _tensorrt_calibration_cache_path(
+                    self.engine_path,
+                    self._trt_calibration_cache,
+                )
+                calibrated_tensor_names = _read_tensorrt_calibration_cache_tensor_names(
+                    cache_path
+                )
                 quant_flag = getattr(
                     getattr(trt, "QuantizationFlag", object),
                     "CALIBRATE_BEFORE_FUSION",
@@ -4354,7 +5265,11 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 prefer_constraints = _tensorrt_native_int8_prefer_constraints()
                 obey_constraints = _tensorrt_native_int8_obey_constraints()
                 if prefer_constraints or obey_constraints:
-                    _prefer_tensorrt_native_int8_layers(network, trt)
+                    _prefer_tensorrt_native_int8_layers(
+                        network,
+                        trt,
+                        calibrated_tensor_names,
+                    )
                     prefer_flag = getattr(
                         trt.BuilderFlag,
                         "PREFER_PRECISION_CONSTRAINTS",
@@ -4371,10 +5286,6 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     elif prefer_flag is not None:
                         config.set_flag(prefer_flag)
                         print("TensorRT native INT8 constraints: prefer")
-                cache_path = _tensorrt_calibration_cache_path(
-                    self.engine_path,
-                    self._trt_calibration_cache,
-                )
                 if self._trt_calibration_dataset:
                     calibration_source = _make_tensorrt_dataset_calibration_source(
                         dataset_path=self._trt_calibration_dataset,

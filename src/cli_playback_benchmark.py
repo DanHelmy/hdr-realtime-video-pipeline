@@ -133,14 +133,7 @@ _RUN_PRESETS = {
     },
 }
 _DEFAULT_RUNS = [
-    "fp32",
-    "fp16",
-    "int8-mixed-ptq",
-    "int8-full-ptq",
     "int8-mixed-qat",
-    "int8-full-qat",
-    "int8-mixed-qat-film",
-    "int8-full-qat-film",
 ]
 
 _CSV_FIELDS = [
@@ -710,7 +703,7 @@ def parse_args():
         "--resolutions",
         nargs="+",
         type=_parse_resolution,
-        default=[(1280, 720), (1920, 1080)],
+        default=[(1280, 720)],
         help="Resolutions to benchmark, e.g. 1280x720 1920x1080.",
     )
     parser.add_argument(
