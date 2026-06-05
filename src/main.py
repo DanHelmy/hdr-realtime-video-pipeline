@@ -43,7 +43,7 @@ from models.hdrtvnet_torch import (
 )
 
 VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
-MODEL_PATH = "src/models/weights/Ensemble_AGCM_LE.pth"
+MODEL_PATH = "src/models/weights/distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"
 
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
@@ -189,7 +189,7 @@ def parse_args():
     parser.add_argument(
         "--hg-weights",
         default=None,
-        help="Path to HG_weights.pth (overrides default path)"
+        help="Path to original/HG.pt or distilled HG weights (overrides default path)"
     )
     parser.add_argument(
         "--no-compile",
@@ -348,11 +348,40 @@ def main():
             args.use_hg = "0"
         if not model_explicit and os.path.normcase(os.path.normpath(args.model)) == os.path.normcase(os.path.normpath(MODEL_PATH)):
             qat_name = (
-                "Ensemble_AGCM_LE_int8_mixed_qat.pt"
+                "distilled/hr/HR_qfriendly_spatialmixglobal_int8_mixed_qat.pt"
                 if str(args.use_hg).strip() != "0"
-                else "Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"
+                else "distilled/hr/HR_qfriendly_spatialmixglobal_int8_mixed_qat.pt"
             )
-            args.model = os.path.join("src", "models", "weights", qat_name)
+            args.model = os.path.join("src", "models", "weights", *qat_name.split("/"))
+        if str(args.use_hg).strip() != "0" and not args.hg_weights:
+            hg_name = (
+                "distilled/hg/HG_qfriendly_directh16_int8_mixed_qat.pt"
+                if str(args.precision).strip().lower().startswith("int8")
+                else "distilled/hg/HG_qfriendly_directh16_fp32.pt"
+            )
+            selected_hg = os.path.join(
+                "src",
+                "models",
+                "weights",
+                *hg_name.split("/"),
+            )
+            if os.path.isfile(selected_hg):
+                args.hg_weights = selected_hg
+    elif (
+        not model_explicit
+        and str(args.use_hg).strip() != "0"
+        and not args.hg_weights
+    ):
+        qfriendly_hg = os.path.join(
+            "src",
+            "models",
+            "weights",
+            "distilled",
+            "hg",
+            "HG_qfriendly_directh16_fp32.pt",
+        )
+        if os.path.isfile(qfriendly_hg):
+            args.hg_weights = qfriendly_hg
 
     source = VideoSource(args.video, prefetch=args.prefetch)
 

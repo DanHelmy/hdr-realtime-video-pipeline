@@ -1,0 +1,23 @@
+# TensorRT-tuned HG mixed layout from the RTX 5060 Ti sweep.
+# Matches the ModelOpt Torch default HG mixed path:
+# include=['hg'], exclude=['hg\.conv1', 'hg\.conv_last'], 36/521 quantizers.
+# In module terms that means 18 HG compute convs; hg.conv1.0, hg.conv10, and
+# hg.conv_last stay W8A16.
+hg.conv2.0
+hg.conv3_1.0
+hg.conv3_2.0
+hg.conv4_1.0
+hg.conv4_2.0
+hg.conv5_1.0
+hg.conv5_2.0
+hg.conv_code1.0
+hg.conv_code2.0
+hg.Up_conv1.0
+hg.conv6
+hg.Up_conv2.0
+hg.conv7
+hg.Up_conv3.0
+hg.conv8
+hg.Up_conv4.0
+hg.conv9
+hg.Up_conv5.0

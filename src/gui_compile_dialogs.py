@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 
-from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer
+from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -24,8 +24,8 @@ from gui_window_utils import configure_independent_window
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-_DEFAULT_MAX_W = 1920
-_DEFAULT_MAX_H = 1080
+_DEFAULT_MAX_W = 3840
+_DEFAULT_MAX_H = 2160
 
 
 def _default_quality_trials() -> int:
@@ -96,12 +96,14 @@ def _kill_process_tree(process: QProcess | None) -> None:
 
 
 class _CompileDialog(QDialog):
-    """Non-modal dialog shown while Triton kernels are being compiled
+    """Modal dialog shown while GPU kernels or TensorRT engines are being prepared
     in-process (loading screen during playback start)."""
 
     def __init__(self, parent=None):
         super().__init__(None)
         self._owner_widget = parent
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setWindowTitle("Compiling Kernels")
         self.setMinimumSize(520, 180)
         self.resize(520, 180)
@@ -216,7 +218,9 @@ class _PrecompileOptionsDialog(QDialog):
 
         self._res_combo = QComboBox()
         res_options = [
-            (f"1080p ({max_w}x{max_h})", f"{max_w}x{max_h}", "1080p"),
+            (f"2160p ({max_w}x{max_h})", f"{max_w}x{max_h}", "2160p"),
+            ("1440p (2560x1440)", "2560x1440", "1440p"),
+            ("1080p (1920x1080)", "1920x1080", "1080p"),
             ("720p (1280x720)", "1280x720", "720p"),
             ("540p (960x540)", "960x540", "540p"),
         ]

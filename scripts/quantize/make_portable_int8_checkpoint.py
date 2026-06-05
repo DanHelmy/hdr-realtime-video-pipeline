@@ -32,7 +32,7 @@ import torch.nn as nn
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _DEFAULT_TENSORRT_SOURCE_DIR = (
-    _REPO_ROOT / "src" / "models" / "weights" / "tensorrt_sources"
+    _REPO_ROOT / "src" / "models" / "weights" / "distilled"
 )
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
@@ -70,6 +70,8 @@ def _build_model_from_arch(arch: dict) -> nn.Module:
             weighting_network=arch.get("weighting_network", False),
             hg_nf=arch.get("hg_nf", 64),
             mask_r=arch.get("mask_r", 0.75),
+            hg_arch=arch.get("hg_arch", None),
+            le_arch=arch.get("le_arch", None),
         )
     return Ensemble_AGCM_LE(
         classifier=arch.get("classifier", "color_condition"),
@@ -79,6 +81,7 @@ def _build_model_from_arch(arch: dict) -> nn.Module:
         nf=arch.get("nf", 32),
         act_type=arch.get("act_type", "relu"),
         weighting_network=arch.get("weighting_network", False),
+        le_arch=arch.get("le_arch", None),
     )
 
 
@@ -169,6 +172,35 @@ def default_tensorrt_source_path(
     suffix: str = "",
 ) -> Path:
     directory = output_dir if output_dir is not None else _DEFAULT_TENSORRT_SOURCE_DIR
+    stem = input_path.stem
+    if stem.startswith("HR_original_int8_"):
+        tag = stem[len("HR_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return directory / "hr" / f"HR_original_{mapped}{suffix}{input_path.suffix}"
+    if stem.startswith("HR_HG_original_int8_"):
+        tag = stem[len("HR_HG_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return directory / "hg" / f"HG_original_{mapped}{suffix}{input_path.suffix}"
+    if stem.startswith("HR_int8_"):
+        tag = stem[len("HR_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return directory / "hr" / f"HR_qfriendly_spatialmixglobal_{mapped}{suffix}{input_path.suffix}"
+    if stem.startswith("HR_HG_int8_"):
+        tag = stem[len("HR_HG_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return directory / "hg" / f"HG_qfriendly_directh16_{mapped}{suffix}{input_path.suffix}"
     return directory / f"{input_path.stem}{suffix}{input_path.suffix}"
 
 

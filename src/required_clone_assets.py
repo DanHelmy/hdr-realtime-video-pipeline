@@ -58,8 +58,8 @@ REQUIRED_CLONE_ASSETS: tuple[RequiredCloneAsset, ...] = (
         min_size_bytes=1024 * 1024,
     ),
     RequiredCloneAsset(
-        name="HG_weights.pth",
-        relative_path=os.path.join("src", "models", "weights", "HG_weights.pth"),
+        name="HG.pt",
+        relative_path=os.path.join("src", "models", "weights", "original", "HG.pt"),
         drive_url=(
             "https://drive.google.com/file/d/"
             "1dpg31f_XoUGujcWLvE5fkXheDdyXbdFp/view?usp=drive_link"

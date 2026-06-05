@@ -6,9 +6,11 @@ from PyQt6.QtCore import QTimer, Qt
 
 from gui_config import (
     DEFAULT_USE_HG,
+    LIVE_CAPTURE_PROCESS_FPS,
     PRECISIONS,
     RESOLUTION_SCALES,
     SOURCE_MODE_VIDEO,
+    VIDEO_PLAYBACK_BUFFER_FRAMES,
     _normalize_source_mode,
 )
 from window_capture_source import target_from_hwnd
@@ -33,6 +35,7 @@ class StateInitMixin:
         self._cur_upscale_target_w = 1920
         self._cur_upscale_target_h = 1080
         self._active_precision = None
+        self._precision_override_key = ""
         self._active_resolution = None
         self._active_use_mpv = False
         self._active_mpv_scale_kernel = BEST_MPV_SCALE
@@ -40,6 +43,7 @@ class StateInitMixin:
         self._active_mpv_cas = 0.0
         self._sdr_mpv_feed_from_worker = False
         self._active_use_hg = bool(DEFAULT_USE_HG)
+        self._active_live_capture_process_fps = float(LIVE_CAPTURE_PROCESS_FPS)
         self._active_upscale_mode = DEFAULT_UPSCALER
         self._active_film_grain = False
         self._source_hdr_info = {"is_hdr": False, "reason": "unknown"}
@@ -172,6 +176,14 @@ class StateInitMixin:
         self._startup_sync_pending = False
         self._startup_frame_relock_pending = False
         self._startup_frame_relock_token = 0
+        self._video_prebuffer_pending = False
+        self._video_prebuffer_anchor_frame = 0
+        self._video_prebuffer_target_frames = max(1, int(VIDEO_PLAYBACK_BUFFER_FRAMES))
+        self._video_prebuffer_reason = ""
+        self._scrub_preview_active = False
+        self._scrub_preview_hold_until_prebuffer = False
+        self._scrub_preview_popup = None
+        self._scrub_preview_mpv = None
         self._last_sdr_frame = None
         self._last_hdr_frame = None
         self._active_video_tab_label = ""
@@ -191,6 +203,7 @@ class StateInitMixin:
         self._last_open_dir = root_dir
         self._last_export_dir = root_dir
         self._predequantize_mode = "auto"
+        os.environ["HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS"] = "0"
         self._runtime_execution_mode = "compile"
         self._suppress_hip_sdk_warning = False
         self._startup_hip_sdk_warning_shown = False
@@ -252,6 +265,23 @@ class StateInitMixin:
         self._periodic_relock_drift_s = max(
             0.0, float(os.environ.get("HDRTVNET_PERIODIC_RELOCK_DRIFT_S", "0.045"))
         )
+        self._periodic_pair_relock_drift_s = max(
+            0.0,
+            float(
+                os.environ.get(
+                    "HDRTVNET_PERIODIC_PAIR_RELOCK_DRIFT_S",
+                    os.environ.get("HDRTVNET_PERIODIC_RELOCK_DRIFT_S", "0.180"),
+                )
+            ),
+        )
+        self._periodic_pair_relock_confirmations = max(
+            1, int(os.environ.get("HDRTVNET_PERIODIC_PAIR_RELOCK_CONFIRMATIONS", "2"))
+        )
+        self._periodic_pair_relock_cooldown_s = max(
+            0.0, float(os.environ.get("HDRTVNET_PERIODIC_PAIR_RELOCK_COOLDOWN_S", "2.5"))
+        )
+        self._periodic_pair_relock_bad_count = 0
+        self._periodic_pair_relock_cooldown_until = 0.0
         self._playhead_relock_token = 0
         self._pending_playhead_relock_on_unmute = False
         self._pending_playhead_relock_pre_delay_ms = -1
@@ -280,6 +310,10 @@ class StateInitMixin:
         self._export_saved_enabled_states = {}
         self._benchmark_interaction_locked = False
         self._benchmark_saved_enabled_states = {}
+        self._compile_interaction_locked = False
+        self._compile_saved_enabled_states = {}
+        self._original_tensorrt_source_process = None
+        self._original_tensorrt_source_dlg = None
         try:
             self._startup_seek_frame = (
                 int(initial_start_frame) if initial_start_frame is not None else None
@@ -308,7 +342,15 @@ class StateInitMixin:
             self._source_mode = source_mode
             self._refresh_source_mode_ui()
             if initial_precision in PRECISIONS:
-                self._cmb_prec.setCurrentText(initial_precision)
+                cfg = PRECISIONS.get(initial_precision, {})
+                if bool(cfg.get("hidden", False)):
+                    self._precision_override_key = str(initial_precision)
+                    if self._cmb_prec.findText("FP16") >= 0:
+                        was_blocked = self._cmb_prec.blockSignals(True)
+                        self._cmb_prec.setCurrentText("FP16")
+                        self._cmb_prec.blockSignals(was_blocked)
+                else:
+                    self._cmb_prec.setCurrentText(initial_precision)
             legacy_resolution_map = {
                 "Native": "1080p",
             }

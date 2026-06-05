@@ -1,4 +1,4 @@
-"""
+﻿"""
 Full INT8 (W8A8) Quantization for HDRTVNet++.
 
 Both weights AND activations are quantized to INT8:
@@ -50,9 +50,37 @@ from models.hdrtvnet_torch import (
 
 def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module:
     """Load the FP32 model (HG composite or base AGCM+LE)."""
+    raw = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(raw, dict) and "state_dict" in raw:
+        base_arch = dict(raw.get("architecture") or {})
+        state = raw["state_dict"]
+    else:
+        base_arch = {
+            "classifier": os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+            "le_arch": os.environ.get("HDRTVNET_LE_ARCH", "sft"),
+            "hg_arch": os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"),
+        }
+        state = raw
+
+    hg_arch = str(base_arch.get("hg_arch") or os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"))
+    hg_state = None
+    if use_hg:
+        raw_hg = torch.load(hg_weights, map_location="cpu", weights_only=False)
+        if isinstance(raw_hg, dict) and "state_dict" in raw_hg:
+            hg_state = raw_hg["state_dict"]
+            hg_meta = dict(raw_hg.get("architecture") or {})
+            hg_arch = str(hg_meta.get("hg_arch") or hg_arch)
+        else:
+            hg_state = raw_hg
+
+    classifier = str(
+        base_arch.get("classifier")
+        or os.environ.get("HDRTVNET_CLASSIFIER", "color_condition")
+    )
+    le_arch = str(base_arch.get("le_arch") or os.environ.get("HDRTVNET_LE_ARCH", "sft"))
     if use_hg:
         model = HG_Composite(
-            classifier="color_condition",
+            classifier=classifier,
             cond_c=6,
             in_nc=3,
             out_nc=3,
@@ -61,19 +89,21 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
             weighting_network=False,
             hg_nf=64,
             mask_r=0.75,
+            hg_arch=hg_arch,
+            le_arch=le_arch,
         )
     else:
         model = Ensemble_AGCM_LE(
-            classifier="color_condition",
+            classifier=classifier,
             cond_c=6,
             in_nc=3,
             out_nc=3,
             nf=32,
             act_type="relu",
             weighting_network=False,
+            le_arch=le_arch,
         )
 
-    state = torch.load(model_path, map_location="cpu", weights_only=True)
     cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
     if use_hg:
         model.base.load_state_dict(cleaned, strict=True)
@@ -81,10 +111,21 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
         model.load_state_dict(cleaned, strict=True)
 
     if use_hg:
-        hg_state = torch.load(hg_weights, map_location="cpu")
-        if isinstance(hg_state, dict) and "state_dict" in hg_state:
-            hg_state = hg_state["state_dict"]
         model.hg.load_state_dict(hg_state, strict=True)
+    model._hdrtvnet_source_arch = {
+        "classifier": classifier,
+        "cond_c": 6,
+        "in_nc": 3,
+        "out_nc": 3,
+        "nf": 32,
+        "act_type": "relu",
+        "weighting_network": False,
+        "use_hg": bool(use_hg),
+        "hg_nf": 64,
+        "mask_r": 0.75,
+        "le_arch": le_arch,
+        "hg_arch": hg_arch,
+    }
     model.eval()
     return model
 
@@ -97,8 +138,9 @@ def load_calibration_images(calib_dir: str, max_images: int = 16,
         paths = sorted(glob.glob(os.path.join(calib_dir, "*.jpg")))
     if not paths:
         raise FileNotFoundError(f"No images found in {calib_dir}")
-    if max_images > 0:
-        paths = paths[:max_images]
+    if max_images > 0 and len(paths) > max_images:
+        indexes = np.linspace(0, len(paths) - 1, max_images, dtype=np.int64)
+        paths = [paths[int(i)] for i in dict.fromkeys(indexes.tolist())]
     tensors = []
     for p in paths:
         img = cv2.imread(p)
@@ -134,6 +176,20 @@ def prepare_model_input(img_tensor, device, dtype):
     return (img_dev, cond)
 
 
+def state_dict_preserve_activation_qparams(model):
+    """Keep static activation quantization parameters in FP32 when saving."""
+    state = model.state_dict()
+    fixed = {}
+    for key, value in state.items():
+        if torch.is_tensor(value) and (
+            key.endswith("x_scale") or key.endswith("x_zero")
+        ):
+            fixed[key] = value.detach().float()
+        else:
+            fixed[key] = value
+    return fixed
+
+
 # ===================================================================
 # Main
 # ===================================================================
@@ -144,7 +200,15 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "Ensemble_AGCM_LE.pth"),
+        default=os.path.join(
+            _REPO_ROOT,
+            "src",
+            "models",
+            "weights",
+            "distilled",
+            "hr",
+            "HR_qfriendly_spatialmixglobal_fp32.pt",
+        ),
                         help="Path to FP32 .pth weights")
     parser.add_argument("--output",
                         default=os.path.join(
@@ -152,11 +216,13 @@ def main():
                             "src",
                             "models",
                             "weights",
-                            "Ensemble_AGCM_LE_int8_full.pt",
+                            "pytorch_int8",
+                            "hg",
+                            "HR_HG_int8_full.pt",
                         ),
                         help="Output path for quantized checkpoint")
-    parser.add_argument("--export-tensorrt-source", default="1", choices=["1", "0"],
-                        help="Also export a portable TensorRT source checkpoint")
+    parser.add_argument("--export-tensorrt-source", default="0", choices=["1", "0"],
+                        help="Also export a legacy portable TensorRT source checkpoint")
     parser.add_argument("--tensorrt-source-dir", default=None,
                         help="Directory for portable TensorRT source checkpoints")
     parser.add_argument("--tensorrt-source-activation-quant",
@@ -187,8 +253,8 @@ def main():
         default=os.path.join(_REPO_ROOT, "dataset", "train_sdr"),
                         help="Directory of SDR images for activation calibration")
     parser.add_argument("--hg-weights",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "HG_weights.pth"),
-                        help="Path to HG weights (HG_weights.pth)")
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hg", "HG_qfriendly_directh16_fp32.pt"),
+                        help="Path to HG weights")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"],
                         help="Use HG refinement (1) or base AGCM+LE only (0)")
     parser.add_argument("--num-calibrate", type=int, default=16,
@@ -201,7 +267,21 @@ def main():
     parser.add_argument("--calibration-device", default="auto",
                         choices=["auto", "cuda", "cpu"],
                         help="Device for activation calibration")
+    output_explicit = any(
+        item == "--output" or item.startswith("--output=")
+        for item in sys.argv[1:]
+    )
     args = parser.parse_args()
+    if not output_explicit and str(args.use_hg).strip() == "0":
+        args.output = os.path.join(
+            _REPO_ROOT,
+            "src",
+            "models",
+            "weights",
+            "pytorch_int8",
+            "hr",
+            "HR_int8_full.pt",
+        )
 
     compute_dtype = torch.float16 if args.precision == "fp16" else torch.float32
     device_str = args.device
@@ -278,32 +358,40 @@ def main():
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     save_data = {
-        "state_dict": model.state_dict(),
+        "state_dict": state_dict_preserve_activation_qparams(model),
         "compute_dtype": str(save_dtype),
         "quantization": "w8a8_full",
         "activation_quant": args.activation_quant,
         "calibration_method": args.calibration_method,
         "calibration_percentile": args.percentile,
         "calibration_percentile_low": args.percentile_low,
-        "architecture": {
-            "classifier": "color_condition",
-            "cond_c": 6,
-            "in_nc": 3,
-            "out_nc": 3,
-            "nf": 32,
-            "act_type": "relu",
-            "weighting_network": False,
-            "use_hg": use_hg,
-            "hg_nf": 64,
-            "mask_r": 0.75,
-        },
+        "architecture": dict(
+            getattr(
+                model,
+                "_hdrtvnet_source_arch",
+                {
+                    "classifier": os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+                    "cond_c": 6,
+                    "in_nc": 3,
+                    "out_nc": 3,
+                    "nf": 32,
+                    "act_type": "relu",
+                    "weighting_network": False,
+                    "use_hg": use_hg,
+                    "hg_nf": 64,
+                    "mask_r": 0.75,
+                    "le_arch": os.environ.get("HDRTVNET_LE_ARCH", "sft"),
+                    "hg_arch": os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"),
+                },
+            )
+        ),
     }
     torch.save(save_data, args.output)
     if str(args.export_tensorrt_source).strip() != "0":
         from make_portable_int8_checkpoint import (
-            convert_checkpoint,
             default_tensorrt_source_path,
         )
+        from split_distilled_tensorrt_sources import generate_tensorrt_source
 
         trt_source_dir = (
             Path(args.tensorrt_source_dir)
@@ -313,11 +401,10 @@ def main():
             Path(args.output),
             trt_source_dir,
         )
-        convert_checkpoint(
+        generate_tensorrt_source(
             Path(args.output),
             trt_source_path,
             activation_quant=args.tensorrt_source_activation_quant,
-            target_backend="tensorrt",
         )
 
     orig_bytes = os.path.getsize(args.model)

@@ -1,0 +1,39 @@
+# Quantization-friendly HR+HG fast path:
+# classifier=agcm_spatialmixglobalh8wide64x6
+# LE=conddirecth8wide96x12
+# HG=directh16wide64x8
+#
+# Matches the TensorRT ModelOpt include mask:
+# base.AGCM.spatial;base.AGCM.global;base.LE.low_in;base.LE.recon_trunk3;hg.low_in;hg.trunk
+base.AGCM.spatial_in
+base.AGCM.spatial_trunk.0
+base.AGCM.spatial_trunk.2
+base.AGCM.spatial_trunk.4
+base.AGCM.spatial_trunk.6
+base.AGCM.spatial_trunk.8
+base.AGCM.spatial_trunk.10
+base.AGCM.spatial_out
+base.AGCM.global_in
+base.AGCM.global_out
+base.LE.recon_trunk3.0
+base.LE.recon_trunk3.2
+base.LE.recon_trunk3.4
+base.LE.recon_trunk3.6
+base.LE.recon_trunk3.8
+base.LE.recon_trunk3.10
+base.LE.recon_trunk3.12
+base.LE.recon_trunk3.14
+base.LE.recon_trunk3.16
+base.LE.recon_trunk3.18
+base.LE.recon_trunk3.20
+base.LE.recon_trunk3.22
+base.LE.low_in
+hg.low_in
+hg.trunk.0
+hg.trunk.2
+hg.trunk.4
+hg.trunk.6
+hg.trunk.8
+hg.trunk.10
+hg.trunk.12
+hg.trunk.14

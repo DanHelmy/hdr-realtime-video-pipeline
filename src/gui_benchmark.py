@@ -57,7 +57,10 @@ from gui_config import (
     PRECISIONS,
     RESOLUTION_SCALES,
     _available_precision_keys,
+    _processing_preset_dims,
+    _select_hg_weights_path,
     _select_model_path,
+    _select_tensorrt_model_path,
 )
 from gui_hdr_io import (
     FFMPEG_WINDOWS_DOWNLOAD_URL,
@@ -94,9 +97,11 @@ from gui_scaling import (
     BEST_MPV_SCALE,
     FILMGRAIN_SHADER_PATH,
     FSR_SHADER_PATH,
+    SSIM_DOWNSCALER_SHADER_PATH,
     SSIM_SUPERRES_SHADER_PATH,
     _ensure_filmgrain_shader,
     _ensure_fsr_shader,
+    _ensure_ssim_downscaler_shader,
     _ensure_ssim_superres_shader,
     _letterbox_bgr,
     _normalize_shader_paths,
@@ -347,10 +352,12 @@ def _new_mpv_widget() -> MpvHDRWidget:
         ensure_fsr_shader=_ensure_fsr_shader,
         ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
         ensure_filmgrain_shader=_ensure_filmgrain_shader,
+        ensure_ssim_downscaler_shader=_ensure_ssim_downscaler_shader,
         best_mpv_scale=BEST_MPV_SCALE,
         fsr_shader_path=FSR_SHADER_PATH,
         ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
         filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
+        ssim_downscaler_shader_path=SSIM_DOWNSCALER_SHADER_PATH,
     )
 
 
@@ -369,10 +376,7 @@ def _sanitize_name(text: str) -> str:
 
 
 def _resolution_dims(res_key: str) -> tuple[int, int]:
-    dims = RESOLUTION_SCALES.get(str(res_key or ""))
-    if dims is None:
-        return 1920, 1080
-    return int(dims[0]), int(dims[1])
+    return _processing_preset_dims(str(res_key or ""))
 
 
 def _fmt_metric(v, fmt: str = ".4f", suffix: str = "") -> str:
@@ -1534,8 +1538,19 @@ class _BenchmarkWorker(QObject):
                 ),
             )
             if _IS_NVIDIA:
+                trt_model_path = _select_tensorrt_model_path(
+                    cfg.precision_key,
+                    bool(cfg.use_hg),
+                )
                 mode_name = f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}"
-                trt_predeq = _resolve_predequantize_arg(str(cfg.predequantize_mode))
+                trt_hg_weights = (
+                    _select_hg_weights_path(cfg.precision_key, tensorrt=True)
+                    if bool(cfg.use_hg)
+                    else None
+                )
+                if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+                    trt_hg_weights = None
+                trt_predeq = False
                 trt_mode_name = tensorrt_mode_name(
                     model_precision,
                     mode_name,
@@ -1543,7 +1558,7 @@ class _BenchmarkWorker(QObject):
                     qdq_fusion="native",
                 )
                 trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
-                    model_path,
+                    trt_model_path,
                     out_w,
                     out_h,
                     model_precision,
@@ -1554,14 +1569,14 @@ class _BenchmarkWorker(QObject):
                     require_exists=True,
                 )
                 engine_path = tensorrt_engine_path(
-                    model_path,
+                    trt_model_path,
                     out_w,
                     out_h,
                     trt_mode_name,
                 )
                 if tensorrt_engine_is_valid(
                     engine_path,
-                    model_path=model_path,
+                    model_path=trt_model_path,
                     width=out_w,
                     height=out_h,
                     precision=model_precision,
@@ -1569,6 +1584,7 @@ class _BenchmarkWorker(QObject):
                     use_hg=bool(cfg.use_hg),
                     predequantize=trt_predeq,
                     qdq_fusion="native",
+                    hg_weights=trt_hg_weights,
                     calibration_cache=trt_calibration_cache,
                 ):
                     self.progress.emit(0, "Loading cached TensorRT engine ...")
@@ -1582,12 +1598,13 @@ class _BenchmarkWorker(QObject):
 
                 with capture_output_to_gui(_emit_trt_line):
                     processor = HDRTVNetTensorRT(
-                        model_path,
+                        trt_model_path,
                         device="auto",
                         precision=model_precision,
                         engine_width=out_w,
                         engine_height=out_h,
                         mode_name=mode_name,
+                        hg_weights=trt_hg_weights,
                         use_hg=bool(cfg.use_hg),
                         predequantize=trt_predeq,
                         qdq_fusion="native",
@@ -1595,6 +1612,13 @@ class _BenchmarkWorker(QObject):
                     )
                 cfg.runtime_mode = "TensorRT"
             else:
+                torch_hg_weights = (
+                    _select_hg_weights_path(cfg.precision_key)
+                    if bool(cfg.use_hg)
+                    else None
+                )
+                if torch_hg_weights and not os.path.isfile(torch_hg_weights):
+                    torch_hg_weights = None
                 processor = HDRTVNetTorch(
                     model_path,
                     device="auto",
@@ -1603,6 +1627,7 @@ class _BenchmarkWorker(QObject):
                     force_compile=bool(compile_cache_ready),
                     compile_mode="auto" if compile_cache_ready else "default",
                     predequantize=_resolve_predequantize_arg(str(cfg.predequantize_mode)),
+                    hg_weights=torch_hg_weights,
                     use_hg=bool(cfg.use_hg),
                     warmup_passes=0,
                 )
@@ -2595,6 +2620,12 @@ class ModelBenchmarkDialog(QDialog):
         opt_form.addRow(self._lbl_predequantize, self._cmb_predequantize)
         opt_form.addRow("Session logs root:", root_row)
         cfg_layout.addWidget(opt_group)
+        if _IS_NVIDIA:
+            self._lbl_predequantize.hide()
+            self._cmb_predequantize.hide()
+            off_idx = self._cmb_predequantize.findData("off")
+            if off_idx >= 0:
+                self._cmb_predequantize.setCurrentIndex(off_idx)
 
         queue_group = QGroupBox("Benchmark Queue")
         queue_layout = QGridLayout(queue_group)
@@ -2605,12 +2636,13 @@ class ModelBenchmarkDialog(QDialog):
         self._lbl_queue_preview = QLabel("Select a queued run to preview its captured settings.")
         self._lbl_queue_preview.setWordWrap(True)
         self._btn_queue_add = QPushButton("Add Current to Queue")
+        self._btn_queue_add_all_precisions = QPushButton("Add All Precisions")
         self._btn_queue_remove = QPushButton("Remove Selected")
         self._btn_queue_run = QPushButton("Run Queue")
         self._btn_queue_clear = QPushButton("Clear Queue")
         self._btn_queue_run.setProperty("role", "primary")
         self._lst_benchmark_queue.setToolTip(
-            "Queued runs use the mode, source/tasks, precision, resolution, HG, and pre-dequantize settings captured when added."
+            "Queued runs use the mode, source/tasks, precision, resolution, and HG settings captured when added."
         )
         queue_layout.addWidget(self._lbl_queue_status, 0, 0, 1, 3)
         queue_layout.addWidget(self._lst_benchmark_queue, 1, 0, 1, 3)
@@ -2619,6 +2651,7 @@ class ModelBenchmarkDialog(QDialog):
         queue_buttons.setContentsMargins(0, 0, 0, 0)
         queue_buttons.setSpacing(6)
         queue_buttons.addWidget(self._btn_queue_add)
+        queue_buttons.addWidget(self._btn_queue_add_all_precisions)
         queue_buttons.addWidget(self._btn_queue_remove)
         queue_buttons.addWidget(self._btn_queue_run)
         queue_buttons.addWidget(self._btn_queue_clear)
@@ -2803,6 +2836,9 @@ class ModelBenchmarkDialog(QDialog):
         self._btn_session_root.clicked.connect(self._pick_session_root)
         self._btn_run.clicked.connect(self._start_benchmark)
         self._btn_queue_add.clicked.connect(self._add_current_benchmark_to_queue)
+        self._btn_queue_add_all_precisions.clicked.connect(
+            self._add_all_precisions_to_queue
+        )
         self._btn_queue_remove.clicked.connect(self._remove_selected_benchmark_from_queue)
         self._btn_queue_run.clicked.connect(self._start_benchmark_queue)
         self._btn_queue_clear.clicked.connect(self._clear_benchmark_queue)
@@ -3483,11 +3519,19 @@ class ModelBenchmarkDialog(QDialog):
         model_precision = str(precision_cfg.get("precision") or "fp16")
         try:
             if _IS_NVIDIA:
+                trt_model_path = _select_tensorrt_model_path(precision, bool(use_hg))
                 out_w, out_h = _resolution_dims(resolution_key)
-                trt_predeq = _resolve_predequantize_arg(predequantize_mode)
+                trt_predeq = False
                 mode_name = f"{precision}_{'hg' if use_hg else 'nohg'}"
+                trt_hg_weights = (
+                    _select_hg_weights_path(precision, tensorrt=True)
+                    if bool(use_hg)
+                    else None
+                )
+                if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+                    trt_hg_weights = None
                 trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
-                    model_path,
+                    trt_model_path,
                     out_w,
                     out_h,
                     model_precision,
@@ -3499,12 +3543,13 @@ class ModelBenchmarkDialog(QDialog):
                 )
                 with capture_output_to_gui(lambda _line: None):
                     processor = HDRTVNetTensorRT(
-                        model_path,
+                        trt_model_path,
                         device="auto",
                         precision=model_precision,
                         engine_width=out_w,
                         engine_height=out_h,
                         mode_name=mode_name,
+                        hg_weights=trt_hg_weights,
                         use_hg=bool(use_hg),
                         predequantize=trt_predeq,
                         qdq_fusion="native",
@@ -3520,6 +3565,13 @@ class ModelBenchmarkDialog(QDialog):
                     use_hg=bool(use_hg),
                     predequantize_mode=predequantize_mode,
                 )
+                torch_hg_weights = (
+                    _select_hg_weights_path(precision)
+                    if bool(use_hg)
+                    else None
+                )
+                if torch_hg_weights and not os.path.isfile(torch_hg_weights):
+                    torch_hg_weights = None
                 processor = HDRTVNetTorch(
                     model_path,
                     device="auto",
@@ -3528,6 +3580,7 @@ class ModelBenchmarkDialog(QDialog):
                     force_compile=bool(compile_ready),
                     compile_mode="auto" if compile_ready else "default",
                     predequantize=_resolve_predequantize_arg(predequantize_mode),
+                    hg_weights=torch_hg_weights,
                     use_hg=bool(use_hg),
                     warmup_passes=0,
                 )
@@ -4809,13 +4862,30 @@ class ModelBenchmarkDialog(QDialog):
                 return base
         return "benchmark_source"
 
-    def _new_session_dir(self, source_name: str, task_count: int) -> str:
+    def _new_session_dir(
+        self,
+        source_name: str,
+        task_count: int,
+        *,
+        precision_key: str | None = None,
+        resolution_key: str | None = None,
+    ) -> str:
         root_dir = self._txt_session_root.text().strip() or self._logs_root
         if not os.path.isdir(root_dir):
             os.makedirs(root_dir, exist_ok=True)
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        pkey = _sanitize_name(self._cmb_precision.currentText().lower().replace(" ", "_"))
-        rkey = _sanitize_name(self._cmb_resolution.currentText().lower().replace(" ", "_"))
+        precision_text = str(
+            precision_key
+            if precision_key is not None
+            else self._cmb_precision.currentText()
+        )
+        resolution_text = str(
+            resolution_key
+            if resolution_key is not None
+            else self._cmb_resolution.currentText()
+        )
+        pkey = _sanitize_name(precision_text.lower().replace(" ", "_"))
+        rkey = _sanitize_name(resolution_text.lower().replace(" ", "_"))
         source_key = _sanitize_name(source_name)
         session_name = f"{ts}__{pkey}"
         if rkey:
@@ -4830,46 +4900,72 @@ class ModelBenchmarkDialog(QDialog):
         os.makedirs(session, exist_ok=True)
         return session
 
-    def _build_current_run_config(self) -> BenchmarkRunConfig:
+    def _build_current_run_config(
+        self,
+        *,
+        precision_key: str | None = None,
+    ) -> BenchmarkRunConfig:
         mode = str(self._cmb_mode.currentData() or "video")
         if mode == "video":
             tasks = self._build_video_tasks()
         else:
             tasks = self._build_dataset_tasks()
         source_name = self._derive_source_name(mode, tasks)
-        session_dir = self._new_session_dir(source_name, len(tasks))
+        selected_precision = str(precision_key or self._cmb_precision.currentText())
+        selected_resolution = self._cmb_resolution.currentText()
+        session_dir = self._new_session_dir(
+            source_name,
+            len(tasks),
+            precision_key=selected_precision,
+            resolution_key=selected_resolution,
+        )
         return BenchmarkRunConfig(
             mode=mode,
             source_name=source_name,
-            precision_key=self._cmb_precision.currentText(),
+            precision_key=selected_precision,
             use_hg=bool(self._chk_use_hg.isChecked()),
-            resolution_key=self._cmb_resolution.currentText(),
-            predequantize_mode=str(self._cmb_predequantize.currentData() or "auto"),
+            resolution_key=selected_resolution,
+            predequantize_mode=(
+                "off"
+                if _IS_NVIDIA
+                else str(self._cmb_predequantize.currentData() or "auto")
+            ),
             tasks=tasks,
             session_dir=session_dir,
         )
 
     def _queue_title_for_config(self, cfg: BenchmarkRunConfig) -> str:
         hg_label = "HG" if bool(cfg.use_hg) else "no-HG"
-        pdq = _normalize_benchmark_predequantize_mode(cfg.predequantize_mode)
         mode_label = "video" if cfg.mode == "video" else "dataset"
-        return (
+        title = (
             f"{cfg.source_name} | {cfg.precision_key} | {cfg.resolution_key} | "
-            f"{hg_label} | predeq={pdq} | {mode_label} n={len(cfg.tasks)}"
+            f"{hg_label} | {mode_label} n={len(cfg.tasks)}"
         )
+        if not _IS_NVIDIA:
+            pdq = _normalize_benchmark_predequantize_mode(cfg.predequantize_mode)
+            title = title.replace(
+                f" | {mode_label} n={len(cfg.tasks)}",
+                f" | predeq={pdq} | {mode_label} n={len(cfg.tasks)}",
+            )
+        return title
 
     def _queue_detail_for_config(self, cfg: BenchmarkRunConfig) -> str:
         hg_label = "on" if bool(cfg.use_hg) else "off"
-        pdq = _normalize_benchmark_predequantize_mode(cfg.predequantize_mode)
         mode_label = "Video" if cfg.mode == "video" else "Dataset"
         first_task = cfg.tasks[0] if cfg.tasks else None
         first_label = str(first_task.label) if first_task is not None else "-"
         if len(cfg.tasks) > 1:
             first_label = f"{first_label} (+{len(cfg.tasks) - 1} more)"
+        precision_part = (
+            f"precision={cfg.precision_key}, resolution={cfg.resolution_key}, "
+            f"HG={hg_label}"
+        )
+        if not _IS_NVIDIA:
+            pdq = _normalize_benchmark_predequantize_mode(cfg.predequantize_mode)
+            precision_part = f"{precision_part}, predequantize={pdq}"
         return (
             f"{mode_label} benchmark: {cfg.source_name} | "
-            f"precision={cfg.precision_key}, resolution={cfg.resolution_key}, "
-            f"HG={hg_label}, predequantize={pdq}, items={len(cfg.tasks)} | "
+            f"{precision_part}, items={len(cfg.tasks)} | "
             f"first item={first_label} | session={cfg.session_dir}"
         )
 
@@ -4894,6 +4990,7 @@ class ModelBenchmarkDialog(QDialog):
             selected_row = int(self._lst_benchmark_queue.currentRow())
         can_remove = (not running) and 0 <= selected_row < queued
         self._btn_queue_add.setEnabled(not running)
+        self._btn_queue_add_all_precisions.setEnabled(not running)
         self._btn_queue_run.setEnabled((not running) and queued > 0)
         self._btn_queue_remove.setEnabled(can_remove)
         self._btn_queue_clear.setEnabled((not running) and queued > 0)
@@ -4935,6 +5032,33 @@ class ModelBenchmarkDialog(QDialog):
         self._benchmark_queue.append(_QueuedBenchmarkRun(config=cfg, title=title))
         self._refresh_queue_list()
         self._set_status(f"Queued benchmark: {title}")
+
+    def _add_all_precisions_to_queue(self):
+        if self._worker_thread is not None:
+            return
+        added = 0
+        last_error = None
+        for precision_key in _available_precision_keys():
+            try:
+                cfg = self._build_current_run_config(precision_key=precision_key)
+            except Exception as exc:
+                last_error = exc
+                break
+            title = self._queue_title_for_config(cfg)
+            self._benchmark_queue.append(_QueuedBenchmarkRun(config=cfg, title=title))
+            added += 1
+        if added <= 0:
+            if last_error is not None:
+                QMessageBox.warning(self, "Benchmark Queue", str(last_error))
+            return
+        self._refresh_queue_list()
+        self._set_status(f"Queued {added} precision benchmark runs.")
+        if last_error is not None:
+            QMessageBox.warning(
+                self,
+                "Benchmark Queue",
+                f"Queued {added} run(s), then stopped:\n{last_error}",
+            )
 
     def _remove_selected_benchmark_from_queue(self):
         if self._worker_thread is not None:
@@ -5000,7 +5124,6 @@ class ModelBenchmarkDialog(QDialog):
             self._cmb_precision,
             self._chk_use_hg,
             self._cmb_resolution,
-            self._cmb_predequantize,
             self._btn_session_root,
             self._cmb_avg_mode,
             self._spn_subset,
@@ -5013,6 +5136,8 @@ class ModelBenchmarkDialog(QDialog):
             self._result_sets_bar,
         ):
             w.setEnabled(not running)
+        if not _IS_NVIDIA:
+            self._cmb_predequantize.setEnabled(not running)
         if hasattr(self, "_lst_benchmark_queue"):
             self._lst_benchmark_queue.setEnabled(not running)
         self._sync_queue_ui()

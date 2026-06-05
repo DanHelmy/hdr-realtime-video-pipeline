@@ -10,14 +10,16 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QCheckBox, QMessageBox, QProgressDialog
 
 from gui_hdr_io import FFMPEG_WINDOWS_DOWNLOAD_URL, hdr_ffmpeg_ready
-from gui_mpv_widget import MpvHDRWidget
+from gui_mpv_widget import MpvFilePreviewWidget, MpvHDRWidget
 from gui_scaling import (
     BEST_MPV_SCALE,
     FSR_SHADER_PATH,
     FILMGRAIN_SHADER_PATH,
+    SSIM_DOWNSCALER_SHADER_PATH,
     SSIM_SUPERRES_SHADER_PATH,
     _ensure_filmgrain_shader,
     _ensure_fsr_shader,
+    _ensure_ssim_downscaler_shader,
     _ensure_ssim_superres_shader,
     _normalize_shader_paths,
 )
@@ -97,10 +99,18 @@ class CompareViewMixin:
             ensure_fsr_shader=_ensure_fsr_shader,
             ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
             ensure_filmgrain_shader=_ensure_filmgrain_shader,
+            ensure_ssim_downscaler_shader=_ensure_ssim_downscaler_shader,
             best_mpv_scale=BEST_MPV_SCALE,
             fsr_shader_path=FSR_SHADER_PATH,
             ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
             filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
+            ssim_downscaler_shader_path=SSIM_DOWNSCALER_SHADER_PATH,
+        )
+
+    def _new_file_preview_widget(self) -> MpvFilePreviewWidget:
+        return MpvFilePreviewWidget(
+            mpv_lib=mpv_lib,
+            mpv_diag=_MPV_DIAG,
         )
 
     def _ensure_compare_dialog(self) -> CompareFrameDialog:

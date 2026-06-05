@@ -95,6 +95,78 @@ class ResBlock_with_SFT(nn.Module):
         return (x[0] + fea, x[1])
 
 
+class ResBlock_noSFT(nn.Module):
+    """Tuple-compatible residual block for clean quantized conv trunks."""
+
+    def __init__(self, nf=64):
+        super(ResBlock_noSFT, self).__init__()
+        self.conv1 = nn.Conv2d(nf, nf, 3, 1, 1)
+        self.conv2 = nn.Conv2d(nf, nf, 3, 1, 1)
+        initialize_weights([self.conv1, self.conv2], 0.1)
+
+    def forward(self, x):
+        fea = F.relu(self.conv1(x[0]), inplace=True)
+        fea = self.conv2(fea)
+        return (x[0] + fea, x[1])
+
+
+class ResBlock_noSFTWide(nn.Module):
+    """Tuple-compatible residual block with a wider internal low-res core."""
+
+    def __init__(self, nf=64, wide_nf=64):
+        super(ResBlock_noSFTWide, self).__init__()
+        self.conv1 = nn.Conv2d(nf, wide_nf, 1, 1, 0)
+        self.conv2 = nn.Conv2d(wide_nf, wide_nf, 3, 1, 1)
+        self.conv3 = nn.Conv2d(wide_nf, nf, 1, 1, 0)
+        initialize_weights([self.conv1, self.conv2], 0.1)
+        nn.init.zeros_(self.conv3.weight)
+        if self.conv3.bias is not None:
+            nn.init.zeros_(self.conv3.bias)
+
+    def forward(self, x):
+        fea = F.relu(self.conv1(x[0]), inplace=True)
+        fea = F.relu(self.conv2(fea), inplace=True)
+        fea = self.conv3(fea)
+        return (x[0] + fea, x[1])
+
+
+class TuplePlainConvTrunk(nn.Module):
+    """Tuple-compatible Conv/ReLU chain with no internal residual adds."""
+
+    def __init__(self, nf=64, depth=8, init_scale=0.1):
+        super(TuplePlainConvTrunk, self).__init__()
+        layers = []
+        for _ in range(max(1, int(depth))):
+            layers.append(nn.Conv2d(nf, nf, 3, 1, 1))
+            layers.append(nn.ReLU(inplace=True))
+        self.layers = nn.Sequential(*layers)
+        initialize_weights([self.layers], init_scale)
+
+    def forward(self, x):
+        return (self.layers(x[0]), x[1])
+
+
+class TupleWidePlainConvTrunk(nn.Module):
+    """Tuple-compatible wide low-res Conv/ReLU chain, projected back to nf."""
+
+    def __init__(self, nf=64, wide_nf=64, depth=8, init_scale=0.1):
+        super(TupleWidePlainConvTrunk, self).__init__()
+        wide_nf = max(int(nf), int(wide_nf))
+        layers = [
+            nn.Conv2d(nf, wide_nf, 1, 1, 0),
+            nn.ReLU(inplace=True),
+        ]
+        for _ in range(max(1, int(depth))):
+            layers.append(nn.Conv2d(wide_nf, wide_nf, 3, 1, 1))
+            layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Conv2d(wide_nf, nf, 1, 1, 0))
+        self.layers = nn.Sequential(*layers)
+        initialize_weights([self.layers], init_scale)
+
+    def forward(self, x):
+        return (self.layers(x[0]), x[1])
+
+
 def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros'):
     """Warp an image or feature map with optical flow
     Args:

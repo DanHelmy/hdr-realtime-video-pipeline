@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import pathlib
+import queue
+import threading
+import time
 
 import cv2
 import numpy as np
@@ -66,6 +69,15 @@ class CliDisplaySink:
         self._app = None
         self._mpv_widget = None
         self._rgb48_state: dict = {}
+        self._async_queue: queue.Queue | None = None
+        self._async_thread: threading.Thread | None = None
+        self._async_shutdown = threading.Event()
+        self._last_event_pump_s = 0.0
+        self._event_pump_interval_s = max(
+            0.0,
+            float(os.environ.get("HDRTVNET_CLI_MPV_EVENT_INTERVAL_MS", "8.0"))
+            / 1000.0,
+        )
 
         if not self.enabled:
             return
@@ -116,9 +128,11 @@ class CliDisplaySink:
             BEST_MPV_SCALE,
             FILMGRAIN_SHADER_PATH,
             FSR_SHADER_PATH,
+            SSIM_DOWNSCALER_SHADER_PATH,
             SSIM_SUPERRES_SHADER_PATH,
             _ensure_filmgrain_shader,
             _ensure_fsr_shader,
+            _ensure_ssim_downscaler_shader,
             _ensure_ssim_superres_shader,
             _normalize_shader_paths,
         )
@@ -141,10 +155,12 @@ class CliDisplaySink:
             ensure_fsr_shader=_ensure_fsr_shader,
             ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
             ensure_filmgrain_shader=_ensure_filmgrain_shader,
+            ensure_ssim_downscaler_shader=_ensure_ssim_downscaler_shader,
             best_mpv_scale=BEST_MPV_SCALE,
             fsr_shader_path=FSR_SHADER_PATH,
             ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
             filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
+            ssim_downscaler_shader_path=SSIM_DOWNSCALER_SHADER_PATH,
         )
         widget.setWindowTitle(self.window_name)
         widget.resize(int(width), int(height))
@@ -167,6 +183,49 @@ class CliDisplaySink:
                 getattr(widget, "_last_scale_error", None) or "mpv display startup failed."
             )
         self._mpv_widget = widget
+        self._start_async_converter(widget)
+
+    def _start_async_converter(self, widget) -> None:
+        self._async_shutdown.clear()
+        self._async_queue = queue.Queue(maxsize=1)
+
+        def _worker() -> None:
+            rgb48_state: dict = {}
+            while not self._async_shutdown.is_set():
+                q = self._async_queue
+                if q is None:
+                    return
+                try:
+                    item = q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    return
+                try:
+                    widget.feed_frame(_bgr_to_rgb48_bytes(item, rgb48_state))
+                except Exception:
+                    return
+
+        self._async_thread = threading.Thread(
+            target=_worker,
+            name="hdrtvnet-cli-mpv-converter",
+            daemon=True,
+        )
+        self._async_thread.start()
+
+    def _queue_latest_frame(self, frame: np.ndarray) -> None:
+        q = self._async_queue
+        if q is None:
+            return
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(np.array(frame, copy=True, order="C"))
+        except queue.Full:
+            pass
 
     def show(self, frame) -> bool:
         if not self.enabled:
@@ -179,8 +238,14 @@ class CliDisplaySink:
         app = self._app
         if widget is None or app is None:
             return False
-        widget.feed_frame(_bgr_to_rgb48_bytes(frame, self._rgb48_state))
-        app.processEvents()
+        self._queue_latest_frame(frame)
+        now_s = time.perf_counter()
+        if (
+            self._last_event_pump_s <= 0.0
+            or now_s - self._last_event_pump_s >= self._event_pump_interval_s
+        ):
+            app.processEvents()
+            self._last_event_pump_s = now_s
         return bool(widget.isVisible())
 
     def close(self) -> None:
@@ -190,6 +255,24 @@ class CliDisplaySink:
             except Exception:
                 pass
             return
+        self._async_shutdown.set()
+        q = self._async_queue
+        if q is not None:
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+        if self._async_thread is not None:
+            self._async_thread.join(timeout=1.0)
+            self._async_thread = None
+        self._async_queue = None
         widget = self._mpv_widget
         app = self._app
         if widget is not None:

@@ -1,9 +1,12 @@
+import copy
+import contextlib
 import hashlib
 import json
 import math
 import os
 import pathlib
 import re
+import shutil
 import struct
 import sys
 import threading
@@ -33,9 +36,10 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DEFAULT_HG_WEIGHTS = os.path.join(
-    _ROOT, "src", "models", "weights", "HG_weights.pth"
+    _ROOT, "src", "models", "weights", "original", "HG.pt"
 )
-_TENSORRT_SOURCE_SUBDIR = "tensorrt_sources"
+_TENSORRT_SOURCE_SUBDIR = "distilled"
+_ORIGINAL_TENSORRT_SOURCE_SUBDIR = "tensorrt"
 _TENSORRT_CALIBRATION_SUBDIR = "tensorrt_calibration"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
 _TENSORRT_SOURCE_SIGNATURE_VERSION = "trt_source_v2"
@@ -307,19 +311,32 @@ class W8A8Conv2d(nn.Module):
         else:
             self.bias = None
         # Activation scale " set during calibration via calibrate_w8a8()
-        self.register_buffer("x_scale", torch.tensor(1.0, dtype=compute_dtype))
+        self.register_buffer("x_scale", torch.tensor(1.0, dtype=torch.float32))
         if asymmetric:
-            self.register_buffer("x_zero", torch.tensor(0.0, dtype=compute_dtype))
+            self.register_buffer("x_zero", torch.tensor(0.0, dtype=torch.float32))
+
+    def _apply(self, fn):
+        x_scale = self.x_scale.detach().clone()
+        x_zero = self.x_zero.detach().clone() if hasattr(self, "x_zero") else None
+        super()._apply(fn)
+        # Keep activation quantization ranges in FP32 even when the module is
+        # moved to FP16 compute.  Some calibrated scales are below FP16 normal
+        # range; downcasting them can collapse the whole eager INT8 path.
+        self.x_scale.data = x_scale.to(device=self.x_scale.device, dtype=torch.float32)
+        if hasattr(self, "x_zero") and x_zero is not None:
+            self.x_zero.data = x_zero.to(device=self.x_zero.device, dtype=torch.float32)
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.is_asymmetric:
             # Asymmetric: map [x_zero, x_zero + x_scale*255] ' [0, 255]
-            x_q = ((x - self.x_zero) / self.x_scale).round().clamp(0, 255)
-            x_deq = x_q * self.x_scale + self.x_zero
+            x_f = x.float()
+            x_q = ((x_f - self.x_zero) / self.x_scale).round().clamp(0, 255)
+            x_deq = (x_q * self.x_scale + self.x_zero).to(self.compute_dtype)
         else:
             # Symmetric: map [-x_scale*127, x_scale*127] ' [-128, 127]
-            x_int8 = (x / self.x_scale).round().clamp(-128, 127).to(torch.int8)
-            x_deq = x_int8.to(self.compute_dtype) * self.x_scale
+            x_int8 = (x.float() / self.x_scale).round().clamp(-128, 127).to(torch.int8)
+            x_deq = x_int8.to(self.compute_dtype) * self.x_scale.to(self.compute_dtype)
         # Dequantize weights
         w = self.weight_int8.to(self.compute_dtype) * self.w_scale.view(-1, 1, 1, 1)
         return F.conv2d(x_deq, w, self.bias, self.stride, self.padding,
@@ -347,17 +364,27 @@ class W8A8Linear(nn.Module):
             self.register_buffer("bias", linear.bias.data.to(compute_dtype))
         else:
             self.bias = None
-        self.register_buffer("x_scale", torch.tensor(1.0, dtype=compute_dtype))
+        self.register_buffer("x_scale", torch.tensor(1.0, dtype=torch.float32))
         if asymmetric:
-            self.register_buffer("x_zero", torch.tensor(0.0, dtype=compute_dtype))
+            self.register_buffer("x_zero", torch.tensor(0.0, dtype=torch.float32))
+
+    def _apply(self, fn):
+        x_scale = self.x_scale.detach().clone()
+        x_zero = self.x_zero.detach().clone() if hasattr(self, "x_zero") else None
+        super()._apply(fn)
+        self.x_scale.data = x_scale.to(device=self.x_scale.device, dtype=torch.float32)
+        if hasattr(self, "x_zero") and x_zero is not None:
+            self.x_zero.data = x_zero.to(device=self.x_zero.device, dtype=torch.float32)
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.is_asymmetric:
-            x_q = ((x - self.x_zero) / self.x_scale).round().clamp(0, 255)
-            x_deq = x_q * self.x_scale + self.x_zero
+            x_f = x.float()
+            x_q = ((x_f - self.x_zero) / self.x_scale).round().clamp(0, 255)
+            x_deq = (x_q * self.x_scale + self.x_zero).to(self.compute_dtype)
         else:
-            x_int8 = (x / self.x_scale).round().clamp(-128, 127).to(torch.int8)
-            x_deq = x_int8.to(self.compute_dtype) * self.x_scale
+            x_int8 = (x.float() / self.x_scale).round().clamp(-128, 127).to(torch.int8)
+            x_deq = x_int8.to(self.compute_dtype) * self.x_scale.to(self.compute_dtype)
         w = self.weight_int8.to(self.compute_dtype) * self.w_scale.view(-1, 1)
         return F.linear(x_deq, w, self.bias)
 
@@ -646,12 +673,17 @@ class TRTFloatConv2d(nn.Module):
         scale = getattr(w8_mod, "scale", None)
         if scale is None:
             scale = w8_mod.w_scale
+        export_dtype = getattr(w8_mod, "compute_dtype", torch.float16)
         scale = scale.detach().float()
-        weight = w8_mod.weight_int8.detach().float() * scale.view(-1, 1, 1, 1)
+        weight = (
+            w8_mod.weight_int8.detach().float() * scale.view(-1, 1, 1, 1)
+        ).to(dtype=export_dtype)
         self.weight = nn.Parameter(weight, requires_grad=False)
         if w8_mod.bias is not None:
-            self.bias = nn.Parameter(w8_mod.bias.detach().float().clone(),
-                                     requires_grad=False)
+            self.bias = nn.Parameter(
+                w8_mod.bias.detach().to(dtype=export_dtype).clone(),
+                requires_grad=False,
+            )
         else:
             self.bias = None
 
@@ -670,12 +702,17 @@ class TRTFloatLinear(nn.Module):
         scale = getattr(w8_mod, "scale", None)
         if scale is None:
             scale = w8_mod.w_scale
+        export_dtype = getattr(w8_mod, "compute_dtype", torch.float16)
         scale = scale.detach().float()
-        weight = w8_mod.weight_int8.detach().float() * scale.view(-1, 1)
+        weight = (
+            w8_mod.weight_int8.detach().float() * scale.view(-1, 1)
+        ).to(dtype=export_dtype)
         self.weight = nn.Parameter(weight, requires_grad=False)
         if w8_mod.bias is not None:
-            self.bias = nn.Parameter(w8_mod.bias.detach().float().clone(),
-                                     requires_grad=False)
+            self.bias = nn.Parameter(
+                w8_mod.bias.detach().to(dtype=export_dtype).clone(),
+                requires_grad=False,
+            )
         else:
             self.bias = None
 
@@ -1137,23 +1174,96 @@ def _get_gpu_info() -> str:
 def _is_int8_checkpoint_path(path: str) -> bool:
     try:
         name = os.path.basename(str(path)).lower()
+        resolved = pathlib.Path(path).resolve()
     except Exception:
         return False
-    return name.endswith(".pt") and "_int8_" in name
+    if not (name.endswith(".pt") and "_int8_" in name):
+        return False
+    parts = {part.lower() for part in resolved.parts}
+    if _TENSORRT_SOURCE_SUBDIR.lower() in parts:
+        return False
+    if "original" in parts and _ORIGINAL_TENSORRT_SOURCE_SUBDIR.lower() in parts:
+        return False
+    try:
+        if not os.path.isfile(path):
+            return True
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return True
+    if not isinstance(checkpoint, dict):
+        return False
+    if checkpoint.get("checkpoint_format") == _PORTABLE_INT8_CHECKPOINT_FORMAT:
+        return True
+    return bool(checkpoint.get("state_dict")) and str(
+        checkpoint.get("quantization", "")
+    ) in {"w8a8_full", "w8a8_mixed"}
 
 
 def _is_tensorrt_source_path(path: str) -> bool:
     try:
-        directory = os.path.basename(os.path.dirname(os.path.abspath(str(path))))
+        parts = {part.lower() for part in pathlib.Path(path).resolve().parts}
     except Exception:
         return False
-    return directory.lower() == _TENSORRT_SOURCE_SUBDIR
+    return (
+        _TENSORRT_SOURCE_SUBDIR.lower() in parts
+        or (
+            "original" in parts
+            and _ORIGINAL_TENSORRT_SOURCE_SUBDIR.lower() in parts
+        )
+    )
 
 
 def _tensorrt_source_candidate_path(model_path: str) -> str:
     path = os.path.abspath(os.path.expanduser(str(model_path)))
+    path_obj = pathlib.Path(path)
     directory, name = os.path.split(path)
-    return os.path.join(directory, _TENSORRT_SOURCE_SUBDIR, name)
+    stem, ext = os.path.splitext(name)
+    source_family = "hr"
+    original_family = "original" in {part.lower() for part in path_obj.parts}
+    if stem.startswith("HR_original_int8_"):
+        tag = stem[len("HR_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        name = f"HR_original_{mapped}{ext}"
+    elif stem.startswith("HR_HG_original_int8_"):
+        source_family = "hg"
+        tag = stem[len("HR_HG_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        name = f"HG_original_{mapped}{ext}"
+    elif stem.startswith("HR_int8_"):
+        tag = stem[len("HR_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        name = f"HR_qfriendly_spatialmixglobal_{mapped}{ext}"
+    elif stem.startswith("HR_HG_int8_"):
+        source_family = "hg"
+        tag = stem[len("HR_HG_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        name = f"HG_qfriendly_directh16_{mapped}{ext}"
+
+    if path_obj.parent.name.lower() in {"hr", "hg"} and path_obj.parent.parent.name.lower() in {"int8", "pytorch_int8"}:
+        weights_root = path_obj.parent.parent.parent
+        if original_family:
+            return str(
+                weights_root
+                / _ORIGINAL_TENSORRT_SOURCE_SUBDIR
+                / source_family
+                / name
+            )
+        return str(weights_root / _TENSORRT_SOURCE_SUBDIR / source_family / name)
+    if os.path.basename(directory).lower() == "int8":
+        directory = os.path.dirname(directory)
+    return os.path.join(directory, _TENSORRT_SOURCE_SUBDIR, source_family, name)
 
 
 def _hash_file_raw(path: str) -> dict[str, object]:
@@ -1274,19 +1384,20 @@ def _regenerate_tensorrt_source_checkpoint(
 
 
 def tensorrt_source_checkpoint_path(model_path: str) -> str:
-    """Resolve an INT8 runtime checkpoint to a current TensorRT source.
+    """Resolve legacy native-INT8 checkpoints to TensorRT source inputs.
 
-    The app selects compressed INT8 checkpoints for PyTorch/AMD. NVIDIA uses
-    the same logical selection, but engine build must prefer a matching current
-    backend-neutral checkpoint under ``weights/tensorrt_sources``. Stale source
-    checkpoints are regenerated from the tracked runtime checkpoint when
-    possible, and rejected when no source runtime checkpoint is available.
+    The current NVIDIA INT8 path uses ModelOpt/QDQ directly from the selected
+    PTQ/QAT/QAT-Film checkpoint, so it must not detour through generated
+    ``weights/distilled`` files. Source checkpoints remain available
+    only for the older native implicit path when ModelOpt INT8 is disabled.
     """
     if not model_path:
         return model_path
     try:
         path = os.path.abspath(os.path.expanduser(str(model_path)))
         if not _is_int8_checkpoint_path(path):
+            return path
+        if _env_bool("HDRTVNET_TRT_INT8_MODELOPT", _IS_NVIDIA):
             return path
         if _is_tensorrt_source_path(path):
             reason = tensorrt_source_checkpoint_validation_error(path)
@@ -1321,6 +1432,28 @@ def tensorrt_source_checkpoint_path(model_path: str) -> str:
         return model_path
 
 
+def _unwrap_source_checkpoint(payload):
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state = payload.get("state_dict") or {}
+        arch = payload.get("architecture") or {}
+        if isinstance(arch, dict):
+            return state, arch
+        return state, {}
+    return payload, {}
+
+
+def _source_checkpoint_architecture(model_path: str) -> dict:
+    try:
+        payload = torch.load(model_path, map_location="cpu", weights_only=True)
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        arch = payload.get("architecture") or {}
+        if isinstance(arch, dict):
+            return arch
+    return {}
+
+
 class HDRTVNetTorch:
     """PyTorch inference wrapper for HDRTVNet with platform-aware optimizations.
 
@@ -1351,6 +1484,7 @@ class HDRTVNetTorch:
             bool(fast_condition_resize)
             or _env_bool("HDRTVNET_FAST_COND_RESIZE", False)
         )
+        self._fast_zero_condition = _env_bool("HDRTVNET_ZERO_COND", False)
         self.device = self._resolve_device(device)
         self.precision = self._resolve_precision(precision, self.device)
         self._use_cuda = self.device.type == "cuda"
@@ -1585,6 +1719,9 @@ class HDRTVNetTorch:
         quant_type = checkpoint.get("quantization", "w8_weight_only")
         state_dict = checkpoint.get("state_dict", {})
         portable_checkpoint = _is_portable_int8_checkpoint(checkpoint)
+        self._int8_quant_type = str(quant_type)
+        self._int8_w8a8_layers = set(checkpoint.get("w8a8_layers") or ())
+        self._int8_fp16_layers = set(checkpoint.get("fp16_layers") or ())
         try:
             sd_numel = sum(v.numel() for v in state_dict.values() if hasattr(v, "numel"))
         except Exception:
@@ -1596,6 +1733,11 @@ class HDRTVNetTorch:
                 " on GPU. Consider re-quantizing with FP16 compute."
             )
 
+        classifier_default = (
+            str(os.environ.get("HDRTVNET_CLASSIFIER", "color_condition")).strip()
+            or "color_condition"
+        )
+
         # Build base architecture (HG composite by default)
         use_hg = bool(arch.get("use_hg", True))
         if not self._use_hg and use_hg:
@@ -1605,7 +1747,7 @@ class HDRTVNetTorch:
             )
         if use_hg:
             model = HG_Composite(
-                classifier=arch.get("classifier", "color_condition"),
+                classifier=arch.get("classifier", classifier_default),
                 cond_c=arch.get("cond_c", 6),
                 in_nc=arch.get("in_nc", 3),
                 out_nc=arch.get("out_nc", 3),
@@ -1614,17 +1756,21 @@ class HDRTVNetTorch:
                 weighting_network=arch.get("weighting_network", False),
                 hg_nf=arch.get("hg_nf", 64),
                 mask_r=arch.get("mask_r", 0.75),
+                hg_arch=arch.get("hg_arch", None),
+                le_arch=arch.get("le_arch", None),
             )
         else:
             model = Ensemble_AGCM_LE(
-                classifier=arch.get("classifier", "color_condition"),
+                classifier=arch.get("classifier", classifier_default),
                 cond_c=arch.get("cond_c", 6),
                 in_nc=arch.get("in_nc", 3),
                 out_nc=arch.get("out_nc", 3),
                 nf=arch.get("nf", 32),
                 act_type=arch.get("act_type", "relu"),
                 weighting_network=arch.get("weighting_network", False),
+                le_arch=arch.get("le_arch", None),
             )
+        split_hg_requested = bool(self._use_hg and not use_hg)
         # Sanity-check no-HG INT8 checkpoints against expected parameter count.
         if (not use_hg) and sd_numel:
             try:
@@ -1720,10 +1866,94 @@ class HDRTVNetTorch:
             if quant_type == "w8a8_mixed" and checkpoint.get("fp16_layers"):
                 label = "Mixed W8A8/W8A16/FP16"
             print(f"Loaded {label} INT8 model (compute_dtype={compute_dtype})")
+        if split_hg_requested:
+            hg_weights_path, searched_hg_paths = self._resolve_hg_weights(model_path)
+            if not hg_weights_path:
+                searched = "\n".join(f"  - {p}" for p in searched_hg_paths)
+                raise FileNotFoundError(
+                    "INT8 HG weights were requested but not found.\n"
+                    "  Searched paths:\n"
+                    f"{searched}\n"
+                    "  Pass --hg-weights or disable HG."
+                )
+            hg_module = self._load_split_int8_hg_module(
+                hg_weights_path,
+                compute_dtype=compute_dtype,
+                predequantize=bool(should_predequantize and should_predequantize != "auto"),
+            )
+            composite = HG_Composite(
+                classifier=arch.get("classifier", classifier_default),
+                cond_c=arch.get("cond_c", 6),
+                in_nc=arch.get("in_nc", 3),
+                out_nc=arch.get("out_nc", 3),
+                nf=arch.get("nf", 32),
+                act_type=arch.get("act_type", "relu"),
+                weighting_network=arch.get("weighting_network", False),
+                hg_nf=arch.get("hg_nf", 64),
+                mask_r=arch.get("mask_r", 0.75),
+                hg_arch=(torch.load(hg_weights_path, map_location="cpu", weights_only=False).get("architecture", {}) or {}).get("hg_arch"),
+                le_arch=arch.get("le_arch", None),
+            ).to(dtype=compute_dtype, device=self.device)
+            composite.base = model
+            composite.hg = hg_module
+            composite.eval()
+            model = composite
+            self._use_hg = True
+            print(f"Attached split INT8 HG weights: {hg_weights_path}")
         return model
 
+    def _load_split_int8_hg_module(self, hg_weights_path, *, compute_dtype, predequantize: bool):
+        checkpoint = torch.load(hg_weights_path, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+            raise ValueError(f"{hg_weights_path} is not an INT8 HG checkpoint.")
+        arch = checkpoint.get("architecture", {}) or {}
+        holder = HG_Composite(
+            classifier="color_condition",
+            cond_c=6,
+            in_nc=arch.get("in_nc", 3),
+            out_nc=arch.get("out_nc", 3),
+            nf=32,
+            act_type="relu",
+            weighting_network=False,
+            hg_nf=arch.get("hg_nf", 64),
+            mask_r=arch.get("mask_r", 0.75),
+            hg_arch=arch.get("hg_arch", None),
+            le_arch=None,
+        )
+        hg = holder.hg
+        quant_type = checkpoint.get("quantization", "w8_weight_only")
+        state_dict = checkpoint.get("state_dict", {})
+        portable_checkpoint = _is_portable_int8_checkpoint(checkpoint)
+        if portable_checkpoint:
+            hg.load_state_dict(state_dict, strict=True)
+
+        if quant_type == "w8a8_mixed":
+            use_asym = checkpoint.get("activation_quant", "symmetric") == "asymmetric"
+            _quantize_model_mixed_v2(
+                hg,
+                compute_dtype,
+                w8a8_layers=checkpoint.get("w8a8_layers", None),
+                fp16_layers=checkpoint.get("fp16_layers", None),
+                asymmetric=use_asym,
+            )
+        elif quant_type == "w8a8_full":
+            use_asym = checkpoint.get("activation_quant", "symmetric") == "asymmetric"
+            _quantize_model_w8a8(hg, compute_dtype, asymmetric=use_asym)
+        else:
+            raise ValueError(f"Unknown HG quantization type '{quant_type}'")
+
+        if portable_checkpoint:
+            _apply_portable_activation_qparams(hg, checkpoint)
+        else:
+            hg.load_state_dict(state_dict, strict=True)
+        hg = hg.to(dtype=compute_dtype, device=self.device)
+        if predequantize:
+            _predequantize_model(hg, compute_dtype)
+        hg.eval()
+        return hg
+
     def _resolve_hg_weights(self, model_path):
-        """Find HG_weights.pth from common locations."""
+        """Find original or distilled HG weights from common locations."""
         candidates = []
         seen = set()
 
@@ -1739,11 +1969,17 @@ class HDRTVNetTorch:
         # User override (if provided) first.
         _add(self._hg_weights)
         # Adjacent to the selected model checkpoint.
-        _add(os.path.join(os.path.dirname(os.path.abspath(model_path)), "HG_weights.pth"))
+        _add(os.path.join(os.path.dirname(os.path.abspath(model_path)), "HG.pt"))
+        _add(
+            os.path.join(
+                os.path.dirname(os.path.abspath(model_path)),
+                "HG_qfriendly_directh16_fp32.pt",
+            )
+        )
         # Repo-default runtime path.
         _add(_DEFAULT_HG_WEIGHTS)
         # Relative path from current working directory (when launched outside repo root).
-        _add(os.path.join(os.getcwd(), "src", "models", "weights", "HG_weights.pth"))
+        _add(os.path.join(os.getcwd(), "src", "models", "weights", "original", "HG.pt"))
 
         for path in candidates:
             if os.path.isfile(path):
@@ -1756,13 +1992,21 @@ class HDRTVNetTorch:
             return self._load_int8_model(model_path)
 
         ext = os.path.splitext(model_path)[1].lower()
-        if ext in {".pt", ".ts"}:
+        if ext == ".ts":
             model = torch.jit.load(model_path, map_location=self.device)
             model.eval()
         else:
             use_hg = bool(self._use_hg)
             hg_weights_path = None
             searched_hg_paths = []
+            base_payload = torch.load(
+                model_path,
+                map_location=self.device,
+                weights_only=True,
+            )
+            base_state, base_arch = _unwrap_source_checkpoint(base_payload)
+            if not isinstance(base_arch, dict):
+                base_arch = {}
             if use_hg:
                 hg_weights_path, searched_hg_paths = self._resolve_hg_weights(model_path)
                 if hg_weights_path:
@@ -1781,16 +2025,33 @@ class HDRTVNetTorch:
                         "WARNING: HG weights not found; continuing with no-HG model.\n"
                         "  Searched paths:\n"
                         f"{searched}\n"
-                        "  To enable HG, place HG_weights.pth under "
+                        "  To enable HG, place original/HG.pt under "
                         "src/models/weights/ or pass --hg-weights."
                     )
                     use_hg = False
 
             self._use_hg = use_hg
+            classifier_name = (
+                str(
+                    base_arch.get(
+                        "classifier",
+                        os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+                    )
+                ).strip()
+                or "color_condition"
+            )
+            le_arch = (
+                str(base_arch.get("le_arch", os.environ.get("HDRTVNET_LE_ARCH", ""))).strip()
+                or None
+            )
+            hg_arch = (
+                str(base_arch.get("hg_arch", os.environ.get("HDRTVNET_HG_ARCH", ""))).strip()
+                or None
+            )
 
             if use_hg:
                 model = HG_Composite(
-                    classifier="color_condition",
+                    classifier=classifier_name,
                     cond_c=6,
                     in_nc=3,
                     out_nc=3,
@@ -1799,38 +2060,39 @@ class HDRTVNetTorch:
                     weighting_network=False,
                     hg_nf=64,
                     mask_r=0.75,
+                    hg_arch=hg_arch,
+                    le_arch=le_arch,
                 ).to(self.device)
 
-                base_state = torch.load(model_path, map_location=self.device,
-                                        weights_only=True)
                 cleaned = {}
                 for key, value in base_state.items():
                     cleaned[key[7:] if key.startswith("module.") else key] = value
                 model.base.load_state_dict(cleaned, strict=True)
 
                 hg_state = torch.load(hg_weights_path, map_location=self.device)
-                if isinstance(hg_state, dict) and "state_dict" in hg_state:
-                    hg_state = hg_state["state_dict"]
+                hg_state, _hg_arch = _unwrap_source_checkpoint(hg_state)
                 model.hg.load_state_dict(hg_state, strict=True)
                 model.eval()
             else:
                 model = Ensemble_AGCM_LE(
-                    classifier="color_condition",
+                    classifier=classifier_name,
                     cond_c=6,
                     in_nc=3,
                     out_nc=3,
                     nf=32,
                     act_type="relu",
                     weighting_network=False,
+                    le_arch=le_arch,
                 ).to(self.device)
 
-                state_dict = torch.load(model_path, map_location=self.device,
-                                        weights_only=True)
                 cleaned = {}
-                for key, value in state_dict.items():
+                for key, value in base_state.items():
                     cleaned[key[7:] if key.startswith("module.") else key] = value
                 model.load_state_dict(cleaned, strict=True)
                 model.eval()
+            setattr(model, "_hdrtvnet_classifier_arch", classifier_name)
+            setattr(model, "_hdrtvnet_le_arch", le_arch or "")
+            setattr(model, "_hdrtvnet_hg_arch", hg_arch or "")
 
         if self.precision == "fp16" and self.device.type == "cuda":
             model = model.half()
@@ -1931,9 +2193,12 @@ class HDRTVNetTorch:
             non_blocking=self._use_cuda,
         )
 
-        # Condition tensor (0.25- spatial). The fast path matches v0.6 and is
-        # useful for throughput A/B tests; bicubic+antialias remains default.
-        if self._fast_condition_resize:
+        # Condition tensor (0.25- spatial). The zero-condition path is an
+        # explicit speed-only TensorRT INT8 shortcut; FP16 keeps the normal path.
+        if self._fast_zero_condition:
+            self._gpu_cond.zero_()
+            return self._gpu_input, self._gpu_cond
+        elif self._fast_condition_resize:
             cond = F.interpolate(
                 self._gpu_input,
                 scale_factor=0.25,
@@ -2292,11 +2557,8 @@ def _resolve_tensorrt_qdq_fusion(precision: str, qdq_fusion: str) -> str:
         return "native"
     if fusion != "auto":
         return fusion
-    # Full INT8 already has Q/DQ around almost every compute op. Forcing extra
-    # Q/DQ on residual inputs changes full-QAT numerics badly. Mixed INT8 still
-    # benefits from the topology hint because only selected layers are W8A8.
-    if str(precision or "").startswith("int8-mixed"):
-        return "add-mul"
+    if str(precision or "").startswith("int8"):
+        return "native"
     return "none"
 
 
@@ -2327,6 +2589,22 @@ def _tensorrt_expected_engine_metadata(
     hg_path = hg_weights or _DEFAULT_HG_WEIGHTS
     aux_streams = _tensorrt_aux_stream_count()
     resolved_qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    fp16_builder_enabled = _tensorrt_fp16_enabled()
+    condition_free_single_input = _tensorrt_condition_free_arch_enabled_for_checkpoint(
+        model_path
+    )
+    effective_modelopt_torch = _tensorrt_int8_modelopt_torch_effective_enabled(
+        mode_name
+    )
+    if str(precision).startswith("int8-full") and (
+        not _tensorrt_full_int8_fp16_islands_enabled()
+        and not (
+            effective_modelopt_torch
+            and not _tensorrt_int8_modelopt_strongly_typed()
+        )
+    ):
+        fp16_builder_enabled = False
+
     metadata = {
         "schema": _TENSORRT_ENGINE_METADATA_SCHEMA,
         "source_signature": _tensorrt_source_signature(),
@@ -2362,17 +2640,142 @@ def _tensorrt_expected_engine_metadata(
         },
         "build": {
             "builder_optimization_level": _tensorrt_builder_optimization_level(),
-            "fp16_enabled": _tensorrt_fp16_enabled(),
+            "fp16_enabled": fp16_builder_enabled,
+            "condition_free_single_input": condition_free_single_input,
             "workspace_gb": _tensorrt_workspace_gb(),
             "aux_streams": aux_streams,
         },
     }
+    if str(precision).startswith("int8"):
+        qat_composition = _tensorrt_int8_qat_composition_policy(mode_name)
+        qat_checkpoint_composition = (
+            _tensorrt_int8_qat_checkpoint_composition_enabled(mode_name)
+        )
+        metadata["build"]["int8_modelopt"] = _tensorrt_int8_modelopt_enabled()
+        metadata["build"]["int8_modelopt_torch"] = effective_modelopt_torch
+        metadata["build"]["int8_modelopt_torch_requested"] = (
+            _tensorrt_int8_modelopt_torch_enabled()
+        )
+        if _tensorrt_mode_name_is_qat(mode_name):
+            metadata["build"]["int8_qat_composition"] = qat_composition
+            metadata["build"]["int8_qat_checkpoint_composition"] = (
+                qat_checkpoint_composition
+            )
+        metadata["build"]["int8_modelopt_torch_mode"] = (
+            _tensorrt_int8_modelopt_torch_mode(precision)
+        )
+        metadata["build"]["int8_modelopt_torch_method"] = (
+            _tensorrt_int8_modelopt_torch_method()
+        )
+        metadata["build"]["int8_modelopt_torch_effective_bits"] = (
+            _tensorrt_int8_modelopt_torch_effective_bits()
+        )
+        metadata["build"]["int8_modelopt_torch_calib_steps"] = (
+            _tensorrt_int8_modelopt_torch_calib_steps()
+        )
+        metadata["build"]["int8_modelopt_torch_score_steps"] = (
+            _tensorrt_int8_modelopt_torch_score_steps()
+        )
+        metadata["build"]["int8_modelopt_torch_include"] = list(
+            _tensorrt_int8_modelopt_torch_include_patterns()
+        )
+        metadata["build"]["int8_modelopt_torch_exclude"] = list(
+            _tensorrt_int8_modelopt_torch_exclude_patterns()
+        )
+        metadata["build"]["int8_modelopt_torch_qdq_dtype"] = (
+            _tensorrt_int8_modelopt_torch_qdq_dtype(torch.float16)
+        )
+        metadata["build"]["int8_modelopt_torch_quant_scheme"] = (
+            _tensorrt_int8_modelopt_torch_quant_scheme()
+        )
+        metadata["build"]["int8_modelopt_torch_hg_default"] = (
+            _tensorrt_int8_modelopt_torch_hg_default_enabled()
+        )
+        metadata["build"]["int8_modelopt_torch_hg_mixed_exclude"] = list(
+            _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns()
+        )
+        metadata["build"]["int8_modelopt_ops"] = _tensorrt_int8_modelopt_ops()
+        metadata["build"]["int8_modelopt_calibration"] = (
+            _tensorrt_int8_modelopt_calibration_method()
+        )
+        metadata["build"]["int8_modelopt_layer_policy"] = (
+            _tensorrt_int8_modelopt_layer_policy()
+        )
+        metadata["build"]["int8_modelopt_node_override"] = (
+            _tensorrt_int8_modelopt_node_override()
+        )
+        metadata["build"]["int8_modelopt_autotune"] = (
+            _tensorrt_int8_modelopt_autotune_enabled()
+        )
+        metadata["build"]["int8_modelopt_autotune_filter"] = (
+            _tensorrt_int8_modelopt_autotune_filter()
+        )
+        metadata["build"]["int8_modelopt_autotune_schemes"] = (
+            _tensorrt_int8_modelopt_autotune_int(
+                "HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_SCHEMES",
+                12,
+                1,
+            )
+        )
+        metadata["build"]["int8_modelopt_strongly_typed"] = (
+            _tensorrt_int8_modelopt_strongly_typed()
+        )
+        metadata["build"]["int8_modelopt_auto_profile"] = (
+            _tensorrt_int8_modelopt_auto_profile_enabled()
+        )
+        try:
+            metadata_onnx_path = tensorrt_onnx_path(
+                model_path,
+                width,
+                height,
+                engine_mode_name,
+            )
+            metadata["build"]["int8_modelopt_prequantized_onnx"] = (
+                _tensorrt_int8_modelopt_prequantized_onnx(metadata_onnx_path)
+            )
+        except Exception:
+            metadata["build"]["int8_modelopt_prequantized_onnx"] = (
+                _tensorrt_int8_modelopt_prequantized_onnx(None)
+            )
     if resolved_qdq_fusion == "native" and str(precision).startswith("int8"):
         metadata["build"]["native_int8_prefer_constraints"] = (
             _tensorrt_native_int8_prefer_constraints()
         )
         metadata["build"]["native_int8_obey_constraints"] = (
             _tensorrt_native_int8_obey_constraints()
+        )
+        metadata["build"]["native_int8_checkpoint_policy"] = (
+            _tensorrt_native_int8_checkpoint_policy_enabled()
+        )
+        metadata["build"]["native_int8_policy_obey"] = (
+            _tensorrt_native_int8_policy_obey()
+        )
+        metadata["build"]["native_int8_policy_int8_outputs"] = (
+            _tensorrt_native_int8_policy_int8_outputs()
+        )
+        metadata["build"]["native_int8_policy_output_constraints"] = (
+            _tensorrt_native_int8_policy_output_constraints()
+        )
+    if str(precision).startswith("int8"):
+        if predequantize_int8:
+            metadata["build"]["int8_zero_condition"] = False
+            metadata["build"]["int8_single_input"] = False
+        else:
+            metadata["build"]["int8_zero_condition"] = _env_bool(
+                "HDRTVNET_TRT_INT8_ZERO_COND",
+                _tensorrt_int8_zero_condition_enabled(mode_name),
+            )
+            metadata["build"]["int8_single_input"] = (
+                condition_free_single_input
+                or _tensorrt_int8_single_input_enabled(mode_name)
+            )
+        metadata["build"]["int8_agcm_only"] = _env_bool(
+            "HDRTVNET_TRT_INT8_AGCM_ONLY",
+            _tensorrt_int8_agcm_only_enabled(mode_name),
+        )
+    if str(precision).startswith("int8-full"):
+        metadata["build"]["full_int8_fp16_islands"] = (
+            _tensorrt_full_int8_fp16_islands_enabled()
         )
     calibration = _tensorrt_calibration_fingerprint(
         precision=precision,
@@ -2559,6 +2962,414 @@ def _tensorrt_fp16_enabled() -> bool:
     return _env_bool("HDRTVNET_TRT_FP16", True)
 
 
+def _tensorrt_int8_modelopt_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT", _IS_NVIDIA)
+
+
+def _tensorrt_int8_modelopt_torch_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH", _IS_NVIDIA)
+
+
+def _tensorrt_mode_name_is_qat(mode_name: str | None = None) -> bool:
+    text = str(mode_name or "").strip().lower()
+    return "qat" in text
+
+
+def _tensorrt_int8_qat_composition_policy(mode_name: str | None = None) -> str:
+    if not _tensorrt_mode_name_is_qat(mode_name):
+        return "runtime"
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_QAT_COMPOSITION", "runtime")
+    ).strip().lower()
+    if text in {"torch", "runtime", "search", "modelopt-torch", "tuned"}:
+        return "runtime"
+    return "checkpoint"
+
+
+def _tensorrt_int8_qat_checkpoint_composition_enabled(
+    mode_name: str | None = None,
+) -> bool:
+    return _tensorrt_int8_qat_composition_policy(mode_name) == "checkpoint"
+
+
+def _tensorrt_int8_modelopt_torch_effective_enabled(
+    mode_name: str | None = None,
+) -> bool:
+    return (
+        _tensorrt_int8_modelopt_torch_enabled()
+        and not _tensorrt_int8_qat_checkpoint_composition_enabled(mode_name)
+    )
+
+
+def _tensorrt_int8_modelopt_torch_mode(precision: str | None = None) -> str:
+    text = str(os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_MODE", "")).strip().lower()
+    if text in {"full", "all", "int8"}:
+        return "full"
+    if text in {"auto", "mixed", "balance", "balanced", "search"}:
+        return "auto"
+    return "full" if str(precision or "").startswith("int8-full") else "auto"
+
+
+def _tensorrt_int8_modelopt_torch_method() -> str:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_METHOD", "gradient")
+    ).strip().lower()
+    return text if text in {"gradient", "kl_div"} else "gradient"
+
+
+def _tensorrt_int8_modelopt_torch_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+    return max(int(minimum), value)
+
+
+def _tensorrt_int8_modelopt_torch_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = float(default)
+    value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
+
+def _tensorrt_int8_modelopt_torch_calib_steps() -> int:
+    return _tensorrt_int8_modelopt_torch_int(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_CALIB_STEPS",
+        8,
+        1,
+    )
+
+
+def _tensorrt_int8_modelopt_torch_score_steps() -> int:
+    return _tensorrt_int8_modelopt_torch_int(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_SCORE_STEPS",
+        4,
+        1,
+    )
+
+
+def _tensorrt_int8_modelopt_torch_effective_bits() -> float:
+    return _tensorrt_int8_modelopt_torch_float(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_EFFECTIVE_BITS",
+        10.0,
+        8.0,
+        16.0,
+    )
+
+
+def _tensorrt_int8_modelopt_torch_seed() -> int:
+    return _tensorrt_int8_modelopt_torch_int(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_SEED",
+        1234,
+        0,
+    )
+
+
+def _tensorrt_int8_modelopt_torch_patterns(name: str) -> tuple[str, ...]:
+    text = str(os.environ.get(name, "") or "").strip()
+    if not text:
+        return ()
+    return tuple(part.strip() for part in re.split(r"[;,]", text) if part.strip())
+
+
+def _tensorrt_int8_modelopt_torch_include_patterns() -> tuple[str, ...]:
+    explicit = _tensorrt_int8_modelopt_torch_patterns(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_INCLUDE"
+    )
+    if explicit:
+        return explicit
+    return (
+        "base.AGCM.spatial",
+        "base.AGCM.global",
+        "base.LE.low_in",
+        "base.LE.recon_trunk3",
+        "AGCM.spatial",
+        "AGCM.global",
+        "LE.low_in",
+        "LE.recon_trunk3",
+        "hg.low_in",
+        "hg.trunk",
+    )
+
+
+def _tensorrt_int8_modelopt_torch_exclude_patterns() -> tuple[str, ...]:
+    return _tensorrt_int8_modelopt_torch_patterns(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_EXCLUDE"
+    )
+
+
+def _tensorrt_int8_modelopt_torch_hg_default_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_HG_DEFAULT", True)
+
+
+def _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns() -> tuple[str, ...]:
+    explicit = _tensorrt_int8_modelopt_torch_patterns(
+        "HDRTVNET_TRT_INT8_MODELOPT_TORCH_HG_MIXED_EXCLUDE"
+    )
+    if explicit:
+        return explicit
+    return ("hg\\.conv1", "hg\\.conv_last")
+
+
+def _tensorrt_int8_modelopt_torch_qdq_dtype(dtype: torch.dtype) -> str:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_QDQ_DTYPE", "auto")
+    ).strip().lower()
+    if text in {"fp32", "float", "float32"}:
+        return "Float"
+    if text in {"fp16", "half", "float16"}:
+        return "Half"
+    return "Half" if dtype == torch.float16 else "Float"
+
+
+def _tensorrt_int8_modelopt_torch_quant_scheme() -> str:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_QUANT_SCHEME", "symmetric")
+    ).strip().lower()
+    if text in {"asym", "asymmetric", "unsigned", "uint8"}:
+        return "asymmetric"
+    return "symmetric"
+
+
+def _tensorrt_int8_modelopt_strongly_typed() -> bool:
+    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_STRONGLY_TYPED", True)
+
+
+def _tensorrt_int8_modelopt_auto_profile_enabled() -> bool:
+    if _tensorrt_int8_modelopt_torch_enabled():
+        return False
+    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_AUTO_PROFILE", True)
+
+
+def _tensorrt_int8_modelopt_auto_profile_path(onnx_path: str) -> str:
+    root, _ext = os.path.splitext(str(onnx_path))
+    return os.path.join(
+        os.path.dirname(root),
+        "modelopt_autotune",
+        f"{pathlib.Path(root).name}_modelopt_int8",
+        "region_models",
+        "region_19_level_0.onnx",
+    )
+
+
+def _tensorrt_int8_modelopt_prequantized_onnx(onnx_path: str | None = None) -> str | None:
+    explicit = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_PREQUANTIZED_ONNX", "")
+    ).strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    if onnx_path and _tensorrt_int8_modelopt_auto_profile_enabled():
+        candidate = os.path.abspath(_tensorrt_int8_modelopt_auto_profile_path(onnx_path))
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _tensorrt_int8_modelopt_calibration_method() -> str:
+    method = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_CALIBRATION", "max")
+    ).strip().lower()
+    return method if method in {"max", "entropy"} else "max"
+
+
+def _tensorrt_int8_modelopt_ops() -> list[str] | None:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_OPS", "Conv,Gemm,MatMul")
+    ).strip()
+    if not text or text.lower() in {"all", "default", "none", "*"}:
+        return None if text.lower() in {"all", "*"} else ["Conv", "Gemm", "MatMul"]
+    ops = [
+        item.strip()
+        for item in re.split(r"[,;\s]+", text)
+        if item.strip()
+    ]
+    return ops or ["Conv", "Gemm", "MatMul"]
+
+
+def _tensorrt_int8_modelopt_layer_policy() -> str:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_LAYER_POLICY", "checkpoint")
+    ).strip().lower()
+    if text in {"all", "ops", "operator", "operators"}:
+        return "all"
+    return "checkpoint"
+
+
+def _tensorrt_int8_modelopt_node_override() -> list[str] | None:
+    text = str(os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_NODES", "")).strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        path = pathlib.Path(text[1:]).expanduser()
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            print(f"TensorRT INT8 ModelOpt node override skipped: {exc}")
+            return None
+    nodes = [
+        item.strip()
+        for item in re.split(r"[,;\s]+", text)
+        if item.strip()
+    ]
+    return nodes or None
+
+
+def _tensorrt_int8_modelopt_autotune_enabled() -> bool:
+    if _tensorrt_int8_modelopt_torch_enabled():
+        return False
+    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE", False)
+
+
+def _tensorrt_int8_modelopt_autotune_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(int(minimum), int(value))
+
+
+def _tensorrt_int8_modelopt_autotune_filter() -> list[str] | None:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_FILTER", "")
+    ).strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        path = pathlib.Path(text[1:]).expanduser()
+        try:
+            return [
+                line.strip()
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ] or None
+        except Exception as exc:
+            print(f"TensorRT INT8 ModelOpt autotune filter skipped: {exc}")
+            return None
+    return [
+        item.strip()
+        for item in re.split(r"[,;\s]+", text)
+        if item.strip()
+    ] or None
+
+
+def _tensorrt_full_int8_fp16_islands_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS", False)
+
+
+def _tensorrt_full_int8_safe_fp16_builder_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_FULL_INT8_SAFE_FP16_BUILDER", True)
+
+
+def _tensorrt_int8_agcm_only_default(mode_name: str | None = None) -> bool:
+    # Keep the TensorRT graph comparable across precisions by default.  The
+    # AGCM-only export is a deployment shortcut, not a fair quantization test.
+    return False
+
+
+def _tensorrt_mode_name_is_mixed_int8(mode_name: str | None = None) -> bool:
+    text = str(mode_name or "").strip().lower()
+    return "mixed" in text and "int8" in text
+
+
+def _tensorrt_mode_name_is_full_int8(mode_name: str | None = None) -> bool:
+    text = str(mode_name or "").strip().lower()
+    return "full" in text and "int8" in text
+
+
+def _tensorrt_int8_agcm_only_enabled(mode_name: str | None = None) -> bool:
+    return _env_bool(
+        "HDRTVNET_TRT_INT8_AGCM_ONLY",
+        _tensorrt_int8_agcm_only_default(mode_name),
+    )
+
+
+def _tensorrt_int8_zero_condition_enabled(mode_name: str | None = None) -> bool:
+    return _env_bool(
+        "HDRTVNET_TRT_INT8_ZERO_COND",
+        _tensorrt_int8_agcm_only_enabled(mode_name)
+        and _tensorrt_mode_name_is_full_int8(mode_name),
+    )
+
+
+def _tensorrt_int8_single_input_enabled(mode_name: str | None = None) -> bool:
+    return (
+        _tensorrt_int8_zero_condition_enabled(mode_name)
+        and _env_bool(
+            "HDRTVNET_TRT_INT8_SINGLE_INPUT",
+            _tensorrt_int8_agcm_only_enabled(mode_name),
+        )
+    )
+
+
+def _tensorrt_condition_free_arch_names_enabled(
+    classifier: str | None,
+    le_arch: str | None,
+) -> bool:
+    classifier = str(classifier or "color_condition").strip().lower().replace("-", "_")
+    classifier_aliases = {
+        "agcm_plain",
+        "agcm_affine",
+        "agcm_lite",
+        "agcm_spatial",
+        "lite_agcm",
+        "adaptive_affine",
+        "plain",
+        "plain3",
+        "plain_agcm",
+        "plain_agcm3",
+        "agcm_base",
+        "agcm_base3",
+        "base",
+        "base3",
+    }
+    le_arch = str(le_arch or "sft").strip().lower().replace("-", "_")
+    return (
+        classifier in classifier_aliases
+        or classifier.startswith("agcm_spatialh")
+        or classifier.startswith("agcm_spatialmix")
+    ) and (
+        le_arch.startswith("plainflat")
+        or le_arch.startswith("plainbottleneck")
+        or le_arch.startswith("plaindirect")
+        or le_arch.startswith("conddirect")
+    )
+
+
+def _tensorrt_condition_free_arch_enabled() -> bool:
+    return _tensorrt_condition_free_arch_names_enabled(
+        os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+        os.environ.get("HDRTVNET_LE_ARCH", "sft"),
+    )
+
+
+def _tensorrt_condition_free_arch_enabled_for_checkpoint(model_path: str) -> bool:
+    arch = _source_checkpoint_architecture(model_path)
+    if arch:
+        return _tensorrt_condition_free_arch_names_enabled(
+            str(arch.get("classifier") or ""),
+            str(arch.get("le_arch") or ""),
+        )
+    return _tensorrt_condition_free_arch_enabled()
+
+
+def _tensorrt_condition_free_arch_enabled_for_model(model: nn.Module | None) -> bool:
+    root = getattr(model, "_orig_mod", model)
+    classifier = getattr(root, "_hdrtvnet_classifier_arch", None)
+    le_arch = getattr(root, "_hdrtvnet_le_arch", None)
+    if classifier or le_arch:
+        return _tensorrt_condition_free_arch_names_enabled(classifier, le_arch)
+    return _tensorrt_condition_free_arch_enabled()
+
+
 def _tensorrt_calibrator_algorithm() -> str:
     text = str(os.environ.get("HDRTVNET_TRT_CALIBRATOR", "entropy")).strip().lower()
     if text in {"minmax", "min-max", "min_max"}:
@@ -2572,6 +3383,26 @@ def _tensorrt_native_int8_obey_constraints() -> bool:
 
 def _tensorrt_native_int8_prefer_constraints() -> bool:
     return _env_bool("HDRTVNET_TRT_NATIVE_INT8_PREFER_CONSTRAINTS", False)
+
+
+def _tensorrt_native_int8_checkpoint_policy_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_CHECKPOINT_POLICY", True)
+
+
+def _tensorrt_native_int8_policy_obey() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_POLICY_OBEY", True)
+
+
+def _tensorrt_native_int8_policy_int8_outputs() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_POLICY_INT8_OUTPUTS", False)
+
+
+def _tensorrt_native_int8_policy_output_constraints() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_POLICY_OUTPUTS", False)
+
+
+def _tensorrt_native_int8_calibrate_before_fusion() -> bool:
+    return _env_bool("HDRTVNET_TRT_NATIVE_INT8_CALIBRATE_BEFORE_FUSION", True)
 
 
 def _tensorrt_auto_qparam_calibration_cache() -> bool:
@@ -2623,6 +3454,8 @@ def _tensorrt_calibration_fingerprint(
     calibration_cache: str | None = None,
 ) -> dict[str, object] | None:
     if not str(precision or "").startswith("int8"):
+        return None
+    if _tensorrt_int8_modelopt_enabled():
         return None
     if _resolve_tensorrt_qdq_fusion(precision, qdq_fusion) != "native":
         return None
@@ -2786,6 +3619,217 @@ def _prefer_tensorrt_native_int8_layers(
     )
 
 
+def _onnx_weight_module_name(weight_name: str | None) -> str | None:
+    if not weight_name:
+        return None
+    name = str(weight_name)
+    if name.startswith("model."):
+        name = name[len("model."):]
+    for suffix in (".weight", ".bias"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return None
+
+
+def _tensorrt_native_int8_onnx_policy(
+    onnx_path: str,
+    *,
+    quant_type: str | None,
+    w8a8_layers: set[str] | None,
+) -> dict[str, str]:
+    """Map ONNX compute node names to either INT8 or FP16 for native TRT PTQ."""
+    try:
+        import onnx
+    except Exception as exc:
+        print(f"TensorRT native INT8 policy skipped: ONNX unavailable: {exc}")
+        return {}
+
+    try:
+        model = onnx.load(onnx_path, load_external_data=False)
+    except Exception as exc:
+        print(f"TensorRT native INT8 policy skipped: ONNX read failed: {exc}")
+        return {}
+
+    quant = str(quant_type or "").strip().lower()
+    target_layers = set(w8a8_layers or ())
+    policy: dict[str, str] = {}
+    for node in model.graph.node:
+        if node.op_type not in {"Conv", "Gemm", "MatMul"}:
+            continue
+        weight_name = node.input[1] if len(node.input) > 1 else None
+        module_name = _onnx_weight_module_name(weight_name)
+        if quant == "w8a8_mixed":
+            precision = "int8" if module_name in target_layers else "fp16"
+        elif quant == "w8a8_full":
+            precision = "int8"
+        else:
+            continue
+        if node.name:
+            policy[str(node.name)] = precision
+
+    if policy:
+        counts = {
+            "int8": sum(1 for value in policy.values() if value == "int8"),
+            "fp16": sum(1 for value in policy.values() if value == "fp16"),
+        }
+        print(
+            "TensorRT native INT8 checkpoint policy: "
+            f"{counts['int8']} INT8 compute node(s), "
+            f"{counts['fp16']} FP16 compute node(s)"
+        )
+    return policy
+
+
+def _tensorrt_onnx_compute_nodes_for_module_patterns(
+    onnx_path: str,
+    *,
+    include: tuple[str, ...],
+    exclude: tuple[str, ...] = (),
+) -> list[str]:
+    try:
+        import onnx
+    except Exception as exc:
+        print(f"TensorRT ONNX node selection skipped: ONNX unavailable: {exc}")
+        return []
+
+    try:
+        model = onnx.load(onnx_path, load_external_data=False)
+    except Exception as exc:
+        print(f"TensorRT ONNX node selection skipped: ONNX read failed: {exc}")
+        return []
+
+    selected: list[str] = []
+    total = 0
+    skipped_unnamed = 0
+    for node in model.graph.node:
+        if node.op_type not in {"Conv", "Gemm", "MatMul"}:
+            continue
+        total += 1
+        weight_name = node.input[1] if len(node.input) > 1 else None
+        module_name = _onnx_weight_module_name(weight_name)
+        if not module_name or not node.name:
+            skipped_unnamed += 1
+            continue
+        keep = True
+        if include:
+            keep = _tensorrt_modelopt_torch_pattern_match(
+                module_name,
+                module_name,
+                include,
+            )
+        if keep and exclude:
+            keep = not _tensorrt_modelopt_torch_pattern_match(
+                module_name,
+                module_name,
+                exclude,
+            )
+        if keep:
+            selected.append(str(node.name))
+
+    print(
+        "TensorRT ONNX node selection: "
+        f"{len(selected)}/{total} compute node(s), "
+        f"include={list(include) or '*'}, exclude={list(exclude) or 'none'}, "
+        f"skipped={skipped_unnamed}"
+    )
+    if selected:
+        preview = ", ".join(selected[:12])
+        more = "" if len(selected) <= 12 else f", +{len(selected) - 12} more"
+        print(f"TensorRT ONNX selected nodes: {preview}{more}")
+    return selected
+
+
+def _tensorrt_layer_onnx_names(layer) -> set[str]:
+    text_parts = [
+        str(getattr(layer, "name", "") or ""),
+        str(getattr(layer, "metadata", "") or ""),
+    ]
+    names: set[str] = set()
+    for text in text_parts:
+        names.update(re.findall(r"\bnode_(?:conv2d|linear|gemm|matmul)[A-Za-z0-9_]*\b", text))
+    return names
+
+
+def _apply_tensorrt_native_int8_checkpoint_policy(
+    network,
+    trt,
+    policy: dict[str, str],
+    *,
+    int8_outputs: bool,
+    constrain_outputs: bool,
+) -> tuple[int, int, int]:
+    if not policy:
+        return 0, 0, 0
+
+    output_names: set[str] = set()
+    try:
+        output_names = {
+            network.get_output(i).name
+            for i in range(int(network.num_outputs))
+            if network.get_output(i) is not None
+        }
+    except Exception:
+        output_names = set()
+
+    int8_layers = 0
+    fp16_layers = 0
+    output_constraints = 0
+    preferred_types = {
+        "CONVOLUTION",
+        "DECONVOLUTION",
+        "FULLY_CONNECTED",
+        "MATRIX_MULTIPLY",
+    }
+    try:
+        layer_count = int(network.num_layers)
+    except Exception:
+        layer_count = 0
+
+    for index in range(layer_count):
+        layer = network.get_layer(index)
+        layer_type = str(getattr(layer, "type", "")).split(".")[-1]
+        onnx_names = _tensorrt_layer_onnx_names(layer)
+        matches = [policy[name] for name in onnx_names if name in policy]
+        if not matches:
+            continue
+        precision = "int8" if "int8" in matches else "fp16"
+        try:
+            if precision == "int8":
+                layer.precision = trt.int8
+                int8_layers += 1
+            else:
+                layer.precision = trt.float16
+                fp16_layers += 1
+        except Exception:
+            continue
+
+        if not constrain_outputs or layer_type not in preferred_types:
+            continue
+        try:
+            output_count = int(layer.num_outputs)
+        except Exception:
+            output_count = 0
+        for output_index in range(output_count):
+            try:
+                tensor = layer.get_output(output_index)
+                if tensor is None or tensor.name in output_names:
+                    continue
+                layer.set_output_type(
+                    output_index,
+                    trt.int8 if (precision == "int8" and int8_outputs) else trt.float16,
+                )
+                output_constraints += 1
+            except Exception:
+                continue
+
+    print(
+        "TensorRT native INT8 checkpoint policy applied: "
+        f"{int8_layers} INT8 layer(s), {fp16_layers} FP16 layer(s), "
+        f"{output_constraints} output constraint(s)"
+    )
+    return int8_layers, fp16_layers, output_constraints
+
+
 def tensorrt_engine_path(
     model_path: str,
     width: int,
@@ -2835,6 +3879,12 @@ def cleanup_tensorrt_onnx_after_engine(onnx_path: str, engine_path: str) -> bool
 def _resolve_tensorrt_predequantize(precision: str, predequantize=False) -> bool:
     if not str(precision or "").startswith("int8"):
         return False
+    if (
+        str(precision or "").startswith("int8-full")
+        and _tensorrt_full_int8_fp16_islands_enabled()
+        and _tensorrt_full_int8_safe_fp16_builder_enabled()
+    ):
+        return True
     if isinstance(predequantize, bool):
         return bool(predequantize)
     text = str(predequantize or "off").strip().lower()
@@ -2842,6 +3892,11 @@ def _resolve_tensorrt_predequantize(precision: str, predequantize=False) -> bool
         return True
     if text in {"0", "false", "no", "off", "n"}:
         return False
+    if str(precision or "").startswith("int8-mixed") and _env_bool(
+        "HDRTVNET_TRT_MIXED_FP16_BUILDER",
+        False,
+    ):
+        return True
     # Auto mirrors the PyTorch path: keep explicit INT8 only on NVIDIA GPUs
     # with native INT8 tensor cores; otherwise export a native FP16 engine.
     if torch.cuda.is_available():
@@ -2864,13 +3919,79 @@ def tensorrt_mode_name(
     if str(precision).startswith("int8"):
         lower = mode_name.lower()
         if _resolve_tensorrt_predequantize(precision, predequantize):
+            if str(precision).startswith("int8-full"):
+                has_island_suffix = (
+                    "fpislandoff" in lower or "fpislandson" in lower
+                )
+                if (
+                    _tensorrt_full_int8_fp16_islands_enabled()
+                    and not has_island_suffix
+                ):
+                    mode_name = f"{mode_name}_fpislandsonv1"
+                    lower = mode_name.lower()
             if "predeq" not in lower:
                 mode_name = f"{mode_name}_predeqv1"
+                lower = mode_name.lower()
+            if (
+                _tensorrt_int8_agcm_only_enabled(mode_name)
+                and "agcmonly" not in lower
+            ):
+                mode_name = f"{mode_name}_agcmonlyv1"
+            return mode_name
+        if _tensorrt_int8_modelopt_enabled():
+            use_qat_checkpoint = (
+                _tensorrt_int8_qat_checkpoint_composition_enabled(mode_name)
+            )
+            use_torch_modelopt = (
+                _tensorrt_int8_modelopt_torch_enabled()
+                and not use_qat_checkpoint
+            )
+            suffix = (
+                "modelopttorchint8"
+                if use_torch_modelopt
+                else "modeloptint8"
+            )
+            if suffix not in lower:
+                mode_name = f"{mode_name}_{suffix}v1"
+                lower = mode_name.lower()
+            if use_qat_checkpoint and "qatckpt" not in lower:
+                mode_name = f"{mode_name}_qatckptv1"
+                lower = mode_name.lower()
+            if (
+                use_torch_modelopt
+                and _tensorrt_int8_modelopt_torch_quant_scheme() == "asymmetric"
+                and "asymact" not in lower
+            ):
+                mode_name = f"{mode_name}_asymactv1"
             return mode_name
         fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
         if fusion == "native":
             if "nativeint8" not in lower and "implicitint8" not in lower:
                 mode_name = f"{mode_name}_nativeint8v1"
+                lower = mode_name.lower()
+            if str(precision).startswith("int8-full"):
+                has_island_suffix = (
+                    "fpislandoff" in lower or "fpislandson" in lower
+                )
+                if not has_island_suffix:
+                    suffix = (
+                        "_fpislandsonv1"
+                        if _tensorrt_full_int8_fp16_islands_enabled()
+                        else "_fpislandoffv1"
+                    )
+                    mode_name = f"{mode_name}{suffix}"
+                    lower = mode_name.lower()
+            if (
+                _tensorrt_int8_agcm_only_enabled(mode_name)
+                and "agcmonly" not in lower
+            ):
+                mode_name = f"{mode_name}_agcmonlyv1"
+                lower = mode_name.lower()
+            if (
+                _tensorrt_int8_single_input_enabled(mode_name)
+                and "singleinput" not in lower
+            ):
+                mode_name = f"{mode_name}_singleinputv1"
             return mode_name
         if "qdq" in lower:
             return mode_name
@@ -2906,12 +4027,15 @@ def tensorrt_prebuilt_calibration_cache_path(
     """
     if not str(precision or "").startswith("int8"):
         return None
+    if _tensorrt_int8_modelopt_enabled():
+        return None
     predeq = _resolve_tensorrt_predequantize(precision, predequantize)
     if predeq:
         return None
     resolved_qdq = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
     if resolved_qdq != "native":
         return None
+    agcm_only = _tensorrt_int8_agcm_only_enabled(mode_name)
 
     mode = tensorrt_mode_name(
         precision,
@@ -2930,7 +4054,7 @@ def tensorrt_prebuilt_calibration_cache_path(
     )
     path = os.path.join(root, calib_name)
     if require_exists and not os.path.isfile(path):
-        if _tensorrt_auto_qparam_calibration_cache():
+        if _tensorrt_auto_qparam_calibration_cache() and not agcm_only:
             try:
                 build_tensorrt_w8a8_qparam_calibration_cache(
                     model_path,
@@ -2978,6 +4102,8 @@ def _resolve_tensorrt_calibration_sources(
     video = calibration_video or os.environ.get("HDRTVNET_TRT_CALIBRATION_VIDEO")
     cache = calibration_cache or os.environ.get("HDRTVNET_TRT_CALIBRATION_CACHE")
     used_prebuilt = False
+    if str(precision or "").startswith("int8") and _tensorrt_int8_modelopt_enabled():
+        return None, None, None, False
     if not dataset and not video and not cache:
         cache = tensorrt_prebuilt_calibration_cache_path(
             model_path,
@@ -3768,12 +4894,44 @@ def build_tensorrt_w8a8_qparam_calibration_cache(
 
 
 class _ONNXExportWrapper(nn.Module):
-    def __init__(self, model: nn.Module, flat_model: bool = False):
+    def __init__(
+        self,
+        model: nn.Module,
+        flat_model: bool = False,
+        zero_cond: torch.Tensor | None = None,
+        agcm_only: bool = False,
+        allow_missing_cond: bool = False,
+    ):
         super().__init__()
         self.model = model
         self.flat_model = bool(flat_model)
+        self.agcm_only = bool(agcm_only)
+        self.allow_missing_cond = bool(allow_missing_cond)
+        if zero_cond is not None:
+            self.register_buffer("_zero_cond", zero_cond, persistent=False)
+        else:
+            self._zero_cond = None
 
-    def forward(self, tensor: torch.Tensor, cond: torch.Tensor):
+    def forward(self, tensor: torch.Tensor, cond: torch.Tensor | None = None):
+        if self._zero_cond is not None:
+            if cond is None:
+                cond = self._zero_cond
+            else:
+                cond = cond.mul(0.0).add(self._zero_cond)
+        elif cond is None:
+            if self.allow_missing_cond:
+                cond = tensor
+            else:
+                raise RuntimeError("TensorRT ONNX export requires a condition tensor.")
+        if self.agcm_only:
+            agcm = getattr(self.model, "AGCM", None)
+            if agcm is None and hasattr(self.model, "base"):
+                agcm = getattr(getattr(self.model, "base"), "AGCM", None)
+            if agcm is not None:
+                out = agcm((tensor, cond))
+                if isinstance(out, (tuple, list)):
+                    return out[0]
+                return out
         if self.flat_model:
             out = self.model(tensor, cond)
         else:
@@ -3867,6 +5025,146 @@ def _patch_tensorrt_qdq_casts(onnx_path: str) -> None:
             "TensorRT Q/DQ Cast cleanup: "
             f"{qdq_to_conv} DQ->compute, {conv_to_qdq} compute->Q Cast(s) removed"
         )
+
+
+def _patch_tensorrt_dq_zero_points(onnx_path: str) -> None:
+    """Drop optional all-zero DQ zero-points that confuse TensorRT scale typing."""
+    try:
+        import onnx
+        from onnx import numpy_helper
+    except Exception as exc:
+        print(f"TensorRT DQ zero-point cleanup skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path, load_external_data=True)
+    except Exception as exc:
+        print(f"TensorRT DQ zero-point cleanup skipped: {exc}")
+        return
+
+    initializers = {init.name: init for init in model.graph.initializer}
+    removed = 0
+    skipped_nonzero = 0
+    skipped_dynamic = 0
+    for node in model.graph.node:
+        if node.op_type != "DequantizeLinear" or len(node.input) < 3:
+            continue
+        zero_name = node.input[2]
+        initializer = initializers.get(zero_name)
+        if initializer is None:
+            skipped_dynamic += 1
+            continue
+        try:
+            array = numpy_helper.to_array(initializer)
+        except Exception:
+            skipped_dynamic += 1
+            continue
+        if array.size and not bool(np.all(array == 0)):
+            skipped_nonzero += 1
+            continue
+        del node.input[2:]
+        removed += 1
+
+    if not removed:
+        print(
+            "TensorRT DQ zero-point cleanup: no removable all-zero "
+            f"zero-points found (dynamic={skipped_dynamic}, nonzero={skipped_nonzero})"
+        )
+        return
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"TensorRT DQ zero-point cleanup check warning: {exc}")
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(
+        "TensorRT DQ zero-point cleanup: "
+        f"removed {removed} all-zero DQ zero-point input(s)"
+    )
+
+
+def _patch_tensorrt_qdq_zero_points(onnx_path: str) -> None:
+    """Drop optional all-zero Q/DQ zero-points from explicit quantized graphs."""
+    try:
+        import onnx
+        from onnx import numpy_helper
+    except Exception as exc:
+        print(f"TensorRT Q/DQ zero-point cleanup skipped: onnx import failed ({exc})")
+        return
+
+    try:
+        model = onnx.load(onnx_path, load_external_data=True)
+    except Exception as exc:
+        print(f"TensorRT Q/DQ zero-point cleanup skipped: {exc}")
+        return
+
+    initializers = {init.name: init for init in model.graph.initializer}
+    removed = 0
+    skipped_nonzero = 0
+    skipped_dynamic = 0
+    for node in model.graph.node:
+        if node.op_type not in {"QuantizeLinear", "DequantizeLinear"}:
+            continue
+        if len(node.input) < 3:
+            continue
+        zero_name = node.input[2]
+        initializer = initializers.get(zero_name)
+        if initializer is None:
+            skipped_dynamic += 1
+            continue
+        try:
+            array = numpy_helper.to_array(initializer)
+        except Exception:
+            skipped_dynamic += 1
+            continue
+        if array.size and not bool(np.all(array == 0)):
+            skipped_nonzero += 1
+            continue
+        del node.input[2:]
+        removed += 1
+
+    if not removed:
+        print(
+            "TensorRT Q/DQ zero-point cleanup: no removable all-zero "
+            f"zero-points found (dynamic={skipped_dynamic}, nonzero={skipped_nonzero})"
+        )
+        return
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"TensorRT Q/DQ zero-point cleanup check warning: {exc}")
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(
+        "TensorRT Q/DQ zero-point cleanup: "
+        f"removed {removed} all-zero Q/DQ zero-point input(s)"
+    )
 
 
 def _patch_tensorrt_elementwise_input_qdq(
@@ -4221,7 +5519,45 @@ def _patch_tensorrt_fp16_constants(onnx_path: str) -> None:
             attr.t.CopyFrom(numpy_helper.from_array(array.astype(np.float16), tensor.name))
             changed_constants += 1
 
-    if not (changed_initializers or changed_constants):
+    producers = {output: node for node in graph.node for output in node.output}
+    consumers: dict[str, list[object]] = {}
+    for node in graph.node:
+        for input_name in node.input:
+            consumers.setdefault(input_name, []).append(node)
+
+    def _constant_dtype(name: str):
+        for initializer in graph.initializer:
+            if initializer.name == name:
+                return initializer.data_type
+        producer = producers.get(name)
+        if producer is None or producer.op_type != "Constant":
+            return None
+        for attr in producer.attribute:
+            if attr.name == "value" and attr.HasField("t"):
+                return attr.t.data_type
+        return None
+
+    changed_casts = 0
+    compare_ops = {"Greater", "Less", "GreaterOrEqual", "LessOrEqual", "Equal"}
+    for node in graph.node:
+        if node.op_type != "Cast" or not node.output:
+            continue
+        to_attr = next((attr for attr in node.attribute if attr.name == "to"), None)
+        if to_attr is None or to_attr.i != TensorProto.FLOAT:
+            continue
+        for consumer in consumers.get(node.output[0], []):
+            if consumer.op_type not in compare_ops:
+                continue
+            if any(
+                input_name != node.output[0]
+                and _constant_dtype(input_name) == TensorProto.FLOAT16
+                for input_name in consumer.input
+            ):
+                to_attr.i = TensorProto.FLOAT16
+                changed_casts += 1
+                break
+
+    if not (changed_initializers or changed_constants or changed_casts):
         print("TensorRT FP16 constant cleanup: no safe FP32 constants found")
         return
 
@@ -4245,23 +5581,25 @@ def _patch_tensorrt_fp16_constants(onnx_path: str) -> None:
     )
     print(
         "TensorRT FP16 constant cleanup: "
-        f"{changed_initializers} initializer(s), {changed_constants} Constant node(s)"
+        f"{changed_initializers} initializer(s), {changed_constants} Constant node(s), "
+        f"{changed_casts} Cast node(s)"
     )
 
 
 def _patch_tensorrt_fp16_qdq_scales(onnx_path: str) -> None:
-    """Use FP16 Q/DQ scales so explicit-quantization islands stay in FP16."""
+    """Keep Q/DQ scales in FP32 so TensorRT does not quantize scale layers."""
     try:
         import onnx
         from onnx import TensorProto, numpy_helper
+        import numpy as np
     except Exception as exc:
-        print(f"TensorRT FP16 Q/DQ scale cleanup skipped: onnx import failed ({exc})")
+        print(f"TensorRT FP32 Q/DQ scale cleanup skipped: onnx import failed ({exc})")
         return
 
     try:
-        model = onnx.load(onnx_path)
+        model = onnx.load(onnx_path, load_external_data=True)
     except Exception as exc:
-        print(f"TensorRT FP16 Q/DQ scale cleanup skipped: {exc}")
+        print(f"TensorRT FP32 Q/DQ scale cleanup skipped: {exc}")
         return
 
     scale_names = set()
@@ -4271,18 +5609,18 @@ def _patch_tensorrt_fp16_qdq_scales(onnx_path: str) -> None:
 
     changed = 0
     for initializer in model.graph.initializer:
-        if initializer.name not in scale_names or initializer.data_type != TensorProto.FLOAT:
+        if initializer.name not in scale_names:
             continue
         array = numpy_helper.to_array(initializer)
-        if array.dtype != np.float32:
+        if array.dtype == np.float32 and initializer.data_type == TensorProto.FLOAT:
             continue
         initializer.CopyFrom(
-            numpy_helper.from_array(array.astype(np.float16), initializer.name)
+            numpy_helper.from_array(array.astype(np.float32), initializer.name)
         )
         changed += 1
 
     if not changed:
-        print("TensorRT FP16 Q/DQ scale cleanup: no FP32 Q/DQ scales found")
+        print("TensorRT FP32 Q/DQ scale cleanup: scales already FP32")
         return
 
     for opset in model.opset_import:
@@ -4298,7 +5636,7 @@ def _patch_tensorrt_fp16_qdq_scales(onnx_path: str) -> None:
     try:
         onnx.checker.check_model(model)
     except Exception as exc:
-        print(f"TensorRT FP16 Q/DQ scale cleanup check warning: {exc}")
+        print(f"TensorRT FP32 Q/DQ scale cleanup check warning: {exc}")
     onnx.save_model(
         model,
         onnx_path,
@@ -4307,7 +5645,7 @@ def _patch_tensorrt_fp16_qdq_scales(onnx_path: str) -> None:
         location=os.path.basename(data_path),
         size_threshold=1024,
     )
-    print(f"TensorRT FP16 Q/DQ scale cleanup: {changed} scale initializer(s)")
+    print(f"TensorRT FP32 Q/DQ scale cleanup: {changed} scale initializer(s)")
 
 
 def _export_tensorrt_onnx_from_model(
@@ -4321,6 +5659,10 @@ def _export_tensorrt_onnx_from_model(
     precision: str,
     flat_model: bool,
     qdq_fusion: str = "auto",
+    int8_zero_condition: bool = False,
+    int8_single_input: bool = False,
+    int8_agcm_only: bool = False,
+    single_input_graph: bool = False,
 ) -> str:
     if os.path.isfile(onnx_path):
         try:
@@ -4342,11 +5684,32 @@ def _export_tensorrt_onnx_from_model(
         else:
             export_model = _convert_model_to_tensorrt_qdq(export_model).eval()
     _patch_adaptive_avgpool_for_trt(export_model)
-    wrapper = _ONNXExportWrapper(export_model, flat_model=flat_model).eval()
     h, w = int(height), int(width)
     cond_h, cond_w = max(1, h // 4), max(1, w // 4)
     tensor = torch.zeros((1, 3, h, w), dtype=dtype, device=device)
     cond = torch.zeros((1, 3, cond_h, cond_w), dtype=dtype, device=device)
+    zero_cond = (
+        torch.zeros_like(cond)
+        if (int8_export and bool(int8_zero_condition))
+        else None
+    )
+    single_input = bool(
+        zero_cond is not None and bool(int8_single_input)
+    ) or bool(single_input_graph)
+    agcm_only = bool(int8_agcm_only)
+    if zero_cond is not None:
+        print("TensorRT INT8 ONNX export: constant zero condition enabled")
+    if single_input:
+        print("TensorRT ONNX export: single input enabled")
+    if agcm_only:
+        print("TensorRT INT8 ONNX export: AGCM-only speed graph enabled")
+    wrapper = _ONNXExportWrapper(
+        export_model,
+        flat_model=flat_model,
+        zero_cond=zero_cond,
+        agcm_only=agcm_only,
+        allow_missing_cond=single_input,
+    ).eval()
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     print(f"TensorRT ONNX export: {onnx_path}")
     for stream_name in ("stdout", "stderr"):
@@ -4357,12 +5720,14 @@ def _export_tensorrt_onnx_from_model(
             except Exception:
                 pass
     with torch.inference_mode():
+        export_args = (tensor,) if single_input else (tensor, cond)
+        input_names = ["input"] if single_input else ["input", "cond"]
         torch.onnx.export(
             wrapper,
-            (tensor, cond),
+            export_args,
             onnx_path,
             verbose=False,
-            input_names=["input", "cond"],
+            input_names=input_names,
             output_names=["output"],
             opset_version=19 if (int8_export and not native_int8_export) else 18,
             do_constant_folding=True,
@@ -4371,6 +5736,7 @@ def _export_tensorrt_onnx_from_model(
         print("TensorRT native INT8 export: Q/DQ graph patches skipped")
     elif int8_export:
         _patch_tensorrt_qdq_casts(onnx_path)
+        _patch_tensorrt_qdq_zero_points(onnx_path)
         if fusion == "add":
             _patch_tensorrt_add_input_qdq(onnx_path)
         elif fusion == "add-mul":
@@ -4384,6 +5750,1045 @@ def _export_tensorrt_onnx_from_model(
                 f"export dtype is {dtype}, keeping FP32 graph valid for validation"
             )
     return onnx_path
+
+
+def _remove_onnx_artifacts(path: str) -> None:
+    for candidate in (path, f"{path}.data"):
+        try:
+            if candidate and os.path.isfile(candidate):
+                os.remove(candidate)
+        except Exception:
+            pass
+
+
+def _unwrap_model_output(output):
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    return output
+
+
+def _make_tensorrt_modelopt_torch_batches(
+    *,
+    model: nn.Module,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    steps: int,
+    include_targets: bool,
+) -> list[tuple[torch.Tensor, ...]]:
+    h, w = int(height), int(width)
+    cond_h, cond_w = max(1, h // 4), max(1, w // 4)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(_tensorrt_int8_modelopt_torch_seed())
+    batches: list[list[torch.Tensor]] = []
+    for index in range(max(1, int(steps))):
+        base = torch.rand((1, 3, h, w), generator=generator, dtype=torch.float32)
+        if index % 5 == 1:
+            base = base * 0.55
+        elif index % 5 == 2:
+            base = torch.sqrt(base.clamp_min(0.0))
+        elif index % 5 == 3:
+            ramp = torch.linspace(0.0, 1.0, w, dtype=torch.float32).view(1, 1, 1, w)
+            base = (base * 0.65) + (ramp * 0.35)
+        elif index % 5 == 4:
+            ramp = torch.linspace(0.0, 1.0, h, dtype=torch.float32).view(1, 1, h, 1)
+            base = (base * 0.65) + (ramp * 0.35)
+        tensor = base.clamp_(0.0, 1.0).to(device=device, dtype=dtype).contiguous()
+        cond = F.interpolate(
+            tensor,
+            size=(cond_h, cond_w),
+            mode="bilinear",
+            align_corners=False,
+        ).contiguous()
+        batches.append([tensor, cond])
+
+    if include_targets:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for batch in batches:
+                target = _unwrap_model_output(model((batch[0], batch[1]))).detach()
+                batch.append(target.to(device=device, dtype=dtype).contiguous())
+        model.train(was_training)
+    return [tuple(batch) for batch in batches]
+
+
+def _tensorrt_modelopt_torch_forward_step(
+    model: nn.Module,
+    batch,
+) -> torch.Tensor:
+    tensor = batch[0]
+    cond = batch[1]
+    return _unwrap_model_output(model((tensor, cond)))
+
+
+def _count_tensorrt_modelopt_torch_quantizers(model: nn.Module) -> tuple[int, int]:
+    enabled = 0
+    total = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        total += 1
+        state = getattr(module, "is_enabled", None)
+        try:
+            is_enabled = bool(state() if callable(state) else state)
+        except Exception:
+            is_enabled = bool(getattr(module, "_is_enabled", False))
+        enabled += int(is_enabled)
+    return enabled, total
+
+
+def _tensorrt_modelopt_torch_quantizer_kind(name: str) -> str:
+    for suffix in (
+        "input_quantizer",
+        "weight_quantizer",
+        "output_quantizer",
+        "_input_quantizer",
+        "_weight_quantizer",
+        "_output_quantizer",
+    ):
+        if str(name).endswith(suffix):
+            return suffix.lstrip("_")
+    return "other"
+
+
+def _summarize_tensorrt_modelopt_torch_quantizers(
+    model: nn.Module,
+) -> dict[str, dict[str, object]]:
+    summary: dict[str, dict[str, object]] = {}
+    for name, module in model.named_modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        kind = _tensorrt_modelopt_torch_quantizer_kind(name)
+        entry = summary.setdefault(kind, {"enabled": 0, "total": 0, "disabled": []})
+        enabled = _tensorrt_modelopt_torch_quantizer_enabled(module)
+        entry["total"] = int(entry["total"]) + 1
+        entry["enabled"] = int(entry["enabled"]) + int(enabled)
+        if not enabled:
+            disabled = entry["disabled"]
+            if isinstance(disabled, list):
+                disabled.append(name)
+    return summary
+
+
+def _print_tensorrt_modelopt_torch_quantizer_summary(model: nn.Module) -> None:
+    summary = _summarize_tensorrt_modelopt_torch_quantizers(model)
+    for kind in ("input_quantizer", "weight_quantizer", "output_quantizer", "other"):
+        entry = summary.get(kind)
+        if not entry:
+            continue
+        print(
+            "TensorRT INT8 ModelOpt Torch "
+            f"{kind}: {int(entry['enabled'])}/{int(entry['total'])} enabled"
+        )
+
+
+def _enable_tensorrt_modelopt_torch_output_quantizers(model: nn.Module) -> int:
+    changed = 0
+    failed: list[str] = []
+    for name, module in model.named_modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        if _tensorrt_modelopt_torch_quantizer_kind(name) != "output_quantizer":
+            continue
+        if _tensorrt_modelopt_torch_quantizer_enabled(module):
+            continue
+        try:
+            if hasattr(module, "enable"):
+                module.enable()
+            else:
+                setattr(module, "_disabled", False)
+                setattr(module, "_is_enabled", True)
+        except Exception:
+            failed.append(name)
+            continue
+        if _tensorrt_modelopt_torch_quantizer_enabled(module):
+            changed += 1
+        else:
+            failed.append(name)
+    if failed:
+        preview = ", ".join(failed[:12])
+        more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
+        raise RuntimeError(
+            "TensorRT INT8 Full contract failed: could not enable "
+            f"{len(failed)} output quantizer(s) ({preview}{more})."
+        )
+    if changed:
+        print(
+            "TensorRT INT8 Full contract: enabled "
+            f"{changed} output quantizer(s)"
+        )
+    return changed
+
+
+def _enable_tensorrt_modelopt_torch_quantizers(
+    model: nn.Module,
+    *,
+    kinds: tuple[str, ...],
+    label: str,
+) -> int:
+    changed = 0
+    failed: list[str] = []
+    wanted = set(kinds)
+    for name, module in model.named_modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        if _tensorrt_modelopt_torch_quantizer_kind(name) not in wanted:
+            continue
+        if _tensorrt_modelopt_torch_quantizer_enabled(module):
+            continue
+        try:
+            if hasattr(module, "enable"):
+                module.enable()
+            else:
+                setattr(module, "_disabled", False)
+                setattr(module, "_is_enabled", True)
+        except Exception:
+            failed.append(name)
+            continue
+        if _tensorrt_modelopt_torch_quantizer_enabled(module):
+            changed += 1
+        else:
+            failed.append(name)
+    if failed:
+        preview = ", ".join(failed[:12])
+        more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
+        raise RuntimeError(
+            f"TensorRT INT8 {label} contract failed: could not enable "
+            f"{len(failed)} quantizer(s) ({preview}{more})."
+        )
+    if changed:
+        print(
+            f"TensorRT INT8 {label} contract: enabled "
+            f"{changed} quantizer(s)"
+        )
+    return changed
+
+
+def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(model: nn.Module) -> int:
+    include = _tensorrt_int8_modelopt_torch_include_patterns()
+    exclude = _tensorrt_int8_modelopt_torch_exclude_patterns()
+    changed = 0
+    failed: list[str] = []
+    for name, module in model.named_modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        if _tensorrt_modelopt_torch_quantizer_kind(name) != "output_quantizer":
+            continue
+        parent_name = _tensorrt_modelopt_torch_quantizer_parent(name)
+        keep = True
+        if include:
+            keep = _tensorrt_modelopt_torch_pattern_match(name, parent_name, include)
+        if keep and exclude:
+            keep = not _tensorrt_modelopt_torch_pattern_match(
+                name,
+                parent_name,
+                exclude,
+            )
+        if not keep or _tensorrt_modelopt_torch_quantizer_enabled(module):
+            continue
+        try:
+            if hasattr(module, "enable"):
+                module.enable()
+            else:
+                setattr(module, "_disabled", False)
+                setattr(module, "_is_enabled", True)
+        except Exception:
+            failed.append(name)
+            continue
+        if _tensorrt_modelopt_torch_quantizer_enabled(module):
+            changed += 1
+        else:
+            failed.append(name)
+    if failed:
+        preview = ", ".join(failed[:12])
+        more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
+        raise RuntimeError(
+            "TensorRT INT8 mixed output quantizer request failed: could not "
+            f"enable {len(failed)} output quantizer(s) ({preview}{more})."
+        )
+    if changed:
+        print(
+            "TensorRT INT8 ModelOpt Torch mixed outputs: enabled "
+            f"{changed} included output quantizer(s)"
+        )
+    return changed
+
+
+def _calibrate_tensorrt_modelopt_torch_enabled_output_quantizers(
+    model: nn.Module,
+    forward_loop,
+) -> int:
+    return _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
+        model,
+        forward_loop,
+        kinds=("output_quantizer",),
+        label="mixed output",
+    )
+
+
+def _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
+    model: nn.Module,
+    forward_loop,
+    *,
+    kinds: tuple[str, ...],
+    label: str,
+) -> int:
+    targets = []
+    wanted = set(kinds)
+    for name, module in model.named_modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        if _tensorrt_modelopt_torch_quantizer_kind(name) not in wanted:
+            continue
+        if not _tensorrt_modelopt_torch_quantizer_enabled(module):
+            continue
+        amax = getattr(module, "_amax", None)
+        if amax is not None:
+            continue
+        targets.append((name, module))
+    if not targets:
+        return 0
+
+    armed = []
+    for _name, module in targets:
+        try:
+            if hasattr(module, "reset_amax"):
+                module.reset_amax()
+            if hasattr(module, "disable_quant"):
+                module.disable_quant()
+            if hasattr(module, "enable_calib"):
+                module.enable_calib()
+            armed.append(module)
+        except Exception:
+            continue
+    if not armed:
+        return 0
+
+    with _tensorrt_modelopt_torch_no_inplace_functionals():
+        forward_loop(model)
+
+    calibrated = 0
+    failed: list[str] = []
+    armed_ids = {id(module) for module in armed}
+    for name, module in targets:
+        if id(module) not in armed_ids:
+            continue
+        try:
+            if hasattr(module, "disable_calib"):
+                module.disable_calib()
+            if hasattr(module, "load_calib_amax"):
+                module.load_calib_amax(strict=True)
+            if hasattr(module, "enable_quant"):
+                module.enable_quant()
+        except Exception:
+            failed.append(name)
+            try:
+                if hasattr(module, "disable_calib"):
+                    module.disable_calib()
+                if hasattr(module, "enable_quant"):
+                    module.enable_quant()
+            except Exception:
+                pass
+            continue
+        if hasattr(module, "_amax"):
+            calibrated += 1
+        else:
+            failed.append(name)
+
+    if failed:
+        preview = ", ".join(failed[:12])
+        more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
+        raise RuntimeError(
+            f"TensorRT INT8 {label} quantizer calibration failed for "
+            f"{len(failed)} quantizer(s) ({preview}{more})."
+        )
+    if calibrated:
+        print(
+            f"TensorRT INT8 ModelOpt Torch {label}: calibrated "
+            f"{calibrated} quantizer(s)"
+        )
+    return calibrated
+
+
+def _enforce_tensorrt_modelopt_torch_full_quantizers(model: nn.Module) -> None:
+    summary = _summarize_tensorrt_modelopt_torch_quantizers(model)
+    disabled_compute: list[str] = []
+    for kind in ("input_quantizer", "weight_quantizer", "output_quantizer"):
+        entry = summary.get(kind, {})
+        disabled = entry.get("disabled", [])
+        if isinstance(disabled, list):
+            disabled_compute.extend(str(name) for name in disabled)
+    if not disabled_compute:
+        return
+    preview = ", ".join(disabled_compute[:12])
+    more = "" if len(disabled_compute) <= 12 else f", +{len(disabled_compute) - 12} more"
+    raise RuntimeError(
+        "TensorRT INT8 Full contract failed: ModelOpt left "
+        f"{len(disabled_compute)} quantizer(s) disabled "
+        f"({preview}{more}). Use int8-mixed for partial quantization."
+    )
+
+
+def _tensorrt_modelopt_torch_int8_config(mtq_module, *, full_outputs: bool = False):
+    cfg = copy.deepcopy(mtq_module.INT8_DEFAULT_CFG)
+    if full_outputs:
+        quant_cfg = cfg.setdefault("quant_cfg", [])
+        if isinstance(quant_cfg, list):
+            quant_cfg.insert(
+                3,
+                {
+                    "quantizer_name": "*output_quantizer",
+                    "cfg": {"num_bits": 8, "axis": None},
+                },
+            )
+    quant_scheme = _tensorrt_int8_modelopt_torch_quant_scheme()
+    for entry in cfg.get("quant_cfg", []):
+        if not isinstance(entry, dict):
+            continue
+        quantizer_name = str(entry.get("quantizer_name", ""))
+        qcfg = entry.get("cfg")
+        if not isinstance(qcfg, dict):
+            continue
+        if quantizer_name.endswith("weight_quantizer"):
+            qcfg["unsigned"] = False
+            qcfg["narrow_range"] = False
+        elif quantizer_name.endswith("input_quantizer") or quantizer_name.endswith("output_quantizer"):
+            qcfg["unsigned"] = quant_scheme == "asymmetric"
+            qcfg["narrow_range"] = False
+    return cfg
+
+
+def _tensorrt_modelopt_torch_quantizer_enabled(module: nn.Module) -> bool:
+    state = getattr(module, "is_enabled", None)
+    try:
+        return bool(state() if callable(state) else state)
+    except Exception:
+        return not bool(getattr(module, "_disabled", False))
+
+
+def _tensorrt_modelopt_torch_quantizer_parent(name: str) -> str:
+    markers = (
+        ".input_quantizer",
+        ".weight_quantizer",
+        ".output_quantizer",
+        "._input_quantizer",
+        "._weight_quantizer",
+        "._output_quantizer",
+    )
+    for marker in markers:
+        index = name.find(marker)
+        if index >= 0:
+            return name[:index]
+    parts = name.split(".")
+    if parts and "quantizer" in parts[-1].lower():
+        return ".".join(parts[:-1])
+    return name
+
+
+def _tensorrt_modelopt_torch_pattern_match(
+    name: str,
+    parent_name: str,
+    patterns: tuple[str, ...],
+) -> bool:
+    if not patterns:
+        return False
+    candidates = (name, parent_name)
+    for raw_pattern in patterns:
+        pattern = str(raw_pattern or "").strip()
+        if not pattern:
+            continue
+        pattern_lower = pattern.lower()
+        for candidate in candidates:
+            candidate_lower = candidate.lower()
+            if (
+                pattern_lower == candidate_lower
+                or candidate_lower.startswith(pattern_lower)
+                or pattern_lower in candidate_lower
+            ):
+                return True
+        try:
+            if any(re.search(pattern, candidate) for candidate in candidates):
+                return True
+        except re.error:
+            pass
+    return False
+
+
+def _apply_tensorrt_modelopt_torch_quantizer_filters(
+    model: nn.Module,
+    precision: str | None = None,
+) -> tuple[int, int, int]:
+    include = _tensorrt_int8_modelopt_torch_include_patterns()
+    exclude = _tensorrt_int8_modelopt_torch_exclude_patterns()
+    has_hg = any(name == "hg" or name.startswith("hg.") for name, _ in model.named_modules())
+    if (
+        has_hg
+        and not include
+        and not exclude
+        and _tensorrt_int8_modelopt_torch_hg_default_enabled()
+    ):
+        include = ("hg",)
+        if str(precision or "").startswith("int8-mixed"):
+            exclude = _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns()
+
+    if not include and not exclude:
+        enabled, total = _count_tensorrt_modelopt_torch_quantizers(model)
+        return enabled, total, 0
+
+    total = 0
+    enabled = 0
+    changed = 0
+    enabled_parents: list[str] = []
+    for name, module in model.named_modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        total += 1
+        parent_name = _tensorrt_modelopt_torch_quantizer_parent(name)
+        keep = True
+        if include:
+            keep = _tensorrt_modelopt_torch_pattern_match(name, parent_name, include)
+        if keep and exclude:
+            keep = not _tensorrt_modelopt_torch_pattern_match(
+                name,
+                parent_name,
+                exclude,
+            )
+        was_enabled = _tensorrt_modelopt_torch_quantizer_enabled(module)
+        try:
+            if keep:
+                pass
+            elif hasattr(module, "disable"):
+                module.disable()
+            else:
+                setattr(module, "_disabled", True)
+        except Exception:
+            pass
+        is_enabled = _tensorrt_modelopt_torch_quantizer_enabled(module)
+        enabled += int(is_enabled)
+        changed += int(was_enabled != is_enabled)
+        if is_enabled and parent_name not in enabled_parents:
+            enabled_parents.append(parent_name)
+
+    print(
+        "TensorRT INT8 ModelOpt Torch quantizer filter: "
+        f"include={list(include) or '*'}, exclude={list(exclude) or 'none'}, "
+        f"enabled={enabled}/{total}, changed={changed}"
+    )
+    if enabled_parents:
+        preview = ", ".join(enabled_parents[:12])
+        more = "" if len(enabled_parents) <= 12 else f", +{len(enabled_parents) - 12} more"
+        print(f"TensorRT INT8 ModelOpt Torch enabled blocks: {preview}{more}")
+    return enabled, total, changed
+
+
+@contextlib.contextmanager
+def _tensorrt_modelopt_torch_no_inplace_functionals():
+    original_relu = F.relu
+    original_leaky_relu = F.leaky_relu
+
+    def _relu_no_inplace(input, inplace: bool = False):
+        return original_relu(input, inplace=False)
+
+    def _leaky_relu_no_inplace(input, negative_slope: float = 0.01, inplace: bool = False):
+        return original_leaky_relu(input, negative_slope=negative_slope, inplace=False)
+
+    F.relu = _relu_no_inplace
+    F.leaky_relu = _leaky_relu_no_inplace
+    try:
+        yield
+    finally:
+        F.relu = original_relu
+        F.leaky_relu = original_leaky_relu
+
+
+def _disable_tensorrt_modelopt_torch_inplace_activations(model: nn.Module) -> int:
+    changed = 0
+    for module in model.modules():
+        if not hasattr(module, "inplace"):
+            continue
+        try:
+            if bool(getattr(module, "inplace")):
+                setattr(module, "inplace", False)
+                changed += 1
+        except Exception:
+            pass
+    if changed:
+        print(
+            "TensorRT INT8 ModelOpt Torch auto_quantize: "
+            f"disabled {changed} in-place activation module(s) for scoring"
+        )
+    return changed
+
+
+def _set_tensorrt_modelopt_torch_export_dtype(
+    model: nn.Module,
+    dtype: torch.dtype,
+) -> None:
+    high_precision = _tensorrt_int8_modelopt_torch_qdq_dtype(dtype)
+    changed = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "TensorQuantizer":
+            continue
+        try:
+            module.trt_high_precision_dtype = high_precision
+            changed += 1
+        except Exception:
+            pass
+    if changed:
+        print(
+            "TensorRT INT8 ModelOpt Torch export dtype: "
+            f"{high_precision} Q/DQ high precision on {changed} quantizer(s)"
+        )
+
+
+def _apply_tensorrt_modelopt_torch_int8_quantization(
+    *,
+    model: nn.Module,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    precision: str,
+) -> nn.Module:
+    try:
+        import modelopt.torch.quantization as mtq
+    except Exception as exc:
+        raise RuntimeError(
+            "ModelOpt PyTorch quantization is not installed. "
+            "Install nvidia-modelopt to use HDRTVNET_TRT_INT8_MODELOPT_TORCH=1."
+        ) from exc
+
+    mode = _tensorrt_int8_modelopt_torch_mode(precision)
+    method = _tensorrt_int8_modelopt_torch_method()
+    quant_scheme = _tensorrt_int8_modelopt_torch_quant_scheme()
+    full_precision = str(precision or "").startswith("int8-full")
+    quant_config = _tensorrt_modelopt_torch_int8_config(
+        mtq,
+        full_outputs=full_precision,
+    )
+    calib_steps = _tensorrt_int8_modelopt_torch_calib_steps()
+    score_steps = _tensorrt_int8_modelopt_torch_score_steps()
+    total_steps = calib_steps if mode == "full" else max(calib_steps, score_steps)
+    include_targets = mode == "auto" and method == "gradient"
+    _disable_tensorrt_modelopt_torch_inplace_activations(model)
+    fallback_model = None
+    if mode == "auto" and method == "gradient":
+        try:
+            fallback_model = copy.deepcopy(model).eval()
+        except Exception:
+            fallback_model = None
+    with _tensorrt_modelopt_torch_no_inplace_functionals():
+        batches = _make_tensorrt_modelopt_torch_batches(
+            model=model,
+            width=width,
+            height=height,
+            dtype=dtype,
+            device=device,
+            steps=total_steps,
+            include_targets=include_targets,
+        )
+
+    def forward_loop(qmodel: nn.Module) -> None:
+        qmodel.eval()
+        with torch.no_grad():
+            for batch in batches[:calib_steps]:
+                _tensorrt_modelopt_torch_forward_step(qmodel, batch)
+
+    print(
+        "TensorRT INT8 ModelOpt Torch quantization: "
+        f"mode={mode}, scheme={quant_scheme}, "
+        f"calib_steps={calib_steps}, score_steps={score_steps}"
+    )
+    if mode == "full":
+        with _tensorrt_modelopt_torch_no_inplace_functionals():
+            quantized = mtq.quantize(
+                model,
+                copy.deepcopy(quant_config),
+                forward_loop,
+            )
+    else:
+        constraints = {"effective_bits": _tensorrt_int8_modelopt_torch_effective_bits()}
+
+        def loss_func(output, batch) -> torch.Tensor:
+            target = batch[2]
+            return F.mse_loss(_unwrap_model_output(output).float(), target.float())
+
+        try:
+            with _tensorrt_modelopt_torch_no_inplace_functionals():
+                quantized, _search_state = mtq.auto_quantize(
+                    model,
+                    constraints=constraints,
+                    quantization_formats=[copy.deepcopy(quant_config)],
+                    data_loader=batches,
+                    forward_step=_tensorrt_modelopt_torch_forward_step,
+                    loss_func=loss_func if method == "gradient" else None,
+                    num_calib_steps=calib_steps,
+                    num_score_steps=score_steps,
+                    method=method,
+                    verbose=_env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_VERBOSE", False),
+                )
+        except Exception as exc:
+            if method == "kl_div" or fallback_model is None:
+                raise
+            print(
+                "TensorRT INT8 ModelOpt Torch gradient search failed; "
+                f"retrying kl_div search ({exc})"
+            )
+            _disable_tensorrt_modelopt_torch_inplace_activations(fallback_model)
+            with _tensorrt_modelopt_torch_no_inplace_functionals():
+                batches = _make_tensorrt_modelopt_torch_batches(
+                    model=fallback_model,
+                    width=width,
+                    height=height,
+                    dtype=dtype,
+                    device=device,
+                    steps=max(calib_steps, score_steps),
+                    include_targets=False,
+                )
+                quantized, _search_state = mtq.auto_quantize(
+                    fallback_model,
+                    constraints=constraints,
+                    quantization_formats=[copy.deepcopy(quant_config)],
+                    data_loader=batches,
+                    forward_step=_tensorrt_modelopt_torch_forward_step,
+                    num_calib_steps=calib_steps,
+                    num_score_steps=score_steps,
+                    method="kl_div",
+                    verbose=_env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_VERBOSE", False),
+                )
+        print(
+            "TensorRT INT8 ModelOpt Torch auto_quantize: "
+            f"effective_bits={constraints['effective_bits']:g}, method={method}"
+        )
+
+    _apply_tensorrt_modelopt_torch_quantizer_filters(quantized, precision)
+    if full_precision:
+        _enable_tensorrt_modelopt_torch_quantizers(
+            quantized,
+            kinds=("input_quantizer", "weight_quantizer", "output_quantizer"),
+            label="Full",
+        )
+        _enable_tensorrt_modelopt_torch_output_quantizers(quantized)
+        _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
+            quantized,
+            forward_loop,
+            kinds=("input_quantizer", "output_quantizer"),
+            label="full activation",
+        )
+    elif _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUTS", False):
+        _enable_tensorrt_modelopt_torch_filtered_output_quantizers(quantized)
+        _calibrate_tensorrt_modelopt_torch_enabled_output_quantizers(
+            quantized,
+            forward_loop,
+        )
+    enabled, total = _count_tensorrt_modelopt_torch_quantizers(quantized)
+    if total:
+        suffix = (
+            "all quantizers required"
+            if full_precision
+            else "all, output quantizers may stay disabled"
+        )
+        print(f"TensorRT INT8 ModelOpt Torch quantizers ({suffix}): {enabled}/{total} enabled")
+        _print_tensorrt_modelopt_torch_quantizer_summary(quantized)
+    if full_precision:
+        _enforce_tensorrt_modelopt_torch_full_quantizers(quantized)
+    try:
+        quantized.eval()
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return quantized
+
+
+def _export_tensorrt_modelopt_torch_onnx_from_model(
+    *,
+    model: nn.Module,
+    onnx_path: str,
+    width: int,
+    height: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    flat_model: bool,
+    single_input_graph: bool = False,
+) -> str:
+    _remove_onnx_artifacts(onnx_path)
+    export_model = getattr(model, "_orig_mod", model).eval()
+    _set_tensorrt_modelopt_torch_export_dtype(export_model, dtype)
+    _patch_adaptive_avgpool_for_trt(export_model)
+    h, w = int(height), int(width)
+    cond_h, cond_w = max(1, h // 4), max(1, w // 4)
+    tensor = torch.zeros((1, 3, h, w), dtype=dtype, device=device)
+    cond = torch.zeros((1, 3, cond_h, cond_w), dtype=dtype, device=device)
+    wrapper = _ONNXExportWrapper(
+        export_model,
+        flat_model=flat_model,
+        allow_missing_cond=single_input_graph,
+    ).eval()
+    os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+    if single_input_graph:
+        print("TensorRT ModelOpt Torch ONNX export: single input enabled")
+    print(f"TensorRT ModelOpt Torch ONNX export: {onnx_path}")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+    try:
+        from modelopt.torch.quantization.export_onnx import (
+            configure_linear_module_onnx_quantizers,
+        )
+        from modelopt.torch.quantization.utils import export_torch_mode
+        import modelopt.torch.quantization.tensor_quant as modelopt_tensor_quant
+    except Exception:
+        configure_linear_module_onnx_quantizers = None
+        export_torch_mode = None
+        modelopt_tensor_quant = None
+
+    def _export_passthrough_quantize_op(
+        inputs: torch.Tensor,
+        amax: torch.Tensor,
+        num_bits: int = 8,
+        exponent_bits: int = 0,
+        unsigned: bool = False,
+        narrow_range: bool = True,
+    ) -> torch.Tensor:
+        return inputs
+
+    original_quantize_op = None
+    if modelopt_tensor_quant is not None:
+        original_quantize_op = getattr(modelopt_tensor_quant, "quantize_op", None)
+        modelopt_tensor_quant.quantize_op = _export_passthrough_quantize_op
+    export_cm = (
+        export_torch_mode()
+        if (
+            export_torch_mode is not None
+            and _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_EXPORT_MODE", False)
+        )
+        else contextlib.nullcontext()
+    )
+    quantizer_cm = (
+        configure_linear_module_onnx_quantizers(export_model)
+        if configure_linear_module_onnx_quantizers is not None
+        else contextlib.nullcontext()
+    )
+    with torch.inference_mode():
+        try:
+            with export_cm, quantizer_cm:
+                export_args = (tensor,) if single_input_graph else (tensor, cond)
+                input_names = ["input"] if single_input_graph else ["input", "cond"]
+                torch.onnx.export(
+                    wrapper,
+                    export_args,
+                    onnx_path,
+                    verbose=False,
+                    input_names=input_names,
+                    output_names=["output"],
+                    opset_version=19,
+                    do_constant_folding=True,
+                    dynamo=False,
+                )
+        finally:
+            if modelopt_tensor_quant is not None and original_quantize_op is not None:
+                modelopt_tensor_quant.quantize_op = original_quantize_op
+    _patch_tensorrt_qdq_zero_points(onnx_path)
+    if dtype == torch.float16:
+        _patch_tensorrt_fp16_constants(onnx_path)
+    return onnx_path
+
+
+def _tensorrt_modelopt_calibration_shapes(
+    onnx_path: str,
+    width: int,
+    height: int,
+) -> str:
+    input_names: list[str] = []
+    try:
+        import onnx
+
+        model = onnx.load(onnx_path, load_external_data=False)
+        input_names = [str(inp.name) for inp in model.graph.input]
+    except Exception:
+        input_names = ["input", "cond"]
+
+    h, w = int(height), int(width)
+    cond_h, cond_w = max(1, h // 4), max(1, w // 4)
+    shapes: list[str] = []
+    for name in input_names:
+        if name == "input":
+            dims = (1, 3, h, w)
+        elif name == "cond":
+            dims = (1, 3, cond_h, cond_w)
+        else:
+            dims = (1,)
+        shapes.append(f"{name}:{'x'.join(str(int(v)) for v in dims)}")
+    return ",".join(shapes)
+
+
+def _patch_tensorrt_modelopt_autotune_region_api() -> None:
+    """Patch ModelOpt autotune Region API drift in the installed package."""
+    try:
+        from modelopt.onnx.quantization.autotune.common import Region
+    except Exception:
+        return
+    if hasattr(Region, "get_all_nodes_recursive"):
+        return
+
+    def _get_all_nodes_recursive(self):
+        return sorted(self.get_region_nodes_and_descendants())
+
+    Region.get_all_nodes_recursive = _get_all_nodes_recursive
+
+
+def _apply_tensorrt_modelopt_int8_quantization(
+    onnx_path: str,
+    *,
+    width: int,
+    height: int,
+    nodes_to_quantize: list[str] | None = None,
+) -> str:
+    if not _tensorrt_int8_modelopt_enabled():
+        return onnx_path
+
+    root, ext = os.path.splitext(onnx_path)
+    quantized_path = f"{root}_modelopt_int8{ext or '.onnx'}"
+    prequantized = _tensorrt_int8_modelopt_prequantized_onnx(onnx_path)
+    if prequantized:
+        prequantized_path = os.path.abspath(os.path.expanduser(prequantized))
+        if not os.path.isfile(prequantized_path):
+            message = f"TensorRT INT8 ModelOpt prequantized ONNX missing: {prequantized_path}"
+            print(message)
+            raise RuntimeError(message)
+        _remove_onnx_artifacts(quantized_path)
+        try:
+            import onnx
+
+            model = onnx.load(prequantized_path, load_external_data=True)
+            onnx.save_model(model, quantized_path, save_as_external_data=False)
+        except Exception:
+            shutil.copy2(prequantized_path, quantized_path)
+            data_path = f"{prequantized_path}.data"
+            if os.path.isfile(data_path):
+                shutil.copy2(data_path, f"{quantized_path}.data")
+        _patch_tensorrt_qdq_zero_points(quantized_path)
+        if _env_bool("HDRTVNET_TRT_INT8_MODELOPT_FP32_SCALES", False):
+            _patch_tensorrt_fp16_qdq_scales(quantized_path)
+        print(f"TensorRT INT8 ModelOpt prequantized ONNX: {prequantized_path}")
+        print(f"TensorRT INT8 ModelOpt ONNX: {quantized_path}")
+        return quantized_path
+
+    try:
+        from modelopt.onnx.quantization import quantize as modelopt_quantize
+    except Exception as exc:
+        message = f"TensorRT INT8 ModelOpt quantization unavailable: {exc}"
+        print(message)
+        raise RuntimeError(message) from exc
+
+    _remove_onnx_artifacts(quantized_path)
+    calibration_shapes = _tensorrt_modelopt_calibration_shapes(
+        onnx_path,
+        width,
+        height,
+    )
+    calibration_method = _tensorrt_int8_modelopt_calibration_method()
+    ops = _tensorrt_int8_modelopt_ops()
+    autotune_enabled = _tensorrt_int8_modelopt_autotune_enabled()
+    autotune_filter = _tensorrt_int8_modelopt_autotune_filter()
+    autotune_output_dir = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_DIR", "")
+    ).strip()
+    if not autotune_output_dir:
+        autotune_output_dir = os.path.join(
+            os.path.dirname(quantized_path),
+            "modelopt_autotune",
+            pathlib.Path(quantized_path).stem,
+        )
+    log_level = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_LOG", "WARNING")
+    ).strip().upper() or "WARNING"
+
+    ops_label = "all supported ops" if ops is None else ",".join(ops)
+    node_label = (
+        "all matching nodes"
+        if not nodes_to_quantize
+        else f"{len(nodes_to_quantize)} checkpoint-selected node(s)"
+    )
+    print(
+        "TensorRT INT8 ModelOpt: inserting explicit INT8 Q/DQ "
+        f"(calibration={calibration_method}, ops={ops_label}, "
+        f"nodes={node_label}, shapes={calibration_shapes})"
+        )
+    if autotune_enabled:
+        _patch_tensorrt_modelopt_autotune_region_api()
+        print(
+            "TensorRT INT8 ModelOpt autotune: "
+            f"schemes={_tensorrt_int8_modelopt_autotune_int('HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_SCHEMES', 12, 1)}, "
+            f"warmup={_tensorrt_int8_modelopt_autotune_int('HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_WARMUP', 8, 0)}, "
+            f"runs={_tensorrt_int8_modelopt_autotune_int('HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_RUNS', 16, 1)}, "
+            f"filter={autotune_filter or 'none'}"
+        )
+    try:
+        modelopt_quantize(
+            onnx_path,
+            quantize_mode="int8",
+            calibration_method=calibration_method,
+            calibration_shapes=calibration_shapes,
+            calibration_eps=["cpu"],
+            output_path=quantized_path,
+            high_precision_dtype="fp16",
+            op_types_to_quantize=ops,
+            nodes_to_quantize=nodes_to_quantize,
+            use_external_data_format=False,
+            keep_intermediate_files=_env_bool(
+                "HDRTVNET_TRT_INT8_MODELOPT_KEEP_INTERMEDIATE",
+                False,
+            ),
+            log_level=log_level,
+            use_zero_point=False,
+            opset=19,
+            autotune=autotune_enabled,
+            autotune_output_dir=autotune_output_dir,
+            autotune_num_schemes_per_region=_tensorrt_int8_modelopt_autotune_int(
+                "HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_SCHEMES",
+                12,
+                1,
+            ),
+            autotune_node_filter_list=autotune_filter,
+            autotune_verbose=_env_bool(
+                "HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_VERBOSE",
+                False,
+            ),
+            autotune_use_trtexec=False,
+            autotune_timing_cache=_tensorrt_timing_cache_path(),
+            autotune_warmup_runs=_tensorrt_int8_modelopt_autotune_int(
+                "HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_WARMUP",
+                8,
+                0,
+            ),
+            autotune_timing_runs=_tensorrt_int8_modelopt_autotune_int(
+                "HDRTVNET_TRT_INT8_MODELOPT_AUTOTUNE_RUNS",
+                16,
+                1,
+            ),
+        )
+    except Exception as exc:
+        message = f"TensorRT INT8 ModelOpt quantization failed: {exc}"
+        print(message)
+        raise RuntimeError(message) from exc
+
+    if not os.path.isfile(quantized_path):
+        message = "TensorRT INT8 ModelOpt quantization produced no ONNX."
+        print(message)
+        raise RuntimeError(message)
+    _patch_tensorrt_qdq_zero_points(quantized_path)
+    if _env_bool("HDRTVNET_TRT_INT8_MODELOPT_FP32_SCALES", False):
+        _patch_tensorrt_fp16_qdq_scales(quantized_path)
+    print(f"TensorRT INT8 ModelOpt ONNX: {quantized_path}")
+    return quantized_path
 
 
 def _resolve_tensorrt_calibration_frames(value=None) -> int:
@@ -4980,6 +7385,11 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             raise RuntimeError("TensorRT backend is only enabled for NVIDIA CUDA devices.")
 
         model_path = tensorrt_source_checkpoint_path(model_path)
+        precision_text = str(precision or "").strip().lower()
+        self._trt_direct_fp_int8 = (
+            precision_text.startswith("int8")
+            and not _is_int8_checkpoint_path(model_path)
+        )
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
         self._trt_base_mode_name = str(mode_name or precision or "mode")
@@ -4988,8 +7398,42 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             precision,
             predequantize,
         )
+        self._trt_modelopt_int8 = (
+            precision_text.startswith("int8")
+            and not self._trt_predequantize_int8
+            and _tensorrt_int8_modelopt_enabled()
+        )
+        self._trt_qat_checkpoint_composition = (
+            self._trt_modelopt_int8
+            and _tensorrt_int8_qat_checkpoint_composition_enabled(
+                self._trt_base_mode_name
+            )
+        )
+        self._trt_modelopt_torch_int8 = (
+            self._trt_modelopt_int8
+            and _tensorrt_int8_modelopt_torch_effective_enabled(
+                self._trt_base_mode_name
+            )
+        )
+        self._trt_int8_agcm_only = (
+            precision_text.startswith("int8")
+            and not self._trt_modelopt_int8
+            and _tensorrt_int8_agcm_only_enabled(self._trt_base_mode_name)
+        )
+        self._trt_int8_zero_condition = (
+            precision_text.startswith("int8")
+            and not self._trt_predequantize_int8
+            and not self._trt_modelopt_int8
+            and _tensorrt_int8_zero_condition_enabled(self._trt_base_mode_name)
+        )
+        self._trt_int8_single_input = (
+            precision_text.startswith("int8")
+            and not self._trt_predequantize_int8
+            and not self._trt_modelopt_int8
+            and _tensorrt_int8_single_input_enabled(self._trt_base_mode_name)
+        )
         self._trt_builder_precision = (
-            "fp16" if self._trt_predequantize_int8 else precision
+            "fp16" if self._trt_predequantize_int8 else precision_text
         )
         self._engine_mode_name = tensorrt_mode_name(
             precision,
@@ -5047,21 +7491,37 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             True,
         )
         self._trt_stream = None
-
         super().__init__(
             model_path,
             device=device,
-            precision=precision,
+            precision=(
+                "fp16"
+                if self._trt_direct_fp_int8
+                else precision
+            ),
             compile_model=False,
             force_compile=False,
             compile_mode="default",
             use_cuda_graphs=False,
             force_channels_last=False,
-            predequantize=True if self._trt_predequantize_int8 else False,
+            predequantize=(
+                True
+                if (self._trt_predequantize_int8 or self._trt_modelopt_int8)
+                else False
+            ),
             hg_weights=hg_weights,
             use_hg=use_hg,
             warmup_passes=0,
         )
+        if self._trt_direct_fp_int8:
+            self.precision = precision_text
+        if self._trt_int8_zero_condition:
+            self._fast_zero_condition = True
+            print("TensorRT INT8 speed mode: zero condition tensor enabled")
+        if self._trt_int8_single_input:
+            print("TensorRT INT8 speed mode: single input enabled")
+        if self._trt_int8_agcm_only:
+            print("TensorRT INT8 speed mode: AGCM-only output enabled")
 
         # TensorRT bindings use dense NCHW buffers; keep preprocessing and
         # postprocessing identical, but make the staging tensors contiguous.
@@ -5069,9 +7529,37 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         if self._trt_use_dedicated_stream:
             self._trt_stream = torch.cuda.Stream()
         if self._trt_predequantize_int8:
+            if str(precision or "").startswith("int8-full"):
+                print(
+                    "TensorRT full INT8 safety: using an AGCM_LE FP16 builder "
+                    "safe engine for this full INT8 preset"
+                )
+            else:
+                print(
+                    "TensorRT mixed balance: exporting an AGCM_LE FP16 builder "
+                    "engine for the selected INT8 mixed preset"
+                )
+        elif self._trt_modelopt_torch_int8:
             print(
-                "TensorRT INT8 pre-dequantize: exporting compressed INT8 "
-                "checkpoint as a native FP16 engine"
+                "TensorRT INT8 ModelOpt Torch: quantizing the PyTorch model "
+                "before ONNX export, then building a native TensorRT engine"
+            )
+        elif self._trt_modelopt_int8:
+            if getattr(self, "_trt_qat_checkpoint_composition", False):
+                print(
+                    "TensorRT INT8 QAT composition: honoring checkpoint "
+                    "W8A8/FP16 layer metadata, then inserting explicit INT8 "
+                    "Q/DQ for TensorRT"
+                )
+            else:
+                print(
+                    "TensorRT INT8 ModelOpt: exporting selected weights as FP16 "
+                    "then inserting explicit INT8 Q/DQ for TensorRT"
+                )
+        elif self._trt_direct_fp_int8:
+            print(
+                "TensorRT native INT8: exporting the FP16 AGCM_LE model and "
+                "letting TensorRT choose native INT8 tactics"
             )
         if getattr(self, "_trt_used_prebuilt_calibration_cache", False):
             print(
@@ -5164,27 +7652,123 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             self._engine_width,
             self._engine_height,
         )
-        onnx_path = _export_tensorrt_onnx_from_model(
-            model=self.model,
-            onnx_path=self.onnx_path,
-            width=self._engine_width,
-            height=self._engine_height,
-            dtype=self._dtype,
-            device=self.device,
-            precision=self._trt_builder_precision,
-            flat_model=getattr(self, "_is_flat_model", False),
-            qdq_fusion=self._trt_qdq_fusion,
-        )
-        self._build_engine_from_onnx(onnx_path, trt)
+        single_input_graph = _tensorrt_condition_free_arch_enabled_for_model(self.model)
+        if getattr(self, "_trt_modelopt_torch_int8", False):
+            self.model = _apply_tensorrt_modelopt_torch_int8_quantization(
+                model=self.model,
+                width=self._engine_width,
+                height=self._engine_height,
+                dtype=self._dtype,
+                device=self.device,
+                precision=self.precision,
+            )
+            onnx_path = _export_tensorrt_modelopt_torch_onnx_from_model(
+                model=self.model,
+                onnx_path=self.onnx_path,
+                width=self._engine_width,
+                height=self._engine_height,
+                dtype=self._dtype,
+                device=self.device,
+                flat_model=getattr(self, "_is_flat_model", False),
+                single_input_graph=single_input_graph,
+            )
+        else:
+            export_precision = (
+                "fp16"
+                if getattr(self, "_trt_modelopt_int8", False)
+                else self._trt_builder_precision
+            )
+            onnx_path = _export_tensorrt_onnx_from_model(
+                model=self.model,
+                onnx_path=self.onnx_path,
+                width=self._engine_width,
+                height=self._engine_height,
+                dtype=self._dtype,
+                device=self.device,
+                precision=export_precision,
+                flat_model=getattr(self, "_is_flat_model", False),
+                qdq_fusion=self._trt_qdq_fusion,
+                int8_zero_condition=getattr(self, "_trt_int8_zero_condition", False),
+                int8_single_input=getattr(self, "_trt_int8_single_input", False),
+                int8_agcm_only=getattr(self, "_trt_int8_agcm_only", False),
+                single_input_graph=single_input_graph,
+            )
+        build_onnx_path = onnx_path
+        if (
+            getattr(self, "_trt_modelopt_int8", False)
+            and not getattr(self, "_trt_modelopt_torch_int8", False)
+        ):
+            force_checkpoint_policy = bool(
+                getattr(self, "_trt_qat_checkpoint_composition", False)
+            )
+            nodes_to_quantize = None
+            if not force_checkpoint_policy:
+                nodes_to_quantize = (
+                    None
+                    if _tensorrt_int8_modelopt_autotune_enabled()
+                    else _tensorrt_int8_modelopt_node_override()
+                )
+            if nodes_to_quantize:
+                print(
+                    "TensorRT INT8 ModelOpt node override: "
+                    f"{len(nodes_to_quantize)} node(s)"
+                )
+            elif force_checkpoint_policy or (
+                _tensorrt_int8_modelopt_layer_policy() == "checkpoint"
+            ):
+                checkpoint_policy = _tensorrt_native_int8_onnx_policy(
+                    onnx_path,
+                    quant_type=getattr(self, "_int8_quant_type", None),
+                    w8a8_layers=getattr(self, "_int8_w8a8_layers", None),
+                )
+                nodes_to_quantize = sorted(
+                    name
+                    for name, precision in checkpoint_policy.items()
+                    if precision == "int8"
+                )
+                if not nodes_to_quantize:
+                    nodes_to_quantize = None
+            build_onnx_path = _apply_tensorrt_modelopt_int8_quantization(
+                onnx_path,
+                width=self._engine_width,
+                height=self._engine_height,
+                nodes_to_quantize=nodes_to_quantize,
+            )
+        self._build_engine_from_onnx(build_onnx_path, trt)
         if self._trt_keep_onnx:
             print(f"TensorRT ONNX kept for inspection: {onnx_path}")
+            if build_onnx_path != onnx_path:
+                print(f"TensorRT build ONNX kept for inspection: {build_onnx_path}")
         else:
             cleanup_tensorrt_onnx_after_engine(onnx_path, self.engine_path)
+            if build_onnx_path != onnx_path:
+                cleanup_tensorrt_onnx_after_engine(build_onnx_path, self.engine_path)
 
     def _build_engine_from_onnx(self, onnx_path: str, trt) -> None:
         logger = trt.Logger(trt.Logger.INFO)
         builder = trt.Builder(logger)
-        flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        builder_precision = str(
+            getattr(self, "_trt_builder_precision", self.precision)
+        ).strip().lower()
+        strongly_typed = bool(
+            builder_precision.startswith("int8")
+            and getattr(self, "_trt_modelopt_int8", False)
+            and _tensorrt_int8_modelopt_strongly_typed()
+        )
+        explicit_batch = getattr(
+            getattr(trt, "NetworkDefinitionCreationFlag", object),
+            "EXPLICIT_BATCH",
+            None,
+        )
+        flags = (1 << int(explicit_batch)) if explicit_batch is not None else 0
+        strong_flag = getattr(
+            getattr(trt, "NetworkDefinitionCreationFlag", object),
+            "STRONGLY_TYPED",
+            None,
+        )
+        if strongly_typed and strong_flag is not None:
+            flags |= 1 << int(strong_flag)
+            print("TensorRT network mode: strongly typed")
         network = builder.create_network(flags)
         parser = trt.OnnxParser(network, logger)
         if not parser.parse_from_file(onnx_path):
@@ -5228,20 +7812,37 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             except Exception as exc:
                 print(f"TensorRT profiling verbosity skipped: {exc}")
 
-        builder_precision = str(
-            getattr(self, "_trt_builder_precision", self.precision)
-        )
         native_int8 = (
             builder_precision.startswith("int8")
             and self._trt_qdq_fusion == "native"
+            and not getattr(self, "_trt_modelopt_int8", False)
+        )
+        platform_has_fast_fp16 = bool(
+            getattr(builder, "platform_has_fast_fp16", True)
+        )
+        platform_has_fast_int8 = bool(
+            getattr(builder, "platform_has_fast_int8", True)
         )
         if (
             builder_precision != "fp32"
-            and builder.platform_has_fast_fp16
-            and _tensorrt_fp16_enabled()
+            and not strongly_typed
+            and platform_has_fast_fp16
+            and (
+                _tensorrt_fp16_enabled()
+                and (
+                    not builder_precision.startswith("int8-full")
+                    or _tensorrt_full_int8_fp16_islands_enabled()
+                    or getattr(self, "_trt_modelopt_torch_int8", False)
+                )
+            )
         ):
             config.set_flag(trt.BuilderFlag.FP16)
-        if str(builder_precision).startswith("int8") and builder.platform_has_fast_int8:
+        if builder_precision.startswith("int8-full"):
+            if _tensorrt_full_int8_fp16_islands_enabled():
+                print("TensorRT full INT8 safety: FP16 islands enabled")
+            else:
+                print("TensorRT full INT8 safety: all-out INT8, FP16 tactics disabled")
+        if native_int8 and platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
             if native_int8:
                 cache_path = _tensorrt_calibration_cache_path(
@@ -5256,15 +7857,58 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     "CALIBRATE_BEFORE_FUSION",
                     None,
                 )
-                if quant_flag is not None and hasattr(config, "set_quantization_flag"):
+                if (
+                    quant_flag is not None
+                    and hasattr(config, "set_quantization_flag")
+                    and _tensorrt_native_int8_calibrate_before_fusion()
+                ):
                     try:
                         config.set_quantization_flag(quant_flag)
                         print("TensorRT native INT8 calibration: before fusion")
                     except Exception as exc:
                         print(f"TensorRT native INT8 calibration flag skipped: {exc}")
+                elif quant_flag is not None:
+                    print("TensorRT native INT8 calibration: after fusion")
                 prefer_constraints = _tensorrt_native_int8_prefer_constraints()
                 obey_constraints = _tensorrt_native_int8_obey_constraints()
-                if prefer_constraints or obey_constraints:
+                checkpoint_policy = {}
+                policy_applied = False
+                if _tensorrt_native_int8_checkpoint_policy_enabled():
+                    checkpoint_policy = _tensorrt_native_int8_onnx_policy(
+                        onnx_path,
+                        quant_type=getattr(self, "_int8_quant_type", None),
+                        w8a8_layers=getattr(self, "_int8_w8a8_layers", None),
+                    )
+                    int8_count, fp16_count, _ = (
+                        _apply_tensorrt_native_int8_checkpoint_policy(
+                            network,
+                            trt,
+                            checkpoint_policy,
+                            int8_outputs=_tensorrt_native_int8_policy_int8_outputs(),
+                            constrain_outputs=(
+                                _tensorrt_native_int8_policy_output_constraints()
+                            ),
+                        )
+                    )
+                    policy_applied = bool(int8_count or fp16_count)
+                    if policy_applied:
+                        prefer_flag = getattr(
+                            trt.BuilderFlag,
+                            "PREFER_PRECISION_CONSTRAINTS",
+                            None,
+                        )
+                        obey_flag = getattr(
+                            trt.BuilderFlag,
+                            "OBEY_PRECISION_CONSTRAINTS",
+                            None,
+                        )
+                        if _tensorrt_native_int8_policy_obey() and obey_flag is not None:
+                            config.set_flag(obey_flag)
+                            print("TensorRT native INT8 checkpoint policy: obey")
+                        elif prefer_flag is not None:
+                            config.set_flag(prefer_flag)
+                            print("TensorRT native INT8 checkpoint policy: prefer")
+                if (prefer_constraints or obey_constraints) and not policy_applied:
                     _prefer_tensorrt_native_int8_layers(
                         network,
                         trt,
@@ -5437,14 +8081,26 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     self._trt_input_names.append(name)
                 else:
                     self._trt_output_names.append(name)
-        if len(self._trt_input_names) < 2 or not self._trt_output_names:
-            raise RuntimeError("Unexpected TensorRT bindings; expected input, cond, output.")
+        if not self._trt_input_names or not self._trt_output_names:
+            raise RuntimeError("Unexpected TensorRT bindings; expected input/output tensors.")
         if "input" in self._trt_input_names and "cond" in self._trt_input_names:
             other_inputs = [
                 name for name in self._trt_input_names
                 if name not in {"input", "cond"}
             ]
             self._trt_input_names = ["input", "cond"] + other_inputs
+        elif len(self._trt_input_names) == 1:
+            self._trt_int8_single_input = True
+            print(
+                "TensorRT binding discovery: single-input engine "
+                f"({self._trt_input_names[0]}); condition input was pruned"
+            )
+        elif len(self._trt_input_names) < 2 and not getattr(
+            self,
+            "_trt_int8_single_input",
+            False,
+        ):
+            raise RuntimeError("Unexpected TensorRT bindings; expected input, cond, output.")
 
     def _tensor_dtype_for_output(self, output_name: str):
         try:
@@ -5463,32 +8119,37 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
     def infer(self, input_cond):
         tensor, cond = input_cond
         tensor = tensor.contiguous()
-        cond = cond.contiguous()
+        cond = cond.contiguous() if cond is not None else None
         ctx = self._trt_context
         engine = self._trt_engine
         current_stream = torch.cuda.current_stream()
         trt_stream = self._trt_stream
+        has_cond_binding = len(self._trt_input_names) > 1
         if trt_stream is not None:
             trt_stream.wait_stream(current_stream)
             tensor.record_stream(trt_stream)
-            cond.record_stream(trt_stream)
+            if has_cond_binding and cond is not None:
+                cond.record_stream(trt_stream)
             stream = trt_stream.cuda_stream
         else:
             stream = current_stream.cuda_stream
 
         input_name = self._trt_input_names[0]
-        cond_name = self._trt_input_names[1]
+        cond_name = self._trt_input_names[1] if has_cond_binding else None
         output_name = self._trt_output_names[0]
 
         if hasattr(ctx, "set_input_shape"):
             tensor_shape = tuple(tensor.shape)
-            cond_shape = tuple(cond.shape)
-            shape_key = (tensor_shape, cond_shape)
+            cond_shape = tuple(cond.shape) if (has_cond_binding and cond is not None) else None
+            shape_key = (tensor_shape, cond_shape) if has_cond_binding else (tensor_shape,)
             if self._trt_shape_cache_key != shape_key:
                 if ctx.set_input_shape(input_name, tensor_shape) is False:
                     raise RuntimeError(f"TensorRT rejected input shape: {tensor_shape}")
-                if ctx.set_input_shape(cond_name, cond_shape) is False:
-                    raise RuntimeError(f"TensorRT rejected cond shape: {cond_shape}")
+                if has_cond_binding:
+                    if cond is None:
+                        raise RuntimeError("TensorRT engine expects cond but none was provided.")
+                    if ctx.set_input_shape(cond_name, cond_shape) is False:
+                        raise RuntimeError(f"TensorRT rejected cond shape: {cond_shape}")
                 self._trt_shape_cache_key = shape_key
                 self._trt_address_cache_key = None
 
@@ -5504,26 +8165,44 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             if trt_stream is not None:
                 self._trt_output.record_stream(trt_stream)
 
-            address_key = (
-                int(tensor.data_ptr()),
-                int(cond.data_ptr()),
-                int(self._trt_output.data_ptr()),
-            )
-            if self._trt_address_cache_key != address_key:
-                for name, ptr in (
+            if has_cond_binding:
+                if cond is None:
+                    raise RuntimeError("TensorRT engine expects cond but none was provided.")
+                address_key = (
+                    int(tensor.data_ptr()),
+                    int(cond.data_ptr()),
+                    int(self._trt_output.data_ptr()),
+                )
+                address_items = (
                     (input_name, address_key[0]),
                     (cond_name, address_key[1]),
                     (output_name, address_key[2]),
-                ):
+                )
+            else:
+                address_key = (
+                    int(tensor.data_ptr()),
+                    int(self._trt_output.data_ptr()),
+                )
+                address_items = (
+                    (input_name, address_key[0]),
+                    (output_name, address_key[1]),
+                )
+            if self._trt_address_cache_key != address_key:
+                for name, ptr in address_items:
                     if ctx.set_tensor_address(name, int(ptr)) is False:
                         raise RuntimeError(f"TensorRT rejected tensor address: {name}")
                 self._trt_address_cache_key = address_key
             ok = ctx.execute_async_v3(stream_handle=stream)
         else:
             bindings = [0] * engine.num_bindings
-            shape_key = (tuple(tensor.shape), tuple(cond.shape))
+            input_values = [(input_name, tensor)]
+            if has_cond_binding:
+                if cond is None:
+                    raise RuntimeError("TensorRT engine expects cond but none was provided.")
+                input_values.append((cond_name, cond))
+            shape_key = tuple(tuple(value.shape) for _name, value in input_values)
             shape_changed = self._trt_legacy_shape_cache_key != shape_key
-            for name, value in ((input_name, tensor), (cond_name, cond)):
+            for name, value in input_values:
                 idx = engine.get_binding_index(name)
                 if shape_changed:
                     try:

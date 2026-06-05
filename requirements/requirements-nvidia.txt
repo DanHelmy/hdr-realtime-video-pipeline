@@ -1,5 +1,5 @@
 -r requirements-common.txt
---index-url https://download.pytorch.org/whl/cu126
+--index-url https://download.pytorch.org/whl/cu130
 --extra-index-url https://pypi.org/simple
 --extra-index-url https://pypi.nvidia.com/
 
@@ -10,6 +10,7 @@ torchaudio==2.9.1
 onnx>=1.16
 onnxscript>=0.1.0
 onnxruntime>=1.20
+nvidia-modelopt[onnx]>=0.44.0
 huggingface_hub>=0.24
 requests>=2.32
 tensorrt_cu12==10.16.1.11

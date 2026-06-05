@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 from windows_runtime import ensure_windows_supported
@@ -30,7 +31,12 @@ from models.hdrtvnet_torch import (
     tensorrt_onnx_path,
     tensorrt_prebuilt_calibration_cache_path,
 )
-from gui_config import PRECISIONS, _select_model_path
+from gui_config import (
+    PRECISIONS,
+    _select_hg_weights_path,
+    _select_model_path,
+    _select_tensorrt_model_path,
+)
 
 
 def _weight(name: str) -> str:
@@ -40,53 +46,53 @@ def _weight(name: str) -> str:
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
-        _weight("Ensemble_AGCM_LE.pth"),
-        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
     ),
     "fp32": (
         "fp32",
-        _weight("Ensemble_AGCM_LE.pth"),
-        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
     ),
     "int8-mixed": (
         "int8-mixed",
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
+        _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
     ),
     "int8-mixed-ptq": (
         "int8-mixed",
-        _weight("Ensemble_AGCM_LE_int8_mixed.pt"),
-        _weight("Ensemble_AGCM_LE_int8_mixed_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_mixed.pt"),
+        _weight("pytorch_int8/hr/HR_int8_mixed.pt"),
     ),
     "int8-mixed-qat": (
         "int8-mixed",
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
+        _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
     ),
     "int8-mixed-qat-film": (
         "int8-mixed",
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat_film.pt"),
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat_film.pt"),
+        _weight("pytorch_int8/hr/HR_int8_mixed_qat_film.pt"),
     ),
     "int8-full": (
         "int8-full",
-        _weight("Ensemble_AGCM_LE_int8_full.pt"),
-        _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
+        _weight("pytorch_int8/hr/HR_int8_full.pt"),
     ),
     "int8-full-ptq": (
         "int8-full",
-        _weight("Ensemble_AGCM_LE_int8_full.pt"),
-        _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
+        _weight("pytorch_int8/hr/HR_int8_full.pt"),
     ),
     "int8-full-qat": (
         "int8-full",
-        _weight("Ensemble_AGCM_LE_int8_full_qat.pt"),
-        _weight("Ensemble_AGCM_LE_int8_full_qat_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_full_qat.pt"),
+        _weight("pytorch_int8/hr/HR_int8_full_qat.pt"),
     ),
     "int8-full-qat-film": (
         "int8-full",
-        _weight("Ensemble_AGCM_LE_int8_full_qat_film.pt"),
-        _weight("Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_full_qat_film.pt"),
+        _weight("pytorch_int8/hr/HR_int8_full_qat_film.pt"),
     ),
 }
 
@@ -112,6 +118,26 @@ def _parse_resolution(text: str) -> tuple[int, int]:
         ) from exc
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def _engine_tag_suffix() -> str:
+    tag = str(os.environ.get("HDRTVNET_TRT_ENGINE_TAG", "")).strip()
+    if not tag:
+        return ""
+    tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", tag).strip("_.-")
+    return f"_{tag}" if tag else ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build cached TensorRT engines for selected resolutions."
@@ -132,34 +158,42 @@ def main() -> int:
     parser.add_argument("--model", default=None, help="Override model path.")
     parser.add_argument(
         "--use-hg",
-        default="0",
+        default="1",
         choices=["1", "0"],
-        help="Enable HG refinement (1/0). Default: 0",
+        help="Enable HG refinement (1/0). Default: 1",
     )
     parser.add_argument(
         "--hg-weights",
         default=None,
-        help="Path to HG_weights.pth (overrides default path).",
+        help="Path to original/HG.pt or distilled HG weights (overrides default path).",
     )
     parser.add_argument(
         "--predequantize",
         default="off",
         choices=["auto", "on", "off"],
-        help=(
-            "INT8 pre-dequantization mode. Keep 'off' for native TensorRT INT8; "
-            "'on' exports the INT8 checkpoint as a native FP16 engine."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--qdq-fusion",
         default="native",
         choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
         help=(
-            "TensorRT INT8 export mode. 'native' exports plain ONNX layers "
-            "and uses TensorRT PTQ calibration. Other values use explicit "
-            "Q/DQ placement. Default: native. "
+            "TensorRT INT8 export mode. With ModelOpt enabled, 'native' means "
+            "explicit Q/DQ export with TensorRT's native Q/DQ fusion. If "
+            "ModelOpt is disabled, it falls back to legacy implicit/native "
+            "TensorRT calibration. Default: native. "
             "'add' inserts Q/DQ on eligible Add inputs that already feed "
             "calibrated quantized paths; 'add-mul' also patches Mul inputs."
+        ),
+    )
+    parser.add_argument(
+        "--full-int8-fp16-islands",
+        default=None,
+        choices=["on", "off"],
+        help=(
+            "Full INT8 TensorRT safety mode. Default/env is off: full INT8 "
+            "engines disable FP16 tactics. Use 'on' to select the safe "
+            "FP16-builder fallback for full INT8 presets."
         ),
     )
     parser.add_argument(
@@ -253,17 +287,38 @@ def main() -> int:
         os.environ["HDRTVNET_TRT_AUX_STREAMS"] = str(max(0, args.aux_streams))
     if args.keep_onnx:
         os.environ["HDRTVNET_TRT_KEEP_ONNX"] = "1"
+    if args.full_int8_fp16_islands is not None:
+        os.environ["HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS"] = (
+            "1" if args.full_int8_fp16_islands == "on" else "0"
+        )
 
     use_hg = str(args.use_hg).strip() != "0"
     precision, default_hg_model, default_nohg_model = _PRECISION_MAP[args.precision]
     default_model = default_hg_model if use_hg else default_nohg_model
-    model_path = os.path.abspath(args.model or default_model)
-    predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
-    gui_precision_key = _gui_precision_key_for_model(precision, model_path, use_hg)
+    gui_precision_key = _gui_precision_key_for_model(precision, default_model, use_hg)
+    selected_model = (
+        _select_tensorrt_model_path(gui_precision_key, use_hg)
+        if gui_precision_key
+        else default_model
+    )
+    model_path = os.path.abspath(args.model or selected_model)
+    selected_hg_weights = args.hg_weights
+    if use_hg and not selected_hg_weights and gui_precision_key:
+        candidate_hg = _select_hg_weights_path(gui_precision_key, tensorrt=True)
+        if candidate_hg and os.path.isfile(candidate_hg):
+            selected_hg_weights = candidate_hg
+    if str(args.predequantize).strip().lower() not in {"", "off"}:
+        print(
+            "TensorRT pre-dequantize is no longer supported; building the native "
+            "TensorRT engine with predequantize=off.",
+            flush=True,
+        )
+    predeq = False
     base_mode_name = f"{gui_precision_key or args.precision}_{'hg' if use_hg else 'nohg'}"
+    tagged_base_mode_name = f"{base_mode_name}{_engine_tag_suffix()}"
     mode_name = tensorrt_mode_name(
         precision,
-        base_mode_name,
+        tagged_base_mode_name,
         predequantize=predeq,
         qdq_fusion=args.qdq_fusion,
     )
@@ -279,6 +334,10 @@ def main() -> int:
             and not args.calibration_dataset
             and not args.calibration_video
             and str(args.qdq_fusion) == "native"
+            and not (
+                str(precision).startswith("int8")
+                and _env_bool("HDRTVNET_TRT_INT8_MODELOPT", True)
+            )
         ):
             calibration_cache = tensorrt_prebuilt_calibration_cache_path(
                 model_path,
@@ -311,11 +370,11 @@ def main() -> int:
             width=w,
             height=h,
             precision=precision,
-            mode_name=base_mode_name,
+            mode_name=tagged_base_mode_name,
             use_hg=use_hg,
             predequantize=predeq,
             qdq_fusion=args.qdq_fusion,
-            hg_weights=args.hg_weights,
+            hg_weights=selected_hg_weights,
             calibration_dataset=args.calibration_dataset,
             calibration_video=args.calibration_video,
             calibration_frames=args.calibration_frames,
@@ -337,8 +396,8 @@ def main() -> int:
             precision=precision,
             engine_width=w,
             engine_height=h,
-            mode_name=base_mode_name,
-            hg_weights=args.hg_weights,
+            mode_name=tagged_base_mode_name,
+            hg_weights=selected_hg_weights,
             use_hg=use_hg,
             predequantize=predeq,
             qdq_fusion=args.qdq_fusion,

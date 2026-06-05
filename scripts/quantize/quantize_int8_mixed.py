@@ -1,13 +1,13 @@
-"""
+﻿"""
 Optimized Mixed INT8 Quantization for HDRTVNet++ (Sensitivity-Based).
 
 Two key improvements over the original channel-threshold heuristic:
 
-  1. **Per-layer sensitivity analysis** — quantize one layer at a time to
+  1. **Per-layer sensitivity analysis** â€” quantize one layer at a time to
      W8A8, measure output MSE, rank by impact.  Layers causing less than
      ``--sensitivity-threshold`` MSE are assigned W8A8; the rest stay W8A16.
 
-  2. **Asymmetric activation quantization** — W8A8 layers use unsigned
+  2. **Asymmetric activation quantization** â€” W8A8 layers use unsigned
      [0, 255] with a zero-point instead of symmetric [-128, 127].
      This gives 2x precision for post-ReLU layers and ~1.8x for
      post-LeakyReLU, since the full 256 levels map the actual value range.
@@ -100,9 +100,37 @@ FP16_SENSITIVE_LAYER_NAMES = _expand_base_optional_layer_names(
 
 def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module:
     """Load the FP32 model (HG composite or base AGCM+LE)."""
+    raw = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(raw, dict) and "state_dict" in raw:
+        base_arch = dict(raw.get("architecture") or {})
+        state = raw["state_dict"]
+    else:
+        base_arch = {
+            "classifier": os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+            "le_arch": os.environ.get("HDRTVNET_LE_ARCH", "sft"),
+            "hg_arch": os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"),
+        }
+        state = raw
+
+    hg_arch = str(base_arch.get("hg_arch") or os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"))
+    hg_state = None
+    if use_hg:
+        raw_hg = torch.load(hg_weights, map_location="cpu", weights_only=False)
+        if isinstance(raw_hg, dict) and "state_dict" in raw_hg:
+            hg_state = raw_hg["state_dict"]
+            hg_meta = dict(raw_hg.get("architecture") or {})
+            hg_arch = str(hg_meta.get("hg_arch") or hg_arch)
+        else:
+            hg_state = raw_hg
+
+    classifier = str(
+        base_arch.get("classifier")
+        or os.environ.get("HDRTVNET_CLASSIFIER", "color_condition")
+    )
+    le_arch = str(base_arch.get("le_arch") or os.environ.get("HDRTVNET_LE_ARCH", "sft"))
     if use_hg:
         model = HG_Composite(
-            classifier="color_condition",
+            classifier=classifier,
             cond_c=6,
             in_nc=3,
             out_nc=3,
@@ -111,18 +139,20 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
             weighting_network=False,
             hg_nf=64,
             mask_r=0.75,
+            hg_arch=hg_arch,
+            le_arch=le_arch,
         )
     else:
         model = Ensemble_AGCM_LE(
-            classifier="color_condition",
+            classifier=classifier,
             cond_c=6,
             in_nc=3,
             out_nc=3,
             nf=32,
             act_type="relu",
             weighting_network=False,
+            le_arch=le_arch,
         )
-    state = torch.load(model_path, map_location="cpu", weights_only=True)
     cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
     if use_hg:
         model.base.load_state_dict(cleaned, strict=True)
@@ -130,10 +160,21 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
         model.load_state_dict(cleaned, strict=True)
 
     if use_hg:
-        hg_state = torch.load(hg_weights, map_location="cpu")
-        if isinstance(hg_state, dict) and "state_dict" in hg_state:
-            hg_state = hg_state["state_dict"]
         model.hg.load_state_dict(hg_state, strict=True)
+    model._hdrtvnet_source_arch = {
+        "classifier": classifier,
+        "cond_c": 6,
+        "in_nc": 3,
+        "out_nc": 3,
+        "nf": 32,
+        "act_type": "relu",
+        "weighting_network": False,
+        "use_hg": bool(use_hg),
+        "hg_nf": 64,
+        "mask_r": 0.75,
+        "le_arch": le_arch,
+        "hg_arch": hg_arch,
+    }
     model.eval()
     return model
 
@@ -146,8 +187,9 @@ def load_calibration_images(calib_dir: str, max_images: int = 16,
         paths = sorted(glob.glob(os.path.join(calib_dir, "*.jpg")))
     if not paths:
         raise FileNotFoundError(f"No images found in {calib_dir}")
-    if max_images > 0:
-        paths = paths[:max_images]
+    if max_images > 0 and len(paths) > max_images:
+        indexes = np.linspace(0, len(paths) - 1, max_images, dtype=np.int64)
+        paths = [paths[int(i)] for i in dict.fromkeys(indexes.tolist())]
     tensors = []
     for p in paths:
         img = cv2.imread(p)
@@ -247,7 +289,35 @@ def apply_protected_layer_prefs(w8a8_layers, w8a16_layers, args):
 def parse_layer_list(layer_spec: str):
     if not layer_spec:
         return []
-    return sorted({name.strip() for name in str(layer_spec).split(",") if name.strip()})
+    text = str(layer_spec).replace(",", " ").replace(";", " ")
+    return sorted({name.strip() for name in text.split() if name.strip()})
+
+
+def parse_layer_file(layer_file: str):
+    if not layer_file:
+        return []
+    path = Path(layer_file).expanduser()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    chunks = []
+    for line in text.splitlines():
+        chunks.append(line.split("#", 1)[0])
+    return parse_layer_list(" ".join(chunks))
+
+
+def resolve_layer_list(inline_spec: str, file_spec: str):
+    return sorted(set(parse_layer_list(inline_spec)) | set(parse_layer_file(file_spec)))
+
+
+def filter_manual_layers(layer_names, candidate_layers, label):
+    candidate_set = set(candidate_layers)
+    requested = sorted(set(layer_names))
+    unknown = [name for name in requested if name not in candidate_set]
+    selected = [name for name in requested if name in candidate_set]
+    if unknown:
+        print(f"  [warn] Ignoring {len(unknown)} unknown {label} layer(s):")
+        for name in unknown:
+            print(f"    - {name}")
+    return selected
 
 
 def resolve_fp16_layer_prefs(candidate_layers, args):
@@ -258,7 +328,8 @@ def resolve_fp16_layer_prefs(candidate_layers, args):
             name for name in FP16_SENSITIVE_LAYER_NAMES if name in candidate_set
         )
     fp16_layers.update(
-        name for name in parse_layer_list(args.fp16_layers)
+        name
+        for name in resolve_layer_list(args.fp16_layers, args.fp16_layers_file)
         if name in candidate_set
     )
     return sorted(fp16_layers)
@@ -524,6 +595,25 @@ def select_w8a8_layers_auto(sensitivities, min_w8a16=0):
     return w8a8, w8a16, info
 
 
+def state_dict_preserve_activation_qparams(model):
+    """Keep static activation quantization parameters in FP32 when saving.
+
+    The deployment checkpoints are usually saved with FP16 compute buffers, but
+    tiny activation scales can underflow to zero in FP16 and turn INT8 eager
+    output black.  Weight scales remain in the requested compute dtype.
+    """
+    state = model.state_dict()
+    fixed = {}
+    for key, value in state.items():
+        if torch.is_tensor(value) and (
+            key.endswith("x_scale") or key.endswith("x_zero")
+        ):
+            fixed[key] = value.detach().float()
+        else:
+            fixed[key] = value
+    return fixed
+
+
 # ===================================================================
 # Main
 # ===================================================================
@@ -535,7 +625,15 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "Ensemble_AGCM_LE.pth"),
+        default=os.path.join(
+            _REPO_ROOT,
+            "src",
+            "models",
+            "weights",
+            "distilled",
+            "hr",
+            "HR_qfriendly_spatialmixglobal_fp32.pt",
+        ),
                         help="Path to FP32 .pth weights")
     parser.add_argument("--output",
                         default=os.path.join(
@@ -543,11 +641,13 @@ def main():
                             "src",
                             "models",
                             "weights",
-                            "Ensemble_AGCM_LE_int8_mixed.pt",
+                            "pytorch_int8",
+                            "hg",
+                            "HR_HG_int8_mixed.pt",
                         ),
                         help="Output path for quantized checkpoint")
-    parser.add_argument("--export-tensorrt-source", default="1", choices=["1", "0"],
-                        help="Also export a portable TensorRT source checkpoint")
+    parser.add_argument("--export-tensorrt-source", default="0", choices=["1", "0"],
+                        help="Also export a legacy portable TensorRT source checkpoint")
     parser.add_argument("--tensorrt-source-dir", default=None,
                         help="Directory for portable TensorRT source checkpoints")
     parser.add_argument("--tensorrt-source-activation-quant",
@@ -570,8 +670,12 @@ def main():
     parser.add_argument("--max-calib-samples", type=int, default=200000,
                         help="Max activation samples per layer for percentile")
     parser.add_argument("--layer-selection", default="auto",
-                        choices=["auto", "threshold"],
+                        choices=["auto", "threshold", "manual"],
                         help="Layer assignment strategy for mixed quantization")
+    parser.add_argument("--w8a8-layers", default="",
+                        help="Manual W8A8 layer names for --layer-selection manual")
+    parser.add_argument("--w8a8-layers-file", default="",
+                        help="Text file of W8A8 layer names for --layer-selection manual")
     parser.add_argument("--sensitivity-threshold", type=float, default=1e-6,
                         help="Per-layer MSE threshold for W8A8 assignment "
                              "(used when --layer-selection threshold)")
@@ -601,6 +705,8 @@ def main():
                         help="Keep a curated set of the most color-sensitive layers in FP16")
     parser.add_argument("--fp16-layers", default="",
                         help="Comma-separated extra layer names to keep in FP16")
+    parser.add_argument("--fp16-layers-file", default="",
+                        help="Text file of extra layer names to keep in FP16")
     parser.add_argument("--num-sensitivity", type=int, default=8,
                         help="Images for sensitivity analysis")
     parser.add_argument(
@@ -608,8 +714,8 @@ def main():
         default=os.path.join(_REPO_ROOT, "dataset", "train_sdr"),
                         help="Directory of SDR images for calibration")
     parser.add_argument("--hg-weights",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "HG_weights.pth"),
-                        help="Path to HG weights (HG_weights.pth)")
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hg", "HG_qfriendly_directh16_fp32.pt"),
+                        help="Path to HG weights")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"],
                         help="Use HG refinement (1) or base AGCM+LE only (0)")
     parser.add_argument("--num-calibrate", type=int, default=16,
@@ -632,7 +738,21 @@ def main():
                         help="Use v1 channel-threshold heuristic (no sensitivity)")
     parser.add_argument("--channel-threshold", type=int, default=32,
                         help="(Legacy) Max channel count for W8A8 (1x1 convs)")
+    output_explicit = any(
+        item == "--output" or item.startswith("--output=")
+        for item in sys.argv[1:]
+    )
     args = parser.parse_args()
+    if not output_explicit and str(args.use_hg).strip() == "0":
+        args.output = os.path.join(
+            _REPO_ROOT,
+            "src",
+            "models",
+            "weights",
+            "pytorch_int8",
+            "hr",
+            "HR_int8_mixed.pt",
+        )
 
     compute_dtype = torch.float16 if args.precision == "fp16" else torch.float32
     device_str = args.device
@@ -691,76 +811,123 @@ def main():
         use_asymmetric = False
     else:
         selection_mode = args.layer_selection
-        # v2: sensitivity analysis + asymmetric activation quant
-        print(f"\n{'='*60}")
-        print("Phase 1: Per-layer sensitivity analysis")
-        print(f"{'='*60}")
-        print("  Score recipe: "
-              f"mse + {args.stability_weight:.2f}*stability "
-              f"+ {args.highlight_weight:.2f}*highlight "
-              f"+ {args.highlight_chroma_weight:.2f}*highlight_chroma")
-
-        # Move to device for sensitivity sweep
-        model = model.to(dtype=sens_dtype, device=sens_device)
-        model.eval()
-
-        calib_images = load_calibration_images(
-            args.calibration_dir, max(args.num_calibrate, args.num_sensitivity)
-        )
-        print(f"  Loaded {len(calib_images)} images")
-        if len(calib_images) == 0:
-            raise RuntimeError(
-                "No valid calibration images loaded for sensitivity analysis"
+        manual_selection = args.layer_selection == "manual"
+        sensitivity_details = {}
+        if manual_selection:
+            print(f"\n{'='*60}")
+            print("Phase 1: Manual TensorRT layer assignment")
+            print(f"{'='*60}")
+            candidate_layers = [
+                name for name, module in model.named_modules()
+                if isinstance(module, (nn.Conv2d, nn.Linear))
+            ]
+            requested_w8a8 = resolve_layer_list(
+                args.w8a8_layers,
+                args.w8a8_layers_file,
             )
-        sens_inputs = [prepare_model_input(img, sens_device, sens_dtype)
-                       for img in calib_images[:args.num_sensitivity]]
-
-        t0 = time.perf_counter()
-        sensitivities, sensitivity_details = compute_layer_sensitivity(
-            model, sens_inputs, args.num_sensitivity, args=args
-        )
-        dt = time.perf_counter() - t0
-        print(f"  Sweep took {dt:.1f}s")
-
-        # Select layers
-        if args.layer_selection == "auto":
-            w8a8_layers, w8a16_layers, selection_info = select_w8a8_layers_auto(
-                sensitivities, min_w8a16=args.auto_min_w8a16
+            if not requested_w8a8:
+                raise ValueError(
+                    "--layer-selection manual requires --w8a8-layers or "
+                    "--w8a8-layers-file"
+                )
+            w8a8_layers = filter_manual_layers(
+                requested_w8a8,
+                candidate_layers,
+                "W8A8",
             )
-            thr = selection_info.get("threshold")
-            if thr is None:
-                print(f"  Auto split (knee @ index {selection_info['knee_index']}): "
-                      "threshold unavailable")
-            else:
-                print(f"  Auto split (knee @ index {selection_info['knee_index']}): "
-                      f"threshold ~= {thr:.2e}")
-            bad = int(selection_info.get("nonfinite_layers", 0))
-            if bad > 0:
-                print(f"  [warn] {bad} layers had non-finite sensitivity "
-                      "and were forced to W8A16")
+            if not w8a8_layers:
+                raise ValueError("Manual W8A8 layer list did not match this model")
+            w8a16_layers = sorted(set(candidate_layers) - set(w8a8_layers))
+            selection_info = {
+                "manual_w8a8_layers": len(w8a8_layers),
+                "manual_w8a16_layers": len(w8a16_layers),
+            }
+            sensitivities = {name: float("nan") for name in candidate_layers}
+            print(f"  Manual W8A8 layers: {len(w8a8_layers)}")
+            print(f"  Remaining W8A16 layers: {len(w8a16_layers)}")
         else:
-            w8a8_layers, w8a16_layers = select_w8a8_layers_threshold(
-                sensitivities, threshold=args.sensitivity_threshold
-            )
-            selection_info = {"threshold": float(args.sensitivity_threshold)}
+            # v2: sensitivity analysis + asymmetric activation quant
+            print(f"\n{'='*60}")
+            print("Phase 1: Per-layer sensitivity analysis")
+            print(f"{'='*60}")
+            print("  Score recipe: "
+                  f"mse + {args.stability_weight:.2f}*stability "
+                  f"+ {args.highlight_weight:.2f}*highlight "
+                  f"+ {args.highlight_chroma_weight:.2f}*highlight_chroma")
 
-        w8a8_layers, w8a16_layers, protected_layers_removed = (
-            apply_protected_layer_prefs(w8a8_layers, w8a16_layers, args)
-        )
-        if protected_layers_removed:
-            selection_mode = (
-                f"{selection_mode}+protected"
-                if "protected" not in selection_mode else selection_mode
+            # Move to device for sensitivity sweep
+            model = model.to(dtype=sens_dtype, device=sens_device)
+            model.eval()
+
+            calib_images = load_calibration_images(
+                args.calibration_dir, max(args.num_calibrate, args.num_sensitivity)
             )
+            print(f"  Loaded {len(calib_images)} images")
+            if len(calib_images) == 0:
+                raise RuntimeError(
+                    "No valid calibration images loaded for sensitivity analysis"
+                )
+            sens_inputs = [prepare_model_input(img, sens_device, sens_dtype)
+                           for img in calib_images[:args.num_sensitivity]]
+
+            t0 = time.perf_counter()
+            sensitivities, sensitivity_details = compute_layer_sensitivity(
+                model, sens_inputs, args.num_sensitivity, args=args
+            )
+            dt = time.perf_counter() - t0
+            print(f"  Sweep took {dt:.1f}s")
+
+            # Select layers
+            if args.layer_selection == "auto":
+                w8a8_layers, w8a16_layers, selection_info = select_w8a8_layers_auto(
+                    sensitivities, min_w8a16=args.auto_min_w8a16
+                )
+                thr = selection_info.get("threshold")
+                if thr is None:
+                    print(f"  Auto split (knee @ index {selection_info['knee_index']}): "
+                          "threshold unavailable")
+                else:
+                    print(f"  Auto split (knee @ index {selection_info['knee_index']}): "
+                          f"threshold ~= {thr:.2e}")
+                bad = int(selection_info.get("nonfinite_layers", 0))
+                if bad > 0:
+                    print(f"  [warn] {bad} layers had non-finite sensitivity "
+                          "and were forced to W8A16")
+            else:
+                w8a8_layers, w8a16_layers = select_w8a8_layers_threshold(
+                    sensitivities, threshold=args.sensitivity_threshold
+                )
+                selection_info = {"threshold": float(args.sensitivity_threshold)}
+
         candidate_layers = list(sensitivities.keys())
-        w8a8_layers, w8a16_layers, fp16_layers = apply_fp16_layer_prefs(
-            w8a8_layers, w8a16_layers, candidate_layers, args
-        )
-        if fp16_layers:
-            selection_mode = (
-                f"{selection_mode}+fp16"
-                if "fp16" not in selection_mode else selection_mode
+        if manual_selection:
+            fp16_layers = filter_manual_layers(
+                resolve_layer_list(args.fp16_layers, args.fp16_layers_file),
+                candidate_layers,
+                "FP16",
             )
+            if fp16_layers:
+                fp16_set = set(fp16_layers)
+                w8a8_layers = [name for name in w8a8_layers if name not in fp16_set]
+                w8a16_layers = [name for name in w8a16_layers if name not in fp16_set]
+                selection_mode = "manual+fp16"
+        else:
+            w8a8_layers, w8a16_layers, protected_layers_removed = (
+                apply_protected_layer_prefs(w8a8_layers, w8a16_layers, args)
+            )
+            if protected_layers_removed:
+                selection_mode = (
+                    f"{selection_mode}+protected"
+                    if "protected" not in selection_mode else selection_mode
+                )
+            w8a8_layers, w8a16_layers, fp16_layers = apply_fp16_layer_prefs(
+                w8a8_layers, w8a16_layers, candidate_layers, args
+            )
+            if fp16_layers:
+                selection_mode = (
+                    f"{selection_mode}+fp16"
+                    if "fp16" not in selection_mode else selection_mode
+                )
 
         # Print sensitivity results
         print(f"\n{'='*60}")
@@ -772,31 +939,40 @@ def main():
         )
         w8a8_set = set(w8a8_layers)
         fp16_set = set(fp16_layers)
-        print(f"\n  Per-layer sensitivity (combined score, ascending):")
-        for name, mse in sorted_sens:
-            if name in fp16_set:
-                tag = "FP16"
-            else:
-                tag = "W8A8" if name in w8a8_set else "W8A16"
-            comp = sensitivity_details.get(name, {})
-            if np.isfinite(mse):
-                psnr_str = (f"{-10 * np.log10(mse):.1f} dB"
-                            if mse > 1e-10 else ">100 dB")
-                mse_str = f"{mse:.2e}"
-            else:
-                psnr_str = "nan"
-                mse_str = "nan"
-            stab_str = (
-                f"{comp.get('stability', float('nan')):.2e}"
-                if np.isfinite(comp.get("stability", float("nan"))) else "nan"
-            )
-            hi_str = (
-                f"{comp.get('highlight_l1', float('nan')):.2e}"
-                if np.isfinite(comp.get("highlight_l1", float("nan"))) else "nan"
-            )
-            print(f"    [{tag:5s}] {name:55s}  "
-                  f"SCORE={mse_str:>8s}  STAB={stab_str:>8s}  "
-                  f"HI={hi_str:>8s}  PSNR={psnr_str}")
+        if manual_selection:
+            print("\n  Manual layer assignment:")
+            for name in sorted(set(w8a8_layers) | set(w8a16_layers) | fp16_set):
+                if name in fp16_set:
+                    tag = "FP16"
+                else:
+                    tag = "W8A8" if name in w8a8_set else "W8A16"
+                print(f"    [{tag:5s}] {name}")
+        else:
+            print(f"\n  Per-layer sensitivity (combined score, ascending):")
+            for name, mse in sorted_sens:
+                if name in fp16_set:
+                    tag = "FP16"
+                else:
+                    tag = "W8A8" if name in w8a8_set else "W8A16"
+                comp = sensitivity_details.get(name, {})
+                if np.isfinite(mse):
+                    psnr_str = (f"{-10 * np.log10(mse):.1f} dB"
+                                if mse > 1e-10 else ">100 dB")
+                    mse_str = f"{mse:.2e}"
+                else:
+                    psnr_str = "nan"
+                    mse_str = "nan"
+                stab_str = (
+                    f"{comp.get('stability', float('nan')):.2e}"
+                    if np.isfinite(comp.get("stability", float("nan"))) else "nan"
+                )
+                hi_str = (
+                    f"{comp.get('highlight_l1', float('nan')):.2e}"
+                    if np.isfinite(comp.get("highlight_l1", float("nan"))) else "nan"
+                )
+                print(f"    [{tag:5s}] {name:55s}  "
+                      f"SCORE={mse_str:>8s}  STAB={stab_str:>8s}  "
+                      f"HI={hi_str:>8s}  PSNR={psnr_str}")
 
         print(f"\n  W8A8  (asymmetric): {len(w8a8_layers)} layers")
         print(f"  W8A16 (weight-only): {len(w8a16_layers)} layers")
@@ -916,7 +1092,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     save_data = {
-        "state_dict": model.state_dict(),
+        "state_dict": state_dict_preserve_activation_qparams(model),
         "compute_dtype": str(save_dtype),
         "quantization": "w8a8_mixed",
         "calibration_method": args.calibration_method,
@@ -934,19 +1110,30 @@ def main():
             "protect_sft_controls": str(args.protect_sft_controls).strip() != "0",
             "fp16_sensitive_layers": str(args.fp16_sensitive_layers).strip() != "0",
             "fp16_layers": parse_layer_list(args.fp16_layers),
+            "fp16_layers_file": args.fp16_layers_file,
+            "w8a8_layers": parse_layer_list(args.w8a8_layers),
+            "w8a8_layers_file": args.w8a8_layers_file,
         },
-        "architecture": {
-            "classifier": "color_condition",
-            "cond_c": 6,
-            "in_nc": 3,
-            "out_nc": 3,
-            "nf": 32,
-            "act_type": "relu",
-            "weighting_network": False,
-            "use_hg": use_hg,
-            "hg_nf": 64,
-            "mask_r": 0.75,
-        },
+        "architecture": dict(
+            getattr(
+                model,
+                "_hdrtvnet_source_arch",
+                {
+                    "classifier": os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+                    "cond_c": 6,
+                    "in_nc": 3,
+                    "out_nc": 3,
+                    "nf": 32,
+                    "act_type": "relu",
+                    "weighting_network": False,
+                    "use_hg": use_hg,
+                    "hg_nf": 64,
+                    "mask_r": 0.75,
+                    "le_arch": os.environ.get("HDRTVNET_LE_ARCH", "sft"),
+                    "hg_arch": os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"),
+                },
+            )
+        ),
     }
 
     if args.legacy:
@@ -961,6 +1148,8 @@ def main():
         save_data["selection_mode"] = selection_mode
         if selection_mode.startswith("threshold"):
             save_data["sensitivity_threshold"] = args.sensitivity_threshold
+        elif selection_mode == "manual":
+            save_data["manual_selection"] = selection_info
         elif selection_info is not None:
             save_data["auto_selection"] = selection_info
         if protected_layers_removed:
@@ -969,9 +1158,9 @@ def main():
     torch.save(save_data, args.output)
     if str(args.export_tensorrt_source).strip() != "0":
         from make_portable_int8_checkpoint import (
-            convert_checkpoint,
             default_tensorrt_source_path,
         )
+        from split_distilled_tensorrt_sources import generate_tensorrt_source
 
         trt_source_dir = (
             Path(args.tensorrt_source_dir)
@@ -981,11 +1170,10 @@ def main():
             Path(args.output),
             trt_source_dir,
         )
-        convert_checkpoint(
+        generate_tensorrt_source(
             Path(args.output),
             trt_source_path,
             activation_quant=args.tensorrt_source_activation_quant,
-            target_backend="tensorrt",
         )
 
     orig_bytes = os.path.getsize(args.model)

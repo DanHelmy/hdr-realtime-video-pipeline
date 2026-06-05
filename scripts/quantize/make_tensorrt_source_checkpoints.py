@@ -1,4 +1,4 @@
-"""Generate TensorRT-targeted source checkpoints for every INT8 variant.
+﻿"""Generate TensorRT-targeted source checkpoints for every INT8 variant.
 
 These outputs are not separately trained models. They are deterministic
 TensorRT source checkpoints: native FP32 state plus the same INT8 masks and
@@ -14,39 +14,60 @@ from pathlib import Path
 import torch
 
 from make_portable_int8_checkpoint import (
-    convert_checkpoint,
     default_tensorrt_source_path,
 )
+from split_distilled_tensorrt_sources import generate_tensorrt_source
 from models.hdrtvnet_torch import tensorrt_source_checkpoint_validation_error
 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _WEIGHTS_DIR = _REPO_ROOT / "src" / "models" / "weights"
-_DEFAULT_OUTPUT_DIR = _WEIGHTS_DIR / "tensorrt_sources"
+_DEFAULT_OUTPUT_DIR = _WEIGHTS_DIR / "distilled"
 
 
 def _default_inputs() -> list[Path]:
     return sorted(
         p
-        for p in _WEIGHTS_DIR.glob("Ensemble_AGCM_LE_int8_*.pt")
-        if p.is_file() and p.parent.name != "tensorrt_sources"
+        for folder in (_WEIGHTS_DIR / "pytorch_int8" / "hr", _WEIGHTS_DIR / "pytorch_int8" / "hg")
+        for p in folder.glob("*.pt")
+        if p.is_file()
     )
 
 
+def _quantizable_layers_from_state(checkpoint: dict) -> set[str]:
+    layers: set[str] = set()
+    for key, value in (checkpoint.get("state_dict") or {}).items():
+        text = str(key)
+        if text.endswith(".weight_int8"):
+            layers.add(text[: -len(".weight_int8")])
+            continue
+        if text.endswith(".weight") and torch.is_tensor(value) and value.ndim in {2, 4}:
+            layers.add(text[: -len(".weight")])
+    return layers
+
+
 def _expected_counts(checkpoint: dict) -> tuple[int, int, int, int]:
-    arch = checkpoint.get("architecture", {})
-    total = 149 if bool(arch.get("use_hg", True)) else 128
     quantization = str(checkpoint.get("quantization") or "")
     fp16 = len(checkpoint.get("fp16_layers") or [])
-    if quantization == "w8a8_mixed":
+    qparams = checkpoint.get("activation_qparams") or {}
+    if qparams:
+        w8a8 = len(qparams)
+    elif quantization == "w8a8_mixed":
         w8a8 = len(checkpoint.get("w8a8_layers") or [])
-    elif quantization == "w8a8_full":
-        w8a8 = total
     else:
-        w8a8 = 0
+        w8a8 = len(
+            {
+                str(key)[: -len(".x_scale")]
+                for key in (checkpoint.get("state_dict") or {})
+                if str(key).endswith(".x_scale")
+            }
+        )
+    total = len(_quantizable_layers_from_state(checkpoint))
+    if quantization == "w8a8_full":
+        total = max(total, w8a8)
     w8a16 = max(0, total - w8a8 - fp16)
-    return w8a8, w8a16, fp16, total
+    return w8a8, w8a16, fp16, max(total, w8a8 + w8a16 + fp16)
 
 
 def _summarize(path: Path) -> str:
@@ -54,7 +75,7 @@ def _summarize(path: Path) -> str:
     w8a8, w8a16, fp16, total = _expected_counts(checkpoint)
     qparams = len(checkpoint.get("activation_qparams") or {})
     return (
-        f"{path.name}: {checkpoint.get('quantization')} "
+            f"{path.name}: {checkpoint.get('quantization')} "
         f"W8A8={w8a8} W8A16={w8a16} FP16={fp16} total={total} "
         f"activation={checkpoint.get('activation_quant')} qparams={qparams} "
         f"target={checkpoint.get('target_backend')}"
@@ -69,13 +90,13 @@ def main() -> int:
         "checkpoints",
         nargs="*",
         type=Path,
-        help="Optional checkpoint list. Defaults to every Ensemble_AGCM_LE_int8_*.pt under weights/.",
+        help="Optional checkpoint list. Defaults to every organized .pt under weights/pytorch_int8/hr and weights/pytorch_int8/hg.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=_DEFAULT_OUTPUT_DIR,
-        help="Output folder. Default: src/models/weights/tensorrt_sources.",
+        help="Output folder. Default: src/models/weights/distilled.",
     )
     parser.add_argument(
         "--activation-quant",
@@ -126,11 +147,10 @@ def main() -> int:
             print(f"[dry-run] {input_path} -> {output_path} ({reason or 'forced'})")
             continue
         print(f"[generate] {input_path.name} -> {output_path.name} ({reason or 'forced'})")
-        convert_checkpoint(
+        generate_tensorrt_source(
             input_path,
             output_path,
             activation_quant=args.activation_quant,
-            target_backend="tensorrt",
         )
         print("  " + _summarize(output_path))
 

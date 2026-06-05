@@ -150,9 +150,11 @@ def _make_mpv_widget(mpv_lib, mpv_diag: bool):
         BEST_MPV_SCALE,
         FILMGRAIN_SHADER_PATH,
         FSR_SHADER_PATH,
+        SSIM_DOWNSCALER_SHADER_PATH,
         SSIM_SUPERRES_SHADER_PATH,
         _ensure_filmgrain_shader,
         _ensure_fsr_shader,
+        _ensure_ssim_downscaler_shader,
         _ensure_ssim_superres_shader,
         _normalize_shader_paths,
     )
@@ -164,10 +166,12 @@ def _make_mpv_widget(mpv_lib, mpv_diag: bool):
         ensure_fsr_shader=_ensure_fsr_shader,
         ensure_ssim_superres_shader=_ensure_ssim_superres_shader,
         ensure_filmgrain_shader=_ensure_filmgrain_shader,
+        ensure_ssim_downscaler_shader=_ensure_ssim_downscaler_shader,
         best_mpv_scale=BEST_MPV_SCALE,
         fsr_shader_path=FSR_SHADER_PATH,
         ssim_superres_shader_path=SSIM_SUPERRES_SHADER_PATH,
         filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
+        ssim_downscaler_shader_path=SSIM_DOWNSCALER_SHADER_PATH,
     )
 
 

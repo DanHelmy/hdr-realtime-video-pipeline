@@ -20,15 +20,20 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
-    LIVE_CAPTURE_DISPLAY_FPS,
-    LIVE_CAPTURE_OBSERVE_FPS,
     LIVE_CAPTURE_PROCESS_FPS,
+    ORIGINAL_PRECISION_KEY,
     PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
+    _int8_precision_warning,
+    _select_hg_weights_path,
     _select_model_path,
+    _select_tensorrt_model_path,
     _available_precision_keys,
     _normalize_source_mode,
+    live_capture_display_fps,
+    live_capture_observe_fps,
+    live_capture_process_fps_from_value,
     MAX_W,
     MAX_H,
     RESOLUTION_SCALES,
@@ -115,11 +120,19 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _HG_WEIGHTS_PATH = os.path.join(
-    _ROOT, "src", "models", "weights", "HG_weights.pth"
+    _ROOT, "src", "models", "weights", "original", "HG.pt"
 )
 _TENSORRT_ENGINE_DIR = os.path.join(_ROOT, "src", "models", "engines")
 _LIBMPV_DLL_PATH = os.path.join(_ROOT, "src", "libmpv-2.dll")
 _HIP_SDK_URL = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+_ORIGINAL_TRT_INT8_TAGS = (
+    "mixed_ptq",
+    "mixed_qat",
+    "mixed_qat_film",
+    "full_ptq",
+    "full_qat",
+    "full_qat_film",
+)
 
 
 def _env_enabled(name: str, default: str = "1") -> bool:
@@ -247,12 +260,16 @@ class PlaybackRuntimeMixin:
         "_cmb_view",
     )
     _BENCHMARK_LOCK_WIDGET_NAMES = _EXPORT_LOCK_WIDGET_NAMES
+    _COMPILE_LOCK_WIDGET_NAMES = _EXPORT_LOCK_WIDGET_NAMES
 
     def _export_controls_locked(self) -> bool:
         return bool(getattr(self, "_export_interaction_locked", False))
 
     def _benchmark_controls_locked(self) -> bool:
         return bool(getattr(self, "_benchmark_interaction_locked", False))
+
+    def _compile_controls_locked(self) -> bool:
+        return bool(getattr(self, "_compile_interaction_locked", False))
 
     def _show_export_lock_message(self, action: str = "Playback") -> bool:
         if self._export_controls_locked():
@@ -263,6 +280,11 @@ class PlaybackRuntimeMixin:
         if self._benchmark_controls_locked():
             self.statusBar().showMessage(
                 f"{action} is locked while benchmark is open. Close the benchmark tool first."
+            )
+            return True
+        if self._compile_controls_locked():
+            self.statusBar().showMessage(
+                f"{action} is locked while TensorRT is preparing the runtime."
             )
             return True
         return False
@@ -328,6 +350,43 @@ class PlaybackRuntimeMixin:
         saved = dict(getattr(self, "_benchmark_saved_enabled_states", {}) or {})
         self._benchmark_saved_enabled_states = {}
         self._benchmark_interaction_locked = False
+        for name, was_enabled in saved.items():
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.setEnabled(bool(was_enabled))
+            except Exception:
+                continue
+        if self._playing:
+            self._btn_apply_settings.setEnabled(self._has_pending_setting_changes())
+        else:
+            self._btn_apply_settings.setEnabled(False)
+
+    def _set_compile_interaction_locked(self, locked: bool):
+        if bool(locked):
+            if self._compile_controls_locked():
+                return
+            saved = {}
+            for name in self._COMPILE_LOCK_WIDGET_NAMES:
+                widget = getattr(self, name, None)
+                if widget is None:
+                    continue
+                try:
+                    saved[name] = bool(widget.isEnabled())
+                    widget.setEnabled(False)
+                except Exception:
+                    continue
+            self._compile_saved_enabled_states = saved
+            self._compile_interaction_locked = True
+            self.statusBar().showMessage(
+                "Playback controls are locked while TensorRT prepares the runtime."
+            )
+            return
+
+        saved = dict(getattr(self, "_compile_saved_enabled_states", {}) or {})
+        self._compile_saved_enabled_states = {}
+        self._compile_interaction_locked = False
         for name, was_enabled in saved.items():
             widget = getattr(self, name, None)
             if widget is None:
@@ -443,6 +502,8 @@ class PlaybackRuntimeMixin:
         )
         if not str(precision).startswith("int8"):
             return mode
+        if _IS_NVIDIA:
+            return "off"
         if mode == "on":
             return "on"
         if mode == "off":
@@ -1016,7 +1077,7 @@ class PlaybackRuntimeMixin:
                 "The app already tried to download the missing files automatically.\n\n"
                 "Required locations:\n\n"
                 "1) libmpv-2.dll -> src/libmpv-2.dll\n"
-                "2) HG_weights.pth -> src/models/weights/HG_weights.pth\n\n"
+                "2) HG.pt -> src/models/weights/original/HG.pt\n\n"
                 "Use Retry to try the auto-download again, Run Setup to refresh the environment, "
                 "or open the Google Drive links and place the files manually."
                 f"{auto_error_text}\n"
@@ -1359,6 +1420,7 @@ class PlaybackRuntimeMixin:
             self._compile_dlg.close()
             self._compile_dlg.deleteLater()
             self._compile_dlg = None
+        self._set_compile_interaction_locked(False)
 
         pending = getattr(self, "_pending_mpv_start", None)
         if pending and self._disp_hdr_mpv is not None:
@@ -1409,8 +1471,6 @@ class PlaybackRuntimeMixin:
                 if self._startup_sync_pending:
                     self._disp_hdr_mpv.set_paused(True)
                 self._worker.set_mpv_widget(self._disp_hdr_mpv)
-                if self._startup_sync_pending:
-                    QTimer.singleShot(250, self._release_startup_sync)
             else:
                 self._active_use_mpv = False
                 self._startup_sync_pending = False
@@ -1442,8 +1502,10 @@ class PlaybackRuntimeMixin:
                 force_hdr_metadata=False,
                 vsync_timed=vsync_timed,
                 sdr_transfer=sdr_transfer,
+                raw_format="bgr24",
             )
             if sdr_mpv_started:
+                self._disp_sdr_mpv.seek_seconds(0.0)
                 if self._startup_sync_pending:
                     self._disp_sdr_mpv.set_paused(True)
                 self._worker.set_sdr_mpv_widget(self._disp_sdr_mpv)
@@ -1460,6 +1522,20 @@ class PlaybackRuntimeMixin:
         self._apply_monitor_upscale_settings(announce=False)
         self._sync_upscale_controls()
         self._refresh_playback_scale_status(force=True)
+        if self._startup_sync_pending:
+            if self._user_pause_override_startup:
+                self._release_startup_sync()
+            else:
+                try:
+                    anchor = int(self._seek_slider.value())
+                except Exception:
+                    anchor = int(getattr(self, "_last_seek_frame", 0))
+                if not self._begin_video_prebuffer(
+                    anchor,
+                    reason="startup",
+                    resume_worker=True,
+                ):
+                    QTimer.singleShot(250, self._release_startup_sync)
 
     def _precompile_kernels(self):
         """Open the pre-compile dialog - runs compile_kernels.py as a
@@ -1507,7 +1583,12 @@ class PlaybackRuntimeMixin:
             precision=prec_arg,
             model_path=model_path,
             use_hg=self._chk_hg.isChecked(),
-            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+            hg_weights=(
+                _select_hg_weights_path(gui_prec)
+                if self._chk_hg.isChecked()
+                and os.path.isfile(_select_hg_weights_path(gui_prec))
+                else None
+            ),
             clear_cache=opts.selected_clean_compile(),
             predequantize_mode=self._effective_precompile_predequantize_mode(
                 prec_arg,
@@ -1940,6 +2021,7 @@ class PlaybackRuntimeMixin:
             except Exception:
                 current_session_id = None
         dlg = WindowCaptureDialog(
+            initial_fps_label=self._live_capture_cadence_text(),
             initial_session_id=current_session_id,
             initial_target=target if isinstance(target, WindowCaptureTarget) else None,
             parent=self,
@@ -2155,7 +2237,12 @@ class PlaybackRuntimeMixin:
             precision=prec_arg,
             model_path=model_path,
             use_hg=bool(config.use_hg),
-            hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+            hg_weights=(
+                _select_hg_weights_path(config.precision_key)
+                if bool(config.use_hg)
+                and os.path.isfile(_select_hg_weights_path(config.precision_key))
+                else None
+            ),
             predequantize_mode=self._effective_precompile_predequantize_mode(
                 prec_arg,
                 selected_pdq_mode,
@@ -2432,6 +2519,43 @@ class PlaybackRuntimeMixin:
         if auto_play:
             QTimer.singleShot(100, self._play)
 
+    def _selected_live_capture_process_fps(self) -> float:
+        value = None
+        if hasattr(self, "_cmb_live_fps") and self._cmb_live_fps is not None:
+            try:
+                value = self._cmb_live_fps.currentData()
+            except Exception:
+                value = self._cmb_live_fps.currentText()
+        return live_capture_process_fps_from_value(
+            value,
+            default=LIVE_CAPTURE_PROCESS_FPS,
+        )
+
+    def _selected_live_capture_observe_fps(self, process_fps: float | None = None) -> float:
+        return live_capture_observe_fps(
+            self._selected_live_capture_process_fps()
+            if process_fps is None
+            else float(process_fps)
+        )
+
+    def _selected_live_capture_display_fps(self, process_fps: float | None = None) -> float:
+        return live_capture_display_fps(
+            self._selected_live_capture_process_fps()
+            if process_fps is None
+            else float(process_fps)
+        )
+
+    def _live_capture_cadence_text(self, process_fps: float | None = None) -> str:
+        proc = self._selected_live_capture_process_fps() if process_fps is None else float(process_fps)
+        observe = self._selected_live_capture_observe_fps(proc)
+        display = self._selected_live_capture_display_fps(proc)
+        return (
+            f"Chrome is observed up to {observe:g} fps, "
+            f"video processing is capped at {proc:g} fps, "
+            f"mpv is fed at {display:g} fps, "
+            "and mpv repeats those frames on display vsync."
+        )
+
     def _set_window_capture_source(self, target: WindowCaptureTarget, auto_play: bool = False):
         if self._show_export_lock_message("Choosing a browser window"):
             return
@@ -2485,7 +2609,8 @@ class PlaybackRuntimeMixin:
 
         self._save_user_settings()
         self._set_source_resolution_options_for_dims(src_w, src_h)
-        self._prepare_live_timeline(LIVE_CAPTURE_PROCESS_FPS)
+        live_process_fps = self._selected_live_capture_process_fps()
+        self._prepare_live_timeline(live_process_fps)
         self._show_idle_preview_frame(preview)
         self._refresh_source_mode_ui()
         self._btn_pause.setEnabled(False)
@@ -2495,12 +2620,7 @@ class PlaybackRuntimeMixin:
         self._update_playback_log_button()
         self.setWindowTitle(f"HDRTVNet++ - {self._capture_target.label}")
         has_tab_audio_sync = bool(str(getattr(self._capture_target, "session_id", "") or "").strip())
-        cadence_text = (
-            f"Chrome is observed up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, "
-            f"video processing is capped at {LIVE_CAPTURE_PROCESS_FPS:g} fps, "
-            f"mpv is fed at {LIVE_CAPTURE_DISPLAY_FPS:g} fps, "
-            "and mpv repeats those frames on display vsync."
-        )
+        cadence_text = self._live_capture_cadence_text(live_process_fps)
         self.statusBar().showMessage(
             (
                 f"Selected live browser window: {self._capture_target.label}. "
@@ -2625,6 +2745,7 @@ class PlaybackRuntimeMixin:
 
         args = [sys.executable, sys.argv[0], "--source-mode", SOURCE_MODE_WINDOW]
         args += capture_target_to_cli_args(target)
+        args += ["--live-fps", str(int(round(self._selected_live_capture_process_fps())))]
         if resolution in RESOLUTION_SCALES:
             args += ["--resolution", resolution]
         elif resolution == "Source":
@@ -2697,6 +2818,19 @@ class PlaybackRuntimeMixin:
             getattr(self, "_source_mode", SOURCE_MODE_VIDEO)
         )
         is_window_source = source_mode == SOURCE_MODE_WINDOW
+        live_process_fps = (
+            self._selected_live_capture_process_fps() if is_window_source else 0.0
+        )
+        live_observe_fps = (
+            self._selected_live_capture_observe_fps(live_process_fps)
+            if is_window_source
+            else 0.0
+        )
+        live_display_fps = (
+            self._selected_live_capture_display_fps(live_process_fps)
+            if is_window_source
+            else 0.0
+        )
         if self._playing:
             return
 
@@ -2735,10 +2869,10 @@ class PlaybackRuntimeMixin:
                 source_url=str(getattr(target, "source_url", "") or "").strip(),
             )
             self._set_source_resolution_options_for_dims(vw, vh)
-            self._prepare_live_timeline(LIVE_CAPTURE_PROCESS_FPS)
+            self._prepare_live_timeline(live_process_fps)
             self._source_hdr_info = {"is_hdr": False, "reason": "browser_window_capture"}
             total_frames = 0
-            self._vid_fps = float(LIVE_CAPTURE_PROCESS_FPS)
+            self._vid_fps = float(live_process_fps)
             if not str(getattr(self._capture_target, "session_id", "") or "").strip():
                 self.statusBar().showMessage(
                     "No matching Chrome Audio Sync session was found. "
@@ -2850,7 +2984,7 @@ class PlaybackRuntimeMixin:
 
         # Set up seek slider
         display_fps = (
-            float(LIVE_CAPTURE_DISPLAY_FPS)
+            float(live_display_fps)
             if is_window_source
             else _limited_playback_fps(self._vid_fps)
         )
@@ -2865,13 +2999,13 @@ class PlaybackRuntimeMixin:
             self._seek_slider.setRange(0, max(0, total_frames - 1))
             self._seek_slider.setValue(0)
             self._seek_slider.setEnabled(True)
-            self._seek_slider.setToolTip("Seek while paused is queued and applied on Resume.")
+            self._seek_slider.setToolTip("Seek video playback.")
             self._lbl_time.setText("0:00")
             dur_secs = total_frames / self._vid_fps if self._vid_fps > 0 else 0
             self._lbl_duration.setText(self._fmt_time(dur_secs))
 
         # Map GUI precision to compile arg
-        gui_prec = self._cmb_prec.currentText()
+        gui_prec = self._effective_precision_key()
         prec_arg = _precision_to_compile_arg(gui_prec)
 
         # Always compile via a clean subprocess - this ensures autotune
@@ -2881,12 +3015,21 @@ class PlaybackRuntimeMixin:
         model_path = _select_model_path(gui_prec, self._chk_hg.isChecked())
         tensorrt_engine_cache_miss = False
         if _IS_NVIDIA:
+            trt_model_path = _select_tensorrt_model_path(
+                gui_prec,
+                self._chk_hg.isChecked(),
+            )
             trt_cfg = PRECISIONS.get(gui_prec, {})
             trt_mode = f"{gui_prec}_{'hg' if self._chk_hg.isChecked() else 'nohg'}"
             trt_precision = trt_cfg.get("precision", prec_arg)
-            trt_predeq = _normalize_predequantize_mode(
-                getattr(self, "_predequantize_mode", "auto")
+            trt_hg_weights = (
+                _select_hg_weights_path(gui_prec, tensorrt=True)
+                if self._chk_hg.isChecked()
+                else None
             )
+            if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+                trt_hg_weights = None
+            trt_predeq = "off"
             trt_engine_mode = tensorrt_mode_name(
                 trt_precision,
                 trt_mode,
@@ -2894,7 +3037,7 @@ class PlaybackRuntimeMixin:
                 qdq_fusion="native",
             )
             trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
-                model_path,
+                trt_model_path,
                 pw,
                 ph,
                 trt_precision,
@@ -2904,12 +3047,12 @@ class PlaybackRuntimeMixin:
                 qdq_fusion="native",
                 require_exists=True,
             )
-            trt_engine = tensorrt_engine_path(model_path, pw, ph, trt_engine_mode)
+            trt_engine = tensorrt_engine_path(trt_model_path, pw, ph, trt_engine_mode)
             tensorrt_engine_cache_miss = bool(
                 trt_engine
                 and not tensorrt_engine_is_valid(
                     trt_engine,
-                    model_path=model_path,
+                    model_path=trt_model_path,
                     width=pw,
                     height=ph,
                     precision=trt_precision,
@@ -2917,6 +3060,7 @@ class PlaybackRuntimeMixin:
                     use_hg=self._chk_hg.isChecked(),
                     predequantize=trt_predeq,
                     qdq_fusion="native",
+                    hg_weights=trt_hg_weights,
                     calibration_cache=trt_calibration_cache,
                 )
             )
@@ -2946,7 +3090,12 @@ class PlaybackRuntimeMixin:
                     precision=prec_arg,
                     model_path=model_path,
                     use_hg=self._chk_hg.isChecked(),
-                    hg_weights=_HG_WEIGHTS_PATH if os.path.isfile(_HG_WEIGHTS_PATH) else None,
+                    hg_weights=(
+                        _select_hg_weights_path(gui_prec)
+                        if self._chk_hg.isChecked()
+                        and os.path.isfile(_select_hg_weights_path(gui_prec))
+                        else None
+                    ),
                     predequantize_mode=self._effective_precompile_predequantize_mode(
                         prec_arg,
                         getattr(self, "_predequantize_mode", "auto"),
@@ -2979,9 +3128,10 @@ class PlaybackRuntimeMixin:
         # Start playback
         self._last_res = (pw, ph)
         self._playing = True
-        self._active_precision = self._cmb_prec.currentText()
+        self._active_precision = gui_prec
         self._active_resolution = self._cmb_res.currentText()
         self._active_use_hg = self._chk_hg.isChecked()
+        self._active_live_capture_process_fps = float(live_process_fps)
         self._active_upscale_mode = upscale_choice
         # Keep mpv initialized whenever available so view switches are UI-only.
         disable_mpv_pipeline = str(
@@ -3066,9 +3216,12 @@ class PlaybackRuntimeMixin:
                 live_vsync_timed,
             )
             if self._disp_sdr_mpv is not None:
+                # Feed SDR at the same processing size as HDR and let mpv's GPU
+                # scaler present it. Feeding final-size SDR frames can overload
+                # the SDR pipe/VO during side-by-side resize and make it drift.
                 self._pending_sdr_mpv_start = (
-                    ow,
-                    oh,
+                    pw,
+                    ph,
                     float(display_fps),
                     "bicubic",
                     live_vsync_timed,
@@ -3081,15 +3234,19 @@ class PlaybackRuntimeMixin:
 
         self._worker.configure(
             self._video_path if not is_window_source else None,
-            self._cmb_prec.currentText(),
+            gui_prec,
             proc_w=pw,
             proc_h=ph,
             output_w=ow,
             output_h=oh,
             input_is_hdr=False,
             use_hg=self._chk_hg.isChecked(),
-            predequantize_mode=_normalize_predequantize_mode(
-                getattr(self, "_predequantize_mode", "auto")
+            predequantize_mode=(
+                "off"
+                if _IS_NVIDIA
+                else _normalize_predequantize_mode(
+                    getattr(self, "_predequantize_mode", "auto")
+                )
             ),
             runtime_execution_mode=_normalize_runtime_execution_mode(
                 getattr(self, "_runtime_execution_mode", "compile")
@@ -3105,8 +3262,9 @@ class PlaybackRuntimeMixin:
                     "source_url": str(getattr(self._capture_target, "source_url", "") or ""),
                     "process_name": str(getattr(self._capture_target, "process_name", "") or ""),
                     "pid": int(getattr(self._capture_target, "pid", 0) or 0),
-                    "fps": float(LIVE_CAPTURE_PROCESS_FPS),
-                    "observe_fps": float(LIVE_CAPTURE_OBSERVE_FPS),
+                    "fps": float(live_process_fps),
+                    "observe_fps": float(live_observe_fps),
+                    "display_fps": float(live_display_fps),
                     "capture_w": int(pw),
                     "capture_h": int(ph),
                 }
@@ -3131,6 +3289,7 @@ class PlaybackRuntimeMixin:
                 height=ph,
                 precision=gui_prec,
             )
+            self._set_compile_interaction_locked(True)
         self._compile_dlg.show()
 
         self._prepare_playback_logging_for_start()
@@ -3165,7 +3324,7 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage(
                 "Live browser window capture started. "
                 "Experimental Chrome-only mode: Chrome's 'Use graphics acceleration when available' must be off. "
-                f"Capture observes Chrome up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, feeds mpv at {LIVE_CAPTURE_DISPLAY_FPS:g} fps, and lets mpv repeat frames on display vsync. HDRTVNet++ stays silent. "
+                f"Capture observes Chrome up to {live_observe_fps:g} fps, processes a steady {live_process_fps:g} fps stream, feeds mpv at {live_display_fps:g} fps, and lets mpv repeat frames on display vsync. HDRTVNet++ stays silent. "
                 "If Chrome Audio Sync is active, the extension delays and plays the tab audio locally."
             )
         elif self._audio_available:
@@ -3213,23 +3372,51 @@ class PlaybackRuntimeMixin:
         if self._worker.is_paused:
             self._user_pause_override_startup = False
             queued = self._pending_seek_on_resume
+            prebuffering = False
             if queued is not None:
+                if self._active_use_mpv:
+                    prebuffering = self._begin_video_prebuffer(
+                        int(queued),
+                        reason="resume-seek",
+                        resume_worker=False,
+                    )
+                if not prebuffering:
+                    try:
+                        self._flush_display_queues(drop_frames=4)
+                    except Exception:
+                        pass
                 self._worker.request_seek(int(queued))
                 fps = getattr(self, "_vid_fps", 30.0)
                 self._seek_audio_seconds(int(queued) / max(fps, 1e-6))
-                if self._disp_hdr_mpv is not None and not self._audio_available:
-                    self._disp_hdr_mpv.seek_seconds(int(queued) / max(fps, 1e-6))
+                try:
+                    self._seek_mpv_panes(int(queued) / max(fps, 1e-6))
+                except Exception:
+                    if self._disp_hdr_mpv is not None and not self._audio_available:
+                        self._disp_hdr_mpv.seek_seconds(int(queued) / max(fps, 1e-6))
                 now_t = time.perf_counter()
                 self._audio_seek_guard_until = now_t + 1.0
                 self._audio_resync_pending = True
                 self._audio_fps_recovered = False
                 self._post_seek_resync_frames = 120
-                self._resume_audio_after_seek = bool(self._audio_available)
+                self._resume_audio_after_seek = bool(
+                    self._audio_available and not prebuffering
+                )
                 self._seek_resume_target = int(queued)
                 self._seek_resume_started_t = time.perf_counter()
                 if self._audio_available:
                     QTimer.singleShot(420, self._ensure_selected_audio_track_qt)
                 self._pending_seek_on_resume = None
+            elif self._active_use_mpv:
+                prebuffering = self._begin_video_prebuffer(
+                    int(getattr(self, "_last_seek_frame", 0)),
+                    reason="resume",
+                    resume_worker=False,
+                )
+            if prebuffering:
+                self._worker.resume()
+                self._set_pause_button_labels(False)
+                self._arm_cursor_idle_timer()
+                return
             self._worker.resume()
             self._set_pause_button_labels(False)
             if self._disp_hdr_mpv is not None:
@@ -3289,8 +3476,14 @@ class PlaybackRuntimeMixin:
                     QTimer.singleShot(80, _resume_video_resync)
             self._arm_cursor_idle_timer()
         else:
+            self._cancel_video_prebuffer()
             self._worker.pause()
+            self._pending_seek_on_resume = None
             self._last_user_pause_t = time.perf_counter()
+            try:
+                self._flush_display_queues(drop_frames=0)
+            except Exception:
+                pass
             self._set_pause_button_labels(True)
             if self._disp_hdr_mpv is not None:
                 self._disp_hdr_mpv.set_paused(True)
@@ -3305,6 +3498,8 @@ class PlaybackRuntimeMixin:
 
     def _stop(self):
         self._suppress_eof_restart_once = True
+        self._cancel_video_prebuffer()
+        self._stop_scrub_preview()
         if hasattr(self, "_cancel_hdr_ground_truth_validation"):
             self._cancel_hdr_ground_truth_validation(invalidate=True)
         if getattr(self, "_compare_snapshot_pending", False):
@@ -3321,6 +3516,7 @@ class PlaybackRuntimeMixin:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.stop_playback()
+        self._stop_scrub_preview()
         self._stop_audio_playback()
         self._set_process_priority(False)
         preserve_capture_target = (
@@ -3397,12 +3593,267 @@ class PlaybackRuntimeMixin:
     # - Slots: settings ---------------------------------------
 
     def _on_precision(self, key):
+        if str(getattr(self, "_precision_override_key", "") or ""):
+            self._precision_override_key = ""
+            self.statusBar().showMessage(
+                "Original model override cleared; using selected precision."
+            )
         self._chk_hg.setEnabled(True)
+        warning = _int8_precision_warning(str(key), self._chk_hg.isChecked())
+        if warning:
+            self.statusBar().showMessage(warning)
         if self._playing:
             self._update_apply_button_state()
 
+    def _effective_precision_key(self) -> str:
+        override = str(getattr(self, "_precision_override_key", "") or "").strip()
+        if override in PRECISIONS:
+            return override
+        return str(self._cmb_prec.currentText() or "").strip()
+
+    def _use_original_model_preset(self):
+        """Prepare and enable the hidden original HR/HG checkpoint override."""
+        if self._show_export_lock_message("Original model"):
+            return
+        process = getattr(self, "_original_tensorrt_source_process", None)
+        if (
+            process is not None
+            and process.state() != QProcess.ProcessState.NotRunning
+        ):
+            self.statusBar().showMessage(
+                "Original TensorRT source preparation is already running."
+            )
+            return
+
+        missing = self._missing_original_tensorrt_source_paths()
+        regen_text = ""
+        if _IS_NVIDIA and missing:
+            regen_text = (
+                "\n\nOn this NVIDIA system, the ignored original TensorRT INT8 HG "
+                "source checkpoints are missing. If you continue, HDRTVNet++ will "
+                "generate them locally from the committed original PyTorch INT8 "
+                "checkpoints before enabling the original model path."
+            )
+        elif _IS_NVIDIA:
+            regen_text = (
+                "\n\nThe local original TensorRT source checkpoints are already present."
+            )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Use Original Model")
+        box.setText("Use the untouched original HR/HR+HG reference model?")
+        box.setInformativeText(
+            "This is a hidden comparison/debug path. It is expected to be slower "
+            "than the default distilled TensorRT-ready checkpoints, and HG depends "
+            "on original/HG.pt when the HG checkbox is enabled."
+            f"{regen_text}"
+        )
+        continue_btn = box.addButton(
+            "Continue",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_btn = box.addButton(
+            "Cancel",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(continue_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not continue_btn:
+            self.statusBar().showMessage("Original model override canceled.")
+            return
+
+        if _IS_NVIDIA and missing:
+            self._prepare_original_tensorrt_sources_async(
+                self._activate_original_model_preset
+            )
+            return
+        self._activate_original_model_preset()
+
+    def _activate_original_model_preset(self):
+        """Enable the hidden original HR/HG checkpoint override."""
+        self._precision_override_key = ORIGINAL_PRECISION_KEY
+        if self._cmb_prec is not None and self._cmb_prec.currentText() != "FP16":
+            was_blocked = self._cmb_prec.blockSignals(True)
+            self._cmb_prec.setCurrentText("FP16")
+            self._cmb_prec.blockSignals(was_blocked)
+        self._save_user_settings()
+        if self._playing:
+            self._update_apply_button_state()
+            suffix = " Click Apply to restart with the original checkpoint."
+        else:
+            suffix = " Press Play to use it."
+        message = (
+            "Original HR/HR+HG override enabled. This hidden comparison path "
+            "uses original/HR.pt and, when HG is checked, original/HG.pt."
+            f"{suffix}"
+        )
+        self.statusBar().showMessage(message)
+        QMessageBox.information(self, "Original Model", message)
+
+    def _expected_original_tensorrt_source_paths(self) -> list[str]:
+        base = os.path.join(_ROOT, "src", "models", "weights", "original", "tensorrt")
+        paths: list[str] = []
+        for tag in _ORIGINAL_TRT_INT8_TAGS:
+            paths.append(os.path.join(base, "hr", f"HR_original_int8_{tag}.pt"))
+            paths.append(os.path.join(base, "hr_hg", f"HR_HG_original_int8_{tag}.pt"))
+            paths.append(os.path.join(base, "hg", f"HG_original_int8_{tag}.pt"))
+        return paths
+
+    def _missing_original_tensorrt_source_paths(self) -> list[str]:
+        return [
+            path
+            for path in self._expected_original_tensorrt_source_paths()
+            if not os.path.isfile(path)
+        ]
+
+    def _prepare_original_tensorrt_sources_async(self, on_ready):
+        script = os.path.join(
+            _ROOT,
+            "scripts",
+            "quantize",
+            "split_distilled_tensorrt_sources.py",
+        )
+        if not os.path.isfile(script):
+            QMessageBox.warning(
+                self,
+                "Original Model",
+                "Cannot prepare original TensorRT sources because the split script is missing.",
+            )
+            return
+
+        source_dir = os.path.join(
+            _ROOT, "src", "models", "weights", "original", "pytorch_int8"
+        )
+        if not os.path.isdir(source_dir):
+            QMessageBox.warning(
+                self,
+                "Original Model",
+                "Cannot prepare original TensorRT sources because original/pytorch_int8 is missing.",
+            )
+            return
+
+        dlg = QProgressDialog(
+            "Preparing original TensorRT HG source checkpoints ...",
+            None,
+            0,
+            0,
+            self,
+        )
+        dlg.setWindowTitle("Preparing Original TensorRT Sources")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        configure_independent_window(dlg, maximize=False, close=False)
+        dlg.show()
+
+        process = QProcess(self)
+        process.setWorkingDirectory(_ROOT)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        env = process.processEnvironment()
+        if env.isEmpty():
+            env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(env)
+
+        output_chunks: list[str] = []
+
+        def _drain_output() -> None:
+            data = process.readAllStandardOutput()
+            if not data:
+                return
+            text = bytes(data).decode("utf-8", errors="replace")
+            output_chunks.append(text)
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if lines:
+                dlg.setLabelText(
+                    "Preparing original TensorRT HG source checkpoints ...\n"
+                    + lines[-1][-160:]
+                )
+
+        def _finish(exit_code: int, _exit_status) -> None:
+            _drain_output()
+            try:
+                dlg.close()
+                dlg.deleteLater()
+            except Exception:
+                pass
+            self._original_tensorrt_source_dlg = None
+            self._original_tensorrt_source_process = None
+            process.deleteLater()
+
+            missing_after = self._missing_original_tensorrt_source_paths()
+            if int(exit_code) == 0 and not missing_after:
+                self.statusBar().showMessage(
+                    "Original TensorRT sources prepared locally."
+                )
+                on_ready()
+                return
+
+            tail = "".join(output_chunks)[-3000:].strip()
+            details = (
+                f"\n\nStill missing {len(missing_after)} source file(s)."
+                if missing_after
+                else ""
+            )
+            if tail:
+                details += f"\n\nLast output:\n{tail}"
+            QMessageBox.warning(
+                self,
+                "Original TensorRT Preparation Failed",
+                "Original TensorRT source generation did not complete."
+                f"{details}",
+            )
+
+        process.readyReadStandardOutput.connect(_drain_output)
+        process.finished.connect(_finish)
+        self._original_tensorrt_source_process = process
+        self._original_tensorrt_source_dlg = dlg
+        process.start(
+            _python_executable_for_clean_subprocess(),
+            [
+                "-u",
+                script,
+                "--only-original",
+                "--missing-only",
+            ],
+        )
+        if not process.waitForStarted(5000):
+            try:
+                dlg.close()
+                dlg.deleteLater()
+            except Exception:
+                pass
+            self._original_tensorrt_source_dlg = None
+            self._original_tensorrt_source_process = None
+            process.deleteLater()
+            QMessageBox.warning(
+                self,
+                "Original TensorRT Preparation Failed",
+                "Could not start the original TensorRT source generator.",
+            )
+
     def _on_resolution(self, scale_key):
         self._sync_upscale_controls()
+        if self._playing:
+            self._update_apply_button_state()
+
+    def _on_live_capture_fps_changed(self, _text: str):
+        process_fps = self._selected_live_capture_process_fps()
+        observe_fps = self._selected_live_capture_observe_fps(process_fps)
+        display_fps = self._selected_live_capture_display_fps(process_fps)
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+            == SOURCE_MODE_WINDOW
+        ):
+            suffix = " Click Apply to restart capture at this cap." if self._playing else ""
+            self.statusBar().showMessage(
+                f"Browser capture cap saved: {process_fps:g} fps process, "
+                f"{observe_fps:g} fps observe, {display_fps:g} fps mpv feed."
+                f"{suffix}"
+            )
         if self._playing:
             self._update_apply_button_state()
 
@@ -3441,6 +3892,12 @@ class PlaybackRuntimeMixin:
         self._save_user_settings()
 
     def _on_hg_toggle(self, _state):
+        warning = _int8_precision_warning(
+            self._effective_precision_key(),
+            self._chk_hg.isChecked(),
+        )
+        if warning:
+            self.statusBar().showMessage(warning)
         if self._playing:
             self._update_apply_button_state()
 
@@ -3453,8 +3910,13 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage("No pending setting changes.")
             return
 
-        new_prec = self._cmb_prec.currentText()
+        new_prec = self._effective_precision_key()
         new_res = self._cmb_res.currentText()
+        is_window_source = (
+            _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+            == SOURCE_MODE_WINDOW
+        )
+        new_live_fps = self._selected_live_capture_process_fps()
         current_upscale = (
             self._cmb_upscale.currentText()
             if hasattr(self, "_cmb_upscale")
@@ -3469,6 +3931,11 @@ class PlaybackRuntimeMixin:
             )
         needs_restart = new_res != self._active_resolution
         if self._chk_hg.isChecked() != self._active_use_hg:
+            needs_restart = True
+        if (
+            is_window_source
+            and abs(float(new_live_fps) - float(self._active_live_capture_process_fps)) > 0.01
+        ):
             needs_restart = True
         notices: list[str] = []
 
@@ -3685,11 +4152,17 @@ class PlaybackRuntimeMixin:
             elif _IS_NVIDIA:
                 use_hg = self._chk_hg.isChecked()
                 trt_cfg = PRECISIONS.get(new_prec, {})
+                trt_model_path = _select_tensorrt_model_path(new_prec, use_hg)
                 trt_mode = f"{new_prec}_{'hg' if use_hg else 'nohg'}"
                 trt_precision = trt_cfg.get("precision", new_prec)
-                trt_predeq = _normalize_predequantize_mode(
-                    getattr(self, "_predequantize_mode", "auto")
+                trt_hg_weights = (
+                    _select_hg_weights_path(new_prec, tensorrt=True)
+                    if use_hg
+                    else None
                 )
+                if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+                    trt_hg_weights = None
+                trt_predeq = "off"
                 trt_engine_mode = tensorrt_mode_name(
                     trt_precision,
                     trt_mode,
@@ -3697,7 +4170,7 @@ class PlaybackRuntimeMixin:
                     qdq_fusion="native",
                 )
                 trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
-                    target_model_path,
+                    trt_model_path,
                     cur_pw,
                     cur_ph,
                     trt_precision,
@@ -3707,10 +4180,10 @@ class PlaybackRuntimeMixin:
                     qdq_fusion="native",
                     require_exists=True,
                 )
-                trt_engine_path = tensorrt_engine_path(target_model_path, cur_pw, cur_ph, trt_engine_mode)
+                trt_engine_path = tensorrt_engine_path(trt_model_path, cur_pw, cur_ph, trt_engine_mode)
                 if not tensorrt_engine_is_valid(
                     trt_engine_path,
-                    model_path=target_model_path,
+                    model_path=trt_model_path,
                     width=cur_pw,
                     height=cur_ph,
                     precision=trt_precision,
@@ -3718,6 +4191,7 @@ class PlaybackRuntimeMixin:
                     use_hg=use_hg,
                     predequantize=trt_predeq,
                     qdq_fusion="native",
+                    hg_weights=trt_hg_weights,
                     calibration_cache=trt_calibration_cache,
                 ):
                     self.statusBar().showMessage(

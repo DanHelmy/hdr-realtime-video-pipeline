@@ -1,4 +1,4 @@
-"""
+﻿"""
 Quantization-Aware Training (QAT) for Full INT8 (W8A8) HDRTVNet++.
 
 Starts from a PTQ W8A8 checkpoint and fine-tunes with fake quantization
@@ -61,6 +61,32 @@ from gui_objective_metrics import (
     _psnr_bgr,
     _ssim_bgr,
 )
+
+
+class temporary_model_arch:
+    """Temporarily override opt-in architecture env vars for teacher builds."""
+
+    def __init__(self, le_arch: str = "", hg_arch: str = ""):
+        self._updates = {
+            "HDRTVNET_LE_ARCH": str(le_arch or "").strip(),
+            "HDRTVNET_HG_ARCH": str(hg_arch or "").strip(),
+        }
+        self._old = {}
+
+    def __enter__(self):
+        for name, value in self._updates.items():
+            self._old[name] = os.environ.get(name)
+            if value:
+                os.environ[name] = value
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for name, old_value in self._old.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
+        return False
 
 
 def configure_reproducibility(args):
@@ -213,6 +239,20 @@ def fake_quantize_asymmetric(x, scale, zero_point):
     return _FakeQuantizeAsymSTE.apply(x, scale, zero_point)
 
 
+def state_dict_preserve_activation_qparams(model):
+    """Keep static activation quantization parameters in FP32 when saving."""
+    state = model.state_dict()
+    fixed = {}
+    for key, value in state.items():
+        if torch.is_tensor(value) and (
+            key.endswith("x_scale") or key.endswith("x_zero")
+        ):
+            fixed[key] = value.detach().float()
+        else:
+            fixed[key] = value
+    return fixed
+
+
 # ===================================================================
 # QAT wrapper layers " W8A8 with learnable scales
 # ===================================================================
@@ -270,18 +310,34 @@ class QATConv2d(nn.Module):
         else:
             raise TypeError(f"Unsupported module type: {type(conv_or_w8)}")
 
+    def _apply(self, fn):
+        x_scale = self.x_scale.detach().clone()
+        x_zero = self.x_zero.detach().clone()
+        super()._apply(fn)
+        self.x_scale.data = x_scale.to(
+            device=self.x_scale.device, dtype=torch.float32
+        )
+        if self.x_scale.grad is not None:
+            self.x_scale.grad.data = self.x_scale.grad.data.float()
+        self.x_zero.data = x_zero.to(device=self.x_zero.device, dtype=torch.float32)
+        if self.x_zero.grad is not None:
+            self.x_zero.grad.data = self.x_zero.grad.data.float()
+        return self
+
     def forward(self, x):
         w_scale = self.w_scale.abs().clamp(min=1e-8)
         w_fq = fake_quantize(self.weight, w_scale.view(-1, 1, 1, 1))
         w_fq = w_fq.to(x.dtype)
 
+        x_dtype = x.dtype
+        x_f = x.float()
         if self.asymmetric:
-            x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
-            x_zp = self.x_zero.to(x.dtype)
-            x = fake_quantize_asymmetric(x, x_scale, x_zp)
+            x_scale = self.x_scale.abs().float().clamp(min=1e-8)
+            x_zp = self.x_zero.float()
+            x = fake_quantize_asymmetric(x_f, x_scale, x_zp).to(x_dtype)
         else:
-            x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
-            x = fake_quantize(x, x_scale)
+            x_scale = self.x_scale.abs().float().clamp(min=1e-8)
+            x = fake_quantize(x_f, x_scale).to(x_dtype)
 
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.conv2d(x, w_fq, bias, self.stride, self.padding,
@@ -329,18 +385,34 @@ class QATLinear(nn.Module):
         else:
             raise TypeError(f"Unsupported module type: {type(linear_or_w8)}")
 
+    def _apply(self, fn):
+        x_scale = self.x_scale.detach().clone()
+        x_zero = self.x_zero.detach().clone()
+        super()._apply(fn)
+        self.x_scale.data = x_scale.to(
+            device=self.x_scale.device, dtype=torch.float32
+        )
+        if self.x_scale.grad is not None:
+            self.x_scale.grad.data = self.x_scale.grad.data.float()
+        self.x_zero.data = x_zero.to(device=self.x_zero.device, dtype=torch.float32)
+        if self.x_zero.grad is not None:
+            self.x_zero.grad.data = self.x_zero.grad.data.float()
+        return self
+
     def forward(self, x):
         w_scale = self.w_scale.abs().clamp(min=1e-8)
         w_fq = fake_quantize(self.weight, w_scale.view(-1, 1))
         w_fq = w_fq.to(x.dtype)
 
+        x_dtype = x.dtype
+        x_f = x.float()
         if self.asymmetric:
-            x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
-            x_zp = self.x_zero.to(x.dtype)
-            x = fake_quantize_asymmetric(x, x_scale, x_zp)
+            x_scale = self.x_scale.abs().float().clamp(min=1e-8)
+            x_zp = self.x_zero.float()
+            x = fake_quantize_asymmetric(x_f, x_scale, x_zp).to(x_dtype)
         else:
-            x_scale = self.x_scale.abs().clamp(min=1e-8).to(x.dtype)
-            x = fake_quantize(x, x_scale)
+            x_scale = self.x_scale.abs().float().clamp(min=1e-8)
+            x = fake_quantize(x_f, x_scale).to(x_dtype)
 
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w_fq, bias)
@@ -377,6 +449,23 @@ def convert_to_qat(model):
 def convert_qat_to_ptq(model, compute_dtype=torch.float16):
     """Freeze QAT layers back to W8A8* for inference."""
     converted = 0
+
+    def _conv_int8_weight(module):
+        w_scale = module.w_scale.detach().abs().clamp(min=1e-8).float()
+        w_int8 = (
+            module.weight.detach().float() /
+            w_scale.view(-1, 1, 1, 1)
+        ).round().clamp(-128, 127).to(torch.int8)
+        return w_int8, w_scale
+
+    def _linear_int8_weight(module):
+        w_scale = module.w_scale.detach().abs().clamp(min=1e-8).float()
+        w_int8 = (
+            module.weight.detach().float() /
+            w_scale.view(-1, 1)
+        ).round().clamp(-128, 127).to(torch.int8)
+        return w_int8, w_scale
+
     for name, module in list(model.named_modules()):
         parts = name.split(".")
         if len(parts) == 0 or parts[0] == "":
@@ -398,9 +487,14 @@ def convert_qat_to_ptq(model, compute_dtype=torch.float16):
 
             new_mod = W8A8Conv2d(tmp_conv, compute_dtype,
                                  asymmetric=module.asymmetric)
-            new_mod.x_scale.fill_(module.x_scale.abs().clamp(min=1e-8).item())
+            w_int8, w_scale = _conv_int8_weight(module)
+            new_mod.weight_int8.copy_(w_int8)
+            new_mod.w_scale.copy_(w_scale.to(compute_dtype))
+            new_mod.x_scale.fill_(
+                module.x_scale.detach().abs().clamp(min=1e-8).item()
+            )
             if module.asymmetric:
-                new_mod.x_zero.fill_(module.x_zero.item())
+                new_mod.x_zero.fill_(module.x_zero.detach().item())
 
             setattr(parent, parts[-1], new_mod)
             converted += 1
@@ -416,9 +510,14 @@ def convert_qat_to_ptq(model, compute_dtype=torch.float16):
 
             new_mod = W8A8Linear(tmp_linear, compute_dtype,
                                  asymmetric=module.asymmetric)
-            new_mod.x_scale.fill_(module.x_scale.abs().clamp(min=1e-8).item())
+            w_int8, w_scale = _linear_int8_weight(module)
+            new_mod.weight_int8.copy_(w_int8)
+            new_mod.w_scale.copy_(w_scale.to(compute_dtype))
+            new_mod.x_scale.fill_(
+                module.x_scale.detach().abs().clamp(min=1e-8).item()
+            )
             if module.asymmetric:
-                new_mod.x_zero.fill_(module.x_zero.item())
+                new_mod.x_zero.fill_(module.x_zero.detach().item())
 
             setattr(parent, parts[-1], new_mod)
             converted += 1
@@ -748,16 +847,20 @@ def load_image_pairs_from_dirs(sdr_dir, hdr_dir, max_long_edge, max_images=0):
     if not common:
         raise FileNotFoundError("No matching filenames between SDR and HDR dirs")
 
-    if max_images > 0:
-        common = common[:max_images]
+    if max_images > 0 and len(common) > max_images:
+        common = sorted(random.sample(common, max_images))
 
     pairs = []
-    for name in common:
+    total = len(common)
+    print(f"  Loading {total} matched SDR/HDR pair(s) ...", flush=True)
+    for idx, name in enumerate(common, 1):
         sdr_t, hdr_t = load_image_pair(
             sdr_map[name], hdr_map[name], max_long_edge
         )
         if sdr_t is not None:
             pairs.append((sdr_t, hdr_t))
+        if idx % 100 == 0 or idx == total:
+            print(f"    loaded {idx}/{total} ({len(pairs)} valid)", flush=True)
     if len(pairs) == 0:
         raise RuntimeError(
             "Matched filenames found, but no valid SDR/HDR pairs could be loaded"
@@ -768,9 +871,10 @@ def load_image_pairs_from_dirs(sdr_dir, hdr_dir, max_long_edge, max_images=0):
 def compute_loss_terms(output, target, args, teacher_output=None, source=None):
     """Composite QAT loss tuned to preserve tone plus SDR source chroma."""
     base_l1 = F.l1_loss(output, target)
-    total = base_l1
+    target_weight = float(getattr(args, "target_loss_weight", 1.0))
+    total = target_weight * base_l1
     metrics = {
-        "total": float(base_l1.detach().item()),
+        "total": float((target_weight * base_l1).detach().item()),
         "l1": float(base_l1.detach().item()),
     }
 
@@ -1050,15 +1154,16 @@ def format_metrics(metrics):
 # ===================================================================
 
 def _build_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module:
+    classifier = os.environ.get("HDRTVNET_CLASSIFIER", "color_condition")
     if use_hg:
         model = HG_Composite(
-            classifier="color_condition", cond_c=6, in_nc=3, out_nc=3,
+            classifier=classifier, cond_c=6, in_nc=3, out_nc=3,
             nf=32, act_type="relu", weighting_network=False,
             hg_nf=64, mask_r=0.75,
         )
     else:
         model = Ensemble_AGCM_LE(
-            classifier="color_condition", cond_c=6, in_nc=3, out_nc=3,
+            classifier=classifier, cond_c=6, in_nc=3, out_nc=3,
             nf=32, act_type="relu", weighting_network=False,
         )
     state = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -1146,7 +1251,8 @@ def train_qat(model, pairs, device, compute_dtype, args,
     else:
         print("  Strategy: adaptive full QAT (all layers trainable)")
     print("  Loss recipe: "
-          f"L1 + {args.teacher_loss_weight:.3f}*teacher "
+          f"{args.target_loss_weight:.3f}*L1 "
+          f"+ {args.teacher_loss_weight:.3f}*teacher "
           f"+ {args.teacher_luma_weight:.3f}*teacher_luma "
           f"+ {args.teacher_chroma_weight:.3f}*teacher_chroma "
           f"+ {args.highlight_loss_weight:.3f}*highlight "
@@ -1382,11 +1488,13 @@ def main():
                             "src",
                             "models",
                             "weights",
-                            "Ensemble_AGCM_LE_int8_full.pt",
+                            "pytorch_int8",
+                            "hg",
+                            "HR_HG_int8_full.pt",
                         ),
                         help="PTQ full checkpoint to start from")
     parser.add_argument("--fp32-model",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "Ensemble_AGCM_LE.pth"),
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hr", "HR_qfriendly_spatialmixglobal_fp32.pt"),
                         help="FP32 model (for --from-scratch or validation)")
     parser.add_argument("--output",
                         default=os.path.join(
@@ -1394,11 +1502,13 @@ def main():
                             "src",
                             "models",
                             "weights",
-                            "Ensemble_AGCM_LE_int8_full_qat.pt",
+                            "pytorch_int8",
+                            "hg",
+                            "HR_HG_int8_full_qat.pt",
                         ),
                         help="Output path for QAT-finetuned checkpoint")
-    parser.add_argument("--export-tensorrt-source", default="1", choices=["1", "0"],
-                        help="Also export a portable TensorRT source checkpoint")
+    parser.add_argument("--export-tensorrt-source", default="0", choices=["1", "0"],
+                        help="Also export a legacy portable TensorRT source checkpoint")
     parser.add_argument("--tensorrt-source-dir", default=None,
                         help="Directory for portable TensorRT source checkpoints")
     parser.add_argument("--tensorrt-source-activation-quant",
@@ -1424,8 +1534,8 @@ def main():
     parser.add_argument("--precision", default="fp16", choices=["fp16", "fp32"],
                         help="Compute precision")
     parser.add_argument("--hg-weights",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "HG_weights.pth"),
-                        help="Path to HG weights (HG_weights.pth)")
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hg", "HG_qfriendly_directh16_fp32.pt"),
+                        help="Path to HG weights")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"],
                         help="Use HG refinement (1) or base AGCM+LE only (0)")
     parser.add_argument("--activation-quant",
@@ -1458,8 +1568,14 @@ def main():
                         help="Resize images so longest edge <= this")
     parser.add_argument("--teacher-loss-weight", type=float, default=0.10,
                         help="Weight for staying close to the selected teacher output")
+    parser.add_argument("--target-loss-weight", type=float, default=1.0,
+                        help="Weight for direct HDR ground-truth L1 loss")
     parser.add_argument("--teacher-source", default="ptq", choices=["ptq", "fp32"],
                         help="Teacher model for distillation losses: starting PTQ checkpoint or FP32 baseline")
+    parser.add_argument("--teacher-le-arch", default="",
+                        help="Optional HDRTVNET_LE_ARCH override for the FP32 teacher only")
+    parser.add_argument("--teacher-hg-arch", default="",
+                        help="Optional HDRTVNET_HG_ARCH override for the FP32 teacher only")
     parser.add_argument("--teacher-luma-weight", type=float, default=0.0,
                         help="Extra teacher luma anchor across the full image")
     parser.add_argument("--teacher-chroma-weight", type=float, default=0.0,
@@ -1551,7 +1667,36 @@ def main():
                         help="Max side for objective monitor metrics")
 
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    ptq_explicit = any(
+        item == "--ptq-checkpoint" or item.startswith("--ptq-checkpoint=")
+        for item in sys.argv[1:]
+    )
+    output_explicit = any(
+        item == "--output" or item.startswith("--output=")
+        for item in sys.argv[1:]
+    )
     args = parser.parse_args()
+    if str(args.use_hg).strip() == "0":
+        if not ptq_explicit:
+            args.ptq_checkpoint = os.path.join(
+                _REPO_ROOT,
+                "src",
+                "models",
+                "weights",
+                "pytorch_int8",
+                "hr",
+                "HR_int8_full.pt",
+            )
+        if not output_explicit:
+            args.output = os.path.join(
+                _REPO_ROOT,
+                "src",
+                "models",
+                "weights",
+                "int8",
+                "hr",
+                "HR_int8_full_qat.pt",
+            )
 
     compute_dtype = torch.float16 if args.precision == "fp16" else torch.float32
     device_str = args.device
@@ -1562,6 +1707,7 @@ def main():
         compute_dtype = torch.float32
 
     seed, deterministic = configure_reproducibility(args)
+    source_arch = {}
 
     print(f"Device: {device}, Precision: {args.precision}")
     if device.type == "cpu" and args.precision == "fp16":
@@ -1576,6 +1722,20 @@ def main():
     if args.from_scratch:
         print(f"\nLoading FP32 model from {args.fp32_model} ...")
         model = _build_fp32_model(args.fp32_model, args.hg_weights, use_hg)
+        source_arch = {
+            "classifier": os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
+            "cond_c": 6,
+            "in_nc": 3,
+            "out_nc": 3,
+            "nf": 32,
+            "act_type": "relu",
+            "weighting_network": False,
+            "use_hg": use_hg,
+            "hg_nf": 64,
+            "mask_r": 0.75,
+            "le_arch": os.environ.get("HDRTVNET_LE_ARCH", "sft"),
+            "hg_arch": os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"),
+        }
 
         use_asym = args.activation_quant == "asymmetric"
         print("Applying full W8A8 PTQ ...")
@@ -1584,7 +1744,15 @@ def main():
         model.eval()
 
         sdr_paths = sorted(glob.glob(os.path.join(args.sdr_dir, "*.png")))
-        calib_paths = sdr_paths if args.num_calibrate <= 0 else sdr_paths[:args.num_calibrate]
+        if args.num_calibrate <= 0 or len(sdr_paths) <= args.num_calibrate:
+            calib_paths = sdr_paths
+        else:
+            indexes = np.linspace(
+                0, len(sdr_paths) - 1, args.num_calibrate, dtype=np.int64
+            )
+            calib_paths = [
+                sdr_paths[int(i)] for i in dict.fromkeys(indexes.tolist())
+            ]
         print(f"Calibrating ({len(calib_paths)} images) ...")
         calib_tensors = []
         for p in calib_paths:
@@ -1632,6 +1800,7 @@ def main():
             raise ValueError(f"{args.ptq_checkpoint} is not a valid checkpoint")
 
         arch = checkpoint.get("architecture", {})
+        source_arch = dict(arch) if isinstance(arch, dict) else {}
         use_hg = bool(arch.get("use_hg", True))
         compute_dtype_str = checkpoint.get("compute_dtype", "torch.float16")
         compute_dtype = torch.float16 if "16" in compute_dtype_str else torch.float32
@@ -1655,6 +1824,8 @@ def main():
                 weighting_network=arch.get("weighting_network", False),
                 hg_nf=arch.get("hg_nf", 64),
                 mask_r=arch.get("mask_r", 0.75),
+                hg_arch=arch.get("hg_arch", None),
+                le_arch=arch.get("le_arch", None),
             )
         else:
             model = Ensemble_AGCM_LE(
@@ -1665,6 +1836,7 @@ def main():
                 nf=arch.get("nf", 32),
                 act_type=arch.get("act_type", "relu"),
                 weighting_network=arch.get("weighting_network", False),
+                le_arch=arch.get("le_arch", None),
             )
 
         _quantize_model_w8a8(model, compute_dtype, asymmetric=use_asym)
@@ -1737,9 +1909,10 @@ def main():
     ):
         if args.teacher_source == "fp32":
             print("\nPreparing FP32 teacher model ...")
-            teacher_model = _build_fp32_model(
-                args.fp32_model, args.hg_weights, use_hg
-            ).to(dtype=teacher_dtype, device=device)
+            with temporary_model_arch(args.teacher_le_arch, args.teacher_hg_arch):
+                teacher_model = _build_fp32_model(
+                    args.fp32_model, args.hg_weights, use_hg
+                ).to(dtype=teacher_dtype, device=device)
         else:
             print("\nPreparing PTQ teacher model ...")
             teacher_model = copy.deepcopy(model).to(dtype=teacher_dtype, device=device)
@@ -1791,7 +1964,7 @@ def main():
     # ------------------------------------------------------------------
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     save_data = {
-        "state_dict": model.state_dict(),
+        "state_dict": state_dict_preserve_activation_qparams(model),
         "compute_dtype": str(compute_dtype),
         "quantization": "w8a8_full",
         "qat_strategy": "frozen_teacher_anchored_full" if args._frozen_qat_layers else "adaptive_full",
@@ -1803,8 +1976,11 @@ def main():
         "qat_lr": args.lr,
         "qat_recipe": {
             "teacher_loss_weight": args.teacher_loss_weight,
+            "target_loss_weight": args.target_loss_weight,
             "teacher_source": args.teacher_source,
             "teacher_dtype": str(teacher_dtype),
+            "teacher_le_arch": args.teacher_le_arch,
+            "teacher_hg_arch": args.teacher_hg_arch,
             "teacher_luma_weight": args.teacher_luma_weight,
             "teacher_chroma_weight": args.teacher_chroma_weight,
             "highlight_loss_weight": args.highlight_loss_weight,
@@ -1868,24 +2044,26 @@ def main():
             "deterministic": deterministic,
         },
         "architecture": {
-            "classifier": "color_condition",
-            "cond_c": 6,
-            "in_nc": 3,
-            "out_nc": 3,
-            "nf": 32,
-            "act_type": "relu",
-            "weighting_network": False,
+            "classifier": source_arch.get("classifier", os.environ.get("HDRTVNET_CLASSIFIER", "color_condition")),
+            "cond_c": source_arch.get("cond_c", 6),
+            "in_nc": source_arch.get("in_nc", 3),
+            "out_nc": source_arch.get("out_nc", 3),
+            "nf": source_arch.get("nf", 32),
+            "act_type": source_arch.get("act_type", "relu"),
+            "weighting_network": source_arch.get("weighting_network", False),
             "use_hg": use_hg,
-            "hg_nf": 64,
-            "mask_r": 0.75,
+            "hg_nf": source_arch.get("hg_nf", 64),
+            "mask_r": source_arch.get("mask_r", 0.75),
+            "le_arch": source_arch.get("le_arch", os.environ.get("HDRTVNET_LE_ARCH", "sft")),
+            "hg_arch": source_arch.get("hg_arch", os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle")),
         },
     }
     torch.save(save_data, args.output)
     if str(args.export_tensorrt_source).strip() != "0":
         from make_portable_int8_checkpoint import (
-            convert_checkpoint,
             default_tensorrt_source_path,
         )
+        from split_distilled_tensorrt_sources import generate_tensorrt_source
 
         trt_source_dir = (
             Path(args.tensorrt_source_dir)
@@ -1895,11 +2073,10 @@ def main():
             Path(args.output),
             trt_source_dir,
         )
-        convert_checkpoint(
+        generate_tensorrt_source(
             Path(args.output),
             trt_source_path,
             activation_quant=args.tensorrt_source_activation_quant,
-            target_backend="tensorrt",
         )
 
     orig_kb = os.path.getsize(args.fp32_model) / 1024

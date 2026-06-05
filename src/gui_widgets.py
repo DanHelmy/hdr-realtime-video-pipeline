@@ -193,7 +193,10 @@ class _CompareVideoPane(QWidget):
         if self._mpv is not None and self._stack is not None:
             try:
                 self._ensure_mpv(w, h)
-                self._mpv.feed_frame(frame_to_rgb48_bytes(frame))
+                if self._force_hdr_metadata:
+                    self._mpv.feed_frame(frame_to_rgb48_bytes(frame))
+                else:
+                    self._mpv.feed_frame(memoryview(np.ascontiguousarray(frame)))
                 self._stack.setCurrentWidget(self._mpv)
                 return
             except Exception as exc:
@@ -218,7 +221,10 @@ class _CompareVideoPane(QWidget):
             # metadata is re-evaluated after show/move/screen changes.
             self._last_size = None
             self._ensure_mpv(w, h)
-            self._mpv.feed_frame(frame_to_rgb48_bytes(frame))
+            if self._force_hdr_metadata:
+                self._mpv.feed_frame(frame_to_rgb48_bytes(frame))
+            else:
+                self._mpv.feed_frame(memoryview(np.ascontiguousarray(frame)))
             self._stack.setCurrentWidget(self._mpv)
             self._last_mpv_error = None
             return True
@@ -380,6 +386,8 @@ class CompareFrameDialog(QDialog):
             for name in (
                 "_disp_hdr_mpv",
                 "_disp_sdr_mpv",
+                "_scrub_preview_mpv",
+                "_scrub_preview_popup",
                 "_disp_hdr_cpu",
                 "_disp_sdr_cpu",
                 "_disp_hdr_stack",

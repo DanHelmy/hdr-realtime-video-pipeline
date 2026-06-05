@@ -14,7 +14,12 @@ from models.hdrtvnet_torch import (
     tensorrt_mode_name,
     tensorrt_prebuilt_calibration_cache_path,
 )
-from gui_config import PRECISIONS, _select_model_path
+from gui_config import (
+    PRECISIONS,
+    _select_hg_weights_path,
+    _select_model_path,
+    _select_tensorrt_model_path,
+)
 from gui_output_capture import capture_output_to_gui
 
 
@@ -112,7 +117,18 @@ class PipelineWorkerModelMixin:
 
         try:
             if _IS_NVIDIA:
+                trt_path = _select_tensorrt_model_path(key, self._use_hg)
+                if not os.path.isfile(trt_path):
+                    self.status_message.emit(f"ERROR: TensorRT model weights not found - {trt_path}")
+                    return False
                 mode_name = f"{key}_{'hg' if self._use_hg else 'nohg'}"
+                trt_hg_weights = (
+                    _select_hg_weights_path(key, tensorrt=True)
+                    if self._use_hg
+                    else None
+                )
+                if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+                    trt_hg_weights = None
                 trt_predeq = _resolve_predequantize_arg(
                     getattr(self, "_predequantize_mode", "auto")
                 )
@@ -123,7 +139,7 @@ class PipelineWorkerModelMixin:
                     qdq_fusion="native",
                 )
                 trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
-                    path,
+                    trt_path,
                     int(cw),
                     int(ch),
                     cfg["precision"],
@@ -134,7 +150,7 @@ class PipelineWorkerModelMixin:
                     require_exists=True,
                 )
                 trt_engine = tensorrt_engine_path(
-                    path,
+                    trt_path,
                     int(cw),
                     int(ch),
                     trt_mode_name,
@@ -142,7 +158,7 @@ class PipelineWorkerModelMixin:
                 if announce_ready:
                     if tensorrt_engine_is_valid(
                         trt_engine,
-                        model_path=path,
+                        model_path=trt_path,
                         width=int(cw),
                         height=int(ch),
                         precision=cfg["precision"],
@@ -150,6 +166,7 @@ class PipelineWorkerModelMixin:
                         use_hg=self._use_hg,
                         predequantize=trt_predeq,
                         qdq_fusion="native",
+                        hg_weights=trt_hg_weights,
                         calibration_cache=trt_calibration_cache,
                     ):
                         self.status_message.emit(
@@ -158,21 +175,29 @@ class PipelineWorkerModelMixin:
                     else:
                         self.status_message.emit(
                             f"Building TensorRT engine for {cw}x{ch} ({key}) ..."
-                        )
+                )
                 with capture_output_to_gui(self.status_message.emit):
                     self._processor = HDRTVNetTensorRT(
-                        path,
+                        trt_path,
                         device="auto",
                         precision=cfg["precision"],
                         engine_width=int(cw),
                         engine_height=int(ch),
                         mode_name=mode_name,
+                        hg_weights=trt_hg_weights,
                         use_hg=self._use_hg,
                         predequantize=trt_predeq,
                         qdq_fusion="native",
                         calibration_cache=trt_calibration_cache,
                     )
             else:
+                torch_hg_weights = (
+                    _select_hg_weights_path(key)
+                    if self._use_hg
+                    else None
+                )
+                if torch_hg_weights and not os.path.isfile(torch_hg_weights):
+                    torch_hg_weights = None
                 resolved_compile_mode = (
                     "auto"
                     if compile_mode is None and bool(compile_model)
@@ -188,6 +213,7 @@ class PipelineWorkerModelMixin:
                     predequantize=_resolve_predequantize_arg(
                         getattr(self, "_predequantize_mode", "auto")
                     ),
+                    hg_weights=torch_hg_weights,
                     use_hg=self._use_hg,
                     warmup_passes=0,
                 )

@@ -106,7 +106,8 @@ class MainWindow(
                  initial_capture_title=None,
                  initial_capture_browser_name=None,
                  initial_capture_process_name=None,
-                 initial_capture_url=None):
+                 initial_capture_url=None,
+                 initial_live_capture_fps=None):
         super().__init__()
         self.setWindowTitle("HDRTVNet++ — Real-Time SDR → HDR Pipeline")
         self.setMinimumSize(1024, 600)
@@ -132,6 +133,7 @@ class MainWindow(
             initial_film_grain,
             initial_hdr_gt,
             initial_source_mode,
+            initial_live_capture_fps,
         )
         self._init_cursor_idle_tracking()
         QTimer.singleShot(0, self._maybe_prompt_source_mode_choice)
@@ -176,7 +178,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

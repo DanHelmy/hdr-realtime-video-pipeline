@@ -20,6 +20,7 @@ from gui_config import (
     PRECISIONS,
     MAX_W,
     MAX_H,
+    VIDEO_PLAYBACK_BUFFER_FRAMES,
 )
 from gui_mpv_widget import MpvHDRWidget
 from gui_pipeline_worker_model import PipelineWorkerModelMixin
@@ -43,7 +44,7 @@ _PLAYHEAD_UPDATE_STRIDE_PLAYING = 10
 _METRICS_EMIT_INTERVAL_S = 0.20
 _FPS_METRICS_WINDOW_FRAMES = 90
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "HG_weights.pth")
+_HG_WEIGHTS_PATH = os.path.join(_HERE, "models", "weights", "original", "HG.pt")
 
 
 def _normalize_runtime_execution_mode(mode: str | None) -> str:
@@ -85,6 +86,7 @@ class PipelineWorker(
     compile_ready = pyqtSignal()          # emitted after warmup_compile finishes
     position_updated = pyqtSignal(int, int)  # (current_frame, total_frames)
     seek_frame_ready = pyqtSignal(int)    # emitted after first rendered frame post-seek
+    display_prebuffer_ready = pyqtSignal(int, int)  # (frame, buffered_frames)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,9 +120,6 @@ class PipelineWorker(
         self._pending_resolution: tuple[int, int] | None = None
         self._enh_prev_luma: torch.Tensor | None = None
         self._enh_temporal_detail: torch.Tensor | None = None
-        self._flat_temporal_prev_rgb: torch.Tensor | None = None
-        self._flat_temporal_prev_luma: torch.Tensor | None = None
-        self._flat_temporal_prev_scene: np.ndarray | None = None
         self._sobel_x: torch.Tensor | None = None
         self._sobel_y: torch.Tensor | None = None
         self._input_is_hdr: bool = False
@@ -142,6 +141,7 @@ class PipelineWorker(
         self._pending_compare_snapshot: dict | None = None
         self._compare_cached_state: dict | None = None
         self._live_latency_smoothed_ms: float = 0.0
+        self._live_display_fps: float = 24.0
         self._metrics_emit_interval_s: float = _METRICS_EMIT_INTERVAL_S
         self._last_metrics_emit_t: float = 0.0
         self._session_logging_lock = threading.Lock()
@@ -153,6 +153,9 @@ class PipelineWorker(
         self._display_handoff_event = threading.Event()
         self._display_handoff_event.set()
         self._use_hdr_gt_fast_path = True
+        self._display_prebuffer_target: int = 0
+        self._display_prebuffer_count: int = 0
+        self._video_playback_buffer_frames: int = max(1, int(VIDEO_PLAYBACK_BUFFER_FRAMES))
 
     # ── public API (called from main thread) ──
 
@@ -195,6 +198,16 @@ class PipelineWorker(
         self._pending_compare_snapshot = None
         self._compare_cached_state = None
         self._live_latency_smoothed_ms = 0.0
+        if self._capture_target:
+            self._live_display_fps = float(
+                self._capture_target.get(
+                    "display_fps",
+                    self._capture_target.get("fps", 24.0),
+                )
+                or 24.0
+            )
+        else:
+            self._live_display_fps = 24.0
         self._realtime_drop_frames = 0
         self._last_metrics_emit_t = 0.0
         self._expect_display_handoff = bool(expect_display_handoff)
@@ -337,8 +350,8 @@ class PipelineWorker(
                 self._paused_control_refresh_frame = max(0, int(self._frame_idx))
             self._pause_event.set()
 
-    def flush_hdr_queue(self, drop_frames: int = 2):
-        """Flush mpv queues and drop a couple of frames to re-align output."""
+    def flush_display_queues(self, drop_frames: int = 2):
+        """Flush worker/mpv display queues and optionally skip stale frames."""
         if self._hdr_queue is not None:
             try:
                 while True:
@@ -351,12 +364,23 @@ class PipelineWorker(
                     self._sdr_queue.get_nowait()
             except _queue.Empty:
                 pass
+        for widget in (self._mpv_widget, self._sdr_mpv_widget):
+            if widget is None:
+                continue
+            try:
+                widget.flush_frames()
+            except Exception:
+                pass
         if self._capture_target:
             return
         self._hdr_drop_until_frame = max(self._hdr_drop_until_frame,
                                          self._frame_idx + max(0, int(drop_frames)))
         self._sdr_drop_until_frame = max(self._sdr_drop_until_frame,
                                          self._frame_idx + max(0, int(drop_frames)))
+
+    def flush_hdr_queue(self, drop_frames: int = 2):
+        """Compatibility wrapper for older GUI callers."""
+        self.flush_display_queues(drop_frames=drop_frames)
 
     def _ensure_sobel_kernels(self, device: torch.device, dtype: torch.dtype):
         if self._sobel_x is not None and self._sobel_x.device == device and self._sobel_x.dtype == dtype:
@@ -456,13 +480,37 @@ class PipelineWorker(
         self._sdr_mpv_widget = widget
 
     def set_sdr_visible(self, visible: bool):
-        """Tell the worker whether the SDR QLabel is on-screen."""
+        """Tell the worker whether the SDR output is on-screen."""
+        visible = bool(visible)
+        if self._sdr_visible == visible:
+            return
         self._sdr_visible = visible
+        if visible:
+            self._start_sdr_feeder()
+        else:
+            self._stop_sdr_feeder()
 
     def request_seek(self, frame_number: int):
         """Request a seek to a specific frame (thread-safe)."""
+        self.flush_display_queues(drop_frames=0)
         self._seek_frame = frame_number
         self._pause_event.set()  # unblock so the loop can process the seek
+
+    def request_display_prebuffer(self, frames: int | None = None):
+        """Ask the worker to report once file playback has queued N frames."""
+        if self._capture_target:
+            return
+        try:
+            target = int(frames if frames is not None else self._video_playback_buffer_frames)
+        except Exception:
+            target = int(self._video_playback_buffer_frames)
+        self._display_prebuffer_target = max(0, target)
+        self._display_prebuffer_count = 0
+        self._pause_event.set()
+
+    def cancel_display_prebuffer(self):
+        self._display_prebuffer_target = 0
+        self._display_prebuffer_count = 0
 
     def pause(self):
         self._user_paused = True
@@ -482,6 +530,7 @@ class PipelineWorker(
         self._paused_control_wake = False
         self._paused_control_refresh_frame = None
         self._display_handoff_event.set()
+        self.cancel_display_prebuffer()
         self._pause_event.set()  # unblock if paused
 
     @property
@@ -738,6 +787,7 @@ class PipelineWorker(
                 frame_idx = max(0, seek_to - 1)
                 force_position_emit = True
                 seek_frame_ready_pending = True
+                self._display_prebuffer_count = 0
                 next_frame_t = time.perf_counter()
                 self._sdr_delay_frame = None
                 self._reset_enhance_history()
@@ -877,6 +927,10 @@ class PipelineWorker(
 
             t0 = time.perf_counter()
 
+            should_cache_compare_state = bool(
+                self._user_paused or self._pending_compare_snapshot is not None
+            )
+
             display_frame, output, prepared_out, need_hdr_cpu, model_latency_ms = self._process_frame(
                 frame=frame,
                 frame_idx=frame_idx,
@@ -888,11 +942,9 @@ class PipelineWorker(
                 lower_res_processing=lower_res_processing,
                 mpv_w=mpv_w,
                 use_cuda=use_cuda,
+                need_compare_frame=should_cache_compare_state,
             )
 
-            should_cache_compare_state = bool(
-                self._user_paused or self._pending_compare_snapshot is not None
-            )
             if should_cache_compare_state:
                 self._cache_compare_state(
                     frame_idx=frame_idx,
@@ -1003,6 +1055,13 @@ class PipelineWorker(
             if seek_frame_ready_pending:
                 self.seek_frame_ready.emit(frame_idx)
                 seek_frame_ready_pending = False
+            if (not is_live_capture) and self._display_prebuffer_target > 0:
+                self._display_prebuffer_count += 1
+                if self._display_prebuffer_count >= self._display_prebuffer_target:
+                    buffered = int(self._display_prebuffer_count)
+                    self._display_prebuffer_target = 0
+                    self._display_prebuffer_count = 0
+                    self.display_prebuffer_ready.emit(frame_idx, buffered)
 
             # Emit only what the UI actually needs
             emit_sdr_preview = self._sdr_visible and self._sdr_mpv_widget is None

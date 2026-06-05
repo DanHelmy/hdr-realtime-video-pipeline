@@ -108,8 +108,13 @@ class WindowingMixin:
         def _do(drop_frames: int):
             if not self._playing:
                 return
+            if bool(getattr(self, "_video_prebuffer_pending", False)):
+                return
             if self._worker is not None:
-                self._worker.flush_hdr_queue(drop_frames=drop_frames)
+                try:
+                    self._worker.flush_display_queues(drop_frames=drop_frames)
+                except AttributeError:
+                    self._worker.flush_hdr_queue(drop_frames=drop_frames)
             if not self._is_live_window_capture_active():
                 self._resync_audio_to_current_timeline()
 
@@ -156,6 +161,7 @@ class WindowingMixin:
         self._active_video_tab_label = new_label
         if self._playing:
             self._sync_worker_sdr_visibility()
+            self._start_periodic_relock()
         if self._playing and reactivate_sdr:
             self._schedule_sdr_reactivation_relock()
         elif self._playing:
@@ -190,6 +196,7 @@ class WindowingMixin:
         self._with_layout_freeze(_apply_pop, refresh_delay=40)
         if self._playing:
             self._sync_worker_sdr_visibility()
+            self._start_periodic_relock()
         if self._playing:
             self._relock_timeline(delay_ms=160, drop_frames=3)
 
@@ -996,6 +1003,14 @@ class WindowingMixin:
         self._periodic_relock_timer.setSingleShot(False)
         self._periodic_relock_timer.timeout.connect(self._periodic_relock_tick)
 
+    def _needs_mpv_pair_relock(self) -> bool:
+        return bool(
+            getattr(self, "_active_use_mpv", False)
+            and self._disp_hdr_mpv is not None
+            and self._disp_sdr_mpv is not None
+            and self._is_sdr_output_visible()
+        )
+
     def _periodic_relock_tick(self):
         if not self._playing:
             return
@@ -1008,9 +1023,12 @@ class WindowingMixin:
             return
         if self._startup_sync_pending:
             return
+        if bool(getattr(self, "_video_prebuffer_pending", False)):
+            return
         if not self._active_use_mpv:
             return
-        if self._audio_available and self._audio_player is not None:
+        pair_relock = self._needs_mpv_pair_relock()
+        if self._audio_available and self._audio_player is not None and not pair_relock:
             return
         # Light-touch resync to keep HDR/SDR aligned over time (video-only).
         fps = getattr(self, "_vid_fps", 30.0)
@@ -1022,36 +1040,66 @@ class WindowingMixin:
             or self._relock_hold_muted
             or self._pending_playhead_relock_on_unmute
         )
+        if self._audio_available and self._audio_player is not None and not audio_clock_ok:
+            return
         if self._audio_available and self._audio_player is not None and audio_clock_ok:
             try:
                 target_sec = float(self._audio_player.position()) / 1000.0
             except Exception:
                 target_sec = float(self._last_seek_frame) / max(fps, 1e-6)
 
-        drift_threshold_s = float(getattr(self, "_periodic_relock_drift_s", 0.045))
-        hdr_drift = None
-        sdr_drift = None
+        hdr_t = None
+        sdr_t = None
         if self._disp_hdr_mpv is not None:
             try:
                 hdr_t = self._disp_hdr_mpv.get_time_seconds()
-                if hdr_t is not None:
-                    hdr_drift = abs(float(hdr_t) - target_sec)
             except Exception:
-                hdr_drift = None
+                hdr_t = None
         if self._disp_sdr_mpv is not None:
             try:
                 sdr_t = self._disp_sdr_mpv.get_time_seconds()
-                if sdr_t is not None:
-                    sdr_drift = abs(float(sdr_t) - target_sec)
             except Exception:
-                sdr_drift = None
+                sdr_t = None
 
-        drifts = [d for d in (hdr_drift, sdr_drift) if d is not None]
-        if drifts and max(drifts) <= max(0.0, drift_threshold_s):
-            return
+        if pair_relock:
+            now_t = time.perf_counter()
+            if now_t < float(getattr(self, "_periodic_pair_relock_cooldown_until", 0.0)):
+                return
+            pair_drift = None
+            if hdr_t is not None and sdr_t is not None:
+                pair_drift = abs(float(hdr_t) - float(sdr_t))
+            pair_threshold_s = float(
+                getattr(self, "_periodic_pair_relock_drift_s", 0.180)
+            )
+            if pair_drift is None or pair_drift <= max(0.0, pair_threshold_s):
+                self._periodic_pair_relock_bad_count = 0
+                return
+            self._periodic_pair_relock_bad_count = int(
+                getattr(self, "_periodic_pair_relock_bad_count", 0)
+            ) + 1
+            if self._periodic_pair_relock_bad_count < int(
+                getattr(self, "_periodic_pair_relock_confirmations", 2)
+            ):
+                return
+            self._periodic_pair_relock_bad_count = 0
+            self._periodic_pair_relock_cooldown_until = now_t + float(
+                getattr(self, "_periodic_pair_relock_cooldown_s", 2.5)
+            )
+        else:
+            drift_threshold_s = float(getattr(self, "_periodic_relock_drift_s", 0.045))
+            drifts = [
+                abs(float(t) - target_sec) for t in (hdr_t, sdr_t) if t is not None
+            ]
+            if drifts and max(drifts) <= max(0.0, drift_threshold_s):
+                return
+            if not drifts:
+                return
 
         if self._worker is not None:
-            self._worker.flush_hdr_queue(drop_frames=1)
+            try:
+                self._worker.flush_display_queues(drop_frames=1)
+            except AttributeError:
+                self._worker.flush_hdr_queue(drop_frames=1)
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_mpv.seek_seconds(target_sec)
         if self._disp_sdr_mpv is not None:
@@ -1062,12 +1110,18 @@ class WindowingMixin:
         if self._periodic_relock_timer is None:
             return
         self._periodic_relock_timer.stop()
+        self._periodic_pair_relock_bad_count = 0
+        self._periodic_pair_relock_cooldown_until = 0.0
         if (
             _normalize_source_mode(getattr(self, "_source_mode", None))
             == SOURCE_MODE_WINDOW
         ):
             return
-        if self._audio_available and self._audio_player is not None:
+        if (
+            self._audio_available
+            and self._audio_player is not None
+            and not self._needs_mpv_pair_relock()
+        ):
             return
         period_ms = int(getattr(self, "_periodic_relock_ms", 1200))
         first_ms = int(getattr(self, "_periodic_relock_first_ms", 450))
@@ -1078,11 +1132,15 @@ class WindowingMixin:
     def _stop_periodic_relock(self):
         if self._periodic_relock_timer is not None:
             self._periodic_relock_timer.stop()
+        self._periodic_pair_relock_bad_count = 0
+        self._periodic_pair_relock_cooldown_until = 0.0
 
     def _pause_for_ui_transition(
         self, duration_ms: int | None = None, wait_for_stable: bool = True
     ):
         if not self._playing:
+            return
+        if bool(getattr(self, "_video_prebuffer_pending", False)):
             return
         if self._worker is not None and self._worker.is_paused:
             return
@@ -1115,6 +1173,24 @@ class WindowingMixin:
         def _resume():
             if not self._playing:
                 return
+            if bool(getattr(self, "_video_prebuffer_pending", False)):
+                return
+            if (
+                _normalize_source_mode(getattr(self, "_source_mode", None))
+                != SOURCE_MODE_WINDOW
+                and getattr(self, "_active_use_mpv", False)
+                and hasattr(self, "_begin_video_prebuffer")
+            ):
+                try:
+                    anchor = int(self._sync_anchor_frame())
+                except Exception:
+                    anchor = int(getattr(self, "_last_seek_frame", 0) or 0)
+                if self._begin_video_prebuffer(
+                    anchor,
+                    reason="ui-transition",
+                    resume_worker=True,
+                ):
+                    return
             if self._worker is not None and self._worker.is_paused:
                 self._worker.resume()
             if self._disp_hdr_mpv is not None:
@@ -1281,6 +1357,7 @@ class WindowingMixin:
         # Let the worker skip unnecessary copies / postprocess
         if self._playing:
             sdr_visible = self._sync_worker_sdr_visibility()
+            self._start_periodic_relock()
             if sdr_visible and self._last_sdr_frame is not None:
                 if self._disp_sdr_cpu is not None:
                     self._disp_sdr_cpu.update_frame(self._last_sdr_frame)

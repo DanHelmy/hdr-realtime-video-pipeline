@@ -8,7 +8,7 @@ import time
 import numpy as np
 import torch
 
-from gui_config import LIVE_CAPTURE_DISPLAY_FPS
+from gui_config import VIDEO_PLAYBACK_BUFFER_FRAMES
 from gui_mpv_widget import MpvHDRWidget
 from timer import prepare_playback_timing_thread, sleep_until
 
@@ -21,8 +21,8 @@ _FEEDER_GPU_RGB48 = str(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _live_present_interval_s() -> float:
-    return 1.0 / max(1.0, float(LIVE_CAPTURE_DISPLAY_FPS or 30.0))
+def _live_present_interval_s(display_fps: float) -> float:
+    return 1.0 / max(1.0, float(display_fps or 24.0))
 
 
 def _next_live_present_deadline(
@@ -88,13 +88,10 @@ def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
         and getattr(rgb, "device", None) is not None
         and rgb.device.type == "cuda"
     ):
-        rgb_u16 = (
-            rgb.to(dtype=torch.float32)
-            .mul_(65535.0)
-            .add_(0.5)
-            .to(dtype=torch.uint16)
-            .contiguous()
-        )
+        # TensorRT/PyTorch inference can hand us inference-mode tensors; avoid
+        # in-place arithmetic here or the mpv feeder thread can die mid-playback.
+        rgb_f32 = rgb.to(dtype=torch.float32)
+        rgb_u16 = ((rgb_f32 * 65535.0) + 0.5).to(dtype=torch.uint16).contiguous()
         host_tensor, host_np = _pinned_u16_host_buffer(
             host_state,
             tuple(int(v) for v in rgb_u16.shape),
@@ -144,6 +141,31 @@ def _bgr_to_rgb48_bytes(frame: np.ndarray, host_state: dict) -> bytes:
     return arr.tobytes()
 
 
+def _bgr_to_sdr_mpv_bytes(frame: np.ndarray, host_state: dict, raw_format: str):
+    fmt = str(raw_format or "rgb48le").strip().lower()
+    if fmt == "rgb48le":
+        return _bgr_to_rgb48_bytes(frame, host_state)
+
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("Expected HxWx3 frame.")
+
+    if frame.dtype == np.uint8:
+        bgr8 = frame
+    elif frame.dtype == np.uint16:
+        bgr8 = np.right_shift(frame, 8).astype(np.uint8, copy=False)
+    else:
+        src = frame.astype(np.float32, copy=False)
+        if src.max(initial=0.0) <= 1.0:
+            src = src * 255.0
+        bgr8 = np.clip(src, 0.0, 255.0).astype(np.uint8)
+
+    if fmt == "bgr24":
+        return memoryview(np.ascontiguousarray(bgr8))
+    if fmt == "rgb24":
+        return memoryview(np.ascontiguousarray(bgr8[:, :, ::-1]))
+    return _bgr_to_rgb48_bytes(frame, host_state)
+
+
 class PipelineWorkerFeedersMixin:
     """HDR/SDR mpv feeder thread helpers for PipelineWorker."""
 
@@ -152,6 +174,8 @@ class PipelineWorkerFeedersMixin:
         hdr_q: _queue.Queue,
         mpv_widget: MpvHDRWidget,
         live_smooth_cadence: bool,
+        display_fps: float,
+        preserve_order: bool = False,
     ):
         """Drain HDR queue, convert tensors to RGB48LE, and feed mpv."""
         prepare_playback_timing_thread()
@@ -159,7 +183,7 @@ class PipelineWorkerFeedersMixin:
             no_item = object()
             next_present_t = 0.0
             latest_rgb48_bytes: bytes | None = None
-            present_interval_s = _live_present_interval_s()
+            present_interval_s = _live_present_interval_s(display_fps)
             rgb48_host_state: dict = {}
             while True:
                 now = time.perf_counter()
@@ -252,15 +276,16 @@ class PipelineWorkerFeedersMixin:
                 continue
             if item is None:
                 break
-            while True:
-                try:
-                    newer = hdr_q.get_nowait()
-                    if newer is None:
-                        item = None
+            if not preserve_order:
+                while True:
+                    try:
+                        newer = hdr_q.get_nowait()
+                        if newer is None:
+                            item = None
+                            break
+                        item = newer
+                    except _queue.Empty:
                         break
-                    item = newer
-                except _queue.Empty:
-                    break
             if item is None:
                 break
             ready_event = None
@@ -287,19 +312,22 @@ class PipelineWorkerFeedersMixin:
         sdr_q: _queue.Queue,
         mpv_widget: MpvHDRWidget,
         live_smooth_cadence: bool,
+        display_fps: float,
+        preserve_order: bool = False,
     ):
         """Drain SDR queue, convert BGR8 to RGB48LE, and feed mpv."""
         prepare_playback_timing_thread()
+        raw_format = str(getattr(mpv_widget, "raw_video_format", "rgb48le") or "rgb48le")
         if live_smooth_cadence:
             no_item = object()
             next_present_t = 0.0
-            latest_rgb48_bytes: bytes | None = None
-            present_interval_s = _live_present_interval_s()
+            latest_sdr_bytes = None
+            present_interval_s = _live_present_interval_s(display_fps)
             rgb48_host_state: dict = {}
             while True:
                 now = time.perf_counter()
                 wait_timeout = 0.2
-                if latest_rgb48_bytes is not None and next_present_t > 0.0:
+                if latest_sdr_bytes is not None and next_present_t > 0.0:
                     wait_timeout = max(
                         0.0,
                         min(_LIVE_SMOOTH_MAX_QUEUE_WAIT_S, next_present_t - now),
@@ -307,7 +335,7 @@ class PipelineWorkerFeedersMixin:
 
                 item = no_item
                 try:
-                    if latest_rgb48_bytes is not None and next_present_t > 0.0:
+                    if latest_sdr_bytes is not None and next_present_t > 0.0:
                         item = _queue_get_until(
                             sdr_q,
                             now + wait_timeout,
@@ -341,12 +369,13 @@ class PipelineWorkerFeedersMixin:
                         frame = item
 
                     try:
-                        latest_rgb48_bytes = _bgr_to_rgb48_bytes(
+                        latest_sdr_bytes = _bgr_to_sdr_mpv_bytes(
                             frame,
                             rgb48_host_state,
+                            raw_format,
                         )
                     except Exception:
-                        latest_rgb48_bytes = None
+                        latest_sdr_bytes = None
 
                     try:
                         item_present_t = float(source_t) if source_t is not None else 0.0
@@ -357,7 +386,7 @@ class PipelineWorkerFeedersMixin:
                     elif next_present_t <= 0.0:
                         next_present_t = time.perf_counter()
 
-                if latest_rgb48_bytes is None:
+                if latest_sdr_bytes is None:
                     continue
 
                 now = time.perf_counter()
@@ -366,7 +395,7 @@ class PipelineWorkerFeedersMixin:
                 if now < next_present_t:
                     continue
 
-                mpv_widget.feed_frame(latest_rgb48_bytes)
+                mpv_widget.feed_frame(latest_sdr_bytes)
                 next_present_t = _next_live_present_deadline(
                     next_present_t,
                     now,
@@ -382,15 +411,16 @@ class PipelineWorkerFeedersMixin:
                 continue
             if item is None:
                 break
-            while True:
-                try:
-                    newer = sdr_q.get_nowait()
-                    if newer is None:
-                        item = None
+            if not preserve_order:
+                while True:
+                    try:
+                        newer = sdr_q.get_nowait()
+                        if newer is None:
+                            item = None
+                            break
+                        item = newer
+                    except _queue.Empty:
                         break
-                    item = newer
-                except _queue.Empty:
-                    break
             if item is None:
                 break
             if isinstance(item, tuple) and len(item) == 2:
@@ -398,24 +428,38 @@ class PipelineWorkerFeedersMixin:
             else:
                 present_t, frame = None, item
             try:
-                rgb48_bytes = _bgr_to_rgb48_bytes(
+                sdr_bytes = _bgr_to_sdr_mpv_bytes(
                     frame,
                     rgb48_host_state,
+                    raw_format,
                 )
                 if present_t is not None:
                     now = time.perf_counter()
                     if now < present_t:
                         sleep_until(present_t)
-                mpv_widget.feed_frame(rgb48_bytes)
+                mpv_widget.feed_frame(sdr_bytes)
             except Exception:
                 pass
 
     def _start_hdr_feeder(self):
         live_smooth_cadence = bool(getattr(self, "_capture_target", None))
-        self._hdr_queue = _queue.Queue(maxsize=1)
+        buffer_frames = (
+            1
+            if live_smooth_cadence
+            else max(1, int(getattr(self, "_video_playback_buffer_frames", VIDEO_PLAYBACK_BUFFER_FRAMES)))
+        )
+        preserve_order = bool((not live_smooth_cadence) and buffer_frames > 1)
+        self._hdr_queue = _queue.Queue(maxsize=buffer_frames)
+        display_fps = float(getattr(self, "_live_display_fps", 24.0) or 24.0)
         self._hdr_thread = threading.Thread(
             target=self._hdr_feeder_fn,
-            args=(self._hdr_queue, self._mpv_widget, live_smooth_cadence),
+            args=(
+                self._hdr_queue,
+                self._mpv_widget,
+                live_smooth_cadence,
+                display_fps,
+                preserve_order,
+            ),
             daemon=True,
         )
         self._hdr_thread.start()
@@ -438,13 +482,30 @@ class PipelineWorkerFeedersMixin:
         self._hdr_thread = None
 
     def _start_sdr_feeder(self):
-        if self._sdr_mpv_widget is None or self._sdr_queue is not None:
+        if (
+            self._sdr_mpv_widget is None
+            or self._sdr_queue is not None
+            or not bool(getattr(self, "_sdr_visible", True))
+        ):
             return
         live_smooth_cadence = bool(getattr(self, "_capture_target", None))
-        self._sdr_queue = _queue.Queue(maxsize=1)
+        buffer_frames = (
+            1
+            if live_smooth_cadence
+            else max(1, int(getattr(self, "_video_playback_buffer_frames", VIDEO_PLAYBACK_BUFFER_FRAMES)))
+        )
+        preserve_order = bool((not live_smooth_cadence) and buffer_frames > 1)
+        self._sdr_queue = _queue.Queue(maxsize=buffer_frames)
+        display_fps = float(getattr(self, "_live_display_fps", 24.0) or 24.0)
         self._sdr_thread = threading.Thread(
             target=self._sdr_feeder_fn,
-            args=(self._sdr_queue, self._sdr_mpv_widget, live_smooth_cadence),
+            args=(
+                self._sdr_queue,
+                self._sdr_mpv_widget,
+                live_smooth_cadence,
+                display_fps,
+                preserve_order,
+            ),
             daemon=True,
         )
         self._sdr_thread.start()

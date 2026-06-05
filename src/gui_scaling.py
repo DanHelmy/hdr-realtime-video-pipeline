@@ -33,6 +33,12 @@ SSIM_SUPERRES_SHADER_URL = (
     "2364ffa6e81540f29cb7ab4c9bc05b6b/raw/"
     "15d93440d0a24fc4b8770070be6a9fa2af6f200b/SSimSuperRes.glsl"
 )
+SSIM_DOWNSCALER_SHADER_PATH = os.path.join(
+    _ROOT,
+    "assets",
+    "shaders",
+    "SSimDownscaler.glsl",
+)
 UPSCALER_CHOICES = ["EWA LanczosSharp", "FSR", "SSimSuperRes"]
 DEFAULT_UPSCALER = "SSimSuperRes"
 
@@ -53,10 +59,8 @@ def _fit_with_aspect(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[in
 
 
 def _limited_playback_fps(src_fps: float) -> float:
-    """Limit playback FPS by halving high-FPS sources (e.g., 50->25, 60->30)."""
+    """Return the source FPS; normal video playback is no longer capped at 30."""
     fps = float(src_fps) if src_fps and src_fps > 0 else 30.0
-    while fps > 30.0:
-        fps *= 0.5
     return max(1.0, fps)
 
 
@@ -210,6 +214,11 @@ def _ensure_ssim_superres_shader() -> bool:
     except Exception as exc:
         print(f"[ssim] download failed: {exc}")
     return os.path.isfile(SSIM_SUPERRES_SHADER_PATH)
+
+
+def _ensure_ssim_downscaler_shader() -> bool:
+    """Ensure the local SSimDownscaler shader exists on disk."""
+    return os.path.isfile(SSIM_DOWNSCALER_SHADER_PATH)
 
 
 def _normalize_shader_paths(paths: list[str]) -> list[str]:

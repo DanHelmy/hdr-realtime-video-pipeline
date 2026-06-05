@@ -113,23 +113,23 @@ def _weight(name):
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
-        _weight("Ensemble_AGCM_LE.pth"),
-        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
     ),
     "fp32": (
         "fp32",
-        _weight("Ensemble_AGCM_LE.pth"),
-        _weight("Ensemble_AGCM_LE.pth"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
     ),
     "int8-mixed": (
         "int8-mixed",
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
-        _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
+        _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
     ),
     "int8-full": (
         "int8-full",
-        _weight("Ensemble_AGCM_LE_int8_full.pt"),
-        _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+        _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
+        _weight("pytorch_int8/hr/HR_int8_full.pt"),
     ),
 }
 
@@ -499,7 +499,7 @@ def main():
     parser.add_argument(
         "--hg-weights",
         default=None,
-        help="Path to HG_weights.pth (overrides default path)",
+        help="Path to original/HG.pt or distilled HG weights (overrides default path)",
     )
     parser.add_argument(
         "--clear-cache",
@@ -627,6 +627,12 @@ def main():
     if not os.path.isfile(model_path):
         print(f"ERROR: Model weights not found: {model_path}", file=sys.stderr)
         sys.exit(1)
+    if use_hg and not args.hg_weights:
+        default_hg_weights = ""
+        if args.precision in {"fp16", "fp32"}:
+            default_hg_weights = _weight("distilled/hg/HG_qfriendly_directh16_fp32.pt")
+        if default_hg_weights and os.path.isfile(default_hg_weights):
+            args.hg_weights = default_hg_weights
     if args.hg_weights and not os.path.isfile(args.hg_weights):
         print(f"ERROR: HG weights not found: {args.hg_weights}", file=sys.stderr)
         sys.exit(1)

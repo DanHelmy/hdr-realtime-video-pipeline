@@ -105,6 +105,7 @@ class AutoMuteMixin:
             or self._worker.is_paused
             or self._startup_sync_pending
             or self._startup_audio_gate_active
+            or bool(getattr(self, "_video_prebuffer_pending", False))
         ):
             return False
 

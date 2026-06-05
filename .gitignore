@@ -27,18 +27,29 @@ benchmark_results_*.csv
 int8_proof*.csv
 *.txt
 logs/
+outputs/
+
+# Keep quantization layout configs tracked despite the broad text ignore.
+!configs/
+!configs/qat_layouts/
+!configs/qat_layouts/*.txt
 
 # Generated model/runtime caches
 src/models/compile_cache/
 src/models/engines/
+src/models/tensorrt_calibration/
 src/models/onnx/
+src/models/weights/experiments/
 src/models/weights/tensorrt_sources/
 *.engine
 
 # Benchmark scripts (development only, not part of pipeline)
 benchmark_*.py
+tmp/
 
 # Build/test caches
+__pycache__/
+*.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -51,21 +62,33 @@ benchmark_*.py
 # Large model artifacts (prefer release assets or Git LFS)
 *.onnx
 *.pt
-src/models/weights/HG_weights.pth
-# Pipeline weights — tracked
-!src/models/weights/Ensemble_AGCM_LE.pth
-!src/models/weights/Ensemble_AGCM_LE_int8_full.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_full_nohg.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_mixed.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_mixed_nohg.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_full_qat.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_full_qat_nohg.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt
-!src/models/weights/Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt
+src/models/weights/original/HG.pt
+# Pipeline weights - tracked
+!src/models/weights/
+!src/models/weights/original/
+!src/models/weights/original/HR.pt
+!src/models/weights/original/pytorch_int8/
+!src/models/weights/original/pytorch_int8/hr/
+!src/models/weights/original/pytorch_int8/hr/*.pt
+!src/models/weights/original/pytorch_int8/hg/
+!src/models/weights/original/pytorch_int8/hg/*.pt
+!src/models/weights/original/tensorrt/
+!src/models/weights/original/tensorrt/hr/
+!src/models/weights/original/tensorrt/hr/*.pt
+!src/models/weights/original/tensorrt/hr_hg/
+!src/models/weights/original/tensorrt/hr_hg/*.pt
+!src/models/weights/distilled/
+!src/models/weights/distilled/hr/
+!src/models/weights/distilled/hr/*.pt
+!src/models/weights/distilled/hr_hg/
+!src/models/weights/distilled/hr_hg/*.pt
+!src/models/weights/distilled/hg/
+!src/models/weights/distilled/hg/*.pt
+!src/models/weights/pytorch_int8/
+!src/models/weights/pytorch_int8/hr/
+!src/models/weights/pytorch_int8/hr/*.pt
+!src/models/weights/pytorch_int8/hg/
+!src/models/weights/pytorch_int8/hg/*.pt
 
 # Calibration / training dataset (download separately)
 dataset/

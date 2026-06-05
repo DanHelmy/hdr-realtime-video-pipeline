@@ -242,7 +242,7 @@ def _inspect_engine(path: Path, output_dir: Path | None = None, tag: str = "engi
         name = str(layer.get("Name") or layer.get("name") or "")
         text = json.dumps(layer, sort_keys=True)
         layer_types[layer_type or "<unknown>"] += 1
-        for token in ("Int8", "Half", "Float", "FP8", "BF16"):
+        for token in ("Int8", "Half", "Float", "BF16"):
             if token in text:
                 precision_tokens[token] += 1
         inputs = [
@@ -257,7 +257,7 @@ def _inspect_engine(path: Path, output_dir: Path | None = None, tag: str = "engi
         ]
         for dtype in outputs:
             output_dtypes[dtype] += 1
-            for token in ("Int8", "Half", "Float", "FP8", "BF16"):
+            for token in ("Int8", "Half", "Float", "BF16"):
                 if token in dtype:
                     output_type_tokens[token] += 1
         if "Conv" in layer_type:

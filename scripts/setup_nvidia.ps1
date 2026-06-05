@@ -200,9 +200,9 @@ except Exception as exc:
 
 try:
     import tensorrt_libs
-    print("[setup-nvidia] TensorRT CUDA 12 libraries import OK")
+    print("[setup-nvidia] TensorRT CUDA libraries import OK")
 except Exception as exc:
-    print(f"[setup-nvidia] WARNING: TensorRT CUDA 12 libraries import failed: {exc}")
+    print(f"[setup-nvidia] WARNING: TensorRT CUDA libraries import failed: {exc}")
     ok = False
 
 try:
@@ -223,39 +223,6 @@ sys.exit(0 if ok else 10)
         return ($LASTEXITCODE -eq 0)
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Ensure-TensorRTSourceCheckpoints([string]$PythonExe, [string]$RepoRoot) {
-    $generator = Join-Path $RepoRoot "scripts\quantize\make_tensorrt_source_checkpoints.py"
-    $weightsDir = Join-Path $RepoRoot "src\models\weights"
-    $sourceDir = Join-Path $weightsDir "tensorrt_sources"
-
-    if (-not (Test-Path $generator)) {
-        Write-Warning "TensorRT source checkpoint generator not found: $generator"
-        return
-    }
-    if (-not (Test-Path $weightsDir)) {
-        Write-Warning "Weights directory not found: $weightsDir"
-        return
-    }
-
-    $checkpoints = @(
-        Get-ChildItem -LiteralPath $weightsDir -Filter "Ensemble_AGCM_LE_int8*.pt" -File |
-            Sort-Object Name |
-            ForEach-Object { $_.FullName }
-    )
-    if ($checkpoints.Count -eq 0) {
-        Write-Warning "No compressed INT8 checkpoints found under $weightsDir"
-        return
-    }
-
-    Write-Step "Checking TensorRT source checkpoints..."
-    Write-Host "[setup-nvidia] Source folder: $sourceDir"
-    Write-Host "[setup-nvidia] Stale or missing files will be regenerated locally."
-    & $PythonExe $generator @checkpoints --activation-quant source
-    if ($LASTEXITCODE -ne 0) {
-        throw "TensorRT source checkpoint check/generation failed with exit code $LASTEXITCODE"
     }
 }
 
@@ -294,8 +261,6 @@ Write-Step "Installing NVIDIA dependencies..."
 if (-not $SkipPipUpgrade) {
     & $venvPython -m pip install --upgrade pip setuptools wheel
 }
-Install-TensorRTCu12LibsWheel -PythonExe $venvPython
-Install-TorchCu126Wheel -PythonExe $venvPython
 & $venvPython -m pip install --prefer-binary -r $reqFile
 
 Write-Step "Checking NVIDIA TensorRT runtime..."
@@ -315,8 +280,6 @@ If playback fails to build an engine:
      Toolkit / TensorRT runtime from NVIDIA, then re-run setup.bat.
 "@
 }
-
-Ensure-TensorRTSourceCheckpoints -PythonExe $venvPython -RepoRoot $repoRoot
 
 Write-Step "Setup complete."
 Write-Host "[setup-nvidia] Python: $pyMm"

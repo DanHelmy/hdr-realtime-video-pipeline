@@ -9,7 +9,7 @@ import threading
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 
-from gui_config import LIVE_CAPTURE_MPV_BUFFER_FRAMES
+from gui_config import LIVE_CAPTURE_MPV_BUFFER_FRAMES, VIDEO_PLAYBACK_BUFFER_FRAMES
 from timer import prepare_playback_timing_thread
 
 _MPV_TONE_MAPPING = "spline"
@@ -234,6 +234,26 @@ def _without_display_quality_options(kwargs: dict) -> dict:
     return _without_dither_options(_without_deband_options(kwargs))
 
 
+def _normalize_raw_video_format(value: str | None, *, hdr: bool) -> str:
+    text = str(value or "").strip().lower().replace("-", "")
+    if not text:
+        return "rgb48le" if hdr else "bgr24"
+    aliases = {
+        "rgb48": "rgb48le",
+        "rgb48le": "rgb48le",
+        "rgb24": "rgb24",
+        "bgr24": "bgr24",
+    }
+    return aliases.get(text, "rgb48le" if hdr else "bgr24")
+
+
+def _raw_video_bytes_per_pixel(mp_format: str) -> int:
+    fmt = str(mp_format or "").strip().lower()
+    if fmt in {"rgb24", "bgr24"}:
+        return 3
+    return 6
+
+
 def _mpv_tone_mapping_options() -> dict:
     return {
         "tone_mapping": _MPV_TONE_MAPPING,
@@ -244,8 +264,9 @@ def _mpv_tone_mapping_options() -> dict:
 class MpvHDRWidget(QWidget):
     """QWidget that embeds an mpv player for real-time HDR frame display.
 
-    Frames are fed as raw RGB48LE over a Windows named pipe to avoid GIL-heavy
-    per-frame Python read callbacks.
+    Frames are fed as raw video over a Windows named pipe to avoid GIL-heavy
+    per-frame Python read callbacks. HDR panes use RGB48LE; SDR panes can use
+    BGR24 to avoid unnecessary conversion and pipe bandwidth.
     """
 
     hdr_info_ready = pyqtSignal(dict)  # emitted once VO params are populated
@@ -264,6 +285,8 @@ class MpvHDRWidget(QWidget):
         fsr_shader_path: str,
         ssim_superres_shader_path: str,
         filmgrain_shader_path: str,
+        ensure_ssim_downscaler_shader=None,
+        ssim_downscaler_shader_path: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -276,6 +299,7 @@ class MpvHDRWidget(QWidget):
         self._pipe_handle = None
         self._feeder: threading.Thread | None = None
         self._queue: _queue.Queue | None = None
+        self._feed_generation_ref: dict[str, int] = {"value": 0}
         self._shutdown = threading.Event()
         self._fps = 30.0
         self._force_hdr_metadata = True
@@ -287,16 +311,22 @@ class MpvHDRWidget(QWidget):
         self._active_vo: str = "gpu-next"
         self._target_colorspace_hint: str = "no"
         self._requested_gpu_api: str = "d3d11"
+        self._raw_video_format: str = "rgb48le"
+        self._preserve_feed_order = False
 
         self._mpv_lib = mpv_lib
         self._mpv_diag = bool(mpv_diag)
         self._normalize_shader_paths = normalize_shader_paths
         self._ensure_fsr_shader = ensure_fsr_shader
         self._ensure_ssim_superres_shader = ensure_ssim_superres_shader
+        self._ensure_ssim_downscaler_shader = (
+            ensure_ssim_downscaler_shader or (lambda: False)
+        )
         self._ensure_filmgrain_shader = ensure_filmgrain_shader
         self._best_mpv_scale = str(best_mpv_scale)
         self._fsr_shader_path = str(fsr_shader_path)
         self._ssim_superres_shader_path = str(ssim_superres_shader_path)
+        self._ssim_downscaler_shader_path = str(ssim_downscaler_shader_path)
         self._filmgrain_shader_path = str(filmgrain_shader_path)
 
     @staticmethod
@@ -319,8 +349,11 @@ class MpvHDRWidget(QWidget):
         use_fsr: bool,
         use_ssim: bool,
         use_film_grain: bool,
+        use_ssim_downscale: bool = True,
     ) -> list[str]:
         shader_paths = []
+        if use_ssim_downscale:
+            shader_paths.append(self._ssim_downscaler_shader_path)
         if use_fsr:
             shader_paths.append(self._fsr_shader_path)
         if use_ssim:
@@ -598,6 +631,7 @@ class MpvHDRWidget(QWidget):
         pipe_name: str,
         frame_queue: _queue.Queue,
         shutdown: threading.Event,
+        feed_generation_ref: dict[str, int] | None = None,
         ready_event: threading.Event | None = None,
     ):
         import ctypes
@@ -665,6 +699,24 @@ class MpvHDRWidget(QWidget):
                 continue
             if item is None:
                 break
+            frame_generation = 0
+            if (
+                isinstance(item, tuple)
+                and len(item) == 3
+                and item[0] == "frame"
+            ):
+                try:
+                    frame_generation = int(item[1])
+                except Exception:
+                    frame_generation = 0
+                item = item[2]
+            current_generation = (
+                int(feed_generation_ref.get("value", 0))
+                if feed_generation_ref is not None
+                else 0
+            )
+            if frame_generation < current_generation:
+                continue
             ptr, buf_len, keepalive = _buffer_ptr(item)
             if not ptr or buf_len <= 0:
                 continue
@@ -707,19 +759,26 @@ class MpvHDRWidget(QWidget):
         vsync_timed: bool = False,
         sdr_transfer: str = "bt1886",
         live_capture: bool | None = None,
+        raw_format: str | None = None,
     ) -> bool:
         self.stop_playback()
         self._shutdown.clear()
+        self._feed_generation_ref = {"value": 0}
         self._fps = float(fps) if fps and fps > 0 else 30.0
         self._force_hdr_metadata = bool(force_hdr_metadata)
         self._sdr_transfer = self._normalize_sdr_transfer(sdr_transfer)
+        self._raw_video_format = _normalize_raw_video_format(
+            raw_format,
+            hdr=self._force_hdr_metadata,
+        )
         vsync_timed = bool(vsync_timed)
         live_capture = bool(vsync_timed if live_capture is None else live_capture)
         buffer_frames = (
             max(1, int(LIVE_CAPTURE_MPV_BUFFER_FRAMES))
             if vsync_timed
-            else 1
+            else max(1, int(VIDEO_PLAYBACK_BUFFER_FRAMES))
         )
+        self._preserve_feed_order = bool((not live_capture) and buffer_frames > 1)
         self._queue = _queue.Queue(maxsize=buffer_frames)
         self._diag_enabled = bool(self._mpv_diag and self._force_hdr_metadata)
         self._last_scale_error = None
@@ -746,6 +805,7 @@ class MpvHDRWidget(QWidget):
             "buffer_frames": int(buffer_frames),
             "sdr_transfer": self._sdr_transfer,
             "live_capture": live_capture,
+            "raw_format": self._raw_video_format,
         }
 
         pipe_id = id(self)
@@ -754,7 +814,9 @@ class MpvHDRWidget(QWidget):
         wid = str(int(self.winId()))
         pipe_url = f"lavf://file:{self._pipe_name}"
 
-        frame_bytes = width * height * 6
+        frame_bytes = width * height * _raw_video_bytes_per_pixel(
+            self._raw_video_format
+        )
         max_demux = str(frame_bytes * max(1, int(buffer_frames)))
         readahead_secs = 0.0
         if vsync_timed:
@@ -783,6 +845,10 @@ class MpvHDRWidget(QWidget):
             print("[mpv] film grain shader unavailable (download failed).")
             if self._last_playback_cfg is not None:
                 self._last_playback_cfg["film_grain"] = False
+        use_ssim_downscale = bool(
+            _env_bool("HDRTVNET_MPV_SSIM_DOWNSCALER", True)
+            and self._ensure_ssim_downscaler_shader()
+        )
 
         # Use gpu-next + colorspace hint so mpv can adapt target output while
         # dragging between HDR/SDR displays (with a compatibility fallback).
@@ -798,7 +864,7 @@ class MpvHDRWidget(QWidget):
             demuxer="rawvideo",
             demuxer_rawvideo_w=str(width),
             demuxer_rawvideo_h=str(height),
-            demuxer_rawvideo_mp_format="rgb48le",
+            demuxer_rawvideo_mp_format=self._raw_video_format,
             demuxer_rawvideo_fps=str(self._fps),
             untimed=(not vsync_timed),
             audio="auto",
@@ -830,6 +896,7 @@ class MpvHDRWidget(QWidget):
         shader_paths = self._build_shader_paths(
             use_fsr=use_fsr,
             use_ssim=use_ssim,
+            use_ssim_downscale=use_ssim_downscale,
             use_film_grain=use_film_grain,
         )
         if self._force_hdr_metadata:
@@ -939,7 +1006,13 @@ class MpvHDRWidget(QWidget):
         pipe_ready = threading.Event()
         self._feeder = threading.Thread(
             target=self._pipe_feeder_fn,
-            args=(self._pipe_name, self._queue, self._shutdown, pipe_ready),
+            args=(
+                self._pipe_name,
+                self._queue,
+                self._shutdown,
+                self._feed_generation_ref,
+                pipe_ready,
+            ),
             daemon=True,
         )
         self._feeder.start()
@@ -1020,17 +1093,55 @@ class MpvHDRWidget(QWidget):
         q = self._queue
         if q is None:
             return
+        item = (
+            "frame",
+            int(self._feed_generation_ref.get("value", 0)),
+            rgb48_bytes,
+        )
+        if bool(getattr(self, "_preserve_feed_order", False)):
+            while not self._shutdown.is_set():
+                try:
+                    q.put(item, timeout=0.05)
+                    return
+                except _queue.Full:
+                    continue
+            return
         try:
-            q.put_nowait(rgb48_bytes)
+            q.put_nowait(item)
         except _queue.Full:
             try:
                 q.get_nowait()
             except _queue.Empty:
                 pass
             try:
-                q.put_nowait(rgb48_bytes)
+                q.put_nowait(item)
             except _queue.Full:
                 pass
+
+    def flush_frames(self, *, drop_mpv_buffers: bool = True):
+        """Discard queued raw frames and ask mpv to forget buffered video."""
+        try:
+            self._feed_generation_ref["value"] = (
+                int(self._feed_generation_ref.get("value", 0)) + 1
+            )
+        except Exception:
+            self._feed_generation_ref = {"value": 1}
+        q = self._queue
+        if q is not None:
+            try:
+                while True:
+                    q.get_nowait()
+            except _queue.Empty:
+                pass
+        if drop_mpv_buffers and self._player is not None:
+            try:
+                self._player.command("drop-buffers")
+            except Exception:
+                pass
+
+    @property
+    def raw_video_format(self) -> str:
+        return str(self._raw_video_format or "rgb48le")
 
     def set_paused(self, paused: bool):
         p = self._player
@@ -1131,9 +1242,14 @@ class MpvHDRWidget(QWidget):
             use_film_grain = bool(film_on and self._ensure_filmgrain_shader())
             if film_on and not use_film_grain:
                 print("[mpv] film grain shader unavailable (download failed).")
+            use_ssim_downscale = bool(
+                _env_bool("HDRTVNET_MPV_SSIM_DOWNSCALER", True)
+                and self._ensure_ssim_downscaler_shader()
+            )
             shader_paths = self._build_shader_paths(
                 use_fsr=use_fsr,
                 use_ssim=use_ssim,
+                use_ssim_downscale=use_ssim_downscale,
                 use_film_grain=use_film_grain,
             )
             if not self._set_shader_chain(shader_paths):
@@ -1195,9 +1311,14 @@ class MpvHDRWidget(QWidget):
             use_ssim = (
                 k == "ssim_superres" and self._ensure_ssim_superres_shader()
             )
+        use_ssim_downscale = bool(
+            _env_bool("HDRTVNET_MPV_SSIM_DOWNSCALER", True)
+            and self._ensure_ssim_downscaler_shader()
+        )
         shader_paths = self._build_shader_paths(
             use_fsr=use_fsr,
             use_ssim=use_ssim,
+            use_ssim_downscale=use_ssim_downscale,
             use_film_grain=use_film,
         )
         try:
@@ -1234,6 +1355,12 @@ class MpvHDRWidget(QWidget):
 
     def stop_playback(self, wait_timeout: float = 3.0):
         self._shutdown.set()
+        try:
+            self._feed_generation_ref["value"] = (
+                int(self._feed_generation_ref.get("value", 0)) + 1
+            )
+        except Exception:
+            self._feed_generation_ref = {"value": 1}
         q = self._queue
         if q is not None:
             try:
@@ -1270,6 +1397,102 @@ class MpvHDRWidget(QWidget):
             "vsync_timed",
             "sdr_transfer",
             "live_capture",
+            "raw_format",
         }
         safe_cfg = {k: v for k, v in cfg.items() if k in allowed}
         self.start_playback(**safe_cfg)
+
+
+class MpvFilePreviewWidget(QWidget):
+    """Paused mpv file player used for exact timeline scrub previews."""
+
+    runtime_notice = pyqtSignal(str)
+
+    def __init__(self, *, mpv_lib, mpv_diag: bool = False, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(240, 135)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setProperty("videoSurface", True)
+        self._mpv_lib = mpv_lib
+        self._diag_enabled = bool(mpv_diag)
+        self._player = None
+        self._path = ""
+        self._last_error = ""
+
+    def start_preview(self, path: str, start_sec: float = 0.0) -> bool:
+        path = str(path or "")
+        if not os.path.isfile(path):
+            return False
+        if self._player is not None and self._path == path:
+            self.seek_seconds(start_sec)
+            return True
+        self.stop_preview()
+        wid = str(int(self.winId()))
+        try:
+            player = self._mpv_lib.MPV(
+                wid=wid,
+                vo="gpu-next",
+                gpu_api="d3d11",
+                hwdec="auto",
+                audio="no",
+                pause=True,
+                keep_open="yes",
+                osc="no",
+                input_default_bindings="no",
+                input_vo_keyboard="no",
+                hr_seek="yes",
+                hr_seek_framedrop="no",
+                cache="yes",
+                demuxer_thread="yes",
+            )
+            self._player = player
+            self._path = path
+            player.play(path)
+            try:
+                player.pause = True
+            except Exception:
+                pass
+            self.seek_seconds(start_sec)
+            return True
+        except Exception as exc:
+            self._last_error = str(exc)
+            if self._diag_enabled:
+                print(f"[mpv preview] startup failed: {exc}")
+            try:
+                self.runtime_notice.emit(f"mpv scrub preview unavailable: {exc}")
+            except Exception:
+                pass
+            self.stop_preview()
+            return False
+
+    def seek_seconds(self, sec: float) -> bool:
+        p = self._player
+        if p is None:
+            return False
+        target = max(0.0, float(sec or 0.0))
+        try:
+            p.pause = True
+        except Exception:
+            pass
+        try:
+            p.command("seek", target, "absolute+exact")
+            return True
+        except Exception:
+            try:
+                p.command("seek", target, "absolute")
+                return True
+            except Exception as exc:
+                self._last_error = str(exc)
+                return False
+
+    def stop_preview(self):
+        p = self._player
+        self._player = None
+        self._path = ""
+        if p is None:
+            return
+        try:
+            p.terminate()
+        except Exception:
+            pass

@@ -37,6 +37,9 @@ class LifecycleMixin:
         self._startup_sync_pending = False
         self._startup_frame_relock_pending = False
         self._startup_frame_relock_token += 1
+        self._video_prebuffer_pending = False
+        self._scrub_preview_active = False
+        self._scrub_preview_hold_until_prebuffer = False
         self._auto_muted_low_fps = False
         self._scrub_muted = False
         self._live_audio_active = False
@@ -94,6 +97,8 @@ class LifecycleMixin:
             self._compile_dlg.close()
             self._compile_dlg.deleteLater()
             self._compile_dlg = None
+        if hasattr(self, "_set_compile_interaction_locked"):
+            self._set_compile_interaction_locked(False)
         self._btn_play.setEnabled(self._current_source_available())
         self._btn_pause.setEnabled(False)
         self._btn_stop.setEnabled(False)
@@ -113,6 +118,8 @@ class LifecycleMixin:
         self._btn_apply_settings.setEnabled(False)
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
+        if hasattr(self, "_stop_scrub_preview"):
+            self._stop_scrub_preview()
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
         self._seek_slider.setEnabled(False)
@@ -166,9 +173,24 @@ class LifecycleMixin:
 
     def closeEvent(self, event):
         from browser_tab_bridge import close_browser_tab_bridge
+        from gui_compile_dialogs import _kill_process_tree
 
         self._ui_closing = True
         self._save_user_settings()
+        process = getattr(self, "_original_tensorrt_source_process", None)
+        if process is not None:
+            try:
+                _kill_process_tree(process)
+            except Exception:
+                pass
+            self._original_tensorrt_source_process = None
+        dlg = getattr(self, "_original_tensorrt_source_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            self._original_tensorrt_source_dlg = None
         if hasattr(self, "_cancel_hdr_ground_truth_validation"):
             self._cancel_hdr_ground_truth_validation(wait=True, invalidate=True)
         if self._export_worker is not None:
@@ -211,6 +233,8 @@ class LifecycleMixin:
             self._disp_hdr_mpv.stop_playback(wait_timeout=0.5)
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.stop_playback(wait_timeout=0.5)
+        if hasattr(self, "_stop_scrub_preview"):
+            self._stop_scrub_preview()
         self._stop_audio_playback()
         if self._playing:
             self._worker.stop()

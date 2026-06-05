@@ -35,7 +35,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gui_config import PRECISIONS, _available_precision_keys, _select_model_path
+from gui_config import (
+    PRECISIONS,
+    _available_precision_keys,
+    _select_hg_weights_path,
+    _select_model_path,
+    _select_tensorrt_model_path,
+)
 from gui_media_probe import _probe_hdr_input, _probe_video_timing_info
 from gui_output_capture import capture_output_to_gui
 from gui_pipeline_worker_frame_processing import PipelineWorkerFrameProcessingMixin
@@ -317,6 +323,7 @@ class ExportOptionsDialog(QDialog):
         advanced_layout.addStretch(1)
         if _IS_NVIDIA:
             perf_group.hide()
+            int8_group.hide()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -543,6 +550,8 @@ class ExportOptionsDialog(QDialog):
         self._txt_output.setText(self._default_output_path())
 
     def _selected_predequantize_mode(self) -> str:
+        if _IS_NVIDIA:
+            return "off"
         value = self._cmb_predequantize.currentData()
         if value in {"auto", "on", "off"}:
             return str(value)
@@ -823,10 +832,19 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
             else:
                 self.progress.emit(0, "Loading export model ...")
             if _IS_NVIDIA:
-                mode_name = f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}"
-                trt_predeq = _resolve_predequantize_arg(
-                    str(self._config.predequantize_mode)
+                trt_model_path = _select_tensorrt_model_path(
+                    self._config.precision_key,
+                    self._config.use_hg,
                 )
+                mode_name = f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}"
+                trt_hg_weights = (
+                    _select_hg_weights_path(self._config.precision_key, tensorrt=True)
+                    if self._config.use_hg
+                    else None
+                )
+                if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+                    trt_hg_weights = None
+                trt_predeq = False
                 trt_mode_name = tensorrt_mode_name(
                     str(cfg.get("precision") or "fp16"),
                     mode_name,
@@ -834,7 +852,7 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     qdq_fusion="native",
                 )
                 trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
-                    model_path,
+                    trt_model_path,
                     int(self._config.width),
                     int(self._config.height),
                     str(cfg.get("precision") or "fp16"),
@@ -845,14 +863,14 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     require_exists=True,
                 )
                 engine_path = tensorrt_engine_path(
-                    model_path,
+                    trt_model_path,
                     int(self._config.width),
                     int(self._config.height),
                     trt_mode_name,
                 )
                 if tensorrt_engine_is_valid(
                     engine_path,
-                    model_path=model_path,
+                    model_path=trt_model_path,
                     width=int(self._config.width),
                     height=int(self._config.height),
                     precision=str(cfg.get("precision") or "fp16"),
@@ -860,6 +878,7 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     use_hg=self._config.use_hg,
                     predequantize=trt_predeq,
                     qdq_fusion="native",
+                    hg_weights=trt_hg_weights,
                     calibration_cache=trt_calibration_cache,
                 ):
                     self.progress.emit(0, "Loading cached TensorRT engine ...")
@@ -873,18 +892,26 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
 
                 with capture_output_to_gui(_emit_trt_line):
                     processor = HDRTVNetTensorRT(
-                        model_path,
+                        trt_model_path,
                         device="auto",
                         precision=str(cfg.get("precision") or "fp16"),
                         engine_width=int(self._config.width),
                         engine_height=int(self._config.height),
                         mode_name=mode_name,
+                        hg_weights=trt_hg_weights,
                         use_hg=self._config.use_hg,
                         predequantize=trt_predeq,
                         qdq_fusion="native",
                         calibration_cache=trt_calibration_cache,
                     )
             else:
+                torch_hg_weights = (
+                    _select_hg_weights_path(self._config.precision_key)
+                    if self._config.use_hg
+                    else None
+                )
+                if torch_hg_weights and not os.path.isfile(torch_hg_weights):
+                    torch_hg_weights = None
                 processor = HDRTVNetTorch(
                     model_path,
                     device="auto",
@@ -894,6 +921,7 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     predequantize=_resolve_predequantize_arg(
                         str(self._config.predequantize_mode)
                     ),
+                    hg_weights=torch_hg_weights,
                     use_hg=self._config.use_hg,
                     warmup_passes=0,
                 )
@@ -1057,11 +1085,7 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                         raw_out,
                         lower_res_processing=False,
                     )
-                    export_out = self._apply_hdr_flat_surface_cleanup(
-                        prepared_out,
-                        model_inp,
-                        quality=os.environ.get("HDRTVNET_EXPORT_HDR_CLEANUP", "highlight-high"),
-                    )
+                    export_out = prepared_out
                 output_rgb48 = self._tensor_to_rgb48_bytes(export_out)
                 if self._canceled():
                     raise InterruptedError("Export canceled by user.")

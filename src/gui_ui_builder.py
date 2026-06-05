@@ -5,6 +5,7 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -22,9 +23,12 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
+    DEFAULT_LIVE_CAPTURE_PROCESS_FPS,
     DEFAULT_PRECISION_KEY,
     DEFAULT_RESOLUTION_KEY,
     DEFAULT_USE_HG,
+    INT8_HG_WARNING,
+    LIVE_CAPTURE_FPS_CHOICES,
     _available_precision_keys,
     RESOLUTION_SCALES,
     SOURCE_MODE_LABELS,
@@ -115,6 +119,15 @@ class UiBuilderMixin:
         self._act_predequantize = tools_menu.addAction(
             "INT8 &Pre-dequantization ...", self._choose_predequantize_mode
         )
+        self._act_use_original_model = tools_menu.addAction(
+            "Use Original HR/HR+HG Model ...",
+            self._use_original_model_preset,
+        )
+        self._act_use_original_model.setToolTip(
+            "Explicitly runs the untouched original HR checkpoint; the HG checkbox "
+            "controls whether original/HG.pt is used. This is hidden from normal "
+            "precision lists because it is a slower comparison path."
+        )
         tools_menu.addAction("Model Quality &Benchmark ...", self._open_benchmark_dialog)
         self._act_precompile_kernels = tools_menu.addAction(
             "&Pre-compile Kernels ...", self._precompile_kernels
@@ -176,6 +189,29 @@ class UiBuilderMixin:
         )
         row0.addWidget(self._cmb_source_mode)
 
+        self._lbl_live_fps = QLabel("Capture FPS:")
+        self._lbl_live_fps.setProperty("muted", True)
+        self._lbl_live_fps.setToolTip(
+            "Browser Window Capture processing cap. The capture thread observes Chrome faster than this and mpv repeats frames on display vsync."
+        )
+        row0.addWidget(self._lbl_live_fps)
+
+        self._cmb_live_fps = QComboBox()
+        for fps in LIVE_CAPTURE_FPS_CHOICES:
+            self._cmb_live_fps.addItem(f"{int(fps)} fps", int(fps))
+        self._cmb_live_fps.setCurrentText(
+            f"{int(DEFAULT_LIVE_CAPTURE_PROCESS_FPS)} fps"
+        )
+        self._cmb_live_fps.setMinimumWidth(96)
+        self._cmb_live_fps.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._cmb_live_fps.setToolTip(
+            "Caps browser-window HDRTVNet++ processing at 24, 30, or 60 fps. 24 fps remains the low-latency smooth default."
+        )
+        row0.addWidget(self._cmb_live_fps)
+
         row0.addStretch(1)
         root.addWidget(self._row0_widget)
 
@@ -220,10 +256,14 @@ class UiBuilderMixin:
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
+        self._cmb_prec.setToolTip(INT8_HG_WARNING)
         row1.addWidget(self._cmb_prec, 2, 1)
         self._chk_hg = QCheckBox("Use HG")
         self._chk_hg.setChecked(bool(DEFAULT_USE_HG))
-        self._chk_hg.setToolTip("Enable highlight refinement (HG) (very heavy).")
+        self._chk_hg.setToolTip(
+            "Enable highlight refinement (HG). INT8 TensorRT speedups are "
+            "expected only with HG enabled."
+        )
 
         lbl_resolution = QLabel("Resolution:")
         lbl_resolution.setProperty("muted", True)
@@ -440,6 +480,39 @@ class UiBuilderMixin:
         row3.addWidget(self._seek_slider, 1)
         row3.addWidget(self._lbl_duration)
         root.addWidget(self._row3_widget)
+
+        self._scrub_preview_popup = None
+        self._scrub_preview_mpv = None
+        if _HAS_MPV:
+            self._scrub_preview_popup = QFrame(self)
+            self._scrub_preview_popup.setObjectName("ScrubPreviewPopup")
+            self._scrub_preview_popup.setWindowFlags(
+                Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+            )
+            self._scrub_preview_popup.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+            self._scrub_preview_popup.setAttribute(
+                Qt.WidgetAttribute.WA_ShowWithoutActivating, True
+            )
+            self._scrub_preview_popup.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+            )
+            self._scrub_preview_popup.setStyleSheet(
+                "#ScrubPreviewPopup {"
+                "background: #05070a;"
+                "border: 1px solid #5f7898;"
+                "border-radius: 4px;"
+                "}"
+            )
+            popup_layout = QVBoxLayout(self._scrub_preview_popup)
+            popup_layout.setContentsMargins(4, 4, 4, 4)
+            popup_layout.setSpacing(0)
+            self._scrub_preview_mpv = self._new_file_preview_widget()
+            self._scrub_preview_mpv.setFixedSize(320, 180)
+            self._scrub_preview_mpv.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+            )
+            popup_layout.addWidget(self._scrub_preview_mpv)
+            self._scrub_preview_popup.hide()
 
     def _build_video_displays(self, root: QVBoxLayout):
         if _HAS_MPV:

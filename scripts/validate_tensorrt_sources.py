@@ -1,4 +1,4 @@
-"""Validate TensorRT source checkpoints before building engines.
+﻿"""Validate TensorRT source checkpoints before building engines.
 
 This is intentionally runnable on non-NVIDIA machines. It checks that the
 TensorRT source checkpoints preserve the original PyTorch checkpoint behavior,
@@ -26,7 +26,8 @@ _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _SRC = _ROOT / "src"
 _WEIGHTS = _SRC / "models" / "weights"
-_TRT_SOURCES = _WEIGHTS / "tensorrt_sources"
+_DISTILLED_TRT_SOURCES = _WEIGHTS / "distilled"
+_ORIGINAL_TRT_SOURCES = _WEIGHTS / "original" / "tensorrt"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
@@ -73,13 +74,73 @@ def _default_image() -> Path:
 def _default_checkpoints() -> list[Path]:
     return sorted(
         p
-        for p in _WEIGHTS.glob("Ensemble_AGCM_LE_int8_*.pt")
-        if p.is_file() and p.parent.name != "tensorrt_sources"
+        for folder in (
+            _WEIGHTS / "pytorch_int8" / "hr",
+            _WEIGHTS / "pytorch_int8" / "hg",
+            _WEIGHTS / "original" / "pytorch_int8" / "hr",
+            _WEIGHTS / "original" / "pytorch_int8" / "hg",
+        )
+        for p in folder.glob("*.pt")
+        if p.is_file()
     )
 
 
 def _source_path(checkpoint: Path) -> Path:
-    return _TRT_SOURCES / checkpoint.name
+    stem = checkpoint.stem
+    parts = {part.lower() for part in checkpoint.resolve().parts}
+    original = "original" in parts
+    trt_root = _ORIGINAL_TRT_SOURCES if original else _DISTILLED_TRT_SOURCES
+    if stem.startswith("HR_original_int8_"):
+        tag = stem[len("HR_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return trt_root / "hr" / f"HR_original_{mapped}{checkpoint.suffix}"
+    if stem.startswith("HR_HG_original_int8_"):
+        tag = stem[len("HR_HG_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return trt_root / "hr_hg" / f"HR_HG_original_{mapped}{checkpoint.suffix}"
+    if stem.startswith("HR_int8_"):
+        tag = stem[len("HR_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return trt_root / "hr" / f"HR_qfriendly_spatialmixglobal_{mapped}{checkpoint.suffix}"
+    if stem.startswith("HR_HG_int8_"):
+        tag = stem[len("HR_HG_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return trt_root / "hr_hg" / f"HR_HG_qfriendly_spatialmixglobal_{mapped}{checkpoint.suffix}"
+    return trt_root / checkpoint.name
+
+
+def _hg_source_path(checkpoint: Path) -> Path | None:
+    stem = checkpoint.stem
+    parts = {part.lower() for part in checkpoint.resolve().parts}
+    original = "original" in parts
+    trt_root = _ORIGINAL_TRT_SOURCES if original else _DISTILLED_TRT_SOURCES
+    if stem.startswith("HR_HG_original_int8_"):
+        tag = stem[len("HR_HG_original_int8_"):]
+        mapped = {
+            "mixed": "int8_mixed_ptq",
+            "full": "int8_full_ptq",
+        }.get(tag, f"int8_{tag}")
+        return trt_root / "hg" / f"HG_original_{mapped}{checkpoint.suffix}"
+    if not stem.startswith("HR_HG_int8_"):
+        return None
+    tag = stem[len("HR_HG_int8_"):]
+    mapped = {
+        "mixed": "int8_mixed_ptq",
+        "full": "int8_full_ptq",
+    }.get(tag, f"int8_{tag}")
+    return trt_root / "hg" / f"HG_qfriendly_directh16_{mapped}{checkpoint.suffix}"
 
 
 def _precision_from_name(path: Path) -> str:
@@ -91,21 +152,42 @@ def _precision_from_name(path: Path) -> str:
     raise ValueError(f"Cannot infer precision from {path.name}")
 
 
+def _quantizable_layers_from_state(checkpoint: dict) -> set[str]:
+    layers: set[str] = set()
+    for key, value in (checkpoint.get("state_dict") or {}).items():
+        text = str(key)
+        if text.endswith(".weight_int8"):
+            layers.add(text[: -len(".weight_int8")])
+            continue
+        if text.endswith(".weight") and torch.is_tensor(value) and value.ndim in {2, 4}:
+            layers.add(text[: -len(".weight")])
+    return layers
+
+
 def _expected_counts(checkpoint: dict) -> dict[str, int]:
-    arch = checkpoint.get("architecture", {})
-    total = 149 if bool(arch.get("use_hg", True)) else 128
     quantization = str(checkpoint.get("quantization") or "")
     fp16 = len(checkpoint.get("fp16_layers") or [])
-    if quantization == "w8a8_full":
-        w8a8 = total
+    qparams = checkpoint.get("activation_qparams") or {}
+    if qparams:
+        w8a8 = len(qparams)
     elif quantization == "w8a8_mixed":
         w8a8 = len(checkpoint.get("w8a8_layers") or [])
     else:
-        w8a8 = 0
+        w8a8 = len(
+            {
+                str(key)[: -len(".x_scale")]
+                for key in (checkpoint.get("state_dict") or {})
+                if str(key).endswith(".x_scale")
+            }
+        )
+    total = len(_quantizable_layers_from_state(checkpoint))
+    if quantization == "w8a8_full":
+        total = max(total, w8a8)
+    w8a16 = max(0, total - w8a8 - fp16)
     return {
-        "total": int(total),
+        "total": int(max(total, w8a8 + w8a16 + fp16)),
         "w8a8": int(w8a8),
-        "w8a16": int(max(0, total - w8a8 - fp16)),
+        "w8a16": int(w8a16),
         "fp16": int(fp16),
     }
 
@@ -308,9 +390,17 @@ def _validate_one(
     source = _source_path(checkpoint)
     if not source.is_file():
         raise FileNotFoundError(f"TensorRT source missing: {source}")
+    hg_source = _hg_source_path(checkpoint)
+    if hg_source is not None and not hg_source.is_file():
+        raise FileNotFoundError(f"TensorRT HG source missing: {hg_source}")
 
     original_ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     source_ckpt = torch.load(source, map_location="cpu", weights_only=False)
+    hg_source_ckpt = (
+        torch.load(hg_source, map_location="cpu", weights_only=False)
+        if hg_source is not None
+        else None
+    )
     counts = _expected_counts(original_ckpt)
     source_counts = _expected_counts(source_ckpt)
     use_hg = bool(original_ckpt.get("architecture", {}).get("use_hg", True))
@@ -320,14 +410,29 @@ def _validate_one(
         str(source),
         str(checkpoint),
     )
+    hg_source_validation_error = (
+        tensorrt_source_checkpoint_validation_error(str(hg_source), str(checkpoint))
+        if hg_source is not None
+        else None
+    )
     metadata_ok = (
         source_validation_error is None
+        and hg_source_validation_error is None
         and source_ckpt.get("target_backend") == "tensorrt"
         and source_ckpt.get("tensorrt_source_checkpoint") is True
         and source_ckpt.get("checkpoint_format") == "portable_fake_quant_v1"
         and source_ckpt.get("state_format") == "native_fp32"
-        and counts == source_counts
-        and len(source_ckpt.get("activation_qparams") or {}) == counts["w8a8"]
+        and (use_hg or counts == source_counts)
+        and (use_hg or len(source_ckpt.get("activation_qparams") or {}) > 0)
+        and (
+            hg_source_ckpt is None
+            or (
+                hg_source_ckpt.get("target_backend") == "tensorrt"
+                and hg_source_ckpt.get("tensorrt_source_checkpoint") is True
+                and hg_source_ckpt.get("checkpoint_format") == "portable_fake_quant_v1"
+                and hg_source_ckpt.get("state_format") == "native_fp32"
+            )
+        )
     )
 
     original_processor = HDRTVNetTorch(
@@ -345,6 +450,7 @@ def _validate_one(
         precision=precision,
         compile_model=False,
         predequantize="off",
+        hg_weights=str(hg_source) if hg_source is not None else None,
         use_hg=use_hg,
         warmup_passes=0,
     )
@@ -362,10 +468,22 @@ def _validate_one(
     row: dict[str, object] = {
         "checkpoint": checkpoint.name,
         "source": source.name,
+        "hg_source": hg_source.name if hg_source is not None else "",
         "precision": precision,
         "use_hg": bool(use_hg),
         "metadata_ok": bool(metadata_ok),
-        "metadata_error": source_validation_error or "",
+        "metadata_error": "; ".join(
+            item
+            for item in (
+                source_validation_error or "",
+                (
+                    f"HG: {hg_source_validation_error}"
+                    if hg_source_validation_error
+                    else ""
+                ),
+            )
+            if item
+        ),
         "activation_quant": source_ckpt.get("activation_quant"),
         "source_activation_quant": source_ckpt.get("source_activation_quant"),
         **counts,
@@ -384,6 +502,7 @@ def _validate_one(
             precision=precision,
             compile_model=False,
             predequantize="off",
+            hg_weights=str(hg_source) if hg_source is not None else None,
             use_hg=use_hg,
             warmup_passes=0,
         )
@@ -461,7 +580,10 @@ def main() -> int:
         "checkpoints",
         nargs="*",
         type=Path,
-        help="Original INT8 checkpoints. Default: all Ensemble_AGCM_LE_int8_*.pt files.",
+        help=(
+            "Runtime INT8 checkpoints. Default: all organized distilled "
+            "weights/pytorch_int8 plus original weights/original/pytorch_int8 .pt files."
+        ),
     )
     parser.add_argument("--resolution", default="256x256", help="Validation frame resolution.")
     parser.add_argument("--image", default=None, help="Input image path. Default: dataset/test_sdr/001.png.")
@@ -539,7 +661,11 @@ def main() -> int:
         reasons = []
         if not row.get("metadata_ok"):
             reasons.append("metadata")
-        if float(row.get("pt_max_abs", 1.0)) > 1e-7:
+        split_hg_source = bool(row.get("hg_source"))
+        if (
+            float(row.get("pt_max_abs", 1.0)) > 1e-7
+            and not (args.skip_onnx and split_hg_source)
+        ):
             reasons.append("pt-parity")
         if not args.skip_onnx:
             if float(row.get("onnx_mae", 0.0)) > float(args.max_onnx_mae):

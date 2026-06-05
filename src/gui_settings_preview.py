@@ -7,10 +7,12 @@ import cv2
 import numpy as np
 
 from PyQt6.QtCore import QEvent
-from PyQt6.QtWidgets import QInputDialog
+from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from gui_config import (
+    DEFAULT_LIVE_CAPTURE_PROCESS_FPS,
     DEFAULT_USE_HG,
+    PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
     _available_precision_keys,
@@ -20,6 +22,7 @@ from gui_config import (
     SOURCE_MODE_LABELS,
     _normalize_source_mode,
     _source_mode_label,
+    live_capture_process_fps_from_value,
     _max_processing_preset_for_source,
     _processing_preset_dims,
     _processing_preset_options_for_source,
@@ -132,6 +135,7 @@ class SettingsPreviewMixin:
         initial_film_grain,
         initial_hdr_gt,
         initial_source_mode=None,
+        initial_live_capture_fps=None,
     ):
         """Load persisted GUI preferences unless explicitly overridden by CLI."""
         data = {}
@@ -146,6 +150,16 @@ class SettingsPreviewMixin:
             p = data.get("precision")
             if p in _available_precision_keys():
                 self._cmb_prec.setCurrentText(p)
+        elif initial_precision in PRECISIONS:
+            cfg = PRECISIONS.get(initial_precision, {})
+            if bool(cfg.get("hidden", False)):
+                self._precision_override_key = str(initial_precision)
+                if self._cmb_prec.findText("FP16") >= 0:
+                    was_blocked = self._cmb_prec.blockSignals(True)
+                    self._cmb_prec.setCurrentText("FP16")
+                    self._cmb_prec.blockSignals(was_blocked)
+            elif initial_precision in _available_precision_keys():
+                self._cmb_prec.setCurrentText(initial_precision)
         self._source_mode_prompt_pending = "source_mode" not in data and initial_source_mode is None
         source_mode = _normalize_source_mode(
             initial_source_mode
@@ -154,6 +168,20 @@ class SettingsPreviewMixin:
         )
         self._source_mode = source_mode
         self._cmb_source_mode.setCurrentText(_source_mode_label(source_mode))
+        if hasattr(self, "_cmb_live_fps") and self._cmb_live_fps is not None:
+            saved_live_fps = (
+                initial_live_capture_fps
+                if initial_live_capture_fps is not None
+                else data.get("live_capture_fps", DEFAULT_LIVE_CAPTURE_PROCESS_FPS)
+            )
+            live_fps = int(live_capture_process_fps_from_value(saved_live_fps))
+            self._cmb_live_fps.blockSignals(True)
+            idx = self._cmb_live_fps.findData(live_fps)
+            if idx < 0:
+                idx = self._cmb_live_fps.findText(f"{live_fps} fps")
+            if idx >= 0:
+                self._cmb_live_fps.setCurrentIndex(idx)
+            self._cmb_live_fps.blockSignals(False)
         if initial_resolution is None:
             r = data.get("resolution")
             if r in RESOLUTION_SCALES or r == "Source":
@@ -227,6 +255,7 @@ class SettingsPreviewMixin:
         if predeq_mode not in {"auto", "on", "off"}:
             predeq_mode = "auto"
         self._predequantize_mode = predeq_mode
+        os.environ["HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS"] = "0"
         self._runtime_execution_mode = _normalize_runtime_execution_mode(
             data.get("runtime_execution_mode", "compile")
         )
@@ -257,6 +286,13 @@ class SettingsPreviewMixin:
             "source_mode": str(getattr(self, "_source_mode", SOURCE_MODE_VIDEO)),
             "precision": self._cmb_prec.currentText(),
             "resolution": self._cmb_res.currentText(),
+            "live_capture_fps": int(
+                live_capture_process_fps_from_value(
+                    self._cmb_live_fps.currentData()
+                    if hasattr(self, "_cmb_live_fps")
+                    else DEFAULT_LIVE_CAPTURE_PROCESS_FPS
+                )
+            ),
             "upscale_mode": self._cmb_upscale.currentText()
             if hasattr(self, "_cmb_upscale")
             else DEFAULT_UPSCALER,
@@ -353,10 +389,30 @@ class SettingsPreviewMixin:
             film_grain_changed = (
                 self._chk_film_grain.isChecked() != self._active_film_grain
             )
+        live_fps_changed = False
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+            == SOURCE_MODE_WINDOW
+            and hasattr(self, "_cmb_live_fps")
+            and self._cmb_live_fps is not None
+        ):
+            current_live_fps = live_capture_process_fps_from_value(
+                self._cmb_live_fps.currentData()
+            )
+            active_live_fps = float(
+                getattr(self, "_active_live_capture_process_fps", current_live_fps)
+            )
+            live_fps_changed = abs(float(current_live_fps) - active_live_fps) > 0.01
+        current_precision = (
+            self._effective_precision_key()
+            if hasattr(self, "_effective_precision_key")
+            else self._cmb_prec.currentText()
+        )
         return (
-            self._cmb_prec.currentText() != self._active_precision
+            current_precision != self._active_precision
             or self._cmb_res.currentText() != self._active_resolution
             or self._chk_hg.isChecked() != self._active_use_hg
+            or live_fps_changed
             or upscale_changed
             or film_grain_changed
         )
@@ -378,6 +434,11 @@ class SettingsPreviewMixin:
             self._cmb_source_mode.setCurrentText(_source_mode_label(mode))
             self._cmb_source_mode.setEnabled(not self._playing)
             self._cmb_source_mode.blockSignals(False)
+        if hasattr(self, "_lbl_live_fps") and self._lbl_live_fps is not None:
+            self._lbl_live_fps.setVisible(is_window)
+        if hasattr(self, "_cmb_live_fps") and self._cmb_live_fps is not None:
+            self._cmb_live_fps.setVisible(is_window)
+            self._cmb_live_fps.setEnabled(is_window)
         if hasattr(self, "_btn_file") and self._btn_file is not None:
             self._btn_file.setText("Choose Browser Window ..." if is_window else "Open Video ...")
         if hasattr(self, "_act_open_source") and self._act_open_source is not None:
@@ -500,12 +561,40 @@ class SettingsPreviewMixin:
             if self._disp_hdr_cpu is not None:
                 self._disp_hdr_cpu.clear_display()
 
+    def _largest_monitor_capture_dims(self) -> tuple[int, int] | None:
+        app = QApplication.instance()
+        screens = app.screens() if app is not None else []
+        best_dims: tuple[int, int] | None = None
+        best_area = 0
+        for screen in screens:
+            try:
+                size = screen.size()
+                dpr = float(screen.devicePixelRatio() or 1.0)
+                width = int(round(size.width() * dpr))
+                height = int(round(size.height() * dpr))
+            except Exception:
+                width = height = 0
+            if width <= 0 or height <= 0:
+                continue
+            area = int(width) * int(height)
+            if area > best_area:
+                best_area = area
+                best_dims = (int(width), int(height))
+        return best_dims
+
     def _set_source_resolution_options_for_dims(self, src_w: int, src_h: int):
-        options = list(RESOLUTION_SCALES.keys())
+        monitor_dims = self._largest_monitor_capture_dims()
+        cap_w, cap_h = int(src_w), int(src_h)
+        if monitor_dims is not None:
+            cap_w = min(cap_w, int(monitor_dims[0]))
+            cap_h = min(cap_h, int(monitor_dims[1]))
+        cap_w = max(1, min(MAX_W, int(cap_w)))
+        cap_h = max(1, min(MAX_H, int(cap_h)))
+        options = _processing_preset_options_for_source(cap_w, cap_h)
         current = self._cmb_res.currentText()
         self._source_proc_dims = None
         self._source_video_dims = (int(src_w), int(src_h))
-        self._source_max_resolution_key = "1080p"
+        self._source_max_resolution_key = _max_processing_preset_for_source(cap_w, cap_h)
         if current == "Source":
             current = self._source_max_resolution_key
         self._cmb_res.blockSignals(True)
@@ -517,9 +606,14 @@ class SettingsPreviewMixin:
             self._cmb_res.setCurrentIndex(0)
         self._cmb_res.blockSignals(False)
         self._sync_upscale_controls()
+        monitor_text = (
+            f"; largest monitor cap is {monitor_dims[0]}x{monitor_dims[1]}"
+            if monitor_dims is not None
+            else ""
+        )
         msg = (
-            f"Browser window source is {int(src_w)}x{int(src_h)}: "
-            "browser-window capture processing/output remains capped at 1080p."
+            f"Browser window source is {int(src_w)}x{int(src_h)}{monitor_text}: "
+            f"max processing/output preset is {self._source_max_resolution_key}."
         )
         self.statusBar().showMessage(msg)
 

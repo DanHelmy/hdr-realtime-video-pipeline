@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
-    LIVE_CAPTURE_OBSERVE_FPS,
+    live_capture_observe_fps,
     LIVE_CAPTURE_PROCESS_FPS,
 )
 from gui_window_utils import configure_independent_window
@@ -84,9 +84,15 @@ class WindowCaptureDialog(QDialog):
         row_window.addWidget(self._btn_refresh)
         root.addLayout(row_window)
 
-        self._lbl_capture_mode = QLabel(
-            f"Video observes Chrome up to {LIVE_CAPTURE_OBSERVE_FPS:g} fps, processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, then mpv repeats frames on display vsync."
-        )
+        capture_mode_text = str(initial_fps_label or "").strip()
+        if not capture_mode_text:
+            observe_fps = live_capture_observe_fps(LIVE_CAPTURE_PROCESS_FPS)
+            capture_mode_text = (
+                f"Video observes Chrome up to {observe_fps:g} fps, "
+                f"processes a steady {LIVE_CAPTURE_PROCESS_FPS:g} fps stream, "
+                "then mpv repeats frames on display vsync."
+            )
+        self._lbl_capture_mode = QLabel(capture_mode_text)
         self._lbl_capture_mode.setWordWrap(True)
         root.addWidget(self._lbl_capture_mode)
 

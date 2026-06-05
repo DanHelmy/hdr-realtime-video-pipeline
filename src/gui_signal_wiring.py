@@ -28,6 +28,9 @@ class SignalWiringMixin:
         self._cmb_audio_track.currentIndexChanged.connect(self._on_audio_track_changed)
         self._cmb_source_mode.currentTextChanged.connect(self._on_source_mode_changed)
         self._cmb_source_mode.currentTextChanged.connect(lambda _v: self._save_user_settings())
+        if hasattr(self, "_cmb_live_fps") and self._cmb_live_fps is not None:
+            self._cmb_live_fps.currentTextChanged.connect(self._on_live_capture_fps_changed)
+            self._cmb_live_fps.currentTextChanged.connect(lambda _v: self._save_user_settings())
         self._cmb_prec.currentTextChanged.connect(self._on_precision)
         self._chk_hg.stateChanged.connect(self._on_hg_toggle)
         self._cmb_prec.currentTextChanged.connect(lambda _v: self._save_user_settings())
@@ -53,8 +56,10 @@ class SignalWiringMixin:
         self._worker.compile_ready.connect(self._on_compile_ready)
         self._worker.position_updated.connect(self._on_position)
         self._worker.seek_frame_ready.connect(self._on_seek_frame_ready)
+        self._worker.display_prebuffer_ready.connect(self._on_display_prebuffer_ready)
         self._seek_slider.sliderPressed.connect(self._on_seek_pressed)
         self._seek_slider.sliderMoved.connect(self._on_seek)
+        self._seek_slider.valueChanged.connect(self._on_seek_value_changed)
         self._seek_slider.sliderReleased.connect(self._on_seek_released)
 
         # HDR info from mpv
@@ -63,3 +68,5 @@ class SignalWiringMixin:
             self._disp_hdr_mpv.runtime_notice.connect(self._on_mpv_notice)
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.runtime_notice.connect(self._on_mpv_notice)
+        if getattr(self, "_scrub_preview_mpv", None) is not None:
+            self._scrub_preview_mpv.runtime_notice.connect(self._on_mpv_notice)

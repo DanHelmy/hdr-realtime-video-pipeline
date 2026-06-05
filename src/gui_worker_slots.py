@@ -70,8 +70,19 @@ class WorkerSlotsMixin:
             and not self._sdr_mpv_feed_from_worker
         ):
             try:
-                rgb16 = np.ascontiguousarray(sdr_show[:, :, ::-1].astype(np.uint16) * 257)
-                self._disp_sdr_mpv.feed_frame(rgb16.data)
+                raw_format = str(
+                    getattr(self._disp_sdr_mpv, "raw_video_format", "rgb48le")
+                    or "rgb48le"
+                ).lower()
+                if raw_format == "bgr24":
+                    self._disp_sdr_mpv.feed_frame(
+                        memoryview(np.ascontiguousarray(sdr_show))
+                    )
+                else:
+                    rgb16 = np.ascontiguousarray(
+                        sdr_show[:, :, ::-1].astype(np.uint16) * 257
+                    )
+                    self._disp_sdr_mpv.feed_frame(rgb16.data)
             except Exception:
                 pass
         if self._disp_sdr_cpu is not None and self._disp_sdr_cpu.isVisible():
@@ -114,7 +125,13 @@ class WorkerSlotsMixin:
             self._audio_sync_frame_hint = max(0, int(getattr(self, "_last_seek_frame", 0)))
 
         fps_now = float(m.get("fps", 0.0))
-        if is_window_source:
+        if bool(getattr(self, "_video_prebuffer_pending", False)):
+            self._fps_prev_sample = None
+            self._fps_is_stable = False
+            self._fps_stable_count = 0
+            self._fps_unstable_count = 0
+            self._fps_stable_since_t = 0.0
+        elif is_window_source:
             self._fps_prev_sample = None
             self._fps_is_stable = False
             self._fps_stable_count = 0
@@ -196,6 +213,8 @@ class WorkerSlotsMixin:
 
     def _on_finished(self):
         self._finalize_playback_logging("playback finished")
+        self._cancel_video_prebuffer()
+        self._stop_scrub_preview()
         is_window_source = (
             _normalize_source_mode(getattr(self, "_source_mode", None))
             == SOURCE_MODE_WINDOW
@@ -217,6 +236,7 @@ class WorkerSlotsMixin:
             self._disp_hdr_mpv.stop_playback()
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_mpv.stop_playback()
+        self._stop_scrub_preview()
         self._stop_audio_playback()
         self._set_process_priority(False)
         if restart_on_capture_loss:

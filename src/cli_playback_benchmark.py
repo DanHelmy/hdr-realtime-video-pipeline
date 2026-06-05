@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import csv
@@ -9,6 +9,7 @@ import pathlib
 import re
 import sys
 import time
+import warnings
 from collections import deque
 from datetime import datetime
 
@@ -39,6 +40,7 @@ import torch
 
 from cli_display import CliDisplaySink
 from gui_compile_cache import _mark_compiled
+from gui_config import _select_hg_weights_path, _select_tensorrt_model_path
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     HDRTVNetTorch,
@@ -55,20 +57,22 @@ def _weight(name: str) -> str:
 _RUN_PRESETS = {
     "fp16": {
         "precision": "fp16",
-        "model": _weight("Ensemble_AGCM_LE.pth"),
+        "model": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        "model_nohg": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
         "label": "fp16",
         "gui_key": "FP16",
     },
     "fp32": {
         "precision": "fp32",
-        "model": _weight("Ensemble_AGCM_LE.pth"),
+        "model": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        "model_nohg": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
         "label": "fp32",
         "gui_key": "FP32",
     },
     "int8-mixed-ptq": {
         "precision": "int8-mixed",
-        "model": _weight("Ensemble_AGCM_LE_int8_mixed.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_nohg.pt"),
+        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed.pt"),
+        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed.pt"),
         "predequantize": "on",
         "label": "int8_mixed_ptq_predeq",
         "trt_predequantize": "off",
@@ -78,8 +82,8 @@ _RUN_PRESETS = {
     },
     "int8-full-ptq": {
         "precision": "int8-full",
-        "model": _weight("Ensemble_AGCM_LE_int8_full.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_nohg.pt"),
+        "model": _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
+        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full.pt"),
         "predequantize": "on",
         "label": "int8_full_ptq_predeq",
         "trt_predequantize": "off",
@@ -89,8 +93,8 @@ _RUN_PRESETS = {
     },
     "int8-mixed-qat": {
         "precision": "int8-mixed",
-        "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_nohg.pt"),
+        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
+        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
         "predequantize": "on",
         "label": "int8_mixed_qat_predeq",
         "trt_predequantize": "off",
@@ -100,8 +104,8 @@ _RUN_PRESETS = {
     },
     "int8-full-qat": {
         "precision": "int8-full",
-        "model": _weight("Ensemble_AGCM_LE_int8_full_qat.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_nohg.pt"),
+        "model": _weight("pytorch_int8/hg/HR_HG_int8_full_qat.pt"),
+        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full_qat.pt"),
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
         "trt_predequantize": "off",
@@ -111,8 +115,8 @@ _RUN_PRESETS = {
     },
     "int8-mixed-qat-film": {
         "precision": "int8-mixed",
-        "model": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_mixed_qat_film_nohg.pt"),
+        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat_film.pt"),
+        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed_qat_film.pt"),
         "predequantize": "on",
         "label": "int8_mixed_qat_film_predeq",
         "trt_predequantize": "off",
@@ -122,8 +126,8 @@ _RUN_PRESETS = {
     },
     "int8-full-qat-film": {
         "precision": "int8-full",
-        "model": _weight("Ensemble_AGCM_LE_int8_full_qat_film.pt"),
-        "model_nohg": _weight("Ensemble_AGCM_LE_int8_full_qat_film_nohg.pt"),
+        "model": _weight("pytorch_int8/hg/HR_HG_int8_full_qat_film.pt"),
+        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full_qat_film.pt"),
         "predequantize": "on",
         "label": "int8_full_qat_film_predeq",
         "trt_predequantize": "off",
@@ -135,6 +139,83 @@ _RUN_PRESETS = {
 _DEFAULT_RUNS = [
     "int8-mixed-qat",
 ]
+
+
+_ORIGINAL_RUN_PATHS = {
+    "fp16": {
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/HR.pt"),
+        "trt_model_nohg": _weight("original/HR.pt"),
+        "trt_hg_weights": _weight("original/HG.pt"),
+    },
+    "fp32": {
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/HR.pt"),
+        "trt_model_nohg": _weight("original/HR.pt"),
+        "trt_hg_weights": _weight("original/HG.pt"),
+    },
+    "int8-mixed-ptq": {
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_ptq.pt"),
+    },
+    "int8-full-ptq": {
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_ptq.pt"),
+    },
+    "int8-mixed-qat": {
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat.pt"),
+    },
+    "int8-full-qat": {
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat.pt"),
+    },
+    "int8-mixed-qat-film": {
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat_film.pt"),
+    },
+    "int8-full-qat-film": {
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat_film.pt"),
+    },
+}
+
+
+def _apply_checkpoint_family(preset: dict, run_key: str, family: str) -> dict:
+    if str(family or "distilled").strip().lower() != "original":
+        return preset
+    override = _ORIGINAL_RUN_PATHS.get(run_key)
+    if not override:
+        return preset
+    preset.update(override)
+    preset["manual_model"] = True
+    preset["mode_name_base"] = f"original_{run_key}"
+    preset["label"] = f"original_{preset.get('label', run_key)}"
+    if preset.get("trt_label"):
+        preset["trt_label"] = f"original_{preset['trt_label']}"
+    return preset
 
 _CSV_FIELDS = [
     "elapsed_s",
@@ -222,12 +303,12 @@ def _tensorrt_device_memory_mb(processor) -> float | None:
     def _read_size(obj) -> float | None:
         if obj is None:
             return None
-        for attr in ("device_memory_size", "device_memory_size_v2"):
-            if not hasattr(obj, attr):
-                continue
+        for attr in ("device_memory_size_v2", "device_memory_size"):
             try:
-                value = getattr(obj, attr)
-                size = value() if callable(value) else value
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    value = getattr(obj, attr, None)
+                    size = value() if callable(value) else value
             except Exception:
                 continue
             if isinstance(size, (int, float)) and size > 0:
@@ -307,8 +388,38 @@ def _runtime_artifact_size_mb(processor, run: dict) -> float:
 def _make_processor(args, run: dict, width: int, height: int):
     predeq_text = str(run.get("predequantize", "auto"))
     predeq = {"auto": "auto", "on": True, "off": False}[predeq_text]
+    gui_key = str(run.get("gui_key") or "").strip()
+    manual_model = bool(run.get("custom_model", False) or run.get("manual_model", False))
     if _IS_NVIDIA and str(args.device).lower() != "cpu":
-        mode_name = f"{run.get('gui_key', run['precision'])}_{'hg' if args.use_hg else 'nohg'}"
+        if (
+            manual_model
+            and not bool(run.get("custom_model", False))
+            and run.get("trt_model")
+        ):
+            run["model"] = str(
+                run.get("trt_model_nohg")
+                if (not bool(args.use_hg)) and run.get("trt_model_nohg")
+                else run.get("trt_model")
+            )
+        if (not manual_model) and gui_key:
+            run["model"] = _select_tensorrt_model_path(
+                gui_key,
+                bool(args.use_hg),
+            )
+        trt_hg_weights = None
+        if bool(args.use_hg):
+            if getattr(args, "hg_weights", None):
+                trt_hg_weights = str(args.hg_weights).strip()
+            elif run.get("trt_hg_weights"):
+                trt_hg_weights = str(run.get("trt_hg_weights")).strip()
+            elif run.get("hg_weights"):
+                trt_hg_weights = str(run.get("hg_weights")).strip()
+            elif gui_key:
+                trt_hg_weights = _select_hg_weights_path(gui_key, tensorrt=True)
+        if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+            trt_hg_weights = None
+        mode_base = str(run.get("mode_name_base", run.get("gui_key", run["precision"])))
+        mode_name = f"{mode_base}_{'hg' if args.use_hg else 'nohg'}"
         calibration_cache = args.trt_calibration_cache
         if (
             not calibration_cache
@@ -333,18 +444,29 @@ def _make_processor(args, run: dict, width: int, height: int):
             engine_width=int(width),
             engine_height=int(height),
             mode_name=mode_name,
+            hg_weights=trt_hg_weights,
             use_hg=bool(args.use_hg),
             predequantize=predeq,
             qdq_fusion=args.trt_qdq_fusion,
             calibration_dataset=args.trt_calibration_dataset,
             calibration_video=(
                 None
-                if args.trt_calibration_dataset or calibration_cache
+                if args.trt_calibration_dataset or args.trt_calibration_cache
                 else args.video
             ),
             calibration_frames=args.trt_calibration_frames,
             calibration_cache=calibration_cache,
         )
+    hg_weights = None
+    if bool(args.use_hg):
+        if getattr(args, "hg_weights", None):
+            hg_weights = str(args.hg_weights).strip()
+        elif run.get("hg_weights"):
+            hg_weights = str(run.get("hg_weights")).strip()
+        elif gui_key:
+            hg_weights = _select_hg_weights_path(gui_key)
+    if hg_weights and not os.path.isfile(hg_weights):
+        hg_weights = None
     return HDRTVNetTorch(
         run["model"],
         device=args.device,
@@ -355,6 +477,7 @@ def _make_processor(args, run: dict, width: int, height: int):
         use_cuda_graphs=False,
         force_channels_last=False,
         predequantize=predeq,
+        hg_weights=hg_weights,
         use_hg=bool(args.use_hg),
         warmup_passes=0,
     )
@@ -546,7 +669,13 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                 break
             frame = _resize_frame(frame, width, height)
             t2 = time.perf_counter()
-            out, pre_t, run_t, post_t = processor.process_timed(frame)
+            if bool(getattr(args, "model_stage_timing", False)):
+                out, pre_t, run_t, post_t = processor.process_timed(frame)
+            else:
+                out = processor.process(frame)
+                pre_t = 0.0
+                run_t = 0.0
+                post_t = 0.0
             t3 = time.perf_counter()
             if display is not None:
                 if not display.show(out):
@@ -560,16 +689,26 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
             stats_frames += 1
             decode_ms += (t1 - t0) * 1000.0
             resize_ms += (t2 - t1) * 1000.0
-            infer_ms += (t3 - t2) * 1000.0
+            infer_elapsed_ms = (t3 - t2) * 1000.0
+            infer_ms += infer_elapsed_ms
             render_ms += (t4 - t3) * 1000.0
             pre_ms += float(pre_t)
-            run_ms += float(run_t)
+            run_ms += (
+                float(run_t)
+                if bool(getattr(args, "model_stage_timing", False))
+                else infer_elapsed_ms
+            )
             post_ms += float(post_t)
             frame_ms = (t4 - t0) * 1000.0
             frame_ms_sum += frame_ms
             if frame_ms > 0:
                 fps_samples.append(1000.0 / frame_ms)
-            model_latency = float(run_t) if float(run_t) > 0.0 else (t3 - t2) * 1000.0
+            model_latency = (
+                float(run_t)
+                if bool(getattr(args, "model_stage_timing", False))
+                and float(run_t) > 0.0
+                else infer_elapsed_ms
+            )
             model_latency_values.append(model_latency)
 
             if stats_frames % int(args.sample_interval) == 0 or stats_frames == timed_frames_target:
@@ -670,6 +809,11 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
         "duration_s": float(args.duration_s),
         "warmup_frames": int(args.warmup_frames),
         "display_backend": str(args.display_backend) if bool(args.display) else None,
+        "model_stage_timing": bool(getattr(args, "model_stage_timing", False)),
+        "full_int8_fp16_islands": str(
+            os.environ.get("HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS", "0")
+        ).strip().lower()
+        in {"1", "true", "yes", "on"},
     }
     worker_summary = {
         "avg_model_latency_ms": avg_model_latency,
@@ -700,6 +844,23 @@ def parse_args():
         help="Video path to benchmark.",
     )
     parser.add_argument(
+        "--model",
+        default="",
+        help=(
+            "Optional model checkpoint override for all selected runs. "
+            "Useful for benchmarking experimental TensorRT checkpoints "
+            "without changing GUI defaults."
+        ),
+    )
+    parser.add_argument(
+        "--hg-weights",
+        default="",
+        help=(
+            "Optional HG checkpoint override for all selected runs. Use this "
+            "with --model when benchmarking the original HR/HG baseline."
+        ),
+    )
+    parser.add_argument(
         "--resolutions",
         nargs="+",
         type=_parse_resolution,
@@ -713,15 +874,33 @@ def parse_args():
         choices=tuple(_RUN_PRESETS.keys()),
         help="Precision/model presets to run.",
     )
+    parser.add_argument(
+        "--checkpoint-family",
+        default="distilled",
+        choices=["distilled", "original"],
+        help=(
+            "Checkpoint family to benchmark. Distilled is the quant-friendly "
+            "default; original uses untouched HR/HG and the matching original "
+            "eager/TensorRT INT8 files."
+        ),
+    )
     parser.add_argument("--duration-s", type=float, default=180.0)
     parser.add_argument("--warmup-frames", type=int, default=120)
     parser.add_argument("--sample-interval", type=int, default=120)
     parser.add_argument("--prefetch", type=int, default=8)
-    parser.add_argument("--use-hg", default="0", choices=["0", "1"])
+    parser.add_argument("--use-hg", default="1", choices=["0", "1"])
     parser.add_argument("--compile-mode", default="max-autotune")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--force-compile", action="store_true")
     parser.add_argument("--skip-cache-warmup", action="store_true")
+    parser.add_argument(
+        "--model-stage-timing",
+        action="store_true",
+        help=(
+            "Use synchronized preprocess/run/post timing. This is diagnostic "
+            "and slower; default uses the normal fast playback path."
+        ),
+    )
     parser.add_argument(
         "--display",
         action="store_true",
@@ -739,8 +918,20 @@ def parse_args():
         default="native",
         choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
         help=(
-            "TensorRT INT8 mode. 'native' uses plain ONNX layers plus TensorRT "
-            "PTQ calibration; other values use explicit Q/DQ. Default: native."
+            "TensorRT INT8 export mode. With ModelOpt enabled, 'native' means "
+            "explicit ModelOpt Q/DQ export with TensorRT's native Q/DQ fusion. "
+            "If ModelOpt is disabled, it falls back to legacy implicit/native "
+            "TensorRT calibration. Default: native."
+        ),
+    )
+    parser.add_argument(
+        "--full-int8-fp16-islands",
+        default=None,
+        choices=["on", "off"],
+        help=(
+            "Full INT8 TensorRT safety mode. Default/env is off: full INT8 "
+            "engines disable FP16 tactics. Use 'on' to select the safe "
+            "FP16-builder fallback for full INT8 presets."
         ),
     )
     parser.add_argument(
@@ -778,6 +969,10 @@ def main() -> int:
     if not os.path.isfile(args.video):
         raise FileNotFoundError(f"Video not found: {args.video}")
     args.use_hg = str(args.use_hg).strip() != "0"
+    if args.full_int8_fp16_islands is not None:
+        os.environ["HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS"] = (
+            "1" if args.full_int8_fp16_islands == "on" else "0"
+        )
 
     source_slug = _slug(pathlib.Path(args.video).stem)
     batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -787,17 +982,36 @@ def main() -> int:
     print(f"[bench] Output: {batch_dir}", flush=True)
     if args.display:
         print(f"[bench] Display: {args.display_backend}", flush=True)
+    print(f"[bench] Checkpoint family: {args.checkpoint_family}", flush=True)
 
     results = []
     for resolution in args.resolutions:
         for run_key in args.runs:
-            preset = dict(_RUN_PRESETS[run_key])
+            preset = _apply_checkpoint_family(
+                dict(_RUN_PRESETS[run_key]),
+                run_key,
+                args.checkpoint_family,
+            )
             if (not args.use_hg) and preset.get("model_nohg"):
                 preset["model"] = preset["model_nohg"]
-            if _IS_NVIDIA and str(args.device).lower() != "cpu":
-                preset["predequantize"] = str(
-                    preset.get("trt_predequantize", preset.get("predequantize", "auto"))
+            manual_model = bool(preset.get("manual_model", False))
+            if args.model:
+                preset["model"] = os.path.abspath(args.model)
+                preset["custom_model"] = True
+                preset["mode_name_base"] = run_key
+                preset["label"] = f"{preset.get('trt_label', preset.get('label', run_key))}_custom"
+                preset["predequantize"] = "off" if _IS_NVIDIA else str(
+                    preset.get("predequantize", "auto")
                 )
+                preset["qdq_fusion"] = str(args.trt_qdq_fusion)
+            elif _IS_NVIDIA and str(args.device).lower() != "cpu":
+                gui_key = str(preset.get("gui_key") or "").strip()
+                if (not manual_model) and gui_key:
+                    preset["model"] = _select_tensorrt_model_path(
+                        gui_key,
+                        bool(args.use_hg),
+                    )
+                preset["predequantize"] = "off"
                 preset["qdq_fusion"] = str(args.trt_qdq_fusion)
                 preset["label"] = str(preset.get("trt_label", preset.get("label", run_key)))
                 if str(args.trt_qdq_fusion) not in {"auto", "native"}:
