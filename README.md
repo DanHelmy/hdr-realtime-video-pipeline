@@ -48,7 +48,7 @@ Core updates include:
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark queue can add the current setup once or add every visible precision preset in one click, making FP32/FP16/INT8 sweeps less tedious
-- deterministic video frame detection now uses FFmpeg keyframe timestamps plus low-resolution preview scoring when available, caches the scored pool, and avoids repeated OpenCV random-seek QC passes
+- deterministic video frame detection now uses FFmpeg keyframe timestamps plus bounded low-resolution preview scoring when available, returns large requested pools from the keyframe timeline without decoding every candidate, caches the scored pool, and avoids repeated OpenCV random-seek QC passes
 - compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path with OpenCV fallback for requested noncurrent frames
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
@@ -404,7 +404,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - queue controls can add the current run or add all visible precision presets for the current source/resolution/HG setup
   - runs quality benchmarking through TensorRT on NVIDIA, cached max-autotune on AMD when available, or eager fallback when no safe compile cache exists
   - video workflow includes deterministic distinct-frame candidate pools, average modes (`selected`, `all`, deterministic subset), and manual frame checkboxes
-  - video frame detection now prefers FFmpeg packet-level keyframe timestamps plus tiny preview-frame scoring, then reuses cached scores for deterministic subset/all-frame modes instead of re-reading every detected frame through OpenCV
+  - video frame detection now prefers FFmpeg packet-level keyframe timestamps plus bounded tiny preview-frame scoring, then reuses cached scores for deterministic subset/all-frame modes instead of re-reading every detected frame through OpenCV
   - dataset workflow includes paired-file scanning with the same averaging modes (`selected`, `all`, deterministic subset)
   - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
   - result previews now use the same compare-style color-managed display path for `SDR`, `HDR GT`, and `HDR Convert`

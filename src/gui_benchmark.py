@@ -290,6 +290,7 @@ _BENCHMARK_POST_VERIFY_CACHE_BYTES = 0
 _BENCHMARK_POST_VERIFY_CACHE_LOCK = threading.Lock()
 _FRAME_DETECT_KEYFRAME_CACHE: OrderedDict[tuple[str, int, int], list[float]] = OrderedDict()
 _FRAME_DETECT_KEYFRAME_CACHE_MAX = 8
+_FRAME_DETECT_LAST_METHOD = ""
 
 
 def _env_benchmark_float(name: str, default: float) -> float:
@@ -1262,42 +1263,59 @@ def _detect_distinct_video_frames_ffmpeg_keyframes(
     if not region_times:
         region_times = times
     max_source_dim = max(0, int(source_width or 0), int(source_height or 0))
-    sample_upper = 64 if max_source_dim >= 2160 else 96
-    sample_count = min(
+    preview_upper = 32 if max_source_dim >= 2160 else 48
+    candidate_count = min(
         len(region_times),
-        max(24, min(sample_upper, int(max(1, desired_count)) * 2)),
+        max(int(max(1, desired_count)), min(preview_upper, 24)),
     )
-    if sample_count <= 0:
+    if candidate_count <= 0:
         return [], {}
-    if sample_count == 1:
-        chosen_times = [region_times[len(region_times) // 2]]
+    if candidate_count == 1:
+        candidate_times = [region_times[len(region_times) // 2]]
     else:
         time_idxs = np.linspace(
             0,
             len(region_times) - 1,
-            num=sample_count,
+            num=candidate_count,
             dtype=np.int64,
         )
-        chosen_times = [float(region_times[int(i)]) for i in time_idxs]
+        candidate_times = [float(region_times[int(i)]) for i in time_idxs]
 
     fallback_idxs = [
         max(0, min(int(total_frames) - 1, int(round(float(ts) * fps_f))))
-        for ts in chosen_times
+        for ts in candidate_times
     ]
 
-    max_workers = min(2 if max_source_dim >= 2160 else 4, max(1, len(chosen_times)))
+    preview_count = min(
+        len(candidate_times),
+        max(8, min(preview_upper, int(max(1, desired_count)))),
+    )
+    if preview_count == len(candidate_times):
+        preview_times = list(candidate_times)
+    elif preview_count <= 1:
+        preview_times = [candidate_times[len(candidate_times) // 2]]
+    else:
+        preview_idxs = np.linspace(
+            0,
+            len(candidate_times) - 1,
+            num=preview_count,
+            dtype=np.int64,
+        )
+        preview_times = [float(candidate_times[int(i)]) for i in preview_idxs]
+
+    max_workers = min(2 if max_source_dim >= 2160 else 4, max(1, len(preview_times)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         preview_frames = list(
             executor.map(
                 lambda ts: _ffmpeg_read_bgr_preview_frame(video_path, ts),
-                chosen_times,
+                preview_times,
             )
         )
 
     prev_hist = None
     prev_luma = None
     scored: list[tuple[float, int]] = []
-    for ts, frame in zip(chosen_times, preview_frames):
+    for ts, frame in zip(preview_times, preview_frames):
         if frame is None:
             continue
         frame_idx = max(0, min(int(total_frames) - 1, int(round(float(ts) * fps_f))))
@@ -1328,7 +1346,11 @@ def _detect_distinct_video_frames_ffmpeg_keyframes(
 
     if len(scored) < min(int(max(1, desired_count)), len(fallback_idxs)):
         scored_idxs = {int(idx) for _score, idx in scored}
-        for idx in fallback_idxs:
+        supplement_idxs = _select_spread_from_scored_frames(
+            [(0.0, int(idx)) for idx in fallback_idxs],
+            min(int(max(1, desired_count)), len(fallback_idxs)),
+        )
+        for idx in supplement_idxs:
             idx_i = int(idx)
             if idx_i in scored_idxs:
                 continue
@@ -1424,6 +1446,8 @@ def _detect_distinct_video_frames_with_scores(
     desired_count: int = 10,
     max_scan_points: int = 240,
 ) -> tuple[list[int], dict[int, float]]:
+    global _FRAME_DETECT_LAST_METHOD
+    _FRAME_DETECT_LAST_METHOD = "opencv"
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         cap.release()
@@ -1465,6 +1489,7 @@ def _detect_distinct_video_frames_with_scores(
             source_height=source_height,
         )
         if fast_frames:
+            _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes"
             return fast_frames, fast_scores
         available = max(1, end_idx - start_idx + 1)
         scan_points = max(desired_count * 5, 64)
@@ -3221,7 +3246,7 @@ class ModelBenchmarkDialog(QDialog):
             sig = f"{os.path.abspath(video_path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
         except Exception:
             sig = os.path.abspath(video_path) if video_path else str(video_path or "")
-        return f"{sig}|count={int(max(1, desired_count))}|qc=4|interest=1|credits=1"
+        return f"{sig}|count={int(max(1, desired_count))}|qc=5|interest=2|credits=1|ffkeys=2"
 
     def _video_pair_cache_key(self, sdr_path: str, gt_path: str) -> tuple:
         return (
@@ -4821,7 +4846,7 @@ class ModelBenchmarkDialog(QDialog):
         if not frames:
             # Oversample enough to find visually distinct candidates, without
             # turning 4K/HEVC videos into hundreds of random decoder seeks.
-            scan_cap = min(720, max(96, pool_count * 5))
+            scan_cap = min(240, max(96, pool_count * 3))
             frames, interest_by_frame = _detect_distinct_video_frames_with_scores(
                 sdr_path,
                 desired_count=pool_count,
@@ -4873,7 +4898,8 @@ class ModelBenchmarkDialog(QDialog):
 
         self._lbl_video_note.setText(
             f"{len(frames)} deterministic candidate frames detected "
-            f"(pool {pool_count}, {'cache hit' if used_cache else 'fresh scan'}). "
+            f"(pool {pool_count}, {'cache hit' if used_cache else 'fresh scan'}, "
+            f"{'cache' if used_cache else str(_FRAME_DETECT_LAST_METHOD or 'scan')}). "
             "Black, blown-out, flat, logo, and credit-style frames are skipped by deterministic QC. "
             "The opening and ending movie regions are avoided by default. "
             "Candidates are ranked for visual interest while staying temporally spread out. "
