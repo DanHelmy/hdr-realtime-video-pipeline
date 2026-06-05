@@ -66,6 +66,7 @@ from gui_config import (
 )
 from gui_hdr_io import (
     FFMPEG_WINDOWS_DOWNLOAD_URL,
+    _ffprobe_video_stream_info,
     hdr_ffmpeg_ready,
     read_hdr_video_frames_rgb16_exact,
     read_hdr_video_frame_rgb16,
@@ -1025,108 +1026,6 @@ def _video_frame_idx_passes_movie_region_qc(
     return start_idx <= idx <= end_idx
 
 
-def _video_frame_idx_passes_benchmark_qc(
-    cap: cv2.VideoCapture,
-    frame_idx_0b: int,
-    total_frames: int | None = None,
-    fps: float | None = None,
-) -> bool:
-    if total_frames is None:
-        try:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        except Exception:
-            total_frames = 0
-    if fps is None:
-        try:
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        except Exception:
-            fps = 0.0
-    if not _video_frame_idx_passes_movie_region_qc(
-        frame_idx_0b,
-        int(total_frames or 0),
-        fps,
-    ):
-        return False
-    try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx_0b)))
-        ok, frame = cap.read()
-    except Exception:
-        return False
-    if not ok or frame is None:
-        return False
-    passed, _reason = _benchmark_frame_qc(frame)
-    return bool(passed)
-
-
-def _filter_video_frame_indices_for_benchmark_qc(
-    video_path: str,
-    frame_indices_1b: list[int],
-) -> list[int]:
-    if not frame_indices_1b:
-        return []
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        cap.release()
-        return []
-    out: list[int] = []
-    seen: set[int] = set()
-    try:
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    except Exception:
-        total_frames = 0
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    except Exception:
-        fps = 0.0
-    try:
-        for frame_1b in frame_indices_1b:
-            try:
-                frame_1b_i = max(1, int(frame_1b))
-            except Exception:
-                continue
-            if frame_1b_i in seen:
-                continue
-            seen.add(frame_1b_i)
-            if _video_frame_idx_passes_benchmark_qc(
-                cap,
-                frame_1b_i - 1,
-                total_frames=total_frames,
-                fps=fps,
-            ):
-                out.append(frame_1b_i)
-    finally:
-        cap.release()
-    return out
-
-
-def _capture_read_frame_at(
-    cap: cv2.VideoCapture,
-    frame_idx_0b: int,
-    *,
-    last_frame_idx_0b: int | None = None,
-    sequential_gap: int = 10,
-) -> tuple[bool, np.ndarray | None, int | None]:
-    idx = max(0, int(frame_idx_0b))
-    if last_frame_idx_0b is not None:
-        gap = idx - int(last_frame_idx_0b)
-        if 0 < gap <= max(0, int(sequential_gap)):
-            frame = None
-            ok = False
-            for _ in range(gap):
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    return False, None, None
-            return True, frame, idx
-    try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-    except Exception:
-        return False, None, None
-    if not ok or frame is None:
-        return False, None, None
-    return True, frame, idx
-
-
 def _ffprobe_video_keyframe_times(video_path: str) -> list[float]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe or not video_path or not os.path.isfile(video_path):
@@ -1375,59 +1274,6 @@ def _detect_distinct_video_frames_ffmpeg_keyframes(
     }
 
 
-def _score_video_frame_indices_for_interest(
-    video_path: str,
-    frame_indices_1b: list[int],
-) -> list[tuple[float, int]]:
-    if not frame_indices_1b:
-        return []
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        cap.release()
-        return []
-    scored: list[tuple[float, int]] = []
-    seen: set[int] = set()
-    try:
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    except Exception:
-        total_frames = 0
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    except Exception:
-        fps = 0.0
-    try:
-        last_frame_idx: int | None = None
-        for frame_1b in frame_indices_1b:
-            try:
-                frame_1b_i = max(1, int(frame_1b))
-            except Exception:
-                continue
-            if frame_1b_i in seen:
-                continue
-            seen.add(frame_1b_i)
-            if not _video_frame_idx_passes_movie_region_qc(
-                frame_1b_i - 1,
-                total_frames,
-                fps,
-            ):
-                continue
-            ok, frame, read_idx = _capture_read_frame_at(
-                cap,
-                frame_1b_i - 1,
-                last_frame_idx_0b=last_frame_idx,
-            )
-            if not ok or frame is None:
-                continue
-            last_frame_idx = read_idx
-            passed, _reason = _benchmark_frame_qc(frame)
-            if not passed:
-                continue
-            scored.append((_frame_visual_interest_score(frame), frame_1b_i - 1))
-    finally:
-        cap.release()
-    return scored
-
-
 def _detect_distinct_video_frames(
     video_path: str,
     desired_count: int = 10,
@@ -1447,110 +1293,53 @@ def _detect_distinct_video_frames_with_scores(
     max_scan_points: int = 240,
 ) -> tuple[list[int], dict[int, float]]:
     global _FRAME_DETECT_LAST_METHOD
-    _FRAME_DETECT_LAST_METHOD = "opencv"
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        cap.release()
+    _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes"
+    stream_info = _ffprobe_video_stream_info(video_path)
+    if not isinstance(stream_info, dict):
+        _FRAME_DETECT_LAST_METHOD = "metadata unavailable"
         return [], {}
 
     try:
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        try:
-            source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        except Exception:
-            source_width = 0
-            source_height = 0
-        try:
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        except Exception:
-            fps = 0.0
-        if total <= 1:
-            if _video_frame_idx_passes_benchmark_qc(
-                cap,
-                0,
-                total_frames=total,
-                fps=fps,
-            ):
-                return [1], {}
-            return [], {}
+        source_width = int(stream_info.get("width") or 0)
+        source_height = int(stream_info.get("height") or 0)
+    except Exception:
+        source_width = 0
+        source_height = 0
+    try:
+        fps = float(stream_info.get("fps") or 0.0)
+    except Exception:
+        fps = 0.0
+    if source_width <= 0 or source_height <= 0 or fps <= 0.0 or not np.isfinite(fps):
+        _FRAME_DETECT_LAST_METHOD = "metadata unavailable"
+        return [], {}
 
-        start_idx, end_idx = _benchmark_movie_frame_bounds(total, fps)
-        if end_idx < start_idx:
-            start_idx, end_idx = 0, total - 1
-        fast_frames, fast_scores = _detect_distinct_video_frames_ffmpeg_keyframes(
-            video_path,
-            desired_count,
-            total_frames=total,
-            fps=fps,
-            start_idx=start_idx,
-            end_idx=end_idx,
-            source_width=source_width,
-            source_height=source_height,
-        )
-        if fast_frames:
-            _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes"
-            return fast_frames, fast_scores
-        available = max(1, end_idx - start_idx + 1)
-        scan_points = max(desired_count * 5, 64)
-        scan_points = min(scan_points, max_scan_points, available)
-        idxs = np.linspace(start_idx, end_idx, num=scan_points, dtype=np.int64)
+    keyframe_times = _ffprobe_video_keyframe_times(video_path)
+    if not keyframe_times:
+        _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes unavailable"
+        return [], {}
+    total = max(
+        2,
+        int(round((float(max(keyframe_times)) + (1.0 / max(float(fps), 1e-6))) * float(fps))) + 1,
+    )
 
-        prev_hist = None
-        prev_luma = None
-        scored: list[tuple[float, int]] = []
-        last_frame_idx: int | None = None
-
-        for idx in idxs:
-            ok, frame, read_idx = _capture_read_frame_at(
-                cap,
-                int(idx),
-                last_frame_idx_0b=last_frame_idx,
-            )
-            if not ok or frame is None:
-                continue
-            last_frame_idx = read_idx
-            passed_qc, _reason = _benchmark_frame_qc(frame)
-            if not passed_qc:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-            luma = float(np.mean(gray))
-            texture = float(np.std(gray)) / 64.0
-            interest = _frame_visual_interest_score(frame)
-            scene_score = 0.0
-            if prev_hist is not None:
-                scene = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
-                luma_jump = abs(luma - float(prev_luma or 0.0)) / 255.0
-                scene_score = (scene * 0.78) + (luma_jump * 0.18)
-            score = (
-                (0.62 * interest)
-                + (0.28 * scene_score)
-                + (0.10 * min(max(texture, 0.0), 1.5))
-            )
-            scored.append((float(score), int(idx)))
-            prev_hist = hist
-            prev_luma = luma
-
-        if not scored:
-            return [], {}
-
-        chosen = _select_spread_from_scored_frames(scored, desired_count)
-        score_by_idx = {int(idx): float(score) for score, idx in scored}
-        chosen = sorted({max(0, min(total - 1, int(v))) for v in chosen})
-        if len(chosen) > desired_count:
-            chosen = chosen[:desired_count]
-        if not chosen:
-            chosen = [0]
-        # UI displays 1-based frame numbering.
-        frames_1b = [int(v) + 1 for v in chosen]
-        return frames_1b, {
-            int(v) + 1: float(score_by_idx.get(int(v), 0.0))
-            for v in chosen
-        }
-    finally:
-        cap.release()
+    start_idx, end_idx = _benchmark_movie_frame_bounds(total, fps)
+    if end_idx < start_idx:
+        start_idx, end_idx = 0, total - 1
+    fast_frames, fast_scores = _detect_distinct_video_frames_ffmpeg_keyframes(
+        video_path,
+        desired_count,
+        total_frames=total,
+        fps=fps,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        source_width=source_width,
+        source_height=source_height,
+    )
+    if fast_frames:
+        _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes"
+        return fast_frames, fast_scores
+    _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes unavailable"
+    return [], {}
 
 
 @dataclass
@@ -3246,7 +3035,7 @@ class ModelBenchmarkDialog(QDialog):
             sig = f"{os.path.abspath(video_path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
         except Exception:
             sig = os.path.abspath(video_path) if video_path else str(video_path or "")
-        return f"{sig}|count={int(max(1, desired_count))}|qc=5|interest=2|credits=1|ffkeys=2"
+        return f"{sig}|count={int(max(1, desired_count))}|qc=5|interest=2|credits=1|ffkeys=3|noopencv=1"
 
     def _video_pair_cache_key(self, sdr_path: str, gt_path: str) -> tuple:
         return (
@@ -4835,13 +4624,9 @@ class ModelBenchmarkDialog(QDialog):
                 sanitized_frames.append(frame_1b_i)
             frames = sanitized_frames
             if not all(int(frame_1b) in interest_by_frame for frame_1b in frames):
-                scored = _score_video_frame_indices_for_interest(sdr_path, frames)
-                frames = [int(idx) + 1 for _score, idx in scored]
-                interest_by_frame = {
-                    int(idx) + 1: float(score)
-                    for score, idx in scored
-                }
-                cache_needs_save = True
+                frames = []
+                interest_by_frame = {}
+                cache_needs_save = False
         used_cache = bool(frames)
         if not frames:
             # Oversample enough to find visually distinct candidates, without
@@ -4877,7 +4662,9 @@ class ModelBenchmarkDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Video Benchmark",
-                "Could not detect representative frames from the selected video.",
+                "Could not detect representative frames from the selected video.\n\n"
+                "FFmpeg keyframe detection is required for video frame detection; "
+                f"last detector path: {_FRAME_DETECT_LAST_METHOD or 'unknown'}.",
             )
             return
 
@@ -5117,10 +4904,7 @@ class ModelBenchmarkDialog(QDialog):
                 break
             scored.append((score, int(task.frame_idx or 0)))
         if missing_scores:
-            scored = _score_video_frame_indices_for_interest(
-                video_path,
-                [int(idx) + 1 for idx in sorted(frame_to_task)],
-            )
+            return self._deterministic_subset(tasks, count)
         chosen = _select_spread_from_scored_frames(scored, count)
         selected = [
             frame_to_task[idx]

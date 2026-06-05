@@ -48,8 +48,8 @@ Core updates include:
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark queue can add the current setup once or add every visible precision preset in one click, making FP32/FP16/INT8 sweeps less tedious
-- deterministic video frame detection now uses FFmpeg keyframe timestamps plus bounded low-resolution preview scoring when available, returns large requested pools from the keyframe timeline without decoding every candidate, caches the scored pool, and avoids repeated OpenCV random-seek QC passes
-- compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path with OpenCV fallback for requested noncurrent frames
+- deterministic video frame detection now requires FFmpeg keyframe timestamps plus bounded low-resolution preview scoring, returns large requested pools from the keyframe timeline without decoding every candidate, caches the scored pool, and avoids OpenCV random-seek QC passes
+- compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path for requested noncurrent video frames instead of falling back to OpenCV video seeking
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
@@ -542,12 +542,12 @@ python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1440p 
   - `HDRTVNET_GT_SYNC_OFFSET_MIN_GAIN` controls how much better a nonzero global offset must be before it replaces frame offset `0`. Default: `0.06`; tiny offsets require a stronger gain to avoid false `+/-1` to `+/-5` frame shifts.
   - the detected offset is cached per file signature and used by Compare, objective logging, and benchmark frame reads.
   - if a movie starts more than two seconds apart between SDR and HDR GT files, raise `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` before launch.
-- Compare recompare, benchmark previews, and deterministic video frame display use guarded FFmpeg fast seeks for SDR frame reads when available, with OpenCV fallback:
-  - `HDRTVNET_SDR_FRAME_FAST_SEEK=0` disables the SDR fast-seek reader.
+- Compare recompare, benchmark previews, and deterministic video frame display use guarded FFmpeg fast seeks for SDR video frame reads instead of OpenCV video seeking:
+  - `HDRTVNET_SDR_FRAME_FAST_SEEK=0` disables the SDR fast-seek reader; requested video frames then report unavailable.
   - `HDRTVNET_SDR_FRAME_FAST_SEEK_PTS_GUARD=0` disables timestamp verification for the fast reader.
   - `HDRTVNET_SDR_FRAME_CACHE_MAX` controls the small repeated-frame cache. Default: `8`.
 - Model Quality Benchmark video candidate detection uses FFmpeg packet-level keyframe timestamps and tiny preview-frame scoring when available, then stores the deterministic scored pool:
-  - `HDRTVNET_FRAME_DETECT_FFMPEG=0` disables this keyframe detector and falls back to the OpenCV scanner.
+  - `HDRTVNET_FRAME_DETECT_FFMPEG=0` disables this keyframe detector. Video candidate detection then reports unavailable instead of falling back to OpenCV random seeking.
 - Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames before final metrics:
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY` enables/disables this pass. Default: `1`.
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS` limits verified rows, or `all` verifies every video row. Default: `all`.

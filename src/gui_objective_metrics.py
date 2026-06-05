@@ -96,9 +96,15 @@ def _video_file_token(path: str) -> str:
         return os.path.abspath(path) if path else ""
 
 
-def _decode_bgr24_frame(cmd: list[str], width: int, height: int) -> tuple[np.ndarray | None, float | None]:
+def _decode_bgr24_frame(
+    cmd: list[str],
+    width: int,
+    height: int,
+    *,
+    timeout_s: float = 10.0,
+) -> tuple[np.ndarray | None, float | None]:
     try:
-        cp = subprocess.run(cmd, capture_output=True, check=True, timeout=10)
+        cp = subprocess.run(cmd, capture_output=True, check=True, timeout=timeout_s)
     except Exception:
         return None, None
     expected = int(width) * int(height) * 3
@@ -173,13 +179,44 @@ def _read_video_frame_at_ffmpeg(path: str, frame_idx: int) -> np.ndarray | None:
     ]
     frame, pts_time = _decode_bgr24_frame(cmd, width, height)
     if frame is None:
-        return None
-    if _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED:
+        pass
+    elif _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED:
         target_pts = float(idx) / float(fps)
         tol_s = max(1e-3, float(_SDR_FRAME_FAST_SEEK_PTS_TOL_FRAMES) / float(fps))
-        if pts_time is None or abs(float(pts_time) - target_pts) > tol_s:
-            return None
-    return frame
+        if pts_time is not None and abs(float(pts_time) - target_pts) <= tol_s:
+            return frame
+    else:
+        return frame
+
+    select_expr = f"select=eq(n\\,{idx}),format=bgr24"
+    exact_cmd = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-map",
+        "0:v:0",
+        "-vf",
+        select_expr,
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-dn",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-",
+    ]
+    exact_frame, _pts = _decode_bgr24_frame(
+        exact_cmd,
+        width,
+        height,
+        timeout_s=45.0,
+    )
+    return exact_frame
 
 
 class _RunningAverage:
@@ -202,7 +239,7 @@ class _RunningAverage:
 
 
 def _read_video_frame_at(path: str, frame_idx: int) -> np.ndarray | None:
-    """Best-effort random access to a single frame from a video path."""
+    """Best-effort FFmpeg random access to a single frame from a video path."""
     if not path or not os.path.isfile(path):
         return None
     try:
@@ -226,28 +263,10 @@ def _read_video_frame_at(path: str, frame_idx: int) -> np.ndarray | None:
                 _SDR_FRAME_CACHE.popitem(last=False)
         return frame
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        cap.release()
-        if cache_key is not None:
-            _SDR_FRAME_CACHE[cache_key] = None
-            _SDR_FRAME_CACHE.move_to_end(cache_key)
-        return None
-    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret or frame is None:
-        if cache_key is not None:
-            _SDR_FRAME_CACHE[cache_key] = None
-            _SDR_FRAME_CACHE.move_to_end(cache_key)
-        return None
-    frame = np.ascontiguousarray(frame)
     if cache_key is not None:
-        _SDR_FRAME_CACHE[cache_key] = frame
+        _SDR_FRAME_CACHE[cache_key] = None
         _SDR_FRAME_CACHE.move_to_end(cache_key)
-        while len(_SDR_FRAME_CACHE) > _SDR_FRAME_CACHE_MAX:
-            _SDR_FRAME_CACHE.popitem(last=False)
-    return frame
+    return None
 
 
 def _prepare_metric_pair(
