@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import datetime as _dt
 import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import queue
 import threading
@@ -286,6 +288,8 @@ _BENCHMARK_POST_VERIFY_CACHE_VERSION = "gt-postverify-v1"
 _BENCHMARK_POST_VERIFY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
 _BENCHMARK_POST_VERIFY_CACHE_BYTES = 0
 _BENCHMARK_POST_VERIFY_CACHE_LOCK = threading.Lock()
+_FRAME_DETECT_KEYFRAME_CACHE: OrderedDict[tuple[str, int, int], list[float]] = OrderedDict()
+_FRAME_DETECT_KEYFRAME_CACHE_MAX = 8
 
 
 def _env_benchmark_float(name: str, default: float) -> float:
@@ -1094,6 +1098,261 @@ def _filter_video_frame_indices_for_benchmark_qc(
     return out
 
 
+def _capture_read_frame_at(
+    cap: cv2.VideoCapture,
+    frame_idx_0b: int,
+    *,
+    last_frame_idx_0b: int | None = None,
+    sequential_gap: int = 10,
+) -> tuple[bool, np.ndarray | None, int | None]:
+    idx = max(0, int(frame_idx_0b))
+    if last_frame_idx_0b is not None:
+        gap = idx - int(last_frame_idx_0b)
+        if 0 < gap <= max(0, int(sequential_gap)):
+            frame = None
+            ok = False
+            for _ in range(gap):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    return False, None, None
+            return True, frame, idx
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+    except Exception:
+        return False, None, None
+    if not ok or frame is None:
+        return False, None, None
+    return True, frame, idx
+
+
+def _ffprobe_video_keyframe_times(video_path: str) -> list[float]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not video_path or not os.path.isfile(video_path):
+        return []
+    cache_key = _post_verify_file_token(video_path)
+    if cache_key in _FRAME_DETECT_KEYFRAME_CACHE:
+        _FRAME_DETECT_KEYFRAME_CACHE.move_to_end(cache_key)
+        return list(_FRAME_DETECT_KEYFRAME_CACHE[cache_key])
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time,flags",
+        "-of",
+        "json",
+        video_path,
+    ]
+    try:
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=45,
+        )
+        payload = json.loads(cp.stdout or "{}")
+    except Exception:
+        return []
+    out: list[float] = []
+    for packet in payload.get("packets") or []:
+        if not isinstance(packet, dict):
+            continue
+        if "K" not in str(packet.get("flags") or ""):
+            continue
+        try:
+            ts = float(packet.get("pts_time"))
+        except Exception:
+            continue
+        if np.isfinite(ts) and ts >= 0.0:
+            out.append(float(ts))
+    if not out:
+        return []
+    times = sorted(set(out))
+    _FRAME_DETECT_KEYFRAME_CACHE[cache_key] = times
+    _FRAME_DETECT_KEYFRAME_CACHE.move_to_end(cache_key)
+    while len(_FRAME_DETECT_KEYFRAME_CACHE) > _FRAME_DETECT_KEYFRAME_CACHE_MAX:
+        _FRAME_DETECT_KEYFRAME_CACHE.popitem(last=False)
+    return list(times)
+
+
+def _ffmpeg_read_bgr_preview_frame(
+    video_path: str,
+    timestamp_s: float,
+    *,
+    width: int = 320,
+    height: int = 180,
+) -> np.ndarray | None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not video_path or not os.path.isfile(video_path):
+        return None
+    w = max(16, int(width))
+    h = max(16, int(height))
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=bgr24"
+    )
+    cmd = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-ss",
+        f"{max(0.0, float(timestamp_s)):.3f}",
+        "-i",
+        video_path,
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-vf",
+        vf,
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, check=True, timeout=8)
+    except Exception:
+        return None
+    expected = w * h * 3
+    data = cp.stdout or b""
+    if len(data) < expected:
+        return None
+    try:
+        frame = np.frombuffer(data[:expected], dtype=np.uint8).reshape((h, w, 3))
+    except Exception:
+        return None
+    return np.ascontiguousarray(frame)
+
+
+def _detect_distinct_video_frames_ffmpeg_keyframes(
+    video_path: str,
+    desired_count: int,
+    *,
+    total_frames: int,
+    fps: float,
+    start_idx: int,
+    end_idx: int,
+    source_width: int = 0,
+    source_height: int = 0,
+) -> tuple[list[int], dict[int, float]]:
+    if str(os.environ.get("HDRTVNET_FRAME_DETECT_FFMPEG", "1")).strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return [], {}
+    if not hdr_ffmpeg_ready():
+        return [], {}
+    fps_f = float(fps or 0.0)
+    if not np.isfinite(fps_f) or fps_f <= 0.0:
+        return [], {}
+    times = _ffprobe_video_keyframe_times(video_path)
+    if not times:
+        return [], {}
+
+    start_s = max(0.0, float(start_idx) / fps_f)
+    end_s = max(start_s, float(end_idx) / fps_f)
+    region_times = [t for t in times if start_s <= t <= end_s]
+    if not region_times:
+        region_times = times
+    max_source_dim = max(0, int(source_width or 0), int(source_height or 0))
+    sample_upper = 64 if max_source_dim >= 2160 else 96
+    sample_count = min(
+        len(region_times),
+        max(24, min(sample_upper, int(max(1, desired_count)) * 2)),
+    )
+    if sample_count <= 0:
+        return [], {}
+    if sample_count == 1:
+        chosen_times = [region_times[len(region_times) // 2]]
+    else:
+        time_idxs = np.linspace(
+            0,
+            len(region_times) - 1,
+            num=sample_count,
+            dtype=np.int64,
+        )
+        chosen_times = [float(region_times[int(i)]) for i in time_idxs]
+
+    fallback_idxs = [
+        max(0, min(int(total_frames) - 1, int(round(float(ts) * fps_f))))
+        for ts in chosen_times
+    ]
+
+    max_workers = min(2 if max_source_dim >= 2160 else 4, max(1, len(chosen_times)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        preview_frames = list(
+            executor.map(
+                lambda ts: _ffmpeg_read_bgr_preview_frame(video_path, ts),
+                chosen_times,
+            )
+        )
+
+    prev_hist = None
+    prev_luma = None
+    scored: list[tuple[float, int]] = []
+    for ts, frame in zip(chosen_times, preview_frames):
+        if frame is None:
+            continue
+        frame_idx = max(0, min(int(total_frames) - 1, int(round(float(ts) * fps_f))))
+        if not _video_frame_idx_passes_movie_region_qc(frame_idx, total_frames, fps_f):
+            continue
+        passed_qc, _reason = _benchmark_frame_qc(frame)
+        if not passed_qc:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        luma = float(np.mean(gray))
+        texture = float(np.std(gray)) / 64.0
+        interest = _frame_visual_interest_score(frame)
+        scene_score = 0.0
+        if prev_hist is not None:
+            scene = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+            luma_jump = abs(luma - float(prev_luma or 0.0)) / 255.0
+            scene_score = (scene * 0.78) + (luma_jump * 0.18)
+        score = (
+            (0.62 * interest)
+            + (0.28 * scene_score)
+            + (0.10 * min(max(texture, 0.0), 1.5))
+        )
+        scored.append((float(score), int(frame_idx)))
+        prev_hist = hist
+        prev_luma = luma
+
+    if len(scored) < min(int(max(1, desired_count)), len(fallback_idxs)):
+        scored_idxs = {int(idx) for _score, idx in scored}
+        for idx in fallback_idxs:
+            idx_i = int(idx)
+            if idx_i in scored_idxs:
+                continue
+            if not _video_frame_idx_passes_movie_region_qc(idx_i, total_frames, fps_f):
+                continue
+            scored.append((0.0, idx_i))
+            scored_idxs.add(idx_i)
+            if len(scored) >= min(int(max(1, desired_count)), len(fallback_idxs)):
+                break
+
+    if not scored:
+        return [], {}
+    chosen = _select_spread_from_scored_frames(scored, desired_count)
+    score_by_idx = {int(idx): float(score) for score, idx in scored}
+    chosen = sorted({max(0, min(int(total_frames) - 1, int(v))) for v in chosen})
+    if len(chosen) > desired_count:
+        chosen = chosen[:desired_count]
+    frames_1b = [int(v) + 1 for v in chosen]
+    return frames_1b, {
+        int(v) + 1: float(score_by_idx.get(int(v), 0.0))
+        for v in chosen
+    }
+
+
 def _score_video_frame_indices_for_interest(
     video_path: str,
     frame_indices_1b: list[int],
@@ -1115,6 +1374,7 @@ def _score_video_frame_indices_for_interest(
     except Exception:
         fps = 0.0
     try:
+        last_frame_idx: int | None = None
         for frame_1b in frame_indices_1b:
             try:
                 frame_1b_i = max(1, int(frame_1b))
@@ -1129,13 +1389,14 @@ def _score_video_frame_indices_for_interest(
                 fps,
             ):
                 continue
-            try:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_1b_i - 1)
-                ok, frame = cap.read()
-            except Exception:
-                continue
+            ok, frame, read_idx = _capture_read_frame_at(
+                cap,
+                frame_1b_i - 1,
+                last_frame_idx_0b=last_frame_idx,
+            )
             if not ok or frame is None:
                 continue
+            last_frame_idx = read_idx
             passed, _reason = _benchmark_frame_qc(frame)
             if not passed:
                 continue
@@ -1148,7 +1409,7 @@ def _score_video_frame_indices_for_interest(
 def _detect_distinct_video_frames(
     video_path: str,
     desired_count: int = 10,
-    max_scan_points: int = 260,
+    max_scan_points: int = 240,
 ) -> list[int]:
     frames, _scores = _detect_distinct_video_frames_with_scores(
         video_path,
@@ -1161,7 +1422,7 @@ def _detect_distinct_video_frames(
 def _detect_distinct_video_frames_with_scores(
     video_path: str,
     desired_count: int = 10,
-    max_scan_points: int = 260,
+    max_scan_points: int = 240,
 ) -> tuple[list[int], dict[int, float]]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1170,6 +1431,12 @@ def _detect_distinct_video_frames_with_scores(
 
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        try:
+            source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        except Exception:
+            source_width = 0
+            source_height = 0
         try:
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         except Exception:
@@ -1187,20 +1454,37 @@ def _detect_distinct_video_frames_with_scores(
         start_idx, end_idx = _benchmark_movie_frame_bounds(total, fps)
         if end_idx < start_idx:
             start_idx, end_idx = 0, total - 1
+        fast_frames, fast_scores = _detect_distinct_video_frames_ffmpeg_keyframes(
+            video_path,
+            desired_count,
+            total_frames=total,
+            fps=fps,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            source_width=source_width,
+            source_height=source_height,
+        )
+        if fast_frames:
+            return fast_frames, fast_scores
         available = max(1, end_idx - start_idx + 1)
-        scan_points = max(desired_count * 18, 80)
+        scan_points = max(desired_count * 5, 64)
         scan_points = min(scan_points, max_scan_points, available)
         idxs = np.linspace(start_idx, end_idx, num=scan_points, dtype=np.int64)
 
         prev_hist = None
         prev_luma = None
         scored: list[tuple[float, int]] = []
+        last_frame_idx: int | None = None
 
         for idx in idxs:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ok, frame = cap.read()
+            ok, frame, read_idx = _capture_read_frame_at(
+                cap,
+                int(idx),
+                last_frame_idx_0b=last_frame_idx,
+            )
             if not ok or frame is None:
                 continue
+            last_frame_idx = read_idx
             passed_qc, _reason = _benchmark_frame_qc(frame)
             if not passed_qc:
                 continue
@@ -4513,21 +4797,31 @@ class ModelBenchmarkDialog(QDialog):
         else:
             frames = list(cached_payload or [])
         if frames:
-            frames = _filter_video_frame_indices_for_benchmark_qc(sdr_path, frames)
+            sanitized_frames: list[int] = []
+            seen_frames: set[int] = set()
+            for frame_1b in frames:
+                try:
+                    frame_1b_i = max(1, int(frame_1b))
+                except Exception:
+                    continue
+                if frame_1b_i in seen_frames:
+                    continue
+                seen_frames.add(frame_1b_i)
+                sanitized_frames.append(frame_1b_i)
+            frames = sanitized_frames
             if not all(int(frame_1b) in interest_by_frame for frame_1b in frames):
-                interest_by_frame.update({
+                scored = _score_video_frame_indices_for_interest(sdr_path, frames)
+                frames = [int(idx) + 1 for _score, idx in scored]
+                interest_by_frame = {
                     int(idx) + 1: float(score)
-                    for score, idx in _score_video_frame_indices_for_interest(
-                        sdr_path,
-                        frames,
-                    )
-                })
+                    for score, idx in scored
+                }
                 cache_needs_save = True
         used_cache = bool(frames)
         if not frames:
-            # Increase scan budget with requested count to keep higher-count runs useful,
-            # while keeping deterministic behavior for the same source+count.
-            scan_cap = min(4000, max(260, pool_count * 24))
+            # Oversample enough to find visually distinct candidates, without
+            # turning 4K/HEVC videos into hundreds of random decoder seeks.
+            scan_cap = min(720, max(96, pool_count * 5))
             frames, interest_by_frame = _detect_distinct_video_frames_with_scores(
                 sdr_path,
                 desired_count=pool_count,
@@ -4706,7 +5000,7 @@ class ModelBenchmarkDialog(QDialog):
 
         avg_mode = str(self._cmb_video_avg_mode.currentData() or "selected")
         if avg_mode == "all":
-            frames = _filter_video_frame_indices_for_benchmark_qc(sdr_path, list(all_frames))
+            frames = list(all_frames)
             if not frames:
                 raise RuntimeError(
                     "All detected frames were rejected by black/overbright deterministic QC."
@@ -4717,10 +5011,7 @@ class ModelBenchmarkDialog(QDialog):
                     "Check at least one candidate frame before using deterministic subset mode."
                 )
             subset_n = max(1, int(self._spn_video_subset.value()))
-            checked_frames = _filter_video_frame_indices_for_benchmark_qc(
-                sdr_path,
-                sorted(set(checked_frames)),
-            )
+            checked_frames = sorted(set(checked_frames))
             if not checked_frames:
                 raise RuntimeError(
                     "All checked candidate frames were rejected by black/overbright deterministic QC."

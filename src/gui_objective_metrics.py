@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +23,27 @@ _OBJECTIVE_HDRVDP3_SAMPLE_EVERY = 24
 _OBJECTIVE_METRIC_MAX_SIDE = 512
 _OBJECTIVE_HDRVDP3_MAX_SIDE = 256
 _HDRVDP3_CMD_ENV = "HDRTVNET_HDRVDP3_CMD"
+_SDR_FRAME_FAST_SEEK_ENABLED = str(
+    os.environ.get("HDRTVNET_SDR_FRAME_FAST_SEEK", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+_SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED = str(
+    os.environ.get("HDRTVNET_SDR_FRAME_FAST_SEEK_PTS_GUARD", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
+try:
+    _SDR_FRAME_FAST_SEEK_PTS_TOL_FRAMES = max(
+        0.10,
+        float(os.environ.get("HDRTVNET_SDR_FRAME_FAST_SEEK_PTS_TOL_FRAMES", "0.75")),
+    )
+except Exception:
+    _SDR_FRAME_FAST_SEEK_PTS_TOL_FRAMES = 0.75
+try:
+    _SDR_FRAME_CACHE_MAX = max(
+        0,
+        min(32, int(os.environ.get("HDRTVNET_SDR_FRAME_CACHE_MAX", "8"))),
+    )
+except Exception:
+    _SDR_FRAME_CACHE_MAX = 8
+_SDR_FRAME_CACHE: OrderedDict[tuple[str, int], np.ndarray | None] = OrderedDict()
 try:
     _OBJECTIVE_HDR_METRIC_PEAK_NITS = float(
         os.environ.get("HDRTVNET_OBJECTIVE_HDR_PEAK_NITS", "1000.0")
@@ -64,6 +88,100 @@ def _default_hdrvdp3_cmd_template() -> str:
     )
 
 
+def _video_file_token(path: str) -> str:
+    try:
+        st = os.stat(path)
+        return f"{os.path.abspath(path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+    except Exception:
+        return os.path.abspath(path) if path else ""
+
+
+def _decode_bgr24_frame(cmd: list[str], width: int, height: int) -> tuple[np.ndarray | None, float | None]:
+    try:
+        cp = subprocess.run(cmd, capture_output=True, check=True, timeout=10)
+    except Exception:
+        return None, None
+    expected = int(width) * int(height) * 3
+    data = cp.stdout or b""
+    if len(data) < expected:
+        return None, None
+    try:
+        frame = np.frombuffer(data[:expected], dtype=np.uint8).reshape((height, width, 3))
+    except Exception:
+        return None, None
+    pts_time = None
+    try:
+        stderr_text = (cp.stderr or b"").decode("utf-8", errors="ignore")
+        matches = re.findall(r"pts_time:([+-]?(?:\d+\.?\d*|\.\d+))", stderr_text)
+        if matches:
+            candidate = float(matches[-1])
+            if math.isfinite(candidate):
+                pts_time = float(candidate)
+    except Exception:
+        pts_time = None
+    return np.ascontiguousarray(frame), pts_time
+
+
+def _read_video_frame_at_ffmpeg(path: str, frame_idx: int) -> np.ndarray | None:
+    if not _SDR_FRAME_FAST_SEEK_ENABLED:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    try:
+        from gui_hdr_io import _ffprobe_video_stream_info, _frame_idx_to_seek_timestamp
+    except Exception:
+        return None
+
+    stream_info = _ffprobe_video_stream_info(path)
+    if not isinstance(stream_info, dict):
+        return None
+    width = int(stream_info.get("width") or 0)
+    height = int(stream_info.get("height") or 0)
+    fps = float(stream_info.get("fps") or 0.0)
+    if width <= 0 or height <= 0 or fps <= 0.0 or not math.isfinite(fps):
+        return None
+
+    idx = max(0, int(frame_idx))
+    seek_ts = _frame_idx_to_seek_timestamp(idx, fps)
+    if seek_ts is None:
+        return None
+
+    vf = "showinfo,format=bgr24" if _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED else "format=bgr24"
+    cmd = [
+        ffmpeg,
+        "-v",
+        "info" if _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED else "error",
+        "-ss",
+        seek_ts,
+        "-i",
+        path,
+        "-map",
+        "0:v:0",
+        "-vf",
+        vf,
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-dn",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-",
+    ]
+    frame, pts_time = _decode_bgr24_frame(cmd, width, height)
+    if frame is None:
+        return None
+    if _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED:
+        target_pts = float(idx) / float(fps)
+        tol_s = max(1e-3, float(_SDR_FRAME_FAST_SEEK_PTS_TOL_FRAMES) / float(fps))
+        if pts_time is None or abs(float(pts_time) - target_pts) > tol_s:
+            return None
+    return frame
+
+
 class _RunningAverage:
     def __init__(self):
         self.count = 0
@@ -87,19 +205,48 @@ def _read_video_frame_at(path: str, frame_idx: int) -> np.ndarray | None:
     """Best-effort random access to a single frame from a video path."""
     if not path or not os.path.isfile(path):
         return None
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        cap.release()
-        return None
     try:
         idx = max(0, int(frame_idx))
     except Exception:
         idx = 0
+    cache_key: tuple[str, int] | None = None
+    if _SDR_FRAME_CACHE_MAX > 0:
+        cache_key = (_video_file_token(path), idx)
+        if cache_key in _SDR_FRAME_CACHE:
+            cached = _SDR_FRAME_CACHE[cache_key]
+            _SDR_FRAME_CACHE.move_to_end(cache_key)
+            return None if cached is None else np.ascontiguousarray(cached)
+
+    frame = _read_video_frame_at_ffmpeg(path, idx)
+    if frame is not None:
+        if cache_key is not None:
+            _SDR_FRAME_CACHE[cache_key] = np.ascontiguousarray(frame)
+            _SDR_FRAME_CACHE.move_to_end(cache_key)
+            while len(_SDR_FRAME_CACHE) > _SDR_FRAME_CACHE_MAX:
+                _SDR_FRAME_CACHE.popitem(last=False)
+        return frame
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        cap.release()
+        if cache_key is not None:
+            _SDR_FRAME_CACHE[cache_key] = None
+            _SDR_FRAME_CACHE.move_to_end(cache_key)
+        return None
     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
     ret, frame = cap.read()
     cap.release()
     if not ret or frame is None:
+        if cache_key is not None:
+            _SDR_FRAME_CACHE[cache_key] = None
+            _SDR_FRAME_CACHE.move_to_end(cache_key)
         return None
+    frame = np.ascontiguousarray(frame)
+    if cache_key is not None:
+        _SDR_FRAME_CACHE[cache_key] = frame
+        _SDR_FRAME_CACHE.move_to_end(cache_key)
+        while len(_SDR_FRAME_CACHE) > _SDR_FRAME_CACHE_MAX:
+            _SDR_FRAME_CACHE.popitem(last=False)
     return frame
 
 

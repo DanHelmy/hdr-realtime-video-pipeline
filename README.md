@@ -1,8 +1,8 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v6.0--in--progress-blue)
-![Stable](https://img.shields.io/badge/stable-v5.1-brightgreen)
-![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
+![Version](https://img.shields.io/badge/version-v6.0-blue)
+![Stable](https://img.shields.io/badge/stable-v6.0-brightgreen)
+![Status](https://img.shields.io/badge/status-stable%20release-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
 ---
@@ -13,11 +13,11 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, backend-specific inference, export, and live browser-window viewing.
 
-`main` currently tracks **v6.0-in-progress**. It contains unreleased development work for the next release, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with `torch.compile`/Triton optimization.
+`main` currently tracks the **v6.0 stable line**, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with `torch.compile`/Triton optimization.
 
-Latest stable tagged release: **v5.1**.
+Latest stable release: **v6.0**.
 
-For normal use, download the latest stable build from GitHub **Releases** instead of cloning `main`. Clone `main` only if you intentionally want the newest unreleased development state.
+For normal use, download the latest stable build from GitHub **Releases** instead of cloning `main`.
 
 Core updates include:
 
@@ -48,6 +48,8 @@ Core updates include:
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark queue can add the current setup once or add every visible precision preset in one click, making FP32/FP16/INT8 sweeps less tedious
+- deterministic video frame detection now uses FFmpeg keyframe timestamps plus low-resolution preview scoring when available, caches the scored pool, and avoids repeated OpenCV random-seek QC passes
+- compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path with OpenCV fallback for requested noncurrent frames
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
@@ -108,13 +110,13 @@ The automatic downloader uses fixed Google Drive file IDs and saves HG locally a
 
 ## Releases
 
-Use the latest stable release unless you are testing unreleased development work:
+Use the latest stable release unless you are testing local development work:
 
-- Latest stable release: **v5.1**
+- Latest stable release: **v6.0**
 - Releases page: [github.com/DanHelmy/hdr-realtime-video-pipeline/releases](https://github.com/DanHelmy/hdr-realtime-video-pipeline/releases)
-- `main` / `v6.0-in-progress`: unreleased development branch for developers only
+- `main`: current v6.0 stable/development head
 
-Do not use the green `Code -> Download ZIP` button for normal installs, because that downloads the current `main` branch rather than a stable release.
+For tagged release ZIPs, use GitHub Releases. The green `Code -> Download ZIP` button downloads the current `main` tree.
 
 ---
 
@@ -366,6 +368,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - clicking `Compare` opens a modal progress dialog while the exact frame is prepared
   - canceling clears the pending compare request and temporary seek instead of leaving playback pinned to the compare frame
   - stale compare results are ignored after cancel
+  - recompare requests for noncurrent SDR video frames use a guarded FFmpeg fast seek first and fall back to OpenCV random access if the fast seek cannot verify the requested timestamp closely enough
 
 - **Safer default quality preset**
   - clean first launches default to `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
@@ -401,6 +404,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - queue controls can add the current run or add all visible precision presets for the current source/resolution/HG setup
   - runs quality benchmarking through TensorRT on NVIDIA, cached max-autotune on AMD when available, or eager fallback when no safe compile cache exists
   - video workflow includes deterministic distinct-frame candidate pools, average modes (`selected`, `all`, deterministic subset), and manual frame checkboxes
+  - video frame detection now prefers FFmpeg packet-level keyframe timestamps plus tiny preview-frame scoring, then reuses cached scores for deterministic subset/all-frame modes instead of re-reading every detected frame through OpenCV
   - dataset workflow includes paired-file scanning with the same averaging modes (`selected`, `all`, deterministic subset)
   - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
   - result previews now use the same compare-style color-managed display path for `SDR`, `HDR GT`, and `HDR Convert`
@@ -538,6 +542,12 @@ python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1440p 
   - `HDRTVNET_GT_SYNC_OFFSET_MIN_GAIN` controls how much better a nonzero global offset must be before it replaces frame offset `0`. Default: `0.06`; tiny offsets require a stronger gain to avoid false `+/-1` to `+/-5` frame shifts.
   - the detected offset is cached per file signature and used by Compare, objective logging, and benchmark frame reads.
   - if a movie starts more than two seconds apart between SDR and HDR GT files, raise `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` before launch.
+- Compare recompare, benchmark previews, and deterministic video frame display use guarded FFmpeg fast seeks for SDR frame reads when available, with OpenCV fallback:
+  - `HDRTVNET_SDR_FRAME_FAST_SEEK=0` disables the SDR fast-seek reader.
+  - `HDRTVNET_SDR_FRAME_FAST_SEEK_PTS_GUARD=0` disables timestamp verification for the fast reader.
+  - `HDRTVNET_SDR_FRAME_CACHE_MAX` controls the small repeated-frame cache. Default: `8`.
+- Model Quality Benchmark video candidate detection uses FFmpeg packet-level keyframe timestamps and tiny preview-frame scoring when available, then stores the deterministic scored pool:
+  - `HDRTVNET_FRAME_DETECT_FFMPEG=0` disables this keyframe detector and falls back to the OpenCV scanner.
 - Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames before final metrics:
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY` enables/disables this pass. Default: `1`.
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS` limits verified rows, or `all` verifies every video row. Default: `all`.
