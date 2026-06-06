@@ -53,9 +53,12 @@ DEFAULT_INCLUDE = (
     "base.AGCM.spatial;base.AGCM.global;base.LE.low_in;"
     "base.LE.recon_trunk3;base.post_correction.trunk;"
     "base.post_correction.out;base.post_correction.net;"
+    "base.post_correction.spatial.trunk;base.post_correction.spatial.out;"
     "AGCM.spatial;AGCM.global;"
     "LE.low_in;LE.recon_trunk3;post_correction.trunk;"
-    "post_correction.out;post_correction.net;hg.low_in;hg.trunk"
+    "post_correction.out;post_correction.net;"
+    "post_correction.spatial.trunk;post_correction.spatial.out;"
+    "hg.low_in;hg.trunk"
 )
 
 

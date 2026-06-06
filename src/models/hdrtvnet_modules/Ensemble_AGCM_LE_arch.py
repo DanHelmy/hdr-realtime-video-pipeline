@@ -12,6 +12,7 @@ from .HDRUNet3T1_arch import (
     HDRUNet3T1CleanTrunkDeep,
     HDRUNet3T1CleanTrunkWideExtra,
     HDRUNet3T1CondDirect,
+    HDRUNet3T1CondGatedDirect,
     HDRUNet3T1FlatTrunk,
     HDRUNet3T1PlainBottleneck,
     HDRUNet3T1PlainDirect,
@@ -25,6 +26,39 @@ def _parse_post_correction(spec):
     if not spec or spec in {"none", "off", "0", "false"}:
         return None
     canonical = spec.replace("-", "").replace("_", "")
+    stack_match = re.fullmatch(
+        r"(?:post)?global(?:color)?(?:correct|correction|corr)?wide([0-9]+)x([0-9]+)"
+        r"(?:post)?(?:color)?(?:correct|correction|corr)h(4|8|16)wide([0-9]+)x([0-9]+)",
+        canonical,
+    )
+    if stack_match:
+        global_width = int(stack_match.group(1))
+        global_depth = int(stack_match.group(2))
+        scale = int(stack_match.group(3))
+        width = int(stack_match.group(4))
+        depth = int(stack_match.group(5))
+        return "global_spatial", global_width, global_depth, scale, width, depth
+    stack_residual_match = re.fullmatch(
+        r"(?:post)?global(?:color)?(?:correct|correction|corr)?wide([0-9]+)x([0-9]+)"
+        r"(?:post)?res(?:idual)?h(2|4|8|16)wide([0-9]+)x([0-9]+)",
+        canonical,
+    )
+    if stack_residual_match:
+        global_width = int(stack_residual_match.group(1))
+        global_depth = int(stack_residual_match.group(2))
+        scale = int(stack_residual_match.group(3))
+        width = int(stack_residual_match.group(4))
+        depth = int(stack_residual_match.group(5))
+        return "global_residual", global_width, global_depth, scale, width, depth
+    residual_match = re.fullmatch(
+        r"(?:post)?res(?:idual)?h(2|4|8|16)wide([0-9]+)x([0-9]+)",
+        canonical,
+    )
+    if residual_match:
+        scale = int(residual_match.group(1))
+        width = int(residual_match.group(2))
+        depth = int(residual_match.group(3))
+        return "residual", scale, width, depth
     global_match = re.fullmatch(
         r"(?:post)?global(?:color)?(?:correct|correction|corr)?wide([0-9]+)x([0-9]+)",
         canonical,
@@ -83,23 +117,30 @@ class SpatialColorCorrection(nn.Module):
 
     def forward(self, img, hdr):
         low = F.avg_pool2d(torch.cat((img, hdr), dim=1), self.scale, self.scale)
-        params = self.out(self.trunk(low))
-        if params.shape[-2:] != hdr.shape[-2:]:
-            params = F.interpolate(
-                params,
-                size=hdr.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        params = params.tanh() * self.limit
-        delta = params[:, :9]
-        shift = params[:, 9:]
+        params_low = self.out(self.trunk(low))
+
+        def _full_param(value):
+            if value.shape[-2:] != hdr.shape[-2:]:
+                value = F.interpolate(
+                    value,
+                    size=hdr.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            return value.tanh() * self.limit
+
+        row0 = _full_param(params_low[:, 0:3])
+        row1 = _full_param(params_low[:, 3:6])
+        row2 = _full_param(params_low[:, 6:9])
+        shift_r = _full_param(params_low[:, 9:10])
+        shift_g = _full_param(params_low[:, 10:11])
+        shift_b = _full_param(params_low[:, 11:12])
         r = hdr[:, 0:1]
         g = hdr[:, 1:2]
         b = hdr[:, 2:3]
-        out_r = r * (delta[:, 0:1] + 1.0) + g * delta[:, 1:2] + b * delta[:, 2:3] + shift[:, 0:1]
-        out_g = r * delta[:, 3:4] + g * (delta[:, 4:5] + 1.0) + b * delta[:, 5:6] + shift[:, 1:2]
-        out_b = r * delta[:, 6:7] + g * delta[:, 7:8] + b * (delta[:, 8:9] + 1.0) + shift[:, 2:3]
+        out_r = r * (row0[:, 0:1] + 1.0) + g * row0[:, 1:2] + b * row0[:, 2:3] + shift_r
+        out_g = r * row1[:, 0:1] + g * (row1[:, 1:2] + 1.0) + b * row1[:, 2:3] + shift_g
+        out_b = r * row2[:, 0:1] + g * row2[:, 1:2] + b * (row2[:, 2:3] + 1.0) + shift_b
         return torch.cat((out_r, out_g, out_b), dim=1)
 
 
@@ -140,6 +181,41 @@ class SpatialAffineCorrection(nn.Module):
         return hdr * (1.0 + scale) + shift
 
 
+class SpatialResidualCorrection(nn.Module):
+    """Low-resolution residual tail for local detail/color correction."""
+
+    def __init__(self, scale=4, width=64, depth=6, limit=0.20):
+        super().__init__()
+        self.scale = int(scale)
+        self.width = int(width)
+        self.depth = int(depth)
+        self.limit = float(limit)
+        layers = [nn.Conv2d(6, self.width, 1), nn.ReLU(inplace=True)]
+        for _ in range(max(0, self.depth)):
+            layers.extend([
+                nn.Conv2d(self.width, self.width, 3, 1, 1),
+                nn.ReLU(inplace=True),
+            ])
+        self.trunk = nn.Sequential(*layers)
+        self.out = nn.Conv2d(self.width, 3 * self.scale * self.scale, 1)
+        self.up = nn.PixelShuffle(self.scale)
+        nn.init.zeros_(self.out.weight)
+        if self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
+
+    def forward(self, img, hdr):
+        low = F.avg_pool2d(torch.cat((img, hdr), dim=1), self.scale, self.scale)
+        delta = self.up(self.out(self.trunk(low))).tanh() * self.limit
+        if delta.shape[-2:] != hdr.shape[-2:]:
+            delta = F.interpolate(
+                delta,
+                size=hdr.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return hdr + delta
+
+
 class GlobalColorCorrection(nn.Module):
     """Per-frame color matrix correction generated from global image context."""
 
@@ -177,6 +253,75 @@ class GlobalColorCorrection(nn.Module):
         return torch.cat((out_r, out_g, out_b), dim=1)
 
 
+class GlobalThenSpatialCorrection(nn.Module):
+    """Existing global correction followed by an identity spatial corrector."""
+
+    def __init__(
+        self,
+        global_width=48,
+        global_depth=2,
+        scale=8,
+        width=48,
+        depth=3,
+        limit=0.25,
+    ):
+        super().__init__()
+        self.net = GlobalColorCorrection(
+            width=global_width,
+            depth=global_depth,
+            limit=limit,
+        ).net
+        self.spatial = SpatialColorCorrection(
+            scale=scale,
+            width=width,
+            depth=depth,
+            limit=limit,
+        )
+
+    def _global(self, img, hdr):
+        params = self.net(torch.cat((img, hdr), dim=1)).tanh() * 0.25
+        delta = params[:, :9]
+        shift = params[:, 9:]
+        r = hdr[:, 0:1]
+        g = hdr[:, 1:2]
+        b = hdr[:, 2:3]
+        out_r = r * (delta[:, 0:1] + 1.0) + g * delta[:, 1:2] + b * delta[:, 2:3] + shift[:, 0:1]
+        out_g = r * delta[:, 3:4] + g * (delta[:, 4:5] + 1.0) + b * delta[:, 5:6] + shift[:, 1:2]
+        out_b = r * delta[:, 6:7] + g * delta[:, 7:8] + b * (delta[:, 8:9] + 1.0) + shift[:, 2:3]
+        return torch.cat((out_r, out_g, out_b), dim=1)
+
+    def forward(self, img, hdr):
+        return self.spatial(img, self._global(img, hdr))
+
+
+class GlobalThenResidualCorrection(GlobalThenSpatialCorrection):
+    """Existing global correction followed by an identity residual tail."""
+
+    def __init__(
+        self,
+        global_width=48,
+        global_depth=2,
+        scale=4,
+        width=64,
+        depth=6,
+        limit=0.20,
+    ):
+        nn.Module.__init__(self)
+        self.net = GlobalColorCorrection(
+            width=global_width,
+            depth=global_depth,
+        ).net
+        self.residual = SpatialResidualCorrection(
+            scale=scale,
+            width=width,
+            depth=depth,
+            limit=limit,
+        )
+
+    def forward(self, img, hdr):
+        return self.residual(img, self._global(img, hdr))
+
+
 class Ensemble_AGCM_LE(nn.Module):
     def __init__(self, classifier='color_condition', cond_c=6, in_nc=3, out_nc=3, nf=32, act_type='relu', weighting_network=False, le_arch=None, post_correction=None):
         super(Ensemble_AGCM_LE, self).__init__()
@@ -191,21 +336,58 @@ class Ensemble_AGCM_LE(nn.Module):
             self.post_correction_name = ""
             self.post_correction = nn.Identity()
         else:
-            mode, scale, width, depth = post_cfg
+            mode = post_cfg[0]
             if mode == "global":
+                _, scale, width, depth = post_cfg
                 self.post_correction_name = f"postglobalwide{width}x{depth}"
                 self.post_correction = GlobalColorCorrection(
                     width=width,
                     depth=depth,
                 )
+            elif mode == "global_spatial":
+                _, global_width, global_depth, scale, width, depth = post_cfg
+                self.post_correction_name = (
+                    f"postglobalwide{global_width}x{global_depth}"
+                    f"corrh{scale}wide{width}x{depth}"
+                )
+                self.post_correction = GlobalThenSpatialCorrection(
+                    global_width=global_width,
+                    global_depth=global_depth,
+                    scale=scale,
+                    width=width,
+                    depth=depth,
+                )
+            elif mode == "global_residual":
+                _, global_width, global_depth, scale, width, depth = post_cfg
+                self.post_correction_name = (
+                    f"postglobalwide{global_width}x{global_depth}"
+                    f"resh{scale}wide{width}x{depth}"
+                )
+                self.post_correction = GlobalThenResidualCorrection(
+                    global_width=global_width,
+                    global_depth=global_depth,
+                    scale=scale,
+                    width=width,
+                    depth=depth,
+                )
             elif mode == "affine":
+                _, scale, width, depth = post_cfg
                 self.post_correction_name = f"postaffineh{scale}wide{width}x{depth}"
                 self.post_correction = SpatialAffineCorrection(
                     scale=scale,
                     width=width,
                     depth=depth,
                 )
+            elif mode == "residual":
+                _, scale, width, depth = post_cfg
+                self.post_correction_name = f"postresh{scale}wide{width}x{depth}"
+                self.post_correction = SpatialResidualCorrection(
+                    scale=scale,
+                    width=width,
+                    depth=depth,
+                )
             else:
+                _, scale, width, depth = post_cfg
                 self.post_correction_name = f"postcorrh{scale}wide{width}x{depth}"
                 self.post_correction = SpatialColorCorrection(
                     scale=scale,
@@ -239,8 +421,29 @@ class Ensemble_AGCM_LE(nn.Module):
                 le_arch=self.le_arch,
             )
         else:
+            gated_direct_match = re.fullmatch(
+                r"condgatedirecth(2|4|8|16|32)wide([0-9]+)x([0-9]+)",
+                canonical_le_arch,
+            )
+            if gated_direct_match:
+                bottleneck_scale = int(gated_direct_match.group(1))
+                wide_nf = int(gated_direct_match.group(2))
+                trunk3_depth = int(gated_direct_match.group(3))
+                self.le_arch = f"condgatedirecth{bottleneck_scale}wide{wide_nf}x{trunk3_depth}"
+                self.LE = HDRUNet3T1CondGatedDirect(
+                    in_nc=in_nc,
+                    out_nc=out_nc,
+                    nf=nf,
+                    act_type=act_type,
+                    weighting_network=weighting_network,
+                    trunk3_depth=trunk3_depth,
+                    wide_nf=wide_nf,
+                    bottleneck_scale=bottleneck_scale,
+                    le_arch=self.le_arch,
+                )
+                return
             cond_direct_match = re.fullmatch(
-                r"conddirecth(4|8|16|32)wide([0-9]+)x([0-9]+)",
+                r"conddirecth(2|4|8|16|32)wide([0-9]+)x([0-9]+)",
                 canonical_le_arch,
             )
             if cond_direct_match:
@@ -257,6 +460,21 @@ class Ensemble_AGCM_LE(nn.Module):
                     trunk3_depth=trunk3_depth,
                     wide_nf=wide_nf,
                     bottleneck_scale=bottleneck_scale,
+                    le_arch=self.le_arch,
+                )
+                return
+            select_sft_match = re.fullmatch(r"(?:select|selective)?sft([1-5]+)", canonical_le_arch)
+            if select_sft_match:
+                requested = tuple(dict.fromkeys(select_sft_match.group(1)))
+                trunk_names = tuple(f"recon_trunk{idx}" for idx in requested)
+                self.le_arch = "selectsft" + "".join(requested)
+                self.LE = HDRUNet3T1SelectiveSFT(
+                    in_nc=in_nc,
+                    out_nc=out_nc,
+                    nf=nf,
+                    act_type=act_type,
+                    weighting_network=weighting_network,
+                    sft_trunks=trunk_names,
                     le_arch=self.le_arch,
                 )
                 return

@@ -55,8 +55,8 @@ Core updates include:
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
 - NVIDIA runtime now defaults to quant-friendly TensorRT ModelOpt Torch builds from self-describing HR/ACGM/LE/HG source checkpoints; mixed presets use the proven runtime include mask, while Full INT8 forces all ModelOpt Torch quantizers
 - normal `FP16` / `FP32` now use the quant-friendly distilled HR/HG architecture; untouched original HR/HG checkpoints remain reference assets for manual experiments
-- current RTX 5060 Ti 1080p clean TensorRT checks: no-HG FP16 `4.22 ms`, Mixed QAT `2.95 ms`, Full QAT `3.70 ms`; HG FP16 `5.02 ms`, Mixed QAT `3.68 ms`, Full QAT `4.63 ms`
-- Full INT8 verifies the strict TensorRT contract: no-HG `85/85` ModelOpt quantizers and `27/27` weights enabled; HG `115/115` ModelOpt quantizers and `37/37` weights enabled
+- current RTX 5060 Ti 1080p clean TensorRT checks: no-HG FP16 `5.26 ms`, Mixed QAT `3.59 ms`, Full QAT `4.30 ms`; HG FP16 `5.64 ms`, Mixed QAT `4.43 ms`, Full QAT `4.97 ms`
+- Full INT8 verifies the strict TensorRT contract: no-HG `103/103` ModelOpt quantizers and `33/33` weights enabled; HG `133/133` ModelOpt quantizers and `43/43` weights enabled
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants trained for the same TensorRT composition used at deployment
 - unsupported extra low-precision experiment presets and builder paths have been removed; the supported NVIDIA deployment surface is FP16/FP32 plus INT8 PTQ/QAT/QAT Film
 - HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
@@ -369,7 +369,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - clicking `Compare` opens a modal progress dialog while the exact frame is prepared
   - canceling clears the pending compare request and temporary seek instead of leaving playback pinned to the compare frame
   - stale compare results are ignored after cancel
-  - recompare requests for noncurrent SDR video frames use a guarded FFmpeg fast seek first and fall back to OpenCV random access if the fast seek cannot verify the requested timestamp closely enough
+  - recompare requests for noncurrent SDR video frames use a guarded FFmpeg fast seek; if the requested timestamp cannot be verified closely enough, the frame read reports unavailable instead of falling back to OpenCV random access
 
 - **Safer default quality preset**
   - clean first launches default to `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
@@ -882,12 +882,12 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 |---|---|---|
 | **FP16** | Half-precision quant-friendly distilled HR/HG path | — |
 | **FP32** | Full-precision quant-friendly distilled HR/HG path | — |
-| **INT8 Full (PTQ)** | W8A8 quantization (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Full (QAT)** | W8A8 + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Full (QAT) (Film)** | W8A8 + movie-accuracy QAT with stronger FP32/HDR anchoring (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16/FP16-sensitive layers (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Mixed (QAT)** | Mixed W8A8/W8A16/FP16-sensitive layers + quantization-aware fine-tuning (HG optional) | ~4.0× vs FP16+HG |
-| **INT8 Mixed (QAT) (Film)** | Mixed movie-accuracy QAT with protected tone-control paths (HG optional) | ~4.0× vs FP16+HG |
+| **INT8 Full (PTQ)** | W8A8 quantization (HG optional) | strict full-INT8 baseline |
+| **INT8 Full (QAT)** | W8A8 + quantization-aware fine-tuning (HG optional) | faster than FP16 on the current RTX 5060 Ti check, slower than Mixed |
+| **INT8 Full (QAT) (Film)** | W8A8 + movie-accuracy QAT with stronger FP32/HDR anchoring (HG optional) | movie-tuned strict full-INT8 baseline |
+| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16/FP16-sensitive layers (HG optional) | fastest deployable INT8 family varies by GPU |
+| **INT8 Mixed (QAT)** | Mixed W8A8/W8A16/FP16-sensitive layers + quantization-aware fine-tuning (HG optional) | current default NVIDIA preset |
+| **INT8 Mixed (QAT) (Film)** | Mixed movie-accuracy QAT with protected tone-control paths (HG optional) | optional movie-domain INT8 preset |
 
 The app includes ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints. On NVIDIA, these presets route through self-describing quant-friendly TensorRT source checkpoints (`HR_qfriendly_*` / `HG_qfriendly_*`) so the engine builder can recreate the HR/ACGM/LE/HG architecture without relying on environment overrides. The Film variants are separate deployable checkpoints rather than runtime color presets.
 
@@ -908,7 +908,7 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, the selected INT8 preset maps to a quant-friendly TensorRT source checkpoint. No-HG uses `src/models/weights/distilled/hr`; HG uses the composite-split HR source in `src/models/weights/distilled/hr_hg` plus the matching HG source in `src/models/weights/distilled/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). Mixed presets use the current proven include mask (`AGCM.spatial`, `AGCM.global`, `LE.low_in`, `LE.recon_trunk3`, `post_correction.net`, plus the matching HG low/trunk regions when HG is enabled) and keep output quantizers disabled unless explicitly requested. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/pytorch_int8/hr` and `src/models/weights/pytorch_int8/hg`.
+On NVIDIA, the selected INT8 preset maps to a quant-friendly TensorRT source checkpoint. No-HG uses `src/models/weights/distilled/hr`; HG uses the composite-split HR source in `src/models/weights/distilled/hr_hg` plus the matching HG source in `src/models/weights/distilled/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). Mixed presets use the current proven include mask (`AGCM.spatial`, `AGCM.global`, `LE.low_in`, `LE.recon_trunk3`, `post_correction.net`, `post_correction.spatial.trunk`, `post_correction.spatial.out`, plus the matching HG low/trunk regions when HG is enabled) and keep output quantizers disabled unless explicitly requested. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/pytorch_int8/hr` and `src/models/weights/pytorch_int8/hg`.
 
 The default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly. Quant-friendly HR/ACGM/LE and HR+HG engines export as single-input graphs when the condition path is structurally unused, reducing runtime binding overhead and avoiding stale condition-tensor metadata.
 
@@ -1068,7 +1068,25 @@ The GUI and CLI precision preset picks three paths:
 
 On NVIDIA, the TensorRT builder uses `trt_model`, the current resolution, precision, and HG toggle to export a temporary ONNX and cache an `.engine` under `src/models/engines/`. PTQ, QAT, and QAT Film are separate source checkpoints. Mixed INT8 uses the selected mixed mask; Full INT8 is the strict contract path and forces all ModelOpt Torch quantizers on.
 
-The distilled FP32 source checkpoint includes a lightweight `postglobalwide48x2` color-correction head. That head is part of HR/ACGM/LE for FP32, FP16, PTQ, QAT, and QAT Film so PyTorch eager checkpoints and TensorRT source checkpoints describe the same model composition.
+The distilled FP32 source checkpoint includes a lightweight `postglobalwide48x2corrh8wide64x4` global+spatial color-correction head. That head is part of HR/ACGM/LE for FP32, FP16, PTQ, QAT, and QAT Film so PyTorch eager checkpoints and TensorRT source checkpoints describe the same model composition. The spatial correction applies the same math through a memory-friendly row-wise TensorRT export path, avoiding the old no-HG FP16 full-resolution 12-channel correction tensor bottleneck.
+
+### Distilled/Q-Friendly Base Recipe
+
+The default shipped model is still HDRTVNet++ in function: HR/ACGM/LE maps SDR to HDR and optional HG refines highlights. The deployment architecture is streamlined for TensorRT fusion:
+
+- AGCM uses `agcm_spatialmixglobalh8wide64x6`
+- LE uses the single-input-friendly direct low-resolution trunk `conddirecth8wide96x12`
+- HG uses `directh16wide64x8`
+- the post head uses `postglobalwide48x2corrh8wide64x4`
+- tensor-side highlight stabilizers/export cleanup passes are disabled; visual stability comes from the model/checkpoints, not a runtime patch layer
+
+The selected FP32 base was chosen by first finding TensorRT-fast graph families, then refitting the post-correction head against the original HR+HG teacher and HDRTV1K validation frames until the visible color shifts and clipping cases were acceptable. The helper used for that refit is:
+
+```powershell
+.\venv\Scripts\python.exe scripts\models\train_distilled_post_correction.py --post-correction postglobalwide48x2corrh8wide64x4 --base-checkpoint src\models\weights\distilled\hr\HR_qfriendly_spatialmixglobal_fp32.pt --hg-checkpoint src\models\weights\distilled\hg\HG_qfriendly_directh16_fp32.pt --teacher-base src\models\weights\original\HR.pt --teacher-hg src\models\weights\original\HG.pt --train-sdr-dir dataset\train_sdr --train-hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-train-images 0 --max-val-images 32 --max-long-edge 1080 --val-max-long-edge 720 --crop-size 384 --epochs 4 --lr 1e-4 --monitor-hg --output src\models\weights\distilled\hr\HR_qfriendly_spatialmixglobal_fp32.pt
+```
+
+After changing the FP32 base, rebuild PTQ/QAT eager checkpoints, then run `scripts\quantize\split_distilled_tensorrt_sources.py` so PyTorch eager and TensorRT source checkpoints describe the same layers.
 
 Regenerate TensorRT sources after replacing eager INT8 checkpoints:
 
@@ -1100,16 +1118,16 @@ Mixed INT8 is an explicit W8A8 layer recipe:
 
 | Family | Mode | W8A8 file | Composition |
 |---|---|---|---|
-| Distilled/q-friendly | HR/no-HG | `configs/qat_layouts/spatialmixglobalh8w64_nohg_mixed_w8a8.txt` | 26 W8A8, 1 W8A16 |
-| Distilled/q-friendly | HR+HG | `configs/qat_layouts/spatialmixglobalh8w64_hg_mixed_w8a8.txt` | 35 W8A8, 2 W8A16 |
+| Distilled/q-friendly | HR/no-HG | `configs/qat_layouts/spatialmixglobalh8w64_nohg_mixed_w8a8.txt` | 32 W8A8, 1 W8A16 |
+| Distilled/q-friendly | HR+HG | `configs/qat_layouts/spatialmixglobalh8w64_hg_mixed_w8a8.txt` | 41 W8A8, 2 W8A16 |
 | Original | HR/no-HG | `configs/qat_layouts/original_nohg_mixed_w8a8.txt` | 29 W8A8, 78 W8A16, 21 FP16 |
 | Original | HR+HG | `configs/qat_layouts/original_hg_composite_mixed_w8a8.txt` | 51 W8A8, 74 W8A16, 24 FP16 |
 
-The distilled mixed path was selected from the fastest stable TensorRT layout: quantize the dense HR/ACGM/LE spatial/global/recon trunk regions plus the global post-correction head, and quantize the direct HG low/trunk region when HG is enabled, while keeping tiny control/output-sensitive layers out of W8A8.
+The distilled mixed path was selected from the fastest stable TensorRT layout: quantize the dense HR/ACGM/LE spatial/global/recon trunk regions plus the global and spatial post-correction heads, and quantize the direct HG low/trunk region when HG is enabled, while keeping tiny control/output-sensitive layers out of W8A8.
 
 ```text
-HR/no-HG: AGCM.spatial;AGCM.global;LE.low_in;LE.recon_trunk3;post_correction.net
-HR+HG:    base.AGCM.spatial;base.AGCM.global;base.LE.low_in;base.LE.recon_trunk3;base.post_correction.net;hg.low_in;hg.trunk
+HR/no-HG: AGCM.spatial;AGCM.global;LE.low_in;LE.recon_trunk3;post_correction.net;post_correction.spatial.trunk;post_correction.spatial.out
+HR+HG:    base.AGCM.spatial;base.AGCM.global;base.LE.low_in;base.LE.recon_trunk3;base.post_correction.net;base.post_correction.spatial.trunk;base.post_correction.spatial.out;hg.low_in;hg.trunk
 ```
 
 Original mixed comes from the legacy sensitivity/protection sweep recovered from the old `Ensemble_AGCM_LE_int8_*` checkpoint metadata. Full INT8 is not a mask: Full means every quantizable conv/linear in that checkpoint family is W8A8, even if it is slower than Mixed.

@@ -774,6 +774,76 @@ class HDRUNet3T1CondDirect(HDRUNet3T1PlainDirect):
         return out, img
 
 
+class HDRUNet3T1CondGatedDirect(HDRUNet3T1CondDirect):
+    """CondDirect plus one low-res self-gate for SFT-like modulation."""
+
+    def __init__(
+        self,
+        in_nc=3,
+        out_nc=3,
+        nf=64,
+        act_type='relu',
+        weighting_network=True,
+        trunk3_depth=16,
+        wide_nf=128,
+        bottleneck_scale=16,
+        gate_width=None,
+        gate_limit=0.75,
+        le_arch="condgatedirecth16wide128x16",
+    ):
+        super().__init__(
+            in_nc=in_nc,
+            out_nc=out_nc,
+            nf=nf,
+            act_type=act_type,
+            weighting_network=weighting_network,
+            trunk3_depth=trunk3_depth,
+            wide_nf=wide_nf,
+            bottleneck_scale=bottleneck_scale,
+            le_arch=le_arch,
+        )
+        gate_width = int(gate_width or max(16, min(self.trunk3_wide_nf, self.trunk3_wide_nf // 2)))
+        self.gate_limit = float(gate_limit)
+        self.feature_gate = nn.Sequential(
+            nn.Conv2d(self.trunk3_wide_nf, gate_width, 1, 1, 0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(gate_width, self.trunk3_wide_nf, 3, 1, 1),
+        )
+        arch_util.initialize_weights([self.feature_gate[0]], 0.1)
+        nn.init.zeros_(self.feature_gate[2].weight)
+        if self.feature_gate[2].bias is not None:
+            nn.init.zeros_(self.feature_gate[2].bias)
+        self.le_arch = le_arch
+
+    def _forward_direct(self, x):
+        img = x[0]
+        if self.weighting_network:
+            mask = self.mask_est(img)
+            mask_out = mask * img
+        else:
+            mask_out = img
+
+        cond = x[1] if isinstance(x, (tuple, list)) and len(x) > 1 else img
+        cond = cond.to(device=img.device, dtype=img.dtype)
+        low_img = F.avg_pool2d(img, self.bottleneck_scale, self.bottleneck_scale)
+        cond_stride = max(1, self.bottleneck_scale // 4)
+        low_cond = F.avg_pool2d(cond, cond_stride, cond_stride)
+        if low_cond.shape[-2:] != low_img.shape[-2:]:
+            low_cond = self._align_to(low_cond, low_img)
+        low = torch.cat((low_img, low_cond), dim=1)
+
+        out = self.act(self.low_in(low))
+        gate = torch.tanh(self.feature_gate(out)) * self.gate_limit
+        out = out * (1.0 + gate)
+        out = self.recon_trunk3(out)
+        out = self.low_out(out)
+        out = self.up(out)
+        if out.shape[-2:] != mask_out.shape[-2:]:
+            out = self._align_to(out, mask_out)
+        out = mask_out + out
+        return out, img
+
+
 class HDRUNet3T1BottleneckHeavy(HDRUNet3T1):
     """Quantization-first LE variant with residual work moved to h/8.
 

@@ -3147,6 +3147,8 @@ def _tensorrt_int8_modelopt_torch_include_patterns() -> tuple[str, ...]:
         "base.post_correction.trunk",
         "base.post_correction.out",
         "base.post_correction.net",
+        "base.post_correction.spatial.trunk",
+        "base.post_correction.spatial.out",
         "AGCM.spatial",
         "AGCM.global",
         "LE.low_in",
@@ -3154,6 +3156,8 @@ def _tensorrt_int8_modelopt_torch_include_patterns() -> tuple[str, ...]:
         "post_correction.trunk",
         "post_correction.out",
         "post_correction.net",
+        "post_correction.spatial.trunk",
+        "post_correction.spatial.out",
         "hg.low_in",
         "hg.trunk",
     )
