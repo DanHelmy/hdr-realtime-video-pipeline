@@ -1,9 +1,10 @@
 # Quantization-friendly HR no-HG fast path:
 # classifier=agcm_spatialmixglobalh8wide64x6
 # LE=conddirecth8wide96x12
+# post_correction=postglobalwide48x2
 #
 # Matches the TensorRT ModelOpt include mask:
-# AGCM.spatial;AGCM.global;LE.low_in;LE.recon_trunk3
+# AGCM.spatial;AGCM.global;LE.low_in;LE.recon_trunk3;post_correction.net
 AGCM.spatial_in
 AGCM.spatial_trunk.0
 AGCM.spatial_trunk.2
@@ -27,3 +28,6 @@ LE.recon_trunk3.18
 LE.recon_trunk3.20
 LE.recon_trunk3.22
 LE.low_in
+post_correction.net.1
+post_correction.net.3
+post_correction.net.5

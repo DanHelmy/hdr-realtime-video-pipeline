@@ -59,6 +59,7 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
             "classifier": os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"),
             "le_arch": os.environ.get("HDRTVNET_LE_ARCH", "sft"),
             "hg_arch": os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle"),
+            "post_correction": os.environ.get("HDRTVNET_POST_CORRECTION", ""),
         }
         state = raw
 
@@ -91,6 +92,7 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
             mask_r=0.75,
             hg_arch=hg_arch,
             le_arch=le_arch,
+            post_correction=base_arch.get("post_correction", None),
         )
     else:
         model = Ensemble_AGCM_LE(
@@ -102,6 +104,7 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
             act_type="relu",
             weighting_network=False,
             le_arch=le_arch,
+            post_correction=base_arch.get("post_correction", None),
         )
 
     cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
@@ -125,6 +128,7 @@ def load_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module
         "mask_r": 0.75,
         "le_arch": le_arch,
         "hg_arch": hg_arch,
+        "post_correction": base_arch.get("post_correction", ""),
     }
     model.eval()
     return model

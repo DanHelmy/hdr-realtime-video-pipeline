@@ -1161,6 +1161,41 @@ def _apply_portable_activation_qparams(model: nn.Module, checkpoint: dict) -> No
         print(f"  Applied portable activation scales: {applied}/{expected}")
 
 
+def _apply_portable_weight_qparams(model: nn.Module, checkpoint: dict) -> None:
+    """Restore exact INT8 weight tensors/scales when a portable checkpoint has them."""
+    qparams = checkpoint.get("weight_qparams") or {}
+    if not isinstance(qparams, dict) or not qparams:
+        return
+
+    expected = 0
+    applied = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, (W8Conv2d, W8Linear, W8A8Conv2d, W8A8Linear)):
+            continue
+        expected += 1
+        entry = qparams.get(name)
+        if not isinstance(entry, dict):
+            continue
+        weight_int8 = entry.get("weight_int8")
+        scale = entry.get("scale")
+        if not torch.is_tensor(weight_int8) or not torch.is_tensor(scale):
+            continue
+        module.weight_int8.copy_(
+            weight_int8.to(device=module.weight_int8.device, dtype=module.weight_int8.dtype)
+        )
+        target_scale = getattr(module, "w_scale", None)
+        if target_scale is None:
+            target_scale = getattr(module, "scale", None)
+        if target_scale is None:
+            continue
+        target_scale.copy_(
+            scale.to(device=target_scale.device, dtype=target_scale.dtype)
+        )
+        applied += 1
+    if expected:
+        print(f"  Applied portable weight qparams: {applied}/{expected}")
+
+
 def _get_gpu_info() -> str:
     """Return GPU name string, or empty if unavailable."""
     if not torch.cuda.is_available():
@@ -1758,6 +1793,7 @@ class HDRTVNetTorch:
                 mask_r=arch.get("mask_r", 0.75),
                 hg_arch=arch.get("hg_arch", None),
                 le_arch=arch.get("le_arch", None),
+                post_correction=arch.get("post_correction", None),
             )
         else:
             model = Ensemble_AGCM_LE(
@@ -1769,6 +1805,7 @@ class HDRTVNetTorch:
                 act_type=arch.get("act_type", "relu"),
                 weighting_network=arch.get("weighting_network", False),
                 le_arch=arch.get("le_arch", None),
+                post_correction=arch.get("post_correction", None),
             )
         split_hg_requested = bool(self._use_hg and not use_hg)
         # Sanity-check no-HG INT8 checkpoints against expected parameter count.
@@ -1817,6 +1854,7 @@ class HDRTVNetTorch:
                 "  Supported: w8a8_full, w8a8_mixed")
 
         if portable_checkpoint:
+            _apply_portable_weight_qparams(model, checkpoint)
             _apply_portable_activation_qparams(model, checkpoint)
             print("Loaded portable INT8 checkpoint base (native FP state + quant metadata)")
         else:
@@ -1893,6 +1931,7 @@ class HDRTVNetTorch:
                 mask_r=arch.get("mask_r", 0.75),
                 hg_arch=(torch.load(hg_weights_path, map_location="cpu", weights_only=False).get("architecture", {}) or {}).get("hg_arch"),
                 le_arch=arch.get("le_arch", None),
+                post_correction=arch.get("post_correction", None),
             ).to(dtype=compute_dtype, device=self.device)
             composite.base = model
             composite.hg = hg_module
@@ -1943,6 +1982,7 @@ class HDRTVNetTorch:
             raise ValueError(f"Unknown HG quantization type '{quant_type}'")
 
         if portable_checkpoint:
+            _apply_portable_weight_qparams(hg, checkpoint)
             _apply_portable_activation_qparams(hg, checkpoint)
         else:
             hg.load_state_dict(state_dict, strict=True)
@@ -2048,6 +2088,15 @@ class HDRTVNetTorch:
                 str(base_arch.get("hg_arch", os.environ.get("HDRTVNET_HG_ARCH", ""))).strip()
                 or None
             )
+            post_correction = (
+                str(
+                    base_arch.get(
+                        "post_correction",
+                        os.environ.get("HDRTVNET_POST_CORRECTION", ""),
+                    )
+                ).strip()
+                or None
+            )
 
             if use_hg:
                 model = HG_Composite(
@@ -2062,6 +2111,7 @@ class HDRTVNetTorch:
                     mask_r=0.75,
                     hg_arch=hg_arch,
                     le_arch=le_arch,
+                    post_correction=post_correction,
                 ).to(self.device)
 
                 cleaned = {}
@@ -2083,6 +2133,7 @@ class HDRTVNetTorch:
                     act_type="relu",
                     weighting_network=False,
                     le_arch=le_arch,
+                    post_correction=post_correction,
                 ).to(self.device)
 
                 cleaned = {}
@@ -2093,6 +2144,7 @@ class HDRTVNetTorch:
             setattr(model, "_hdrtvnet_classifier_arch", classifier_name)
             setattr(model, "_hdrtvnet_le_arch", le_arch or "")
             setattr(model, "_hdrtvnet_hg_arch", hg_arch or "")
+            setattr(model, "_hdrtvnet_post_correction", post_correction or "")
 
         if self.precision == "fp16" and self.device.type == "cuda":
             model = model.half()
@@ -3092,10 +3144,16 @@ def _tensorrt_int8_modelopt_torch_include_patterns() -> tuple[str, ...]:
         "base.AGCM.global",
         "base.LE.low_in",
         "base.LE.recon_trunk3",
+        "base.post_correction.trunk",
+        "base.post_correction.out",
+        "base.post_correction.net",
         "AGCM.spatial",
         "AGCM.global",
         "LE.low_in",
         "LE.recon_trunk3",
+        "post_correction.trunk",
+        "post_correction.out",
+        "post_correction.net",
         "hg.low_in",
         "hg.trunk",
     )

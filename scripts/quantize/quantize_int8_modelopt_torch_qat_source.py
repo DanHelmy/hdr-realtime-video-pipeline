@@ -51,8 +51,11 @@ from scripts.quantize.quantize_int8_mixed_qat import (  # noqa: E402
 
 DEFAULT_INCLUDE = (
     "base.AGCM.spatial;base.AGCM.global;base.LE.low_in;"
-    "base.LE.recon_trunk3;AGCM.spatial;AGCM.global;"
-    "LE.low_in;LE.recon_trunk3;hg.low_in;hg.trunk"
+    "base.LE.recon_trunk3;base.post_correction.trunk;"
+    "base.post_correction.out;base.post_correction.net;"
+    "AGCM.spatial;AGCM.global;"
+    "LE.low_in;LE.recon_trunk3;post_correction.trunk;"
+    "post_correction.out;post_correction.net;hg.low_in;hg.trunk"
 )
 
 
@@ -546,6 +549,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--classifier", default="agcm_spatialmixglobalh8wide64x6")
     parser.add_argument("--le-arch", default="conddirecth8wide96x12")
     parser.add_argument("--hg-arch", default="directh16wide64x8")
+    parser.add_argument("--post-correction", default="")
     parser.add_argument("--include", default=DEFAULT_INCLUDE)
     parser.add_argument("--width", type=int, default=3840)
     parser.add_argument("--height", type=int, default=2160)
@@ -677,6 +681,7 @@ def main() -> int:
         "HDRTVNET_CLASSIFIER": args.classifier,
         "HDRTVNET_LE_ARCH": args.le_arch,
         "HDRTVNET_HG_ARCH": args.hg_arch,
+        "HDRTVNET_POST_CORRECTION": args.post_correction,
         "HDRTVNET_TRT_INT8_MODELOPT": "1",
         "HDRTVNET_TRT_INT8_MODELOPT_TORCH": "1",
         "HDRTVNET_TRT_INT8_MODELOPT_TORCH_INCLUDE": args.include,
@@ -744,6 +749,7 @@ def main() -> int:
             "classifier": args.classifier,
             "le_arch": args.le_arch,
             "hg_arch": args.hg_arch,
+            "post_correction": args.post_correction,
             "use_hg": str(args.use_hg).strip() != "0",
             "source_base": args.fp32_model,
             "source_hg": args.hg_weights,

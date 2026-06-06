@@ -1357,19 +1357,30 @@ def promote_selected_layers_to_fp16(model, layer_names, compute_dtype):
 # ===================================================================
 
 def _build_fp32_model(model_path: str, hg_weights: str, use_hg: bool) -> nn.Module:
-    classifier = os.environ.get("HDRTVNET_CLASSIFIER", "color_condition")
+    raw = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(raw, dict) and "state_dict" in raw:
+        state = raw["state_dict"]
+        arch = dict(raw.get("architecture") or {})
+    else:
+        state = raw
+        arch = {}
+    classifier = arch.get("classifier", os.environ.get("HDRTVNET_CLASSIFIER", "color_condition"))
+    le_arch = arch.get("le_arch", os.environ.get("HDRTVNET_LE_ARCH", None))
+    hg_arch = arch.get("hg_arch", os.environ.get("HDRTVNET_HG_ARCH", None))
+    post_correction = arch.get("post_correction", os.environ.get("HDRTVNET_POST_CORRECTION", None))
     if use_hg:
         model = HG_Composite(
             classifier=classifier, cond_c=6, in_nc=3, out_nc=3,
             nf=32, act_type="relu", weighting_network=False,
-            hg_nf=64, mask_r=0.75,
+            hg_nf=64, mask_r=0.75, hg_arch=hg_arch,
+            le_arch=le_arch, post_correction=post_correction,
         )
     else:
         model = Ensemble_AGCM_LE(
             classifier=classifier, cond_c=6, in_nc=3, out_nc=3,
             nf=32, act_type="relu", weighting_network=False,
+            le_arch=le_arch, post_correction=post_correction,
         )
-    state = torch.load(model_path, map_location="cpu", weights_only=True)
     cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
     if use_hg:
         model.base.load_state_dict(cleaned, strict=True)
@@ -2087,6 +2098,7 @@ def main():
                 mask_r=arch.get("mask_r", 0.75),
                 hg_arch=arch.get("hg_arch", None),
                 le_arch=arch.get("le_arch", None),
+                post_correction=arch.get("post_correction", None),
             )
         else:
             model = Ensemble_AGCM_LE(
@@ -2098,6 +2110,7 @@ def main():
                 act_type=arch.get("act_type", "relu"),
                 weighting_network=arch.get("weighting_network", False),
                 le_arch=arch.get("le_arch", None),
+                post_correction=arch.get("post_correction", None),
             )
 
         # Support both v1 (channel-threshold) and v2 (sensitivity-based) checkpoints
@@ -2378,6 +2391,7 @@ def main():
             "mask_r": source_arch.get("mask_r", 0.75),
             "le_arch": source_arch.get("le_arch", os.environ.get("HDRTVNET_LE_ARCH", "sft")),
             "hg_arch": source_arch.get("hg_arch", os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle")),
+            "post_correction": source_arch.get("post_correction", os.environ.get("HDRTVNET_POST_CORRECTION", "")),
         },
     }
     # Propagate v2 metadata from source checkpoint

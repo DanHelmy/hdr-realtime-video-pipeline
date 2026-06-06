@@ -19,7 +19,7 @@ class HG_Composite(nn.Module):
     def __init__(self, classifier="color_condition", cond_c=6,
                  in_nc=3, out_nc=3, nf=32, act_type="relu",
                  weighting_network=False, hg_nf=64, mask_r=0.75,
-                 hg_arch=None, le_arch=None):
+                 hg_arch=None, le_arch=None, post_correction=None):
         super().__init__()
         hg_arch = str(
             hg_arch or os.environ.get("HDRTVNET_HG_ARCH", "pixelshuffle")
@@ -34,6 +34,7 @@ class HG_Composite(nn.Module):
             act_type=act_type,
             weighting_network=weighting_network,
             le_arch=le_arch,
+            post_correction=post_correction,
         )
         direct_match = re.fullmatch(
             r"directh(2|4|8|16|32)wide([0-9]+)x([0-9]+)",

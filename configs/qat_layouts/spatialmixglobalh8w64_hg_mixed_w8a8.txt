@@ -2,9 +2,10 @@
 # classifier=agcm_spatialmixglobalh8wide64x6
 # LE=conddirecth8wide96x12
 # HG=directh16wide64x8
+# post_correction=postglobalwide48x2
 #
 # Matches the TensorRT ModelOpt include mask:
-# base.AGCM.spatial;base.AGCM.global;base.LE.low_in;base.LE.recon_trunk3;hg.low_in;hg.trunk
+# base.AGCM.spatial;base.AGCM.global;base.LE.low_in;base.LE.recon_trunk3;base.post_correction.net;hg.low_in;hg.trunk
 base.AGCM.spatial_in
 base.AGCM.spatial_trunk.0
 base.AGCM.spatial_trunk.2
@@ -28,6 +29,9 @@ base.LE.recon_trunk3.18
 base.LE.recon_trunk3.20
 base.LE.recon_trunk3.22
 base.LE.low_in
+base.post_correction.net.1
+base.post_correction.net.3
+base.post_correction.net.5
 hg.low_in
 hg.trunk.0
 hg.trunk.2

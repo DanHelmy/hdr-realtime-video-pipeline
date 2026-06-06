@@ -3,6 +3,7 @@ import re
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .Condition_arch import ConditionNet, is_plain_agcm_classifier, remap_condition_state_dict
 from .HDRUNet3T1_arch import (
     HDRUNet3T1,
@@ -19,10 +20,198 @@ from .HDRUNet3T1_arch import (
 )
 
 
+def _parse_post_correction(spec):
+    spec = str(spec or "").strip().lower()
+    if not spec or spec in {"none", "off", "0", "false"}:
+        return None
+    canonical = spec.replace("-", "").replace("_", "")
+    global_match = re.fullmatch(
+        r"(?:post)?global(?:color)?(?:correct|correction|corr)?wide([0-9]+)x([0-9]+)",
+        canonical,
+    )
+    if global_match:
+        width = int(global_match.group(1))
+        depth = int(global_match.group(2))
+        return "global", 1, width, depth
+    affine_match = re.fullmatch(
+        r"(?:post)?affineh(4|8|16)wide([0-9]+)x([0-9]+)",
+        canonical,
+    )
+    if affine_match:
+        scale = int(affine_match.group(1))
+        width = int(affine_match.group(2))
+        depth = int(affine_match.group(3))
+        return "affine", scale, width, depth
+    match = re.fullmatch(
+        r"(?:post)?(?:color)?(?:correct|correction|corr)h(4|8|16)wide([0-9]+)x([0-9]+)",
+        canonical,
+    )
+    if not match:
+        raise ValueError(f"Unsupported post_correction '{spec}'")
+    scale = int(match.group(1))
+    width = int(match.group(2))
+    depth = int(match.group(3))
+    return "spatial", scale, width, depth
+
+
+class SpatialColorCorrection(nn.Module):
+    """Small identity-initialized output color corrector.
+
+    It predicts a low-resolution 3x3 color matrix plus RGB shift from the
+    original SDR input and the HR output, then applies it at full resolution.
+    The zero-initialized final layer makes the module an exact identity until
+    trained.
+    """
+
+    def __init__(self, scale=8, width=32, depth=3, limit=0.25):
+        super().__init__()
+        self.scale = int(scale)
+        self.width = int(width)
+        self.depth = int(depth)
+        self.limit = float(limit)
+        layers = [nn.Conv2d(6, self.width, 1), nn.ReLU(inplace=True)]
+        for _ in range(max(0, self.depth)):
+            layers.extend([
+                nn.Conv2d(self.width, self.width, 3, 1, 1),
+                nn.ReLU(inplace=True),
+            ])
+        self.trunk = nn.Sequential(*layers)
+        self.out = nn.Conv2d(self.width, 12, 1)
+        nn.init.zeros_(self.out.weight)
+        if self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
+
+    def forward(self, img, hdr):
+        low = F.avg_pool2d(torch.cat((img, hdr), dim=1), self.scale, self.scale)
+        params = self.out(self.trunk(low))
+        if params.shape[-2:] != hdr.shape[-2:]:
+            params = F.interpolate(
+                params,
+                size=hdr.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        params = params.tanh() * self.limit
+        delta = params[:, :9]
+        shift = params[:, 9:]
+        r = hdr[:, 0:1]
+        g = hdr[:, 1:2]
+        b = hdr[:, 2:3]
+        out_r = r * (delta[:, 0:1] + 1.0) + g * delta[:, 1:2] + b * delta[:, 2:3] + shift[:, 0:1]
+        out_g = r * delta[:, 3:4] + g * (delta[:, 4:5] + 1.0) + b * delta[:, 5:6] + shift[:, 1:2]
+        out_b = r * delta[:, 6:7] + g * delta[:, 7:8] + b * (delta[:, 8:9] + 1.0) + shift[:, 2:3]
+        return torch.cat((out_r, out_g, out_b), dim=1)
+
+
+class SpatialAffineCorrection(nn.Module):
+    """Spatial per-channel scale/shift correction."""
+
+    def __init__(self, scale=8, width=32, depth=3, limit=0.25):
+        super().__init__()
+        self.scale = int(scale)
+        self.width = int(width)
+        self.depth = int(depth)
+        self.limit = float(limit)
+        layers = [nn.Conv2d(6, self.width, 1), nn.ReLU(inplace=True)]
+        for _ in range(max(0, self.depth)):
+            layers.extend([
+                nn.Conv2d(self.width, self.width, 3, 1, 1),
+                nn.ReLU(inplace=True),
+            ])
+        self.trunk = nn.Sequential(*layers)
+        self.out = nn.Conv2d(self.width, 6, 1)
+        nn.init.zeros_(self.out.weight)
+        if self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
+
+    def forward(self, img, hdr):
+        low = F.avg_pool2d(torch.cat((img, hdr), dim=1), self.scale, self.scale)
+        params = self.out(self.trunk(low))
+        if params.shape[-2:] != hdr.shape[-2:]:
+            params = F.interpolate(
+                params,
+                size=hdr.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        params = params.tanh() * self.limit
+        scale = params[:, :3]
+        shift = params[:, 3:]
+        return hdr * (1.0 + scale) + shift
+
+
+class GlobalColorCorrection(nn.Module):
+    """Per-frame color matrix correction generated from global image context."""
+
+    def __init__(self, width=48, depth=2, limit=0.25):
+        super().__init__()
+        self.width = int(width)
+        self.depth = int(depth)
+        self.limit = float(limit)
+        layers = [
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(6, self.width, 1),
+            nn.ReLU(inplace=True),
+        ]
+        for _ in range(max(0, self.depth - 1)):
+            layers.extend([
+                nn.Conv2d(self.width, self.width, 1),
+                nn.ReLU(inplace=True),
+            ])
+        layers.append(nn.Conv2d(self.width, 12, 1))
+        self.net = nn.Sequential(*layers)
+        nn.init.zeros_(self.net[-1].weight)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, img, hdr):
+        params = self.net(torch.cat((img, hdr), dim=1)).tanh() * self.limit
+        delta = params[:, :9]
+        shift = params[:, 9:]
+        r = hdr[:, 0:1]
+        g = hdr[:, 1:2]
+        b = hdr[:, 2:3]
+        out_r = r * (delta[:, 0:1] + 1.0) + g * delta[:, 1:2] + b * delta[:, 2:3] + shift[:, 0:1]
+        out_g = r * delta[:, 3:4] + g * (delta[:, 4:5] + 1.0) + b * delta[:, 5:6] + shift[:, 1:2]
+        out_b = r * delta[:, 6:7] + g * delta[:, 7:8] + b * (delta[:, 8:9] + 1.0) + shift[:, 2:3]
+        return torch.cat((out_r, out_g, out_b), dim=1)
+
+
 class Ensemble_AGCM_LE(nn.Module):
-    def __init__(self, classifier='color_condition', cond_c=6, in_nc=3, out_nc=3, nf=32, act_type='relu', weighting_network=False, le_arch=None):
+    def __init__(self, classifier='color_condition', cond_c=6, in_nc=3, out_nc=3, nf=32, act_type='relu', weighting_network=False, le_arch=None, post_correction=None):
         super(Ensemble_AGCM_LE, self).__init__()
         self.AGCM = ConditionNet(classifier=classifier, cond_c=cond_c)
+        post_correction = (
+            post_correction
+            if post_correction is not None
+            else os.environ.get("HDRTVNET_POST_CORRECTION", "")
+        )
+        post_cfg = _parse_post_correction(post_correction)
+        if post_cfg is None:
+            self.post_correction_name = ""
+            self.post_correction = nn.Identity()
+        else:
+            mode, scale, width, depth = post_cfg
+            if mode == "global":
+                self.post_correction_name = f"postglobalwide{width}x{depth}"
+                self.post_correction = GlobalColorCorrection(
+                    width=width,
+                    depth=depth,
+                )
+            elif mode == "affine":
+                self.post_correction_name = f"postaffineh{scale}wide{width}x{depth}"
+                self.post_correction = SpatialAffineCorrection(
+                    scale=scale,
+                    width=width,
+                    depth=depth,
+                )
+            else:
+                self.post_correction_name = f"postcorrh{scale}wide{width}x{depth}"
+                self.post_correction = SpatialColorCorrection(
+                    scale=scale,
+                    width=width,
+                    depth=depth,
+                )
         # fix AGCM
         # for p in self.parameters():
         #     p.requires_grad = False
@@ -484,7 +673,10 @@ class Ensemble_AGCM_LE(nn.Module):
         LE_input = [condition_output, condition_output]
         # condition = image
         LE_output = self.LE(LE_input)
-        return LE_output[0], condition_output
+        output = LE_output[0]
+        if self.post_correction_name:
+            output = self.post_correction(input[0], output)
+        return output, condition_output
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         mapped = remap_condition_state_dict(

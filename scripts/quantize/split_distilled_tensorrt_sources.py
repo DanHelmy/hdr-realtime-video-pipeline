@@ -56,9 +56,27 @@ def _filter_qparams(checkpoint: dict, *, prefix: str | None) -> dict:
     return qparams
 
 
+def _filter_weight_qparams(checkpoint: dict, *, prefix: str | None) -> dict:
+    qparams = {}
+    for layer, value in (checkpoint.get("weight_qparams") or {}).items():
+        text = str(layer)
+        if prefix is None:
+            if text.startswith("hg."):
+                continue
+            text = text[5:] if text.startswith("base.") else text
+        else:
+            if not text.startswith(prefix):
+                continue
+            text = text[len(prefix):]
+        qparams[text] = value
+    return qparams
+
+
 def _copy_split_quant_metadata(save_data: dict, checkpoint: dict, *, prefix: str | None) -> None:
     if checkpoint.get("activation_qparams") is not None:
         save_data["activation_qparams"] = _filter_qparams(checkpoint, prefix=prefix)
+    if checkpoint.get("weight_qparams") is not None:
+        save_data["weight_qparams"] = _filter_weight_qparams(checkpoint, prefix=prefix)
     for key in ("w8a8_layers", "fp16_layers"):
         if checkpoint.get(key) is not None:
             save_data[key] = _filter_layer_list(checkpoint, key, prefix=prefix)

@@ -39,6 +39,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE
 from models.hdrtvnet_modules.HG_Composite_arch import HG_Composite
 from models.hdrtvnet_torch import (
+    W8Conv2d,
+    W8Linear,
     W8A8Conv2d,
     W8A8Linear,
     _PORTABLE_INT8_CHECKPOINT_FORMAT,
@@ -72,6 +74,7 @@ def _build_model_from_arch(arch: dict) -> nn.Module:
             mask_r=arch.get("mask_r", 0.75),
             hg_arch=arch.get("hg_arch", None),
             le_arch=arch.get("le_arch", None),
+            post_correction=arch.get("post_correction", None),
         )
     return Ensemble_AGCM_LE(
         classifier=arch.get("classifier", "color_condition"),
@@ -82,6 +85,7 @@ def _build_model_from_arch(arch: dict) -> nn.Module:
         act_type=arch.get("act_type", "relu"),
         weighting_network=arch.get("weighting_network", False),
         le_arch=arch.get("le_arch", None),
+        post_correction=arch.get("post_correction", None),
     )
 
 
@@ -152,6 +156,23 @@ def _collect_activation_qparams(
             x_scale = max(abs(x_min), abs(x_max), 1e-8) / 127.0
 
         qparams[name] = {"scale": float(x_scale), "zero": 0.0}
+    return qparams
+
+
+def _collect_weight_qparams(model: nn.Module) -> dict[str, dict[str, torch.Tensor]]:
+    qparams: dict[str, dict[str, torch.Tensor]] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, (W8Conv2d, W8Linear, W8A8Conv2d, W8A8Linear)):
+            continue
+        scale = getattr(module, "w_scale", None)
+        if scale is None:
+            scale = getattr(module, "scale", None)
+        if scale is None or not hasattr(module, "weight_int8"):
+            continue
+        qparams[name] = {
+            "weight_int8": module.weight_int8.detach().cpu().clone(),
+            "scale": scale.detach().cpu().clone(),
+        }
     return qparams
 
 
@@ -239,6 +260,7 @@ def convert_checkpoint(
 
     model = _materialize_runtime_model(checkpoint)
     qparams = _collect_activation_qparams(model, activation_quant)
+    weight_qparams = _collect_weight_qparams(model)
     with contextlib.redirect_stdout(io.StringIO()):
         _predequantize_model(model, torch.float32)
     native_state = _native_fp32_state_dict(model)
@@ -251,6 +273,7 @@ def convert_checkpoint(
         "checkpoint_format",
         "state_format",
         "activation_qparams",
+        "weight_qparams",
         "activation_scales",
         "activation_zero_points",
         "backend_neutral",
@@ -286,13 +309,14 @@ def convert_checkpoint(
             ),
             "activation_quant": target_activation_quant,
             "activation_qparams": qparams,
+            "weight_qparams": weight_qparams,
             "source_activation_quant": source_activation_quant,
             "source_checkpoint_format": "runtime_int8_wrappers",
             "portable_source_checkpoint": str(input_path.resolve()),
             "portable_recipe": {
                 "fp_state": "native_fp32",
                 "w8a8_activation_qparams": target_activation_quant,
-                "w8_weights": "recreated_from_native_state_at_load",
+                "w8_weights": "preserved_from_runtime_checkpoint",
                 "tensorrt": (
                     "explicit_signed_qdq_from_same_masks_and_qparams"
                     if backend == "tensorrt"
@@ -318,6 +342,7 @@ def convert_checkpoint(
     print(f"  target backend          : {backend}")
     print("  materialized state      : native FP32 source weights")
     print(f"  activation qparams      : {len(qparams)}")
+    print(f"  weight qparams          : {len(weight_qparams)}")
     print(f"  native state tensors    : {len(native_state)} (int8={int8_tensors})")
 
 
