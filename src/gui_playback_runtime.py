@@ -615,6 +615,148 @@ class PlaybackRuntimeMixin:
                 return True
         return False
 
+    def _target_processing_dims_for_resolution(self, resolution_key: str) -> tuple[int, int]:
+        output_key = str(getattr(self, "_source_max_resolution_key", "1080p") or "1080p")
+        ow, oh = _processing_preset_dims(output_key)
+        scale_key = str(resolution_key or "").strip()
+        if scale_key == "Source":
+            scale_key = output_key
+        scale_dims = RESOLUTION_SCALES.get(scale_key)
+        if scale_dims is not None and (scale_dims[0] < ow or scale_dims[1] < oh):
+            return int(scale_dims[0]), int(scale_dims[1])
+        return int(ow), int(oh)
+
+    def _tensorrt_engine_ready_for_runtime(
+        self,
+        w: int,
+        h: int,
+        gui_precision: str,
+        use_hg: bool,
+    ) -> bool:
+        if not _IS_NVIDIA:
+            return True
+        trt_cfg = PRECISIONS.get(gui_precision, {})
+        trt_model_path = _select_tensorrt_model_path(gui_precision, bool(use_hg))
+        trt_mode = f"{gui_precision}_{'hg' if bool(use_hg) else 'nohg'}"
+        trt_precision = trt_cfg.get(
+            "precision",
+            _precision_to_compile_arg(gui_precision),
+        )
+        trt_hg_weights = (
+            _select_hg_weights_path(gui_precision, tensorrt=True)
+            if bool(use_hg)
+            else None
+        )
+        if trt_hg_weights and not os.path.isfile(trt_hg_weights):
+            trt_hg_weights = None
+        trt_predeq = "off"
+        trt_engine_mode = tensorrt_mode_name(
+            trt_precision,
+            trt_mode,
+            predequantize=trt_predeq,
+            qdq_fusion="native",
+        )
+        trt_calibration_cache = tensorrt_prebuilt_calibration_cache_path(
+            trt_model_path,
+            int(w),
+            int(h),
+            trt_precision,
+            trt_mode,
+            use_hg=bool(use_hg),
+            predequantize=trt_predeq,
+            qdq_fusion="native",
+            require_exists=True,
+        )
+        trt_engine = tensorrt_engine_path(
+            trt_model_path,
+            int(w),
+            int(h),
+            trt_engine_mode,
+        )
+        if not trt_engine:
+            return False
+        return bool(
+            tensorrt_engine_is_valid(
+                trt_engine,
+                model_path=trt_model_path,
+                width=int(w),
+                height=int(h),
+                precision=trt_precision,
+                mode_name=trt_mode,
+                use_hg=bool(use_hg),
+                predequantize=trt_predeq,
+                qdq_fusion="native",
+                hg_weights=trt_hg_weights,
+                calibration_cache=trt_calibration_cache,
+            )
+        )
+
+    def _pending_runtime_build_kind(
+        self,
+        w: int,
+        h: int,
+        gui_precision: str,
+        use_hg: bool,
+    ) -> str | None:
+        if _IS_NVIDIA:
+            if not self._tensorrt_engine_ready_for_runtime(
+                int(w),
+                int(h),
+                gui_precision,
+                bool(use_hg),
+            ):
+                return "TensorRT engine"
+            return None
+        if not self._runtime_execution_mode_uses_compile():
+            return None
+        if not self._can_run_autotune_compile():
+            return None
+        precision_arg = _precision_to_compile_arg(gui_precision)
+        model_path = _select_model_path(gui_precision, bool(use_hg))
+        if not self._is_compile_ready_for_runtime(
+            int(w),
+            int(h),
+            precision_arg,
+            model_path=model_path,
+            use_hg=bool(use_hg),
+            selected_predequantize_mode=getattr(self, "_predequantize_mode", "auto"),
+        ):
+            return "max-autotune compile"
+        return None
+
+    def _confirm_apply_runtime_build_if_needed(
+        self,
+        *,
+        w: int,
+        h: int,
+        gui_precision: str,
+        use_hg: bool,
+    ) -> bool:
+        build_kind = self._pending_runtime_build_kind(
+            int(w),
+            int(h),
+            gui_precision,
+            bool(use_hg),
+        )
+        if build_kind is None:
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Runtime Build Required",
+            f"{build_kind} is not ready for {int(w)}x{int(h)} / {gui_precision} "
+            f"({'HG' if bool(use_hg) else 'no-HG'}).\n\n"
+            "Applying these settings will restart playback and can take a while "
+            "before the app is responsive again.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Apply canceled before rebuilding runtime.")
+            return False
+        return True
+
     def _runtime_compile_verified_keys(self) -> set[tuple]:
         verified = getattr(self, "_runtime_compile_verified", None)
         if not isinstance(verified, set):
@@ -1210,6 +1352,24 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage("Kernel compile cancelled by user.")
             return False
 
+        return True
+
+    def _confirm_replace_video_while_playing(self, path: str | None = None) -> bool:
+        if not bool(getattr(self, "_playing", False)):
+            return True
+        label = os.path.basename(str(path or "").strip()) or "the selected video"
+        answer = QMessageBox.question(
+            self,
+            "Open New Video?",
+            "A video is currently playing.\n\n"
+            f"Opening {label} will stop current playback and load the new source.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Open video canceled; current playback continues.")
+            return False
         return True
 
     def _predequantize_mode_label(self) -> str:
@@ -2442,6 +2602,8 @@ class PlaybackRuntimeMixin:
     def _set_video(self, path, auto_play: bool = False):
         if self._show_export_lock_message("Loading a new video"):
             return
+        if not self._confirm_replace_video_while_playing(path):
+            return
         candidate_hdr = _probe_hdr_input(path)
         if bool(candidate_hdr.get("is_hdr", False)):
             reason = str(candidate_hdr.get("reason", "HDR metadata detected")).strip()
@@ -3154,7 +3316,7 @@ class PlaybackRuntimeMixin:
         self._btn_pause.setEnabled(not is_window_source)
         self._btn_stop.setEnabled(True)
         self._btn_compare.setEnabled(not is_window_source)
-        self._btn_file.setEnabled(False)
+        self._btn_file.setEnabled(not is_window_source)
         if self._btn_toggle_ui is not None:
             self._btn_toggle_ui.setEnabled(True)
         self._cmb_prec.setEnabled(True)
@@ -3950,6 +4112,14 @@ class PlaybackRuntimeMixin:
             return ok
 
         if needs_restart:
+            target_pw, target_ph = self._target_processing_dims_for_resolution(new_res)
+            if not self._confirm_apply_runtime_build_if_needed(
+                w=target_pw,
+                h=target_ph,
+                gui_precision=new_prec,
+                use_hg=self._chk_hg.isChecked(),
+            ):
+                return
             self._save_user_settings()
             self._restart_with_active_source(
                 resolution=new_res,
@@ -4134,6 +4304,13 @@ class PlaybackRuntimeMixin:
                     self.statusBar().showMessage(
                         f"Precision {new_prec} not precompiled at {cur_pw}x{cur_ph}; restarting for clean compile."
                     )
+                    if not self._confirm_apply_runtime_build_if_needed(
+                        w=cur_pw,
+                        h=cur_ph,
+                        gui_precision=new_prec,
+                        use_hg=self._chk_hg.isChecked(),
+                    ):
+                        return
                     self._save_user_settings()
                     self._restart_with_active_source(
                         resolution=new_res,
@@ -4197,6 +4374,13 @@ class PlaybackRuntimeMixin:
                     self.statusBar().showMessage(
                         f"TensorRT engine for {new_prec} not built at {cur_pw}x{cur_ph}; restarting to build."
                     )
+                    if not self._confirm_apply_runtime_build_if_needed(
+                        w=cur_pw,
+                        h=cur_ph,
+                        gui_precision=new_prec,
+                        use_hg=use_hg,
+                    ):
+                        return
                     self._save_user_settings()
                     self._restart_with_active_source(
                         resolution=new_res,
