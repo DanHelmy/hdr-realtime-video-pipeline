@@ -73,39 +73,63 @@ def _pinned_u16_host_buffer(state: dict, shape: tuple[int, int, int]):
     return tensor, arr
 
 
+def _cuda_rgb48_state(state: dict, shape: tuple[int, int, int], device):
+    key = (shape, str(device))
+    if (
+        state.get("cuda_key") == key
+        and state.get("rgb_f32") is not None
+        and state.get("rgb_u16") is not None
+        and state.get("stream") is not None
+    ):
+        return state["stream"], state["rgb_f32"], state["rgb_u16"]
+    with torch.cuda.device(device):
+        stream = torch.cuda.Stream()
+        rgb_f32 = torch.empty(shape, dtype=torch.float32, device=device)
+        rgb_u16 = torch.empty(shape, dtype=torch.uint16, device=device)
+    state["cuda_key"] = key
+    state["stream"] = stream
+    state["rgb_f32"] = rgb_f32
+    state["rgb_u16"] = rgb_u16
+    return stream, rgb_f32, rgb_u16
+
+
 def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
     with torch.inference_mode():
         prepared = tensor[0] if isinstance(tensor, (tuple, list)) else tensor
-        rgb = (
-            prepared.squeeze(0)
-            .clamp(0.0, 1.0)
-            .permute(1, 2, 0)
-            .contiguous()
-        )
+        rgb = prepared.squeeze(0).permute(1, 2, 0)
 
     if (
         _FEEDER_GPU_RGB48
         and getattr(rgb, "device", None) is not None
         and rgb.device.type == "cuda"
     ):
-        # TensorRT/PyTorch inference can hand us inference-mode tensors; avoid
-        # in-place arithmetic here or the mpv feeder thread can die mid-playback.
-        rgb_f32 = rgb.to(dtype=torch.float32)
-        rgb_u16 = ((rgb_f32 * 65535.0) + 0.5).to(dtype=torch.uint16).contiguous()
+        shape = tuple(int(v) for v in rgb.shape)
+        stream, rgb_f32, rgb_u16 = _cuda_rgb48_state(
+            host_state,
+            shape,
+            rgb.device,
+        )
         host_tensor, host_np = _pinned_u16_host_buffer(
             host_state,
-            tuple(int(v) for v in rgb_u16.shape),
+            shape,
         )
         non_blocking = False
         try:
             non_blocking = bool(host_tensor.is_pinned())
         except Exception:
             non_blocking = False
-        host_tensor.copy_(rgb_u16, non_blocking=non_blocking)
-        torch.cuda.current_stream().synchronize()
+        # Keep the 4K RGB48 conversion off the inference stream and reuse the
+        # large staging tensors. Reallocating these every frame causes periodic
+        # GUI-only latency spikes even when the TensorRT engine itself is flat.
+        with torch.cuda.device(rgb.device), torch.cuda.stream(stream):
+            rgb_f32.copy_(rgb, non_blocking=True)
+            rgb_f32.clamp_(0.0, 1.0).mul_(65535.0).add_(0.5)
+            rgb_u16.copy_(rgb_f32, non_blocking=True)
+            host_tensor.copy_(rgb_u16, non_blocking=non_blocking)
+        stream.synchronize()
         return host_np.tobytes()
 
-    rgb_cpu = rgb.cpu().numpy()
+    rgb_cpu = rgb.clamp(0.0, 1.0).contiguous().cpu().numpy()
     rgb_f32 = rgb_cpu.astype(np.float32, copy=False)
     shape = tuple(int(v) for v in rgb_f32.shape)
     arr = host_state.get("numpy")

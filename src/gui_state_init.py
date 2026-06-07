@@ -270,15 +270,15 @@ class StateInitMixin:
             float(
                 os.environ.get(
                     "HDRTVNET_PERIODIC_PAIR_RELOCK_DRIFT_S",
-                    os.environ.get("HDRTVNET_PERIODIC_RELOCK_DRIFT_S", "0.180"),
+                    os.environ.get("HDRTVNET_PERIODIC_RELOCK_DRIFT_S", "0.350"),
                 )
             ),
         )
         self._periodic_pair_relock_confirmations = max(
-            1, int(os.environ.get("HDRTVNET_PERIODIC_PAIR_RELOCK_CONFIRMATIONS", "2"))
+            1, int(os.environ.get("HDRTVNET_PERIODIC_PAIR_RELOCK_CONFIRMATIONS", "3"))
         )
         self._periodic_pair_relock_cooldown_s = max(
-            0.0, float(os.environ.get("HDRTVNET_PERIODIC_PAIR_RELOCK_COOLDOWN_S", "2.5"))
+            0.0, float(os.environ.get("HDRTVNET_PERIODIC_PAIR_RELOCK_COOLDOWN_S", "5.0"))
         )
         self._periodic_pair_relock_bad_count = 0
         self._periodic_pair_relock_cooldown_until = 0.0
