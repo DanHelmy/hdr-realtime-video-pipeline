@@ -134,6 +134,45 @@ def _paired_paths(sdr_dir: Path, hdr_dir: Path, max_images: int) -> list[tuple[P
     return pairs
 
 
+def _manifest_pairs(manifest_path: Path, max_images: int) -> list[tuple[Path, Path]]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    items = payload.get("items", payload) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise TypeError(f"Manifest must contain a list or an 'items' list: {manifest_path}")
+    repo_root = _ROOT
+    base_dir = manifest_path.parent
+    pairs: list[tuple[Path, Path]] = []
+
+    def _resolve(value: str) -> Path:
+        path = Path(str(value))
+        if path.is_absolute():
+            return path
+        candidate = (repo_root / path).resolve()
+        if candidate.is_file():
+            return candidate
+        return (base_dir / path).resolve()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sdr_value = item.get("sdr") or item.get("sdr_path")
+        hdr_value = item.get("hdr") or item.get("hdr_path")
+        if not sdr_value or not hdr_value:
+            continue
+        repeat = max(1, int(item.get("repeat", 1) or 1))
+        sdr = _resolve(str(sdr_value))
+        hdr = _resolve(str(hdr_value))
+        if not sdr.is_file() or not hdr.is_file():
+            raise FileNotFoundError(f"Manifest pair missing: {sdr} / {hdr}")
+        for _ in range(repeat):
+            pairs.append((sdr, hdr))
+    if max_images > 0:
+        pairs = pairs[:max_images]
+    if not pairs:
+        raise FileNotFoundError(f"No pairs found in manifest: {manifest_path}")
+    return pairs
+
+
 def _crop_pair(sdr: torch.Tensor, hdr: torch.Tensor, crop_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     if crop_size <= 0:
         return sdr, hdr
@@ -482,6 +521,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-hdr-dir", default=str(_ROOT / "dataset" / "train_hdr"))
     parser.add_argument("--val-sdr-dir", default=str(_ROOT / "dataset" / "test_sdr"))
     parser.add_argument("--val-hdr-dir", default=str(_ROOT / "dataset" / "test_hdr"))
+    parser.add_argument(
+        "--train-manifest",
+        default="",
+        help="Optional JSON manifest of SDR/HDR training pairs. Items may include repeat counts.",
+    )
+    parser.add_argument(
+        "--val-manifest",
+        default="",
+        help="Optional JSON manifest of SDR/HDR validation pairs.",
+    )
     parser.add_argument("--max-train-images", type=int, default=0)
     parser.add_argument("--max-val-images", type=int, default=32)
     parser.add_argument("--max-long-edge", type=int, default=1080)
@@ -551,8 +600,14 @@ def main() -> int:
     device = torch.device(device_name)
     dtype = torch.float16 if args.precision == "fp16" and device.type == "cuda" else torch.float32
 
-    train_pairs = _paired_paths(Path(args.train_sdr_dir), Path(args.train_hdr_dir), int(args.max_train_images))
-    val_pairs = _paired_paths(Path(args.val_sdr_dir), Path(args.val_hdr_dir), int(args.max_val_images))
+    if str(args.train_manifest or "").strip():
+        train_pairs = _manifest_pairs(Path(args.train_manifest), int(args.max_train_images))
+    else:
+        train_pairs = _paired_paths(Path(args.train_sdr_dir), Path(args.train_hdr_dir), int(args.max_train_images))
+    if str(args.val_manifest or "").strip():
+        val_pairs = _manifest_pairs(Path(args.val_manifest), int(args.max_val_images))
+    else:
+        val_pairs = _paired_paths(Path(args.val_sdr_dir), Path(args.val_hdr_dir), int(args.max_val_images))
     print(f"Training post head {args.post_correction} on {len(train_pairs)} pair(s); validating {len(val_pairs)} pair(s)")
     print(f"device={device}, dtype={dtype}, crop={args.crop_size}, batch={args.batch_size}")
 

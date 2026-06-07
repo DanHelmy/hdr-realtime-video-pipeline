@@ -1905,7 +1905,7 @@ def main():
                 "src",
                 "models",
                 "weights",
-                "int8",
+                "pytorch_int8",
                 "hr",
                 "HR_int8_mixed_qat.pt",
             )

@@ -25,13 +25,25 @@ from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE  # no
 from models.hdrtvnet_modules.HG_Composite_arch import HG_Composite  # noqa: E402
 
 
+def _load_payload(path: Path) -> dict:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, dict):
+        return payload
+    raise TypeError(f"{path} did not contain a checkpoint-like mapping")
+
+
 def _load_state(path: Path) -> dict[str, torch.Tensor]:
-    payload = torch.load(path, map_location="cpu")
+    payload = _load_payload(path)
     if isinstance(payload, dict) and "state_dict" in payload:
         payload = payload["state_dict"]
     if not isinstance(payload, dict):
         raise TypeError(f"{path} did not contain a state_dict-like mapping")
     return {str(k).replace("module.", ""): v for k, v in payload.items()}
+
+
+def _arch(path: Path) -> dict:
+    payload = _load_payload(path)
+    return dict(payload.get("architecture") or {})
 
 
 def _load_composite(
@@ -40,6 +52,7 @@ def _load_composite(
     le_arch: str,
     hg_arch: str,
     classifier: str,
+    post_correction: str = "",
 ) -> HG_Composite:
     model = HG_Composite(
         classifier=classifier,
@@ -53,6 +66,7 @@ def _load_composite(
         mask_r=0.75,
         le_arch=le_arch,
         hg_arch=hg_arch,
+        post_correction=post_correction,
     )
     model.base.load_state_dict(_load_state(base_path), strict=True)
     model.hg.load_state_dict(_load_state(hg_path), strict=True)
@@ -60,7 +74,12 @@ def _load_composite(
     return model
 
 
-def _load_base(base_path: Path, le_arch: str, classifier: str) -> Ensemble_AGCM_LE:
+def _load_base(
+    base_path: Path,
+    le_arch: str,
+    classifier: str,
+    post_correction: str = "",
+) -> Ensemble_AGCM_LE:
     model = Ensemble_AGCM_LE(
         classifier=classifier,
         cond_c=6,
@@ -70,6 +89,7 @@ def _load_base(base_path: Path, le_arch: str, classifier: str) -> Ensemble_AGCM_
         act_type="relu",
         weighting_network=False,
         le_arch=le_arch,
+        post_correction=post_correction,
     )
     model.load_state_dict(_load_state(base_path), strict=True)
     model.eval()
@@ -135,6 +155,44 @@ def _paired_paths(sdr_dir: Path, hdr_dir: Path, max_images: int):
     return pairs
 
 
+def _manifest_pairs(manifest_path: Path, max_images: int):
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    items = payload.get("items", payload) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise TypeError(f"Manifest must contain a list or an 'items' list: {manifest_path}")
+
+    def _resolve(value: str) -> Path:
+        path = Path(str(value))
+        if path.is_absolute():
+            return path
+        candidate = (_ROOT / path).resolve()
+        if candidate.is_file():
+            return candidate
+        return (manifest_path.parent / path).resolve()
+
+    pairs = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sdr_value = item.get("sdr") or item.get("sdr_path")
+        hdr_value = item.get("hdr") or item.get("hdr_path")
+        if not sdr_value or not hdr_value:
+            continue
+        sdr = _resolve(str(sdr_value))
+        hdr = _resolve(str(hdr_value))
+        key = (str(sdr), str(hdr))
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((sdr, hdr))
+        if max_images > 0 and len(pairs) >= max_images:
+            break
+    if not pairs:
+        raise FileNotFoundError(f"No pairs found in manifest: {manifest_path}")
+    return pairs
+
+
 def parse_candidate(spec: str) -> tuple[str, Path]:
     if "=" not in spec:
         path = Path(spec)
@@ -151,12 +209,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-hg", default=str(weights_dir / "original" / "HG.pt"))
     parser.add_argument("--teacher-classifier", default="color_condition")
     parser.add_argument("--student-le-arch", default="")
-    parser.add_argument("--student-hg", default=str(experiments_dir / "HG_weights_fusedbn.pth"))
-    parser.add_argument("--student-hg-arch", default="fusedbn")
-    parser.add_argument("--student-classifier", default="color_condition")
+    parser.add_argument("--student-hg", default=str(weights_dir / "distilled" / "hg" / "HG_qfriendly_directh16_fp32.pt"))
+    parser.add_argument("--student-hg-arch", default="")
+    parser.add_argument("--student-classifier", default="")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"])
     parser.add_argument("--sdr-dir", default=str(_ROOT / "dataset" / "test_sdr"))
     parser.add_argument("--hdr-dir", default=str(_ROOT / "dataset" / "test_hdr"))
+    parser.add_argument("--manifest", default="", help="Optional JSON manifest of SDR/HDR pairs.")
     parser.add_argument("--max-images", type=int, default=32)
     parser.add_argument("--max-long-edge", type=int, default=720)
     parser.add_argument("--preview-count", type=int, default=4)
@@ -191,7 +250,10 @@ def main() -> int:
     device = torch.device(device_name)
     dtype = torch.float16 if args.precision == "fp16" and device.type == "cuda" else torch.float32
 
-    pairs = _paired_paths(Path(args.sdr_dir), Path(args.hdr_dir), args.max_images)
+    if str(args.manifest or "").strip():
+        pairs = _manifest_pairs(Path(args.manifest), args.max_images)
+    else:
+        pairs = _paired_paths(Path(args.sdr_dir), Path(args.hdr_dir), args.max_images)
     if not pairs:
         raise RuntimeError("No SDR/HDR pairs found")
     print(f"Evaluating {len(candidates)} candidates on {len(pairs)} pair(s), {device}/{dtype}")
@@ -204,32 +266,50 @@ def main() -> int:
             le_arch="sft",
             hg_arch="pixelshuffle",
             classifier=args.teacher_classifier,
+            post_correction="",
         ).to(device=device, dtype=dtype)
     else:
         teacher = _load_base(
             Path(args.teacher_base),
             le_arch="sft",
             classifier=args.teacher_classifier,
+            post_correction="",
         ).to(device=device, dtype=dtype)
     teacher.eval()
 
     output_dir = Path(args.output_dir)
     all_results = []
     for name, path in candidates:
-        le_arch = str(args.student_le_arch or name).strip()
+        candidate_arch = _arch(path)
+        hg_arch = _arch(Path(args.student_hg))
+        le_arch = str(args.student_le_arch or candidate_arch.get("le_arch") or name).strip()
+        classifier = str(
+            args.student_classifier
+            or candidate_arch.get("classifier")
+            or "color_condition"
+        ).strip()
+        post_correction = str(candidate_arch.get("post_correction") or "").strip()
+        student_hg_arch = str(
+            args.student_hg_arch
+            or hg_arch.get("hg_arch")
+            or candidate_arch.get("hg_arch")
+            or "pixelshuffle"
+        ).strip()
         if use_hg:
             student = _load_composite(
                 path,
                 Path(args.student_hg),
                 le_arch=le_arch,
-                hg_arch=args.student_hg_arch,
-                classifier=args.student_classifier,
+                hg_arch=student_hg_arch,
+                classifier=classifier,
+                post_correction=post_correction,
             ).to(device=device, dtype=dtype)
         else:
             student = _load_base(
                 path,
                 le_arch=le_arch,
-                classifier=args.student_classifier,
+                classifier=classifier,
+                post_correction=post_correction,
             ).to(device=device, dtype=dtype)
         student.eval()
 
@@ -252,6 +332,8 @@ def main() -> int:
                 rows.append(row)
                 if idx < args.preview_count:
                     stem = f"{idx:03d}_{sdr_path.stem}"
+                    _save_png16(sdr.to(device=device, dtype=dtype), output_dir / name / f"{stem}_sdr.png")
+                    _save_png16(hdr, output_dir / name / f"{stem}_gt.png")
                     _save_png16(teacher_out, output_dir / name / f"{stem}_teacher.png")
                     _save_png16(student_out, output_dir / name / f"{stem}_student.png")
                     _save_png16((student_out.float() - teacher_out.float()).abs() * 8.0, output_dir / name / f"{stem}_diff_x8.png")
@@ -260,6 +342,10 @@ def main() -> int:
             "candidate": name,
             "path": str(path),
             "count": len(rows),
+            "le_arch": le_arch,
+            "classifier": classifier,
+            "post_correction": post_correction,
+            "student_hg_arch": student_hg_arch if use_hg else "",
         }
         for key in (
             "student_vs_teacher_psnr",
