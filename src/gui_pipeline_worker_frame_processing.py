@@ -110,6 +110,46 @@ class PipelineWorkerFrameProcessingMixin:
                 output = cv2.resize(output, (out_w, out_h), interpolation=cv2.INTER_AREA)
         return output
 
+    def _stage_hdr_display_tensor(self, prepared_out, use_cuda: bool):
+        if not torch.is_tensor(prepared_out):
+            try:
+                return prepared_out.clone()
+            except Exception:
+                return prepared_out
+        if (
+            not use_cuda
+            or getattr(prepared_out, "device", None) is None
+            or prepared_out.device.type != "cuda"
+        ):
+            return prepared_out.clone()
+
+        try:
+            queue_frames = int(getattr(self, "_video_playback_buffer_frames", 1))
+        except Exception:
+            queue_frames = 1
+        pool_size = max(2, min(16, queue_frames + 2))
+        key = (
+            tuple(int(v) for v in prepared_out.shape),
+            str(prepared_out.device),
+            str(prepared_out.dtype),
+            int(pool_size),
+        )
+        pool = getattr(self, "_hdr_display_tensor_pool", None)
+        if getattr(self, "_hdr_display_tensor_pool_key", None) != key or not pool:
+            pool = [
+                torch.empty_like(prepared_out, memory_format=torch.contiguous_format)
+                for _ in range(pool_size)
+            ]
+            self._hdr_display_tensor_pool = pool
+            self._hdr_display_tensor_pool_key = key
+            self._hdr_display_tensor_pool_idx = 0
+
+        idx = int(getattr(self, "_hdr_display_tensor_pool_idx", 0) or 0) % len(pool)
+        staged = pool[idx]
+        self._hdr_display_tensor_pool_idx = (idx + 1) % len(pool)
+        staged.copy_(prepared_out, non_blocking=True)
+        return staged
+
     def _cuda_timing_events(self):
         events = getattr(self, "_infer_timing_events", None)
         if events is not None:
@@ -257,7 +297,7 @@ class PipelineWorkerFrameProcessingMixin:
             else:
                 self._hdr_drop_until_frame = 0
             if self._hdr_drop_until_frame == 0:
-                queued_tensor = prepared_out.clone()
+                queued_tensor = self._stage_hdr_display_tensor(prepared_out, use_cuda)
                 if use_cuda:
                     ready_event = torch.cuda.Event(enable_timing=False)
                     ready_event.record(torch.cuda.current_stream())

@@ -99,7 +99,11 @@ class WorkerSlotsMixin:
             == SOURCE_MODE_WINDOW
         )
         shown_latency_ms = float(
-            m.get("model_latency_ms", m.get("latency_ms", 0.0)) or 0.0
+            m.get(
+                "model_latency_display_ms",
+                m.get("model_latency_ms", m.get("latency_ms", 0.0)),
+            )
+            or 0.0
         )
         self._m["latency"].setText(f"Latency: {shown_latency_ms:.1f} ms")
         self._m["frame"].setText(

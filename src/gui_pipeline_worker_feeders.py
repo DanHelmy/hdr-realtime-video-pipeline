@@ -509,7 +509,6 @@ class PipelineWorkerFeedersMixin:
         if (
             self._sdr_mpv_widget is None
             or self._sdr_queue is not None
-            or not bool(getattr(self, "_sdr_visible", True))
         ):
             return
         live_smooth_cadence = bool(getattr(self, "_capture_target", None))

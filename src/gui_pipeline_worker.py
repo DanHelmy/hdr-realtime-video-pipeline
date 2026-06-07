@@ -156,6 +156,10 @@ class PipelineWorker(
         self._display_prebuffer_target: int = 0
         self._display_prebuffer_count: int = 0
         self._video_playback_buffer_frames: int = max(1, int(VIDEO_PLAYBACK_BUFFER_FRAMES))
+        self._reset_runtime_metrics_requested: bool = False
+        self._hdr_display_tensor_pool = []
+        self._hdr_display_tensor_pool_key = None
+        self._hdr_display_tensor_pool_idx = 0
 
     # ── public API (called from main thread) ──
 
@@ -382,6 +386,12 @@ class PipelineWorker(
         """Compatibility wrapper for older GUI callers."""
         self.flush_display_queues(drop_frames=drop_frames)
 
+    def reset_runtime_metrics(self):
+        """Drop stale rolling metric samples after OS/UI presentation stalls."""
+        self._reset_runtime_metrics_requested = True
+        if not self._user_paused:
+            self._pause_event.set()
+
     def _ensure_sobel_kernels(self, device: torch.device, dtype: torch.dtype):
         if self._sobel_x is not None and self._sobel_x.device == device and self._sobel_x.dtype == dtype:
             return
@@ -478,17 +488,31 @@ class PipelineWorker(
     def set_sdr_mpv_widget(self, widget):
         """Set the MpvHDRWidget reference for feeding SDR frames."""
         self._sdr_mpv_widget = widget
+        if widget is not None:
+            self._sdr_visible = True
+        else:
+            self._stop_sdr_feeder()
 
     def set_sdr_visible(self, visible: bool):
         """Tell the worker whether the SDR output is on-screen."""
+        if self._sdr_mpv_widget is not None:
+            # mpv panes stay warm even while their tab is hidden; visibility only
+            # controls the CPU preview fallback when no SDR mpv pane exists.
+            visible = True
         visible = bool(visible)
         if self._sdr_visible == visible:
             return
         self._sdr_visible = visible
         if visible:
             self._start_sdr_feeder()
-        else:
+        elif self._capture_target:
             self._stop_sdr_feeder()
+        elif self._sdr_queue is not None:
+            try:
+                while True:
+                    self._sdr_queue.get_nowait()
+            except _queue.Empty:
+                pass
 
     def request_seek(self, frame_number: int):
         """Request a seek to a specific frame (thread-safe)."""
@@ -804,6 +828,7 @@ class PipelineWorker(
                     self._hold_until_t = time.perf_counter() + 0.5
                 # Discard stale FPS history so metrics/auto-mute re-lock quickly.
                 frame_times.clear()
+                model_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
                 live_capture_prev_perf = 0.0
@@ -813,10 +838,19 @@ class PipelineWorker(
             self._pause_event.wait()
             if self._stop_flag:
                 break
+            if self._reset_runtime_metrics_requested:
+                self._reset_runtime_metrics_requested = False
+                frame_times.clear()
+                model_times.clear()
+                presented_times.clear()
+                metrics_warmup_frames = 4
+                live_capture_prev_perf = 0.0
+                self._last_metrics_emit_t = 0.0
             if paused_before_wait:
                 next_frame_t = time.perf_counter()
                 # Pauses create a long timestamp gap that pollutes FPS windows.
                 frame_times.clear()
+                model_times.clear()
                 presented_times.clear()
                 metrics_warmup_frames = 4
                 live_capture_prev_perf = 0.0

@@ -313,6 +313,7 @@ class MpvHDRWidget(QWidget):
         self._requested_gpu_api: str = "d3d11"
         self._raw_video_format: str = "rgb48le"
         self._preserve_feed_order = False
+        self._target_wid: str | None = None
 
         self._mpv_lib = mpv_lib
         self._mpv_diag = bool(mpv_diag)
@@ -812,6 +813,7 @@ class MpvHDRWidget(QWidget):
         self._pipe_name = rf"\\.\pipe\hdrtvnet_mpv_{pipe_id}"
 
         wid = str(int(self.winId()))
+        self._target_wid = wid
         pipe_url = f"lavf://file:{self._pipe_name}"
 
         frame_bytes = width * height * _raw_video_bytes_per_pixel(
@@ -1379,6 +1381,15 @@ class MpvHDRWidget(QWidget):
             self._feeder.join(timeout=max(0.0, float(wait_timeout)))
             self._feeder = None
         self._queue = None
+        self._target_wid = None
+
+    def needs_surface_refresh(self) -> bool:
+        if self._player is None or not self._last_playback_cfg:
+            return False
+        try:
+            return str(int(self.winId())) != str(self._target_wid or "")
+        except Exception:
+            return True
 
     def refresh_surface(self):
         cfg = self._last_playback_cfg

@@ -94,32 +94,35 @@ class WindowingMixin:
 
     def _sync_worker_sdr_visibility(self) -> bool:
         visible = self._is_sdr_output_visible()
+        worker_visible = visible
+        if (
+            self._playing
+            and getattr(self, "_active_use_mpv", False)
+            and self._disp_sdr_mpv is not None
+        ):
+            # Keep SDR mpv fed even on HDR-only view. Switching back to SDR or
+            # side-by-side is then a warm pane switch instead of a cold feeder
+            # restart with stale frames.
+            worker_visible = True
         try:
-            self._worker.set_sdr_visible(visible)
+            self._worker.set_sdr_visible(worker_visible)
         except Exception:
             pass
         return visible
 
     def _schedule_sdr_reactivation_relock(self):
-        """Re-pair mpv outputs after leaving HDR-only playback."""
+        """Recover metrics after showing SDR; the pane is kept warm already."""
         if not self._playing:
             return
 
-        def _do(drop_frames: int):
-            if not self._playing:
-                return
-            if bool(getattr(self, "_video_prebuffer_pending", False)):
-                return
-            if self._worker is not None:
-                try:
-                    self._worker.flush_display_queues(drop_frames=drop_frames)
-                except AttributeError:
-                    self._worker.flush_hdr_queue(drop_frames=drop_frames)
-            if not self._is_live_window_capture_active():
-                self._resync_audio_to_current_timeline()
-
-        QTimer.singleShot(70, lambda: _do(3))
-        QTimer.singleShot(190, lambda: _do(2))
+        try:
+            self._worker.reset_runtime_metrics()
+        except Exception:
+            pass
+        if self._is_live_window_capture_active():
+            self._schedule_window_state_refresh(40, soft_only=True)
+        else:
+            self._relock_timeline(delay_ms=90, drop_frames=1)
 
     def _on_video_tab_changed(self, index: int):
         if self._video_tabs is None or index < 0:
@@ -127,6 +130,8 @@ class WindowingMixin:
         new_label = str(self._video_tabs.tabText(index) or "")
         old_label = str(getattr(self, "_active_video_tab_label", "") or "")
         reactivate_sdr = old_label == "HDR" and new_label in {"SDR", "Side by Side"}
+        if self._playing and not self._is_live_window_capture_active():
+            self._pause_for_ui_transition(duration_ms=120, wait_for_stable=True)
 
         def _apply_tab_switch():
             label = new_label
@@ -164,7 +169,7 @@ class WindowingMixin:
         if self._playing and reactivate_sdr:
             self._schedule_sdr_reactivation_relock()
         elif self._playing:
-            self._relock_timeline(delay_ms=140, drop_frames=3)
+            self._relock_timeline(delay_ms=140, drop_frames=1)
 
     def _on_app_state_changed(self, state: Qt.ApplicationState):
         active = state == Qt.ApplicationState.ApplicationActive
@@ -173,8 +178,12 @@ class WindowingMixin:
         self._app_active = active
         if self._playing:
             self._set_process_priority(True)
+            try:
+                self._worker.reset_runtime_metrics()
+            except Exception:
+                pass
             if active:
-                self._relock_timeline(delay_ms=60, drop_frames=2)
+                self._relock_timeline(delay_ms=80, drop_frames=1)
 
     def _toggle_sdr_popout(self):
         if self._sdr_float_window is not None:
@@ -1001,14 +1010,6 @@ class WindowingMixin:
         self._periodic_relock_timer.setSingleShot(False)
         self._periodic_relock_timer.timeout.connect(self._periodic_relock_tick)
 
-    def _needs_mpv_pair_relock(self) -> bool:
-        return bool(
-            getattr(self, "_active_use_mpv", False)
-            and self._disp_hdr_mpv is not None
-            and self._disp_sdr_mpv is not None
-            and self._is_sdr_output_visible()
-        )
-
     def _periodic_relock_tick(self):
         if not self._playing:
             return
@@ -1025,8 +1026,7 @@ class WindowingMixin:
             return
         if not self._active_use_mpv:
             return
-        pair_relock = self._needs_mpv_pair_relock()
-        if self._audio_available and self._audio_player is not None and not pair_relock:
+        if self._audio_available and self._audio_player is not None:
             return
         # Light-touch resync to keep HDR/SDR aligned over time (video-only).
         fps = getattr(self, "_vid_fps", 30.0)
@@ -1059,39 +1059,14 @@ class WindowingMixin:
             except Exception:
                 sdr_t = None
 
-        if pair_relock:
-            now_t = time.perf_counter()
-            if now_t < float(getattr(self, "_periodic_pair_relock_cooldown_until", 0.0)):
-                return
-            pair_drift = None
-            if hdr_t is not None and sdr_t is not None:
-                pair_drift = abs(float(hdr_t) - float(sdr_t))
-            pair_threshold_s = float(
-                getattr(self, "_periodic_pair_relock_drift_s", 0.180)
-            )
-            if pair_drift is None or pair_drift <= max(0.0, pair_threshold_s):
-                self._periodic_pair_relock_bad_count = 0
-                return
-            self._periodic_pair_relock_bad_count = int(
-                getattr(self, "_periodic_pair_relock_bad_count", 0)
-            ) + 1
-            if self._periodic_pair_relock_bad_count < int(
-                getattr(self, "_periodic_pair_relock_confirmations", 2)
-            ):
-                return
-            self._periodic_pair_relock_bad_count = 0
-            self._periodic_pair_relock_cooldown_until = now_t + float(
-                getattr(self, "_periodic_pair_relock_cooldown_s", 2.5)
-            )
-        else:
-            drift_threshold_s = float(getattr(self, "_periodic_relock_drift_s", 0.045))
-            drifts = [
-                abs(float(t) - target_sec) for t in (hdr_t, sdr_t) if t is not None
-            ]
-            if drifts and max(drifts) <= max(0.0, drift_threshold_s):
-                return
-            if not drifts:
-                return
+        drift_threshold_s = float(getattr(self, "_periodic_relock_drift_s", 0.045))
+        drifts = [
+            abs(float(t) - target_sec) for t in (hdr_t, sdr_t) if t is not None
+        ]
+        if drifts and max(drifts) <= max(0.0, drift_threshold_s):
+            return
+        if not drifts:
+            return
 
         if self._worker is not None:
             try:
@@ -1108,18 +1083,12 @@ class WindowingMixin:
         if self._periodic_relock_timer is None:
             return
         self._periodic_relock_timer.stop()
-        self._periodic_pair_relock_bad_count = 0
-        self._periodic_pair_relock_cooldown_until = 0.0
         if (
             _normalize_source_mode(getattr(self, "_source_mode", None))
             == SOURCE_MODE_WINDOW
         ):
             return
-        if (
-            self._audio_available
-            and self._audio_player is not None
-            and not self._needs_mpv_pair_relock()
-        ):
+        if self._audio_available and self._audio_player is not None:
             return
         period_ms = int(getattr(self, "_periodic_relock_ms", 1200))
         first_ms = int(getattr(self, "_periodic_relock_first_ms", 450))
@@ -1130,8 +1099,6 @@ class WindowingMixin:
     def _stop_periodic_relock(self):
         if self._periodic_relock_timer is not None:
             self._periodic_relock_timer.stop()
-        self._periodic_pair_relock_bad_count = 0
-        self._periodic_pair_relock_cooldown_until = 0.0
 
     def _pause_for_ui_transition(
         self,
@@ -1206,49 +1173,42 @@ class WindowingMixin:
         if not self._playing or not self._active_use_mpv:
             return
         source_mode = _normalize_source_mode(getattr(self, "_source_mode", None))
+        if self._disp_sdr_mpv is not None and self._disp_sdr_stack is not None:
+            self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_mpv)
+        if self._disp_hdr_mpv is not None and self._disp_hdr_stack is not None:
+            self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_mpv)
+        try:
+            self._sync_worker_sdr_visibility()
+        except Exception:
+            pass
+
         if source_mode != SOURCE_MODE_WINDOW:
-            # Non-window playback can also start in a sluggish present state
-            # when launched directly into fullscreen. Trigger the same
-            # pause/relock/refresh path once after startup to avoid needing a
-            # manual fullscreen toggle.
-            self._pause_for_ui_transition(duration_ms=120, wait_for_stable=True)
-            self._with_layout_freeze(lambda: None, refresh_delay=40)
-            self._relock_timeline(delay_ms=140, drop_frames=3)
-            return
-        tabs = getattr(self, "_video_tabs", None)
-        if tabs is None or tabs.count() < 2:
-            self._pause_for_ui_transition(duration_ms=120, wait_for_stable=True)
-            self._with_layout_freeze(lambda: None, refresh_delay=40)
-            self._relock_timeline(delay_ms=140, drop_frames=3)
-            return
-        original_index = max(0, int(tabs.currentIndex()))
-        candidate_index = None
-        for offset in range(1, tabs.count()):
-            idx = (original_index + offset) % tabs.count()
-            if idx != original_index:
-                candidate_index = idx
-                break
-        if candidate_index is None:
-            return
+            # Normal file playback can use the seekable relock path after a
+            # soft surface refresh. Live capture has no seekable timeline.
+            self._pause_for_ui_transition(duration_ms=100, wait_for_stable=True)
 
-        # The reliable user-discovered fix is an actual pane change, not just
-        # a repaint. Mirror that once on startup, then restore the user's tab.
-        tabs.setCurrentIndex(candidate_index)
-
-        def _restore_original_tab():
-            if (
-                _normalize_source_mode(getattr(self, "_source_mode", None))
-                != SOURCE_MODE_WINDOW
-            ):
+        def _soft_warm():
+            if not self._playing or not self._active_use_mpv:
                 return
-            if not self._playing:
-                return
-            try:
-                tabs.setCurrentIndex(original_index)
-            except Exception:
-                pass
+            worker_paused = bool(self._worker is not None and self._worker.is_paused)
+            can_unpause_mpv = bool(source_mode == SOURCE_MODE_WINDOW or not worker_paused)
+            if can_unpause_mpv and self._disp_hdr_mpv is not None:
+                self._disp_hdr_mpv.set_paused(False)
+            if can_unpause_mpv and self._disp_sdr_mpv is not None:
+                self._disp_sdr_mpv.set_paused(False)
+            self._with_layout_freeze(
+                lambda: None,
+                refresh_delay=40,
+                refresh_soft_only=True,
+            )
+            self._apply_mpv_runtime_filters(2)
+            if source_mode != SOURCE_MODE_WINDOW:
+                self._relock_timeline(delay_ms=140, drop_frames=2)
 
-        QTimer.singleShot(120, _restore_original_tab)
+        _soft_warm()
+        QTimer.singleShot(220, _soft_warm)
+        if source_mode != SOURCE_MODE_WINDOW:
+            QTimer.singleShot(420, _soft_warm)
 
     def _toggle_borderless_full_window(self):
         now_t = time.perf_counter()
@@ -1375,11 +1335,19 @@ class WindowingMixin:
                 self._apply_mpv_runtime_filters(2)
             return
         self._deferred_mpv_refresh = False
-        if (not soft_only) and self._disp_hdr_mpv is not None:
+        if (
+            (not soft_only)
+            and self._disp_hdr_mpv is not None
+            and self._disp_hdr_mpv.needs_surface_refresh()
+        ):
             self._disp_hdr_mpv.refresh_surface()
             if paused:
                 self._disp_hdr_mpv.set_paused(True)
-        if (not soft_only) and self._disp_sdr_mpv is not None:
+        if (
+            (not soft_only)
+            and self._disp_sdr_mpv is not None
+            and self._disp_sdr_mpv.needs_surface_refresh()
+        ):
             self._disp_sdr_mpv.refresh_surface()
             if paused:
                 self._disp_sdr_mpv.set_paused(True)

@@ -11,6 +11,18 @@ from models.hdrtvnet_torch import _IS_NVIDIA
 class PipelineWorkerRuntimeMetricsMixin:
     """Live metrics emit helper for PipelineWorker."""
 
+    @staticmethod
+    def _trimmed_latency_average(values) -> float:
+        vals = [float(v) for v in values if float(v) > 0.0]
+        if not vals:
+            return 0.0
+        if len(vals) < 8:
+            return sum(vals) / len(vals)
+        vals.sort()
+        trim = max(1, len(vals) // 10)
+        kept = vals[trim:-trim] if len(vals) > (trim * 2) else vals
+        return sum(kept) / len(kept)
+
     def _emit_runtime_metrics_if_ready(
         self,
         *,
@@ -54,6 +66,7 @@ class PipelineWorkerRuntimeMetricsMixin:
             if model_times
             else 0.0
         )
+        model_display_avg = self._trimmed_latency_average(model_times)
         if len(presented_times) >= 2:
             dt = presented_times[-1] - presented_times[0]
             fps = ((len(presented_times) - 1) / dt) if dt > 0 else 0.0
@@ -117,6 +130,7 @@ class PipelineWorkerRuntimeMetricsMixin:
             "fps": fps,
             "latency_ms": avg,
             "model_latency_ms": float(model_avg),
+            "model_latency_display_ms": float(model_display_avg),
             "live_video_latency_ms": float(live_video_latency_ms),
             "is_live_capture": bool(is_live_capture),
             "frame": frame_idx,

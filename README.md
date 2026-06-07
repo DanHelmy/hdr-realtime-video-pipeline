@@ -40,6 +40,8 @@ Core updates include:
 - `SSimDownscaler.glsl` is loaded automatically as the mpv downscale shader companion when present (`HDRTVNET_MPV_SSIM_DOWNSCALER=0` disables it)
 - SDR panes now use SDR-specific downscaling (`mitchell`, non-linear) instead of the HDR linear-light downscale path, reducing glow around tiny SDR text in side-by-side/windowed layouts
 - SDR preview panes feed mpv as BGR24 instead of RGB48 when HDR metadata is not forced, cutting SDR-only/side-by-side pipe bandwidth and conversion cost
+- SDR and HDR mpv panes now start and stay fed together from playback startup, so switching among `SDR`, `HDR`, and `Side by Side` is a warm UI change instead of enabling a cold pane after the click
+- tab, pop-out, and side-by-side layout refreshes avoid restarting mpv unless Qt actually recreates the native video surface, preventing the SDR-only flash-to-black and drift after view switches
 - normal video playback now uses a fixed small mpv/worker frame buffer before startup, seek, and resume release, so audio and both panes restart together instead of relying on a mute-until-stable gate
 - timeline scrubbing uses a paused mpv file preview for exact seek thumbnails while the main HDR/SDR raw-video pipes stay isolated
 - the status bar now keeps the live pane upscale state visible during playback instead of only reporting it on monitor moves; audio recovery notices yield to that persistent scaling state
@@ -236,6 +238,7 @@ Browser capture pacing:
 - The live mpv feeder allows a tiny bounded refill after a late write so mpv's raw-video pipe does not underflow into visible pauses.
 - Playback, capture, and feeder timing threads opt into Windows high-resolution timers plus MMCSS `Playback` scheduling so frame-deadline wakeups are less likely to slip under CPU load.
 - Once a live feeder has a frame to repeat, it uses precise short-slice polling instead of relying on coarse `Queue.get(timeout=...)` wakeups for presentation deadlines.
+- Both browser-capture mpv panes are attached and fed at startup; the GUI performs a soft surface warm-up after handoff instead of relying on a manual or simulated tab switch.
 - The mpv named-pipe writer avoids per-chunk `bytes` copies when writing frame buffers, reducing avoidable jitter in the final delivery step.
 - mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
 - Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
@@ -301,7 +304,7 @@ Important:
 - Chrome Audio Sync now stays active until you stop it manually in the extension.
 - HDRTVNet++ stays silent during browser-window playback.
 - Browser-window capture observes Chrome separately (default 2x the selected GUI cap), feeds mpv a steady `24`/`30`/`60` fps stream, and lets mpv repeat frames on display vsync.
-- After a cold compile, playback waits for mpv to attach before the worker starts producing frames; this prevents the HDR pane from staying black while the worker silently falls back to CPU output.
+- After a cold compile, playback waits for both mpv panes to attach before the worker starts producing frames, then softly warms their surfaces; this prevents hidden-tab panes from staying black until the user switches views.
 - Without Chrome Audio Sync, Chrome keeps playing audio locally and it can lead the video.
 - If the Chrome source window disappears unexpectedly, HDRTVNet++ now treats that as source loss and restarts cleanly instead of holding onto a dead browser feed.
 
@@ -389,8 +392,9 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **Smoother normal video playback**
   - startup, seek, and resume fill a fixed `HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES` buffer before releasing audio and HDR/SDR panes together; default is `12`
   - side-by-side SDR/HDR mpv feeds preserve ordered frames during normal video playback, while Browser Window Capture keeps its low-delay latest-frame stabilizer
+  - SDR and HDR mpv panes stay active across `SDR`, `HDR`, and `Side by Side`; ordinary layout switches no longer tear down mpv, so switching to SDR-only should not flash black or drift out of sync
   - dragging the playhead shows an exact mpv scrub preview from the source file instead of relying on OpenCV seeking
-  - side-by-side relock is less aggressive, so normal timestamp noise does not repeatedly flush both mpv panes
+  - side-by-side relock is back to the v5.1-style one-shot UI transition path; the periodic HDR-vs-SDR pair-chasing loop was removed so normal timestamp noise does not repeatedly flush both mpv panes
 
 ### Previous v5.1 Highlights
 

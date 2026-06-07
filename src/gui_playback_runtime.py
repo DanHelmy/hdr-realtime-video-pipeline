@@ -1682,6 +1682,13 @@ class PlaybackRuntimeMixin:
         self._apply_monitor_upscale_settings(announce=False)
         self._sync_upscale_controls()
         self._refresh_playback_scale_status(force=True)
+        if (
+            bool(getattr(self, "_active_use_mpv", False))
+            and _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        ):
+            QTimer.singleShot(80, self._stabilize_window_capture_surface_after_startup)
+            QTimer.singleShot(360, self._stabilize_window_capture_surface_after_startup)
         if self._startup_sync_pending:
             if self._user_pause_override_startup:
                 self._release_startup_sync()
@@ -3437,7 +3444,10 @@ class PlaybackRuntimeMixin:
         )
         try:
             self._active_video_tab_label = self._current_video_tab_label()
-            self._worker.set_sdr_visible(self._is_sdr_output_visible())
+            sdr_worker_visible = bool(self._is_sdr_output_visible())
+            if bool(use_mpv_pipeline):
+                sdr_worker_visible = True
+            self._worker.set_sdr_visible(sdr_worker_visible)
         except Exception:
             pass
 
