@@ -1,7 +1,7 @@
 ﻿# HDR Real-Time Video Processing Framework
 
-![Version](https://img.shields.io/badge/version-v6.1-blue)
-![Stable](https://img.shields.io/badge/stable-v6.1-brightgreen)
+![Version](https://img.shields.io/badge/version-v6.0-blue)
+![Stable](https://img.shields.io/badge/stable-v6.0-brightgreen)
 ![Status](https://img.shields.io/badge/status-stable%20release-brightgreen)
 ![Thesis](https://img.shields.io/badge/type-academic%20research-green)
 
@@ -13,9 +13,9 @@
 
 This project converts standard dynamic range (SDR) video to high dynamic range (HDR) in real time using HDRTVNet++ and a desktop GUI built around low-latency playback, backend-specific inference, export, and live browser-window viewing.
 
-`main` currently tracks the **v6.1 stable line**, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with `torch.compile`/Triton optimization.
+`main` currently tracks the **v6.0 stable line**, including a hybrid inference runtime where NVIDIA devices use TensorRT engines and AMD devices keep the PyTorch pipeline with `torch.compile`/Triton optimization.
 
-Latest stable release: **v6.1**.
+Latest stable release: **v6.0**.
 
 For normal use, download the latest stable build from GitHub **Releases** instead of cloning `main`.
 
@@ -113,9 +113,9 @@ The automatic downloader uses fixed Google Drive file IDs and saves HG locally a
 
 Use the latest stable release unless you are testing local development work:
 
-- Latest stable release: **v6.1**
+- Latest stable release: **v6.0**
 - Releases page: [github.com/DanHelmy/hdr-realtime-video-pipeline/releases](https://github.com/DanHelmy/hdr-realtime-video-pipeline/releases)
-- `main`: current v6.1 stable/development head
+- `main`: current v6.0 stable/development head
 
 For tagged release ZIPs, use GitHub Releases. The green `Code -> Download ZIP` button downloads the current `main` tree.
 
@@ -148,7 +148,7 @@ cd hdr-realtime-video-pipeline
 
 ---
 
-## UI Tour (v6.1)
+## UI Tour (v6.0)
 
 ### 1. Main Workspace
 
@@ -307,7 +307,7 @@ Important:
 
 ---
 
-## GUI (v6.1)
+## GUI (v6.0)
 
 ```bash
 python src/gui.py
@@ -315,7 +315,7 @@ python src/gui.py
 
 The GUI is the primary way to use the pipeline. It handles backend selection, model/engine loading, HDR display, export, dedicated objective benchmarking, and live browser-window viewing.
 
-### v6.1 Highlights
+### v6.0 Highlights
 
 - **Hybrid inference runtime**
   - NVIDIA devices use TensorRT engines for all inference
@@ -530,7 +530,7 @@ python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1440p 
 ### Objective Metrics (PSNR / SSIM / DeltaEITP / HDR-VDP3)
 
 - Use **HDR GT ...** in the GUI, then click **Compare** to compute per-frame accuracy metrics.
-- In `v6.1`, compare and the `Model Quality Benchmark` tool use the same shared full-reference metric pipeline.
+- In `v6.0`, compare and the `Model Quality Benchmark` tool use the same shared full-reference metric pipeline.
 - `PSNR` and `SSIM` are computed from the linear HDR image pair.
 - `DeltaEITP` and `HDR-VDP3` are computed from a BT.2020/PQ display-managed path derived from that linear HDR pair.
 - `DeltaEITP-N` is grade-normalized in absolute linear RGB before BT.2020/PQ conversion; it is not normalized on PQ code values and it is not re-normalized after PQ encoding.
