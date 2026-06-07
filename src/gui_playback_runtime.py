@@ -3568,12 +3568,6 @@ class PlaybackRuntimeMixin:
                 if self._audio_available:
                     QTimer.singleShot(420, self._ensure_selected_audio_track_qt)
                 self._pending_seek_on_resume = None
-            elif self._active_use_mpv:
-                prebuffering = self._begin_video_prebuffer(
-                    int(getattr(self, "_last_seek_frame", 0)),
-                    reason="resume",
-                    resume_worker=False,
-                )
             if prebuffering:
                 self._worker.resume()
                 self._set_pause_button_labels(False)

@@ -127,7 +127,6 @@ class WindowingMixin:
         new_label = str(self._video_tabs.tabText(index) or "")
         old_label = str(getattr(self, "_active_video_tab_label", "") or "")
         reactivate_sdr = old_label == "HDR" and new_label in {"SDR", "Side by Side"}
-        self._pause_for_ui_transition(duration_ms=260 if reactivate_sdr else None)
 
         def _apply_tab_switch():
             label = new_label
@@ -175,7 +174,7 @@ class WindowingMixin:
         if self._playing:
             self._set_process_priority(True)
             if active:
-                self._pause_for_ui_transition()
+                self._relock_timeline(delay_ms=60, drop_frames=2)
 
     def _toggle_sdr_popout(self):
         if self._sdr_float_window is not None:
@@ -609,7 +608,6 @@ class WindowingMixin:
     def _toggle_ui_visibility(self):
         if not self._playing:
             return
-        self._pause_for_ui_transition()
         self._ui_hidden = not self._ui_hidden
         self._set_immersive_video_ui(self._ui_hidden)
         if self._ui_hidden:
@@ -1136,7 +1134,9 @@ class WindowingMixin:
         self._periodic_pair_relock_cooldown_until = 0.0
 
     def _pause_for_ui_transition(
-        self, duration_ms: int | None = None, wait_for_stable: bool = True
+        self,
+        duration_ms: int | None = None,
+        wait_for_stable: bool = True,
     ):
         if not self._playing:
             return
@@ -1175,22 +1175,6 @@ class WindowingMixin:
                 return
             if bool(getattr(self, "_video_prebuffer_pending", False)):
                 return
-            if (
-                _normalize_source_mode(getattr(self, "_source_mode", None))
-                != SOURCE_MODE_WINDOW
-                and getattr(self, "_active_use_mpv", False)
-                and hasattr(self, "_begin_video_prebuffer")
-            ):
-                try:
-                    anchor = int(self._sync_anchor_frame())
-                except Exception:
-                    anchor = int(getattr(self, "_last_seek_frame", 0) or 0)
-                if self._begin_video_prebuffer(
-                    anchor,
-                    reason="ui-transition",
-                    resume_worker=True,
-                ):
-                    return
             if self._worker is not None and self._worker.is_paused:
                 self._worker.resume()
             if self._disp_hdr_mpv is not None:
