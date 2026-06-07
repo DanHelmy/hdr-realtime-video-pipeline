@@ -40,7 +40,7 @@ SSIM_DOWNSCALER_SHADER_PATH = os.path.join(
     "SSimDownscaler.glsl",
 )
 UPSCALER_CHOICES = ["EWA LanczosSharp", "FSR", "SSimSuperRes"]
-DEFAULT_UPSCALER = "SSimSuperRes"
+DEFAULT_UPSCALER = "FSR"
 
 
 def _fit_with_aspect(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:

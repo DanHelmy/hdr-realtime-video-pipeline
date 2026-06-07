@@ -52,7 +52,7 @@ Core updates include:
 - compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path for requested noncurrent video frames instead of falling back to OpenCV video seeking
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
-- first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
+- first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
 - NVIDIA runtime now defaults to quant-friendly TensorRT ModelOpt Torch builds from self-describing HR/ACGM/LE/HG source checkpoints; mixed presets use the proven runtime include mask, while Full INT8 forces all ModelOpt Torch quantizers
 - normal `FP16` / `FP32` now use the quant-friendly distilled HR/HG architecture; untouched original HR/HG checkpoints remain reference assets for manual experiments
 - current RTX 5060 Ti 1080p clean TensorRT checks: no-HG FP16 `5.26 ms`, Mixed QAT `3.59 ms`, Full QAT `4.30 ms`; HG FP16 `5.64 ms`, Mixed QAT `4.43 ms`, Full QAT `4.97 ms`
@@ -372,7 +372,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - recompare requests for noncurrent SDR video frames use a guarded FFmpeg fast seek; if the requested timestamp cannot be verified closely enough, the frame read reports unavailable instead of falling back to OpenCV random access
 
 - **Safer default quality preset**
-  - clean first launches default to `INT8 Mixed (QAT)`, `1080p`, `SSimSuperRes`, and HG off
+  - clean first launches default to `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
   - existing `.gui_prefs.json` settings still win, so local user choices are preserved
 
 - **Pane-aware playback upscale**
@@ -384,7 +384,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - Apply feedback now reports whether the selected upscale is active or only saved as an inactive preference for the current pane size
   - FSR now runs through an RGB `MAIN` shader path for RGB48 playback, and any residual scale after EASU uses the best mpv scaler instead of bilinear
   - the status bar keeps the current pane upscale state visible during playback, and audio recovery notices yield to that live scaling status
-  - moving or resizing the main window or popped-out HDR view updates the mpv scale/CAS settings without restarting inference
+  - moving or resizing the main window or popped-out HDR view updates the mpv scale/shader settings without restarting inference
 
 - **Smoother normal video playback**
   - startup, seek, and resume fill a fixed `HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES` buffer before releasing audio and HDR/SDR panes together; default is `12`
@@ -516,7 +516,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Pre-compile kernels** | AMD-only PyTorch kernel precompile for any resolution/precision ahead of time |
 | **Clear kernel cache** | AMD-only PyTorch kernel cache clearing for the current project checkout |
 | **Dark theme** | Modern dark UI, auto-applied |
-| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, browser capture FPS, view/tab, upscale, film grain, metrics visibility, HG toggle, AMD pre-dequantization/runtime mode, volume, audio track, cursor hide, last-open directory). On a clean first launch the default preset is `INT8 Mixed (QAT)` / `1080p` / `SSimSuperRes` / HG off |
+| **Persistent GUI settings** | Saved in `.gui_prefs.json` (precision, resolution, browser capture FPS, view/tab, upscale, film grain, metrics visibility, HG toggle, AMD pre-dequantization/runtime mode, volume, audio track, cursor hide, last-open directory). On a clean first launch the default preset is `INT8 Mixed (QAT)` / `1080p` / `FSR` / HG off |
 
 ### GUI Launch Flags
 
@@ -628,8 +628,8 @@ Playback scaling is pane-aware:
 - Hide-UI fullscreen becomes monitor-sized naturally because the HDR pane fills the display.
 - In Hide-UI playback, the playhead, `Show UI`, and performance metrics reappear only while the cursor is moving.
 - Compare and benchmark preview panes use the same high-quality mpv scaler family without extra CAS sharpening.
-- FSR is adapted for the RGB48 playback path by running EASU/RCAS on `MAIN` RGB; if FSR only scales partway to the target, mpv finishes the residual scale with the best configured scaler instead of bilinear.
-- Moving or resizing the app or a popped-out HDR view hot-swaps the mpv scale/CAS settings without restarting the model pipeline.
+- FSR is adapted for the RGB48 playback path by running EASU on `MAIN` RGB without the RCAS/CAS sharpening pass; if FSR only scales partway to the target, mpv finishes the residual scale with the best configured scaler instead of bilinear.
+- Moving or resizing the app or a popped-out HDR view hot-swaps the mpv scale/shader settings without restarting the model pipeline.
 
 Thesis figure screenshots can be rendered from saved benchmark frames through the same embedded mpv preview path:
 

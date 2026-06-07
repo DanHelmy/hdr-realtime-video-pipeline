@@ -9,6 +9,7 @@ from windows_runtime import (
     project_cache_root,
     enable_high_resolution_timer,
     ensure_windows_supported,
+    install_torch_windows_warning_filter,
 )
 
 
@@ -119,6 +120,7 @@ def prepare_runtime_environment(current_file: str) -> tuple[str, str]:
     """Configure cache and DLL lookup paths before torch/PyQt are imported."""
     ensure_windows_supported("HDRTVNet++ GUI")
     enable_high_resolution_timer(1)
+    install_torch_windows_warning_filter()
     configure_rocm_sdk_environment()
     cache_root = project_cache_root(current_file)
     try:

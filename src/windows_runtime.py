@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 import hashlib
+import logging
 import os
 import pathlib
 import sys
@@ -25,6 +26,48 @@ def ensure_windows_supported(component: str) -> None:
     raise SystemExit(
         f"{component} is Windows-only. Unsupported platform: {os.name}."
     )
+
+
+_TORCH_WINDOWS_LOG_FILTER_INSTALLED = False
+
+
+def install_torch_windows_warning_filter() -> None:
+    """Hide known harmless Torch startup noise on Windows.
+
+    PyTorch imports can emit two scary-looking warnings on Windows even when
+    the app is working normally: elastic stdout/stderr redirects are unsupported
+    on Windows/macOS, and cpp_extension cannot query `cl` when MSVC is not in
+    PATH. Keep real Torch warnings visible and filter only those exact messages.
+    """
+    global _TORCH_WINDOWS_LOG_FILTER_INSTALLED
+    if _TORCH_WINDOWS_LOG_FILTER_INSTALLED:
+        return
+    _TORCH_WINDOWS_LOG_FILTER_INSTALLED = True
+
+    class _TorchWindowsNoiseFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                text = str(record.getMessage() or "")
+            except Exception:
+                return True
+            if "Redirects are currently not supported in Windows or MacOs" in text:
+                return False
+            if (
+                "Error checking compiler version for cl:" in text
+                and "cannot find the file specified" in text.lower()
+            ):
+                return False
+            return True
+
+    noise_filter = _TorchWindowsNoiseFilter()
+    for logger_name in (
+        "torch.distributed.elastic.multiprocessing.redirects",
+        "torch.utils.cpp_extension",
+    ):
+        try:
+            logging.getLogger(logger_name).addFilter(noise_filter)
+        except Exception:
+            pass
 
 
 def _has_hip_runtime_header(root: str | os.PathLike[str]) -> bool:

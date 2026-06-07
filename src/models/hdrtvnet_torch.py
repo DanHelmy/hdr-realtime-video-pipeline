@@ -13,6 +13,13 @@ import threading
 import time
 import warnings
 
+try:
+    from windows_runtime import install_torch_windows_warning_filter
+
+    install_torch_windows_warning_filter()
+except Exception:
+    pass
+
 import numpy as np
 import torch
 import torch.nn as nn

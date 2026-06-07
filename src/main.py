@@ -7,11 +7,13 @@ import cv2
 from windows_runtime import (
     configure_rocm_sdk_environment,
     ensure_windows_supported,
+    install_torch_windows_warning_filter,
     project_cache_root,
 )
 
 # Pin PyTorch/Triton caches inside this checkout so generated kernels are visible.
 ensure_windows_supported("HDRTVNet++ CLI")
+install_torch_windows_warning_filter()
 configure_rocm_sdk_environment()
 
 _cache_root = project_cache_root(__file__)

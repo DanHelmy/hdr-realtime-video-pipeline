@@ -13,9 +13,10 @@ import os
 import re
 import sys
 
-from windows_runtime import ensure_windows_supported
+from windows_runtime import ensure_windows_supported, install_torch_windows_warning_filter
 
 ensure_windows_supported("HDRTVNet++ TensorRT engine builder")
+install_torch_windows_warning_filter()
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:

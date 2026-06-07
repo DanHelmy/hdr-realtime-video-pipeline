@@ -20,10 +20,12 @@ if os.name == "nt" and hasattr(sys.stdout, "reconfigure"):
 from windows_runtime import (
     configure_rocm_sdk_environment,
     ensure_windows_supported,
+    install_torch_windows_warning_filter,
     project_cache_root,
 )
 
 ensure_windows_supported("HDRTVNet++ CLI playback benchmark")
+install_torch_windows_warning_filter()
 configure_rocm_sdk_environment()
 
 _HERE = pathlib.Path(__file__).resolve().parent
