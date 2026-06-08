@@ -55,9 +55,10 @@ Core updates include:
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
-- NVIDIA runtime now defaults to quant-friendly TensorRT ModelOpt Torch builds from self-describing HR/ACGM/LE/HG source checkpoints; mixed presets use the proven runtime include mask, while Full INT8 forces all ModelOpt Torch quantizers
+- NVIDIA runtime now defaults to quant-friendly TensorRT ModelOpt Torch builds from self-describing HR/ACGM/LE/HG source checkpoints; mixed presets use the current active-compute Q/DQ recipe, while Full INT8 forces all ModelOpt Torch quantizers
 - normal `FP16` / `FP32` now use the quant-friendly distilled HR/HG architecture; untouched original HR/HG checkpoints remain reference assets for manual experiments
-- current RTX 5060 Ti 1080p TensorRT stress checks after the selective-SFT checkpoint refresh: no-HG FP16 `32.47 ms` / Mixed QAT `28.68 ms` / Full QAT `28.13 ms`; HG FP16 `32.83 ms` / Mixed QAT `29.08 ms` / Full QAT `28.59 ms`
+- current RTX 5060 Ti 1080p TensorRT stress checks after the mixed-Q/DQ stability refresh: no-HG FP16 `38.10 ms` / Mixed PTQ `28.94 ms` / Mixed QAT `29.04 ms`; HG FP16 `38.35 ms` / Mixed QAT `31.56 ms`
+- final 1080p mpv playback check on the Daredevil stress clip: FP32 `93.90 ms`, FP16 `39.97 ms`, Mixed QAT `30.82 ms`, Full QAT `30.47 ms`
 - Full INT8 verifies the strict checkpoint contract: no-HG `120` W8A8 layers and HG `130` W8A8 layers, with no W8A16 or FP16 fallback layers in the checkpoint composition
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants trained for the same TensorRT composition used at deployment
 - unsupported extra low-precision experiment presets and builder paths have been removed; the supported NVIDIA deployment surface is FP16/FP32 plus INT8 PTQ/QAT/QAT Film
@@ -690,7 +691,7 @@ The first time you play, export, or benchmark a given model/resolution/mode comb
 
 `src/models/engines/{model}_{resolution}_{mode}.engine`
 
-INT8 TensorRT modes include a versioned ModelOpt Torch/QDQ suffix in the mode portion of the filename. Mixed INT8 uses the runtime include mask and disables output quantizers by default; Full INT8 turns every ModelOpt Torch quantizer on and disables FP16 tactics when FP16 islands are off.
+INT8 TensorRT modes include a versioned ModelOpt Torch/QDQ suffix in the mode portion of the filename. Mixed INT8 uses the runtime include mask, KL-divergence scoring, an `8.25` effective-bit target, and active-compute output quantizers so TensorRT does not inherit orphaned Q/DQ outputs. Full INT8 turns every ModelOpt Torch quantizer on and disables FP16 tactics when FP16 islands are off.
 
 If the engine is missing, the app loads the selected `.pt` model, exports a temporary ONNX file with the same model/resolution/mode stem, builds a TensorRT engine, saves it, removes the ONNX file, and then runs inference through that engine. Later runs load the `.engine` directly when the cached engine metadata still matches the model, resolution, precision, mode, TensorRT export settings, and CUDA device fingerprint.
 
@@ -718,6 +719,9 @@ Advanced TensorRT build environment overrides:
 - `HDRTVNET_TRT_TIMING_CACHE=path|none` changes or disables the shared timing cache.
 - `HDRTVNET_TRT_DEDICATED_STREAM=1|0` runs TensorRT enqueue on a non-default CUDA stream; default is `1`.
 - `HDRTVNET_TRT_AUX_STREAMS=N` optionally sets TensorRT build-time auxiliary stream count.
+- `HDRTVNET_TRT_INT8_MODELOPT_TORCH_EFFECTIVE_BITS=8.25` adjusts the mixed INT8 ModelOpt target; lower values quantize more layers but can reintroduce highlight rolloff/flicker.
+- `HDRTVNET_TRT_INT8_MODELOPT_TORCH_METHOD=kl_div|gradient` changes mixed INT8 scoring; the shipped default is `kl_div`.
+- `HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUT_POLICY=active|include` controls mixed output Q/DQ. The shipped default is `active`, meaning output quantizers are enabled only for layers whose input/weight quantizers stayed active.
 
 The manual prebuild script also exposes `--opt-level`, `--workspace-gb`, `--timing-cache`, `--aux-streams`, `--force-onnx`, and `--benchmark-runs` so NVIDIA test machines can rebuild and report comparable numbers from one command. `--force-onnx` is mainly for clearing stale ONNX files left by older builds.
 
@@ -912,7 +916,7 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, the selected INT8 preset maps to a quant-friendly TensorRT source checkpoint. No-HG uses `src/models/weights/distilled/hr`; HG uses the composite-split HR source in `src/models/weights/distilled/hr_hg` plus the matching HG source in `src/models/weights/distilled/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). Mixed presets use the current proven include mask (`AGCM.spatial`, `AGCM.global`, `LE.low_in`, `LE.recon_trunk3`, `post_correction.net`, `post_correction.residual.trunk`, `post_correction.residual.out`, plus the matching HG low/trunk regions when HG is enabled) and keep output quantizers disabled unless explicitly requested. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/pytorch_int8/hr` and `src/models/weights/pytorch_int8/hg`.
+On NVIDIA, the selected INT8 preset maps to a quant-friendly TensorRT source checkpoint. No-HG uses `src/models/weights/distilled/hr`; HG uses the composite-split HR source in `src/models/weights/distilled/hr_hg` plus the matching HG source in `src/models/weights/distilled/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). No-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Both use KL-divergence scoring with an `8.25` effective-bit target and enable output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/pytorch_int8/hr` and `src/models/weights/pytorch_int8/hg`.
 
 The default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly. Quant-friendly HR/ACGM/LE and HR+HG engines export as single-input graphs when the condition path is structurally unused, reducing runtime binding overhead and avoiding stale condition-tensor metadata.
 
@@ -1132,17 +1136,17 @@ Mixed INT8 is an explicit W8A8 layer recipe:
 
 | Family | Mode | W8A8 file | Composition |
 |---|---|---|---|
-| Distilled/q-friendly | HR/no-HG | `configs/qat_layouts/selectsft1235_nohg_mixed_w8a8.txt` | 119 W8A8, 1 W8A16 (`LE.conv_last`), 0 FP16 |
-| Distilled/q-friendly | HR+HG | `configs/qat_layouts/selectsft1235_hg_mixed_w8a8.txt` | 128 W8A8, 2 W8A16 (`base.LE.conv_last`, `hg.low_out`), 0 FP16 |
+| Distilled/q-friendly | HR/no-HG | `configs/qat_layouts/selectsft1235_nohg_mixed_w8a8.txt` | 104 W8A8, 1 W8A16 (`LE.conv_last`), AGCM FP16 |
+| Distilled/q-friendly | HR+HG | `configs/qat_layouts/selectsft1235_hg_mixed_w8a8.txt` | 113 W8A8, 2 W8A16 (`base.LE.conv_last`, `hg.low_out`), AGCM FP16 |
 | Original | HR/no-HG | `configs/qat_layouts/original_nohg_mixed_w8a8.txt` | 29 W8A8, 78 W8A16, 21 FP16 |
 | Original | HR+HG | `configs/qat_layouts/original_hg_composite_mixed_w8a8.txt` | 51 W8A8, 74 W8A16, 24 FP16 |
 
-The distilled mixed path was selected from the fastest stable TensorRT layout that preserved the original-like output: quantize all AGCM/LE/HG compute regions, keep only the final RGB output projections in W8A16, and keep no FP16 islands. Keeping `LE.conv_last` and `hg.low_out` out of W8A8 avoids the full-INT8 edge/color artifacts while retaining the TensorRT speed win.
+The distilled mixed path was selected from the fastest stable TensorRT layout that preserved the original-like output: quantize the LE trunk and HG refinement, keep the final RGB output projections in W8A16, and leave AGCM in FP16. Keeping AGCM out of mixed mode avoided the Daredevil opening-card flicker/highlight rolloff regression while preserving the 1080p TensorRT speed win.
 
 ```text
-HR/no-HG include: AGCM, LE
+HR/no-HG include: LE
 HR/no-HG exit:    LE.conv_last -> W8A16
-HR+HG include:    base.AGCM, base.LE, hg
+HR+HG include:    base.LE, hg
 HR+HG exits:      base.LE.conv_last, hg.low_out -> W8A16
 ```
 

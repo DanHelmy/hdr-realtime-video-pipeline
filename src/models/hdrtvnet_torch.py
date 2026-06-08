@@ -2719,10 +2719,10 @@ def _tensorrt_expected_engine_metadata(
             )
         ):
             if use_hg:
-                modelopt_torch_include = ("base.AGCM", "base.LE", "hg")
+                modelopt_torch_include = ("base.LE", "hg")
                 modelopt_torch_exclude = ("base.LE.conv_last", "hg.low_out")
             else:
-                modelopt_torch_include = ("AGCM", "LE")
+                modelopt_torch_include = ("LE",)
                 modelopt_torch_exclude = ("LE.conv_last",)
 
         qat_composition = _tensorrt_int8_qat_composition_policy(mode_name)
@@ -2765,6 +2765,9 @@ def _tensorrt_expected_engine_metadata(
         )
         metadata["build"]["int8_modelopt_torch_quant_scheme"] = (
             _tensorrt_int8_modelopt_torch_quant_scheme()
+        )
+        metadata["build"]["int8_modelopt_torch_output_policy"] = (
+            _tensorrt_int8_modelopt_torch_output_policy()
         )
         metadata["build"]["int8_modelopt_torch_hg_default"] = (
             _tensorrt_int8_modelopt_torch_hg_default_enabled()
@@ -3092,7 +3095,7 @@ def _tensorrt_int8_modelopt_torch_mode(precision: str | None = None) -> str:
 
 def _tensorrt_int8_modelopt_torch_method() -> str:
     text = str(
-        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_METHOD", "gradient")
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_METHOD", "kl_div")
     ).strip().lower()
     return text if text in {"gradient", "kl_div"} else "gradient"
 
@@ -3140,7 +3143,7 @@ def _tensorrt_int8_modelopt_torch_score_steps() -> int:
 def _tensorrt_int8_modelopt_torch_effective_bits() -> float:
     return _tensorrt_int8_modelopt_torch_float(
         "HDRTVNET_TRT_INT8_MODELOPT_TORCH_EFFECTIVE_BITS",
-        10.0,
+        8.25,
         8.0,
         16.0,
     )
@@ -3192,8 +3195,8 @@ def _tensorrt_int8_modelopt_torch_include_patterns(
         and _tensorrt_modelopt_torch_is_selective_sft_model(model)
     ):
         if _tensorrt_modelopt_torch_has_composite_base(model):
-            return ("base.AGCM", "base.LE", "hg")
-        return ("AGCM", "LE")
+            return ("base.LE", "hg")
+        return ("LE",)
     return (
         "base.AGCM.spatial",
         "base.AGCM.global",
@@ -3251,6 +3254,15 @@ def _tensorrt_int8_modelopt_torch_outputs_enabled(
         str(precision or "").startswith("int8-mixed")
         and _tensorrt_modelopt_torch_is_selective_sft_model(model)
     )
+
+
+def _tensorrt_int8_modelopt_torch_output_policy() -> str:
+    text = str(
+        os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUT_POLICY", "active")
+    ).strip().lower()
+    if text in {"active", "compute", "selected"}:
+        return "active"
+    return "include"
 
 
 def _tensorrt_int8_modelopt_torch_hg_default_enabled() -> bool:
@@ -6118,6 +6130,9 @@ def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
 ) -> int:
     include = _tensorrt_int8_modelopt_torch_include_patterns(model, precision)
     exclude = _tensorrt_int8_modelopt_torch_exclude_patterns(model, precision)
+    output_policy = _tensorrt_int8_modelopt_torch_output_policy()
+    active_compute_only = output_policy == "active"
+    modules = dict(model.named_modules()) if active_compute_only else {}
     changed = 0
     failed: list[str] = []
     for name, module in model.named_modules():
@@ -6134,6 +6149,18 @@ def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
                 name,
                 parent_name,
                 exclude,
+            )
+        if keep and active_compute_only:
+            keep = any(
+                _tensorrt_modelopt_torch_quantizer_enabled(candidate)
+                for candidate_name in (
+                    f"{parent_name}.input_quantizer",
+                    f"{parent_name}._input_quantizer",
+                    f"{parent_name}.weight_quantizer",
+                    f"{parent_name}._weight_quantizer",
+                )
+                for candidate in (modules.get(candidate_name),)
+                if candidate is not None
             )
         if not keep or _tensorrt_modelopt_torch_quantizer_enabled(module):
             continue
@@ -6161,6 +6188,7 @@ def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
         print(
             "TensorRT INT8 ModelOpt Torch mixed outputs: enabled "
             f"{changed} included output quantizer(s)"
+            + (" with active-compute policy" if active_compute_only else "")
         )
     return changed
 
