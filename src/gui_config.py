@@ -14,6 +14,7 @@ def _weight(name: str) -> str:
 PRECISIONS = {
     "FP16": {
         "precision": "fp16",
+        "engine_mode": "FP16",
         "model": _weight("original/HR.pt"),
         "model_nohg": _weight("original/HR.pt"),
         "hg_weights": _weight("original/HG.pt"),
@@ -23,6 +24,7 @@ PRECISIONS = {
     },
     "FP32": {
         "precision": "fp32",
+        "engine_mode": "FP32",
         "model": _weight("original/HR.pt"),
         "model_nohg": _weight("original/HR.pt"),
         "hg_weights": _weight("original/HG.pt"),
@@ -32,6 +34,7 @@ PRECISIONS = {
     },
     "INT8 Mixed (PTQ)": {
         "precision": "int8-mixed",
+        "engine_mode": "original_int8-mixed-ptq",
         "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt"),
         "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed.pt"),
         "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_ptq.pt"),
@@ -40,6 +43,7 @@ PRECISIONS = {
     },
     "INT8 Mixed (QAT)": {
         "precision": "int8-mixed",
+        "engine_mode": "original_int8-mixed-qat",
         "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
         "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
         "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat.pt"),
@@ -48,6 +52,7 @@ PRECISIONS = {
     },
     "INT8 Mixed (QAT) (Film)": {
         "precision": "int8-mixed",
+        "engine_mode": "original_int8-mixed-qat-film",
         "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt"),
         "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt"),
         "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat_film.pt"),
@@ -56,6 +61,7 @@ PRECISIONS = {
     },
     "INT8 Full (PTQ)": {
         "precision": "int8-full",
+        "engine_mode": "original_int8-full-ptq",
         "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
         "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
         "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_ptq.pt"),
@@ -64,6 +70,7 @@ PRECISIONS = {
     },
     "INT8 Full (QAT)": {
         "precision": "int8-full",
+        "engine_mode": "original_int8-full-qat",
         "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
         "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
         "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat.pt"),
@@ -72,6 +79,7 @@ PRECISIONS = {
     },
     "INT8 Full (QAT) (Film)": {
         "precision": "int8-full",
+        "engine_mode": "original_int8-full-qat-film",
         "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
         "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
         "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat_film.pt"),
@@ -85,8 +93,10 @@ DEFAULT_RESOLUTION_KEY = "1080p"
 DEFAULT_USE_HG = False
 INT8_HG_WARNING = (
     "INT8 TensorRT speedups depend on the selected graph and GPU generation. "
-    "Mixed QAT presets use the TensorRT source checkpoints by default; Full "
-    "INT8 remains a strict all-quantizer baseline for testing."
+    "Using HG can require generating both the local HG TensorRT source model "
+    "checkpoint and the TensorRT engine before playback starts. Mixed QAT "
+    "presets use protected TensorRT source checkpoints by default; Full INT8 "
+    "remains a strict all-quantizer baseline for testing."
 )
 
 
@@ -117,6 +127,16 @@ def _select_hg_weights_path(precision_key: str, *, tensorrt: bool = False) -> st
             return cfg.get("trt_hg_weights") or ""
         return _weight("original/HG.pt")
     return cfg.get("hg_weights") or _weight("original/HG.pt")
+
+
+def _precision_engine_mode_base(precision_key: str) -> str:
+    cfg = PRECISIONS.get(str(precision_key), {})
+    return str(
+        cfg.get("engine_mode")
+        or cfg.get("precision")
+        or precision_key
+        or "mode"
+    ).strip()
 
 
 def _precision_is_int8(precision_key: str) -> bool:

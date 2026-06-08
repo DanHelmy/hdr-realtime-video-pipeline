@@ -25,6 +25,7 @@ from gui_config import (
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
     _int8_precision_warning,
+    _precision_engine_mode_base,
     _select_hg_weights_path,
     _select_model_path,
     _select_tensorrt_model_path,
@@ -636,7 +637,7 @@ class PlaybackRuntimeMixin:
             return True
         trt_cfg = PRECISIONS.get(gui_precision, {})
         trt_model_path = _select_tensorrt_model_path(gui_precision, bool(use_hg))
-        trt_mode = f"{gui_precision}_{'hg' if bool(use_hg) else 'nohg'}"
+        trt_mode = f"{_precision_engine_mode_base(gui_precision)}_{'hg' if bool(use_hg) else 'nohg'}"
         trt_precision = trt_cfg.get(
             "precision",
             _precision_to_compile_arg(gui_precision),
@@ -698,6 +699,15 @@ class PlaybackRuntimeMixin:
         use_hg: bool,
     ) -> str | None:
         if _IS_NVIDIA:
+            missing_sources = [
+                path
+                for path in self._selected_tensorrt_source_paths(
+                    gui_precision, bool(use_hg)
+                )
+                if not os.path.isfile(path)
+            ]
+            if missing_sources:
+                return "TensorRT source checkpoint and engine"
             if not self._tensorrt_engine_ready_for_runtime(
                 int(w),
                 int(h),
@@ -3194,7 +3204,7 @@ class PlaybackRuntimeMixin:
                 self._chk_hg.isChecked(),
             )
             trt_cfg = PRECISIONS.get(gui_prec, {})
-            trt_mode = f"{gui_prec}_{'hg' if self._chk_hg.isChecked() else 'nohg'}"
+            trt_mode = f"{_precision_engine_mode_base(gui_prec)}_{'hg' if self._chk_hg.isChecked() else 'nohg'}"
             trt_precision = trt_cfg.get("precision", prec_arg)
             trt_hg_weights = (
                 _select_hg_weights_path(gui_prec, tensorrt=True)
@@ -3816,9 +3826,12 @@ class PlaybackRuntimeMixin:
         box.setText("Generate local TensorRT source checkpoints?")
         box.setInformativeText(
             "This INT8 preset needs TensorRT source checkpoints that are generated "
-            "locally from the committed PyTorch INT8 checkpoints. The large HG "
-            "source files are intentionally not committed, so the first HG INT8 "
-            "run can take a little while before playback starts.\n\n"
+            "locally from the committed PyTorch INT8 checkpoints. With HG enabled, "
+            "the app may need to generate the local HG TensorRT source model "
+            "checkpoint first, then build the specific TensorRT engine for the "
+            "selected precision and resolution. The large HG source files are "
+            "intentionally not committed, so the first HG INT8 run can take a "
+            "little while before playback starts.\n\n"
             f"Missing source file(s): {len(missing)}"
         )
         continue_btn = box.addButton(
@@ -4326,7 +4339,7 @@ class PlaybackRuntimeMixin:
                 use_hg = self._chk_hg.isChecked()
                 trt_cfg = PRECISIONS.get(new_prec, {})
                 trt_model_path = _select_tensorrt_model_path(new_prec, use_hg)
-                trt_mode = f"{new_prec}_{'hg' if use_hg else 'nohg'}"
+                trt_mode = f"{_precision_engine_mode_base(new_prec)}_{'hg' if use_hg else 'nohg'}"
                 trt_precision = trt_cfg.get("precision", new_prec)
                 trt_hg_weights = (
                     _select_hg_weights_path(new_prec, tensorrt=True)

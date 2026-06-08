@@ -36,6 +36,7 @@ import numpy as np
 import torch
 from collections import deque
 from cli_display import CliDisplaySink
+from gui_config import _precision_engine_mode_base
 from video_source import VideoSource
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
@@ -404,7 +405,13 @@ def main():
     predeq = {"auto": "auto", "on": True, "off": False}[args.predequantize]
     try:
         if _IS_NVIDIA and str(args.device).lower() != "cpu":
-            mode_name = f"{args.precision}_{'hg' if str(args.use_hg).strip() != '0' else 'nohg'}"
+            if str(args.precision).strip().lower() == "int8-mixed":
+                mode_base = _precision_engine_mode_base("INT8 Mixed (QAT)")
+            elif str(args.precision).strip().lower() == "int8-full":
+                mode_base = _precision_engine_mode_base("INT8 Full (QAT)")
+            else:
+                mode_base = args.precision
+            mode_name = f"{mode_base}_{'hg' if str(args.use_hg).strip() != '0' else 'nohg'}"
             auto_calibration_cache = args.trt_calibration_cache
             if not auto_calibration_cache and not args.trt_calibration_dataset:
                 auto_calibration_cache = tensorrt_prebuilt_calibration_cache_path(

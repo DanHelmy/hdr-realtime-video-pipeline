@@ -42,7 +42,11 @@ import torch
 
 from cli_display import CliDisplaySink
 from gui_compile_cache import _mark_compiled
-from gui_config import _select_hg_weights_path, _select_tensorrt_model_path
+from gui_config import (
+    _precision_engine_mode_base,
+    _select_hg_weights_path,
+    _select_tensorrt_model_path,
+)
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     HDRTVNetTorch,
@@ -370,7 +374,11 @@ def _make_processor(args, run: dict, width: int, height: int):
                 trt_hg_weights = _select_hg_weights_path(gui_key, tensorrt=True)
         if trt_hg_weights and not os.path.isfile(trt_hg_weights):
             trt_hg_weights = None
-        mode_base = str(run.get("mode_name_base", run.get("gui_key", run["precision"])))
+        mode_base = str(
+            run.get("mode_name_base")
+            or (_precision_engine_mode_base(gui_key) if gui_key else "")
+            or run["precision"]
+        )
         mode_name = f"{mode_base}_{'hg' if args.use_hg else 'nohg'}"
         calibration_cache = args.trt_calibration_cache
         if (

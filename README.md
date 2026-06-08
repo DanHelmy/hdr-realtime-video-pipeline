@@ -57,9 +57,9 @@ Core updates include:
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
 - NVIDIA runtime now defaults to original HR/ACGM/LE/HG TensorRT ModelOpt Torch builds; mixed presets use the stable active-compute Q/DQ recipe, while Full INT8 forces all ModelOpt Torch quantizers
 - normal `FP16` / `FP32` use the original HR/HR+HG checkpoints; INT8 PTQ/QAT/QAT Film use matching original eager and TensorRT source checkpoints
-- current RTX 5060 Ti 1080p TensorRT/mpv stress checks: no-HG FP16 `39.68 ms`, Mixed QAT `30.36 ms`, Full QAT `29.55 ms`; HG FP16 `77.96 ms`, Mixed QAT `69.21 ms`, Full QAT `57.56 ms`
+- current RTX 5060 Ti TensorRT/mpv 30-second stress checks on the Daredevil 2160p SDR clip: 1080p no-HG FP16 `34.23 ms`, Mixed QAT `30.68 ms`, Full QAT `29.96 ms`; 1080p HG FP16 `72.74 ms`, Mixed QAT `66.16 ms`, Full QAT `58.63 ms`; 720p no-HG remains FP16-favored (`15.64 ms` FP16 vs `18.44 ms` Mixed QAT) because the no-HG graph is small enough that INT8 overhead dominates
 - the final TensorRT sweep did not find a stable 25-28 ms mixed path; more aggressive AGCM quantization was faster by less than a millisecond but failed visual/temporal rolloff checks, so the stable LE/HG recipe remains the shipped mixed baseline. On the current RTX 5060 Ti HG path, strict Full QAT is the fastest INT8 preset while Mixed QAT remains the protected lower-risk composition.
-- Full INT8 verifies the strict checkpoint contract: no-HG `120` W8A8 layers and HG `130` W8A8 layers, with no W8A16 or FP16 fallback layers in the checkpoint composition
+- Full INT8 verifies the strict checkpoint contract: no-HG `128` W8A8 layers and HG `149` W8A8 layers, with no W8A16 or FP16 fallback layers in the checkpoint composition
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants trained for the same TensorRT composition used at deployment
 - unsupported extra low-precision experiment presets and builder paths have been removed; the supported NVIDIA deployment surface is FP16/FP32 plus INT8 PTQ/QAT/QAT Film
 - HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
@@ -695,7 +695,7 @@ INT8 TensorRT modes include a versioned ModelOpt Torch/QDQ suffix in the mode po
 
 If the engine is missing, the app loads the selected `.pt` model, exports a temporary ONNX file with the same model/resolution/mode stem, builds a TensorRT engine, saves it, removes the ONNX file, and then runs inference through that engine. Later runs load the `.engine` directly when the cached engine metadata still matches the model, resolution, precision, mode, TensorRT export settings, and CUDA device fingerprint.
 
-Checkpoint source selection is preset-driven. FP32/FP16 modes use `src/models/weights/original/HR.pt` plus `src/models/weights/original/HG.pt` when HG is enabled. INT8 no-HG modes use matching TensorRT source checkpoints under `src/models/weights/original/tensorrt/hr`; INT8 HG modes use the HR source split from the exact HR+HG composite under `original/tensorrt/hr_hg` plus the matching HG source under `original/tensorrt/hg`. The Google Drive HG asset can stay named `HG.pt`; the GUI saves it locally as `src/models/weights/original/HG.pt`. The large original HG TensorRT source files are intentionally not tracked by Git, so the first NVIDIA INT8+HG activation can show a modal preparation dialog and regenerate those local files from `src/models/weights/original/pytorch_int8` before building the engine.
+Checkpoint source selection is preset-driven. FP32/FP16 modes use `src/models/weights/original/HR.pt` plus `src/models/weights/original/HG.pt` when HG is enabled. INT8 no-HG modes use matching TensorRT source checkpoints under `src/models/weights/original/tensorrt/hr`; INT8 HG modes use the HR source split from the exact HR+HG composite under `original/tensorrt/hr_hg` plus the matching HG source under `original/tensorrt/hg`. The Google Drive HG asset can stay named `HG.pt`; the GUI saves it locally as `src/models/weights/original/HG.pt`. The large original HG TensorRT source files are intentionally not tracked by Git, so the first NVIDIA INT8+HG run can warn the user, regenerate the missing local HG TensorRT source checkpoint from `src/models/weights/original/pytorch_int8`, and then build the selected engine.
 
 TensorRT engines are not universal binaries. The same checkpoint and command can be run on other TensorRT-capable NVIDIA GPUs, but each machine should build its own `.engine` because TensorRT chooses tactics for the local GPU architecture, driver, TensorRT version, workspace, and timing cache. Tensor Core GPUs normally benefit most from FP16/INT8. Older or non-Tensor-Core NVIDIA GPUs may still build through TensorRT, but INT8 speedups are not guaranteed and TensorRT may choose DP4A, FP16, or FP32 tactics depending on what the hardware supports. Non-NVIDIA GPUs do not use TensorRT; AMD/CPU use the PyTorch path.
 
@@ -1071,7 +1071,7 @@ The GUI and CLI precision preset picks three paths:
 
 On NVIDIA, the TensorRT builder uses `trt_model`, the current resolution, precision, and HG toggle to export a temporary ONNX and cache an `.engine` under `src/models/engines/`. PTQ, QAT, and QAT Film are separate source checkpoints. Mixed INT8 uses the selected mixed mask; Full INT8 is the strict contract path and forces all ModelOpt Torch quantizers on.
 
-If the selected INT8+HG TensorRT HG source is missing, the GUI asks before generating it locally. The same preparation can be run from the terminal:
+If the selected INT8+HG TensorRT HG source is missing, the GUI asks when that HG setting is applied, then generates the source locally before the engine build starts. The same preparation can be run from the terminal:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\quantize\split_tensorrt_sources.py --missing-only

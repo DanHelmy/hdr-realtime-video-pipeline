@@ -35,6 +35,7 @@ from models.hdrtvnet_torch import (
 )
 from gui_config import (
     PRECISIONS,
+    _precision_engine_mode_base,
     _select_hg_weights_path,
     _select_model_path,
     _select_tensorrt_model_path,
@@ -364,7 +365,12 @@ def main() -> int:
             flush=True,
         )
     predeq = False
-    base_mode_name = f"{gui_precision_key or args.precision}_{'hg' if use_hg else 'nohg'}"
+    mode_base = (
+        _precision_engine_mode_base(gui_precision_key)
+        if gui_precision_key
+        else args.precision
+    )
+    base_mode_name = f"{mode_base}_{'hg' if use_hg else 'nohg'}"
     tagged_base_mode_name = f"{base_mode_name}{_engine_tag_suffix()}"
     mode_name = tensorrt_mode_name(
         precision,
