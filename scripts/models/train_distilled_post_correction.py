@@ -212,10 +212,56 @@ def _grad_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(ax, bx) + F.l1_loss(ay, by)
 
 
+def _edge_response(luma: torch.Tensor) -> torch.Tensor:
+    dx = F.pad((luma[:, :, :, 1:] - luma[:, :, :, :-1]).abs(), (0, 1, 0, 0))
+    dy = F.pad((luma[:, :, 1:, :] - luma[:, :, :-1, :]).abs(), (0, 0, 0, 1))
+    return dx + dy
+
+
+def _soft_dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    radius = int(radius)
+    if radius <= 0:
+        return mask
+    kernel = radius * 2 + 1
+    return F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=radius)
+
+
 def _masked_l1(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask = mask.to(dtype=a.dtype)
     denom = mask.mean().clamp_min(1e-6)
     return ((a - b).abs() * mask).mean() / denom
+
+
+def _bright_edge_masks(
+    reference: torch.Tensor,
+    *,
+    edge_threshold: float,
+    bright_threshold: float,
+    radius: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ref_luma = _luma(reference.clamp(0.0, 1.0))
+    edge = _edge_response(ref_luma)
+    edge_strength = ((edge - float(edge_threshold)) / max(float(edge_threshold), 1e-6)).clamp(0.0, 1.0)
+    bright_context = _soft_dilate(ref_luma, max(1, int(radius)))
+    bright_strength = ((bright_context - float(bright_threshold)) / 0.20).clamp(0.0, 1.0)
+    edge_mask = (edge_strength * bright_strength).clamp(0.0, 1.0)
+    dilated = _soft_dilate(edge_mask, int(radius)).clamp(0.0, 1.0)
+    halo = (dilated - edge_mask).clamp(0.0, 1.0)
+    return edge_mask, dilated, halo
+
+
+def _bright_edge_metric(output: torch.Tensor, reference: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_mask, dilated, halo = _bright_edge_masks(
+        reference,
+        edge_threshold=float(args.bright_edge_threshold),
+        bright_threshold=float(args.bright_edge_luma_threshold),
+        radius=int(args.bright_edge_radius),
+    )
+    out_luma = _luma(output.clamp(0.0, 1.0))
+    ref_luma = _luma(reference.clamp(0.0, 1.0))
+    edge_l1 = _masked_l1(_edge_response(out_luma), _edge_response(ref_luma), dilated)
+    halo_l1 = _masked_l1(out_luma, ref_luma, halo)
+    return edge_l1, halo_l1
 
 
 def _loss_terms(
@@ -283,6 +329,16 @@ def _loss_terms(
         metrics["teacher_l1"] = float(teacher_l1.detach().item())
         metrics["teacher_mse"] = float(teacher_mse.detach().item())
         metrics["teacher_luma"] = float(teacher_luma.detach().item())
+
+    edge_ref = teacher_output.to(device=out.device, dtype=out.dtype).clamp(0.0, 1.0) if teacher_output is not None else tgt
+    if float(args.bright_edge_weight) > 0 or float(args.halo_weight) > 0:
+        edge_l1, halo_l1 = _bright_edge_metric(out, edge_ref, args)
+        if float(args.bright_edge_weight) > 0:
+            loss = loss + float(args.bright_edge_weight) * edge_l1
+        if float(args.halo_weight) > 0:
+            loss = loss + float(args.halo_weight) * halo_l1
+        metrics["bright_edge"] = float(edge_l1.detach().item())
+        metrics["halo"] = float(halo_l1.detach().item())
 
     metrics["total"] = float(loss.detach().item())
     return loss, metrics
@@ -370,7 +426,14 @@ def _load_student(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def _load_teacher(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> HG_Composite | None:
-    if float(args.teacher_weight) <= 0 and float(args.teacher_luma_weight) <= 0:
+    teacher_terms = (
+        float(args.teacher_weight),
+        float(args.teacher_mse_weight),
+        float(args.teacher_luma_weight),
+        float(args.bright_edge_weight),
+        float(args.halo_weight),
+    )
+    if all(term <= 0 for term in teacher_terms):
         return None
     teacher = HG_Composite(
         classifier=args.teacher_classifier,
@@ -399,6 +462,10 @@ def _validate(
     teacher_psnr = []
     teacher_base_match_psnr = []
     teacher_hg_match_psnr = []
+    teacher_base_edge_l1 = []
+    teacher_base_halo_l1 = []
+    teacher_hg_edge_l1 = []
+    teacher_hg_halo_l1 = []
     with torch.inference_mode():
         for sdr_path, hdr_path in pairs:
             sdr = _read_rgb(sdr_path, int(args.val_max_long_edge))
@@ -414,8 +481,14 @@ def _validate(
                 teacher_ref = _run_hg(teacher, teacher_base) if bool(args.monitor_hg) else teacher_base
                 teacher_psnr.append(_psnr(teacher_ref, hdr))
                 teacher_base_match_psnr.append(_psnr(base_out, teacher_base))
+                edge_l1, halo_l1 = _bright_edge_metric(base_out, teacher_base, args)
+                teacher_base_edge_l1.append(float(edge_l1.detach().item()))
+                teacher_base_halo_l1.append(float(halo_l1.detach().item()))
                 if (float(args.hg_loss_weight) > 0 or bool(args.monitor_hg)) and bool(args.monitor_hg):
                     teacher_hg_match_psnr.append(_psnr(hg_out, teacher_ref))
+                    edge_l1, halo_l1 = _bright_edge_metric(hg_out, teacher_ref, args)
+                    teacher_hg_edge_l1.append(float(edge_l1.detach().item()))
+                    teacher_hg_halo_l1.append(float(halo_l1.detach().item()))
     metrics = {
         "nohg_psnr": float(np.mean(nohg_psnr)) if nohg_psnr else 0.0,
         "nohg_min_psnr": float(np.min(nohg_psnr)) if nohg_psnr else 0.0,
@@ -424,10 +497,21 @@ def _validate(
         "teacher_psnr": float(np.mean(teacher_psnr)) if teacher_psnr else 0.0,
         "teacher_base_match_psnr": float(np.mean(teacher_base_match_psnr)) if teacher_base_match_psnr else 0.0,
         "teacher_hg_match_psnr": float(np.mean(teacher_hg_match_psnr)) if teacher_hg_match_psnr else 0.0,
+        "teacher_base_edge_l1": float(np.mean(teacher_base_edge_l1)) if teacher_base_edge_l1 else 0.0,
+        "teacher_base_halo_l1": float(np.mean(teacher_base_halo_l1)) if teacher_base_halo_l1 else 0.0,
+        "teacher_hg_edge_l1": float(np.mean(teacher_hg_edge_l1)) if teacher_hg_edge_l1 else 0.0,
+        "teacher_hg_halo_l1": float(np.mean(teacher_hg_halo_l1)) if teacher_hg_halo_l1 else 0.0,
     }
     score_base = metrics["hg_psnr"] if bool(args.monitor_hg) and hg_psnr else metrics["nohg_psnr"]
     score_min = metrics["hg_min_psnr"] if bool(args.monitor_hg) and hg_psnr else metrics["nohg_min_psnr"]
-    metrics["score"] = float(score_base + 0.08 * score_min)
+    edge_key = "teacher_hg_edge_l1" if bool(args.monitor_hg) and teacher_hg_edge_l1 else "teacher_base_edge_l1"
+    halo_key = "teacher_hg_halo_l1" if bool(args.monitor_hg) and teacher_hg_halo_l1 else "teacher_base_halo_l1"
+    metrics["score"] = float(
+        score_base
+        + float(args.score_min_weight) * score_min
+        - float(args.score_edge_weight) * 100.0 * metrics[edge_key]
+        - float(args.score_halo_weight) * 100.0 * metrics[halo_key]
+    )
     model.train()
     return metrics
 
@@ -452,7 +536,14 @@ def _save_checkpoint(model: HG_Composite, base_payload: dict, arch: dict, args: 
         "luma_weight": float(args.luma_weight),
         "chroma_weight": float(args.chroma_weight),
         "gradient_weight": float(args.gradient_weight),
+        "bright_edge_weight": float(args.bright_edge_weight),
+        "halo_weight": float(args.halo_weight),
+        "bright_edge_threshold": float(args.bright_edge_threshold),
+        "bright_edge_luma_threshold": float(args.bright_edge_luma_threshold),
+        "bright_edge_radius": int(args.bright_edge_radius),
         "hg_loss_weight": float(args.hg_loss_weight),
+        "score_edge_weight": float(args.score_edge_weight),
+        "score_halo_weight": float(args.score_halo_weight),
         "train_patterns": str(args.train_patterns),
         "train_expanded_only": bool(args.train_expanded_only),
         "best_metrics": metrics,
@@ -545,6 +636,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--luma-weight", type=float, default=0.65)
     parser.add_argument("--chroma-weight", type=float, default=0.35)
     parser.add_argument("--gradient-weight", type=float, default=0.08)
+    parser.add_argument(
+        "--bright-edge-weight",
+        type=float,
+        default=0.0,
+        help="Extra edge-response loss on bright/high-contrast teacher or HDR GT boundaries.",
+    )
+    parser.add_argument(
+        "--halo-weight",
+        type=float,
+        default=0.0,
+        help="Extra luma loss in a ring around bright/high-contrast edges to reduce echo/halo artifacts.",
+    )
     parser.add_argument("--highlight-weight", type=float, default=0.45)
     parser.add_argument("--dark-weight", type=float, default=0.20)
     parser.add_argument("--source-chroma-weight", type=float, default=0.03)
@@ -555,6 +658,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--highlight-threshold", type=float, default=0.72)
     parser.add_argument("--dark-threshold", type=float, default=0.12)
     parser.add_argument("--source-chroma-threshold", type=float, default=0.16)
+    parser.add_argument("--bright-edge-threshold", type=float, default=0.055)
+    parser.add_argument("--bright-edge-luma-threshold", type=float, default=0.56)
+    parser.add_argument("--bright-edge-radius", type=int, default=2)
     parser.add_argument("--hard-replay-ratio", type=float, default=0.25)
     parser.add_argument("--hard-replay-repeat", type=int, default=1)
     parser.add_argument("--validate-every", type=int, default=1)
@@ -564,6 +670,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.08,
         help="Validation score adds this multiple of the monitored minimum-frame PSNR to average PSNR.",
+    )
+    parser.add_argument(
+        "--score-edge-weight",
+        type=float,
+        default=0.0,
+        help="Validation score penalty multiplier for bright-edge L1.",
+    )
+    parser.add_argument(
+        "--score-halo-weight",
+        type=float,
+        default=0.0,
+        help="Validation score penalty multiplier for bright-edge halo L1.",
     )
     parser.add_argument(
         "--score-metric",
@@ -708,11 +826,19 @@ def main() -> int:
             if score_metric:
                 if score_metric not in metrics:
                     raise KeyError(f"--score-metric '{score_metric}' is not available in validation metrics")
-                score = float(metrics[score_metric])
+                edge_key = "teacher_hg_edge_l1" if bool(args.monitor_hg) else "teacher_base_edge_l1"
+                halo_key = "teacher_hg_halo_l1" if bool(args.monitor_hg) else "teacher_base_halo_l1"
+                score = float(
+                    metrics[score_metric]
+                    - float(args.score_edge_weight) * 100.0 * metrics.get(edge_key, 0.0)
+                    - float(args.score_halo_weight) * 100.0 * metrics.get(halo_key, 0.0)
+                )
             else:
-                score_base = metrics["hg_psnr"] if bool(args.monitor_hg) else metrics["nohg_psnr"]
-                score_min = metrics["hg_min_psnr"] if bool(args.monitor_hg) else metrics["nohg_min_psnr"]
-                score = float(score_base + float(args.score_min_weight) * score_min)
+                score = float(metrics.get("score", 0.0))
+                if not score:
+                    score_base = metrics["hg_psnr"] if bool(args.monitor_hg) else metrics["nohg_psnr"]
+                    score_min = metrics["hg_min_psnr"] if bool(args.monitor_hg) else metrics["nohg_min_psnr"]
+                    score = float(score_base + float(args.score_min_weight) * score_min)
             metrics["score"] = score
         else:
             score = float(-avg_running.get("total", 1e9))
