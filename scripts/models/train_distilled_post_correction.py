@@ -1,8 +1,8 @@
-"""Train TensorRT-friendly post-correction heads for the distilled HR model.
+"""Fine-tune TensorRT-friendly distilled HR components.
 
-The fast distilled trunk stays frozen. Only the small post-correction module is
-trained, so experiments can improve color/tonal parity without changing the
-INT8-friendly compute path that made the TensorRT engines fast.
+The selected train patterns are optimized against HDRTV1K targets plus the
+original HR/HG teacher, so TensorRT structure is preserved while color and edge
+artifacts are pulled back toward the reference model.
 """
 
 from __future__ import annotations
@@ -373,8 +373,8 @@ def _split_patterns(text: str) -> tuple[str, ...]:
 def _load_student(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> tuple[HG_Composite, dict]:
     base_payload = _load_checkpoint(Path(args.base_checkpoint))
     arch = dict(base_payload.get("architecture") or {})
-    le_arch = str(args.le_arch or arch.get("le_arch") or "conddirecth8wide96x12")
-    classifier = str(args.classifier or arch.get("classifier") or "agcm_spatialmixglobalh8wide64x6")
+    le_arch = str(args.le_arch or arch.get("le_arch") or "selectsft1235")
+    classifier = str(args.classifier or arch.get("classifier") or "color_condition")
     hg_payload = _load_checkpoint(Path(args.hg_checkpoint))
     hg_arch = str(args.hg_arch or (hg_payload.get("architecture") or {}).get("hg_arch") or arch.get("hg_arch") or "directh16wide64x8")
 
@@ -579,7 +579,7 @@ def _save_checkpoint(model: HG_Composite, base_payload: dict, arch: dict, args: 
 def parse_args() -> argparse.Namespace:
     weights = _SRC / "models" / "weights"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-checkpoint", default=str(weights / "distilled" / "hr" / "HR_qfriendly_spatialmixglobal_fp32.pt"))
+    parser.add_argument("--base-checkpoint", default=str(weights / "distilled" / "hr" / "HR_qfriendly_selectsft1235_fp32.pt"))
     parser.add_argument("--hg-checkpoint", default=str(weights / "distilled" / "hg" / "HG_qfriendly_directh16_fp32.pt"))
     parser.add_argument("--teacher-base", default=str(weights / "original" / "HR.pt"))
     parser.add_argument("--teacher-hg", default=str(weights / "original" / "HG.pt"))
@@ -726,7 +726,7 @@ def main() -> int:
         val_pairs = _manifest_pairs(Path(args.val_manifest), int(args.max_val_images))
     else:
         val_pairs = _paired_paths(Path(args.val_sdr_dir), Path(args.val_hdr_dir), int(args.max_val_images))
-    print(f"Training post head {args.post_correction} on {len(train_pairs)} pair(s); validating {len(val_pairs)} pair(s)")
+    print(f"Training selected distilled HR patterns on {len(train_pairs)} pair(s); validating {len(val_pairs)} pair(s)")
     print(f"device={device}, dtype={dtype}, crop={args.crop_size}, batch={args.batch_size}")
 
     student, arch = _load_student(args, device, dtype)
@@ -735,7 +735,7 @@ def main() -> int:
 
     params = [p for p in student.parameters() if p.requires_grad]
     if not params:
-        raise RuntimeError("No trainable post-correction parameters found")
+        raise RuntimeError("No trainable distilled HR parameters found")
     optimizer = torch.optim.AdamW(params, lr=float(args.lr), weight_decay=float(args.weight_decay))
     amp_enabled = bool(args.amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=(amp_enabled or (dtype == torch.float16 and device.type == "cuda")))

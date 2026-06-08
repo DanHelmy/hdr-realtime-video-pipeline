@@ -1,4 +1,4 @@
-﻿"""
+"""
 Full INT8 (W8A8) Quantization for HDRTVNet++.
 
 Both weights AND activations are quantized to INT8:
@@ -211,7 +211,7 @@ def main():
             "weights",
             "distilled",
             "hr",
-            "HR_qfriendly_spatialmixglobal_fp32.pt",
+            "HR_qfriendly_selectsft1235_fp32.pt",
         ),
                         help="Path to FP32 .pth weights")
     parser.add_argument("--output",

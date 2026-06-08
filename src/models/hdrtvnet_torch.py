@@ -1283,7 +1283,7 @@ def _tensorrt_source_candidate_path(model_path: str) -> str:
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        name = f"HR_qfriendly_spatialmixglobal_{mapped}{ext}"
+        name = f"HR_qfriendly_selectsft1235_{mapped}{ext}"
     elif stem.startswith("HR_HG_int8_"):
         source_family = "hg"
         tag = stem[len("HR_HG_int8_"):]
@@ -2706,6 +2706,25 @@ def _tensorrt_expected_engine_metadata(
         },
     }
     if str(precision).startswith("int8"):
+        modelopt_torch_include = _tensorrt_int8_modelopt_torch_include_patterns()
+        modelopt_torch_exclude = _tensorrt_int8_modelopt_torch_exclude_patterns()
+        if (
+            str(precision).startswith("int8-mixed")
+            and "selectsft1235" in pathlib.Path(str(model_path)).name.lower()
+            and not _tensorrt_int8_modelopt_torch_patterns(
+                "HDRTVNET_TRT_INT8_MODELOPT_TORCH_INCLUDE"
+            )
+            and not _tensorrt_int8_modelopt_torch_patterns(
+                "HDRTVNET_TRT_INT8_MODELOPT_TORCH_EXCLUDE"
+            )
+        ):
+            if use_hg:
+                modelopt_torch_include = ("base.AGCM", "base.LE", "hg")
+                modelopt_torch_exclude = ("base.LE.conv_last", "hg.low_out")
+            else:
+                modelopt_torch_include = ("AGCM", "LE")
+                modelopt_torch_exclude = ("LE.conv_last",)
+
         qat_composition = _tensorrt_int8_qat_composition_policy(mode_name)
         qat_checkpoint_composition = (
             _tensorrt_int8_qat_checkpoint_composition_enabled(mode_name)
@@ -2736,10 +2755,10 @@ def _tensorrt_expected_engine_metadata(
             _tensorrt_int8_modelopt_torch_score_steps()
         )
         metadata["build"]["int8_modelopt_torch_include"] = list(
-            _tensorrt_int8_modelopt_torch_include_patterns()
+            modelopt_torch_include
         )
         metadata["build"]["int8_modelopt_torch_exclude"] = list(
-            _tensorrt_int8_modelopt_torch_exclude_patterns()
+            modelopt_torch_exclude
         )
         metadata["build"]["int8_modelopt_torch_qdq_dtype"] = (
             _tensorrt_int8_modelopt_torch_qdq_dtype(torch.float16)
@@ -2751,7 +2770,9 @@ def _tensorrt_expected_engine_metadata(
             _tensorrt_int8_modelopt_torch_hg_default_enabled()
         )
         metadata["build"]["int8_modelopt_torch_hg_mixed_exclude"] = list(
-            _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns()
+            modelopt_torch_exclude
+            if str(precision).startswith("int8-mixed")
+            else _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns()
         )
         metadata["build"]["int8_modelopt_ops"] = _tensorrt_int8_modelopt_ops()
         metadata["build"]["int8_modelopt_calibration"] = (
@@ -3140,12 +3161,39 @@ def _tensorrt_int8_modelopt_torch_patterns(name: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in re.split(r"[;,]", text) if part.strip())
 
 
-def _tensorrt_int8_modelopt_torch_include_patterns() -> tuple[str, ...]:
+def _tensorrt_modelopt_torch_is_selective_sft_model(model: nn.Module | None) -> bool:
+    if model is None:
+        return False
+    for name, _module in model.named_modules():
+        if re.search(r"(^|\.)SFT_layer[1-5]($|\.)", name):
+            return True
+        if re.search(r"(^|\.)CondNet[1-5]($|\.)", name):
+            return True
+    return False
+
+
+def _tensorrt_modelopt_torch_has_composite_base(model: nn.Module | None) -> bool:
+    if model is None:
+        return False
+    return any(name == "base" or name.startswith("base.") for name, _ in model.named_modules())
+
+
+def _tensorrt_int8_modelopt_torch_include_patterns(
+    model: nn.Module | None = None,
+    precision: str | None = None,
+) -> tuple[str, ...]:
     explicit = _tensorrt_int8_modelopt_torch_patterns(
         "HDRTVNET_TRT_INT8_MODELOPT_TORCH_INCLUDE"
     )
     if explicit:
         return explicit
+    if (
+        str(precision or "").startswith("int8-mixed")
+        and _tensorrt_modelopt_torch_is_selective_sft_model(model)
+    ):
+        if _tensorrt_modelopt_torch_has_composite_base(model):
+            return ("base.AGCM", "base.LE", "hg")
+        return ("AGCM", "LE")
     return (
         "base.AGCM.spatial",
         "base.AGCM.global",
@@ -3174,9 +3222,34 @@ def _tensorrt_int8_modelopt_torch_include_patterns() -> tuple[str, ...]:
     )
 
 
-def _tensorrt_int8_modelopt_torch_exclude_patterns() -> tuple[str, ...]:
-    return _tensorrt_int8_modelopt_torch_patterns(
+def _tensorrt_int8_modelopt_torch_exclude_patterns(
+    model: nn.Module | None = None,
+    precision: str | None = None,
+) -> tuple[str, ...]:
+    explicit = _tensorrt_int8_modelopt_torch_patterns(
         "HDRTVNET_TRT_INT8_MODELOPT_TORCH_EXCLUDE"
+    )
+    if explicit:
+        return explicit
+    if (
+        str(precision or "").startswith("int8-mixed")
+        and _tensorrt_modelopt_torch_is_selective_sft_model(model)
+    ):
+        if _tensorrt_modelopt_torch_has_composite_base(model):
+            return ("base.LE.conv_last", "hg.low_out")
+        return ("LE.conv_last",)
+    return ()
+
+
+def _tensorrt_int8_modelopt_torch_outputs_enabled(
+    model: nn.Module | None,
+    precision: str | None = None,
+) -> bool:
+    if "HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUTS" in os.environ:
+        return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUTS", False)
+    return (
+        str(precision or "").startswith("int8-mixed")
+        and _tensorrt_modelopt_torch_is_selective_sft_model(model)
     )
 
 
@@ -6039,9 +6112,12 @@ def _enable_tensorrt_modelopt_torch_quantizers(
     return changed
 
 
-def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(model: nn.Module) -> int:
-    include = _tensorrt_int8_modelopt_torch_include_patterns()
-    exclude = _tensorrt_int8_modelopt_torch_exclude_patterns()
+def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
+    model: nn.Module,
+    precision: str | None = None,
+) -> int:
+    include = _tensorrt_int8_modelopt_torch_include_patterns(model, precision)
+    exclude = _tensorrt_int8_modelopt_torch_exclude_patterns(model, precision)
     changed = 0
     failed: list[str] = []
     for name, module in model.named_modules():
@@ -6293,8 +6369,8 @@ def _apply_tensorrt_modelopt_torch_quantizer_filters(
     model: nn.Module,
     precision: str | None = None,
 ) -> tuple[int, int, int]:
-    include = _tensorrt_int8_modelopt_torch_include_patterns()
-    exclude = _tensorrt_int8_modelopt_torch_exclude_patterns()
+    include = _tensorrt_int8_modelopt_torch_include_patterns(model, precision)
+    exclude = _tensorrt_int8_modelopt_torch_exclude_patterns(model, precision)
     has_hg = any(name == "hg" or name.startswith("hg.") for name, _ in model.named_modules())
     if (
         has_hg
@@ -6550,8 +6626,11 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
             kinds=("input_quantizer", "output_quantizer"),
             label="full activation",
         )
-    elif _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUTS", False):
-        _enable_tensorrt_modelopt_torch_filtered_output_quantizers(quantized)
+    elif _tensorrt_int8_modelopt_torch_outputs_enabled(quantized, precision):
+        _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
+            quantized,
+            precision,
+        )
         _calibrate_tensorrt_modelopt_torch_enabled_output_quantizers(
             quantized,
             forward_loop,

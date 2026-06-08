@@ -45,7 +45,7 @@ from models.hdrtvnet_torch import (
 )
 
 VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
-MODEL_PATH = "src/models/weights/distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"
+MODEL_PATH = "src/models/weights/distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"
 
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
@@ -350,9 +350,9 @@ def main():
             args.use_hg = "0"
         if not model_explicit and os.path.normcase(os.path.normpath(args.model)) == os.path.normcase(os.path.normpath(MODEL_PATH)):
             qat_name = (
-                "distilled/hr/HR_qfriendly_spatialmixglobal_int8_mixed_qat.pt"
+                "distilled/hr/HR_qfriendly_selectsft1235_int8_mixed_qat.pt"
                 if str(args.use_hg).strip() != "0"
-                else "distilled/hr/HR_qfriendly_spatialmixglobal_int8_mixed_qat.pt"
+                else "distilled/hr/HR_qfriendly_selectsft1235_int8_mixed_qat.pt"
             )
             args.model = os.path.join("src", "models", "weights", *qat_name.split("/"))
         if str(args.use_hg).strip() != "0" and not args.hg_weights:

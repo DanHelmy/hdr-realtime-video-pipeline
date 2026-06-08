@@ -1,4 +1,4 @@
-﻿"""
+"""
 Quantization-Aware Training (QAT) for Mixed INT8 HDRTVNet++.
 
 Starts from a PTQ mixed checkpoint and fine-tunes with fake quantization
@@ -1710,7 +1710,7 @@ def main():
                         ),
                         help="PTQ mixed checkpoint to start from")
     parser.add_argument("--fp32-model",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hr", "HR_qfriendly_spatialmixglobal_fp32.pt"),
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hr", "HR_qfriendly_selectsft1235_fp32.pt"),
                         help="FP32 model (for --from-scratch or validation)")
     parser.add_argument("--output",
                         default=os.path.join(

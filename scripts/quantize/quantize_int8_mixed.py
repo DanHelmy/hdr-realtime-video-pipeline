@@ -1,13 +1,13 @@
-﻿"""
+"""
 Optimized Mixed INT8 Quantization for HDRTVNet++ (Sensitivity-Based).
 
 Two key improvements over the original channel-threshold heuristic:
 
-  1. **Per-layer sensitivity analysis** â€” quantize one layer at a time to
+  1. **Per-layer sensitivity analysis** — quantize one layer at a time to
      W8A8, measure output MSE, rank by impact.  Layers causing less than
      ``--sensitivity-threshold`` MSE are assigned W8A8; the rest stay W8A16.
 
-  2. **Asymmetric activation quantization** â€” W8A8 layers use unsigned
+  2. **Asymmetric activation quantization** — W8A8 layers use unsigned
      [0, 255] with a zero-point instead of symmetric [-128, 127].
      This gives 2x precision for post-ReLU layers and ~1.8x for
      post-LeakyReLU, since the full 256 levels map the actual value range.
@@ -636,7 +636,7 @@ def main():
             "weights",
             "distilled",
             "hr",
-            "HR_qfriendly_spatialmixglobal_fp32.pt",
+            "HR_qfriendly_selectsft1235_fp32.pt",
         ),
                         help="Path to FP32 .pth weights")
     parser.add_argument("--output",

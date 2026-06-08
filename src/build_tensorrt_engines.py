@@ -47,13 +47,13 @@ def _weight(name: str) -> str:
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
     ),
     "fp32": (
         "fp32",
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
     ),
     "int8-mixed": (
         "int8-mixed",

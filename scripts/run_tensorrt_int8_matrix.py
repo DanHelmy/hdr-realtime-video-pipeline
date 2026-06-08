@@ -1,4 +1,4 @@
-﻿"""Run the TensorRT INT8 readiness matrix on a NVIDIA machine.
+"""Run the TensorRT INT8 readiness matrix on a NVIDIA machine.
 
 This script builds TensorRT INT8 engines with predequantization off. The
 default INT8 path is native TensorRT PTQ calibration, so ONNX artifacts do not
@@ -35,16 +35,16 @@ _VARIANTS = {
     "fp32": {
         "builder_precision": "fp32",
         "runtime_precision": "fp32",
-        "model": "distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt",
-        "model_nohg": "distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt",
+        "model": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
+        "model_nohg": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
         "cli_run": "fp32",
         "gui_key": "FP32",
     },
     "fp16": {
         "builder_precision": "fp16",
         "runtime_precision": "fp16",
-        "model": "distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt",
-        "model_nohg": "distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt",
+        "model": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
+        "model_nohg": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
         "cli_run": "fp16",
         "gui_key": "FP16",
     },

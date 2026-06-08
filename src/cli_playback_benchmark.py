@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import csv
@@ -59,15 +59,15 @@ def _weight(name: str) -> str:
 _RUN_PRESETS = {
     "fp16": {
         "precision": "fp16",
-        "model": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
-        "model_nohg": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        "model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        "model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
         "label": "fp16",
         "gui_key": "FP16",
     },
     "fp32": {
         "precision": "fp32",
-        "model": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
-        "model_nohg": _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        "model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        "model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
         "label": "fp32",
         "gui_key": "FP32",
     },

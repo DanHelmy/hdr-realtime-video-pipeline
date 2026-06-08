@@ -215,8 +215,8 @@ def main() -> int:
             runtime_tag = tag.replace("_ptq", "")
             hr_source = int8 / "hr" / f"HR_int8_{runtime_tag}.pt"
             hg_source = int8 / "hg" / f"HR_HG_int8_{runtime_tag}.pt"
-            hr_output = distilled / "hr" / f"HR_qfriendly_spatialmixglobal_int8_{out_tag}.pt"
-            hr_hg_output = distilled / "hr_hg" / f"HR_HG_qfriendly_spatialmixglobal_int8_{out_tag}.pt"
+            hr_output = distilled / "hr" / f"HR_qfriendly_selectsft1235_int8_{out_tag}.pt"
+            hr_hg_output = distilled / "hr_hg" / f"HR_HG_qfriendly_selectsft1235_int8_{out_tag}.pt"
             hg_output = distilled / "hg" / f"HG_qfriendly_directh16_int8_{out_tag}.pt"
             if args.missing_only and hr_output.is_file():
                 print(f"Skipped existing TensorRT source: {hr_output}")
@@ -256,7 +256,7 @@ def main() -> int:
 
     if not args.only_original:
         for path in (
-            "HR_qfriendly_spatialmixglobal_fp32.pt",
+            "HR_qfriendly_selectsft1235_fp32.pt",
             "HG_qfriendly_directh16_fp32.pt",
         ):
             family = "hr" if path.startswith("HR_") else "hg"

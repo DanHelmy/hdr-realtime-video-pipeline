@@ -1,4 +1,4 @@
-﻿"""Validate TensorRT source checkpoints before building engines.
+"""Validate TensorRT source checkpoints before building engines.
 
 This is intentionally runnable on non-NVIDIA machines. It checks that the
 TensorRT source checkpoints preserve the original PyTorch checkpoint behavior,
@@ -110,14 +110,14 @@ def _source_path(checkpoint: Path) -> Path:
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return trt_root / "hr" / f"HR_qfriendly_spatialmixglobal_{mapped}{checkpoint.suffix}"
+        return trt_root / "hr" / f"HR_qfriendly_selectsft1235_{mapped}{checkpoint.suffix}"
     if stem.startswith("HR_HG_int8_"):
         tag = stem[len("HR_HG_int8_"):]
         mapped = {
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return trt_root / "hr_hg" / f"HR_HG_qfriendly_spatialmixglobal_{mapped}{checkpoint.suffix}"
+        return trt_root / "hr_hg" / f"HR_HG_qfriendly_selectsft1235_{mapped}{checkpoint.suffix}"
     return trt_root / checkpoint.name
 
 

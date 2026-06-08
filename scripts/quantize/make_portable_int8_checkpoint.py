@@ -214,7 +214,7 @@ def default_tensorrt_source_path(
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return directory / "hr" / f"HR_qfriendly_spatialmixglobal_{mapped}{suffix}{input_path.suffix}"
+        return directory / "hr" / f"HR_qfriendly_selectsft1235_{mapped}{suffix}{input_path.suffix}"
     if stem.startswith("HR_HG_int8_"):
         tag = stem[len("HR_HG_int8_"):]
         mapped = {

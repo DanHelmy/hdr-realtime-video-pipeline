@@ -1,4 +1,4 @@
-﻿"""
+"""
 Standalone Triton kernel compiler - runs in a clean process with zero
 GPU overhead (no GUI, no mpv, no display) so that torch.compile
 max-autotune benchmarks are accurate.
@@ -115,13 +115,13 @@ def _weight(name):
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
     ),
     "fp32": (
         "fp32",
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_spatialmixglobal_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
     ),
     "int8-mixed": (
         "int8-mixed",

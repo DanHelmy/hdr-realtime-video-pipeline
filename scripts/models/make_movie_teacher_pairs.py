@@ -65,10 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-base", required=True)
     parser.add_argument("--teacher-hg", default="")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"])
-    parser.add_argument("--classifier", default="agcm_spatialmixglobalh8wide64x6")
-    parser.add_argument("--le-arch", default="conddirecth8wide96x12")
+    parser.add_argument("--classifier", default="color_condition")
+    parser.add_argument("--le-arch", default="selectsft1235")
     parser.add_argument("--hg-arch", default="directh16wide64x8")
     parser.add_argument("--frames", default="")
+    parser.add_argument("--name-prefix", default="")
     parser.add_argument("--num-frames", type=int, default=160)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int, default=0)
@@ -135,7 +136,9 @@ def main() -> int:
             result = teacher(inp)
             output = result[0] if isinstance(result, (tuple, list)) else result
 
-            name = f"movie_{frame_idx:08d}.png"
+            prefix = str(args.name_prefix or "movie").strip() or "movie"
+            safe_prefix = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in prefix)
+            name = f"{safe_prefix}_{frame_idx:08d}.png"
             cv2.imwrite(str(sdr_dir / name), frame)
             cv2.imwrite(str(hdr_dir / name), _tensor_to_bgr_u16(output))
             written += 1
