@@ -32,7 +32,7 @@ import torch.nn as nn
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _DEFAULT_TENSORRT_SOURCE_DIR = (
-    _REPO_ROOT / "src" / "models" / "weights" / "distilled"
+    _REPO_ROOT / "src" / "models" / "weights" / "original" / "tensorrt"
 )
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
@@ -214,14 +214,14 @@ def default_tensorrt_source_path(
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return directory / "hr" / f"HR_qfriendly_selectsft1235_{mapped}{suffix}{input_path.suffix}"
+        return directory / "hr" / f"HR_original_{mapped}{suffix}{input_path.suffix}"
     if stem.startswith("HR_HG_int8_"):
         tag = stem[len("HR_HG_int8_"):]
         mapped = {
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return directory / "hg" / f"HG_qfriendly_directh16_{mapped}{suffix}{input_path.suffix}"
+        return directory / "hg" / f"HG_original_{mapped}{suffix}{input_path.suffix}"
     return directory / f"{input_path.stem}{suffix}{input_path.suffix}"
 
 

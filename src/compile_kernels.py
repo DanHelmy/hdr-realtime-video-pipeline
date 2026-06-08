@@ -115,23 +115,23 @@ def _weight(name):
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("original/HR.pt"),
+        _weight("original/HR.pt"),
     ),
     "fp32": (
         "fp32",
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("original/HR.pt"),
+        _weight("original/HR.pt"),
     ),
     "int8-mixed": (
         "int8-mixed",
-        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
-        _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
     ),
     "int8-full": (
         "int8-full",
-        _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
-        _weight("pytorch_int8/hr/HR_int8_full.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
     ),
 }
 
@@ -501,7 +501,7 @@ def main():
     parser.add_argument(
         "--hg-weights",
         default=None,
-        help="Path to original/HG.pt or distilled HG weights (overrides default path)",
+        help="Path to original/HG.pt (overrides default path)",
     )
     parser.add_argument(
         "--clear-cache",
@@ -632,7 +632,7 @@ def main():
     if use_hg and not args.hg_weights:
         default_hg_weights = ""
         if args.precision in {"fp16", "fp32"}:
-            default_hg_weights = _weight("distilled/hg/HG_qfriendly_directh16_fp32.pt")
+            default_hg_weights = _weight("original/HG.pt")
         if default_hg_weights and os.path.isfile(default_hg_weights):
             args.hg_weights = default_hg_weights
     if args.hg_weights and not os.path.isfile(args.hg_weights):

@@ -26,7 +26,6 @@ _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _SRC = _ROOT / "src"
 _WEIGHTS = _SRC / "models" / "weights"
-_DISTILLED_TRT_SOURCES = _WEIGHTS / "distilled"
 _ORIGINAL_TRT_SOURCES = _WEIGHTS / "original" / "tensorrt"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -75,8 +74,6 @@ def _default_checkpoints() -> list[Path]:
     return sorted(
         p
         for folder in (
-            _WEIGHTS / "pytorch_int8" / "hr",
-            _WEIGHTS / "pytorch_int8" / "hg",
             _WEIGHTS / "original" / "pytorch_int8" / "hr",
             _WEIGHTS / "original" / "pytorch_int8" / "hg",
         )
@@ -89,7 +86,7 @@ def _source_path(checkpoint: Path) -> Path:
     stem = checkpoint.stem
     parts = {part.lower() for part in checkpoint.resolve().parts}
     original = "original" in parts
-    trt_root = _ORIGINAL_TRT_SOURCES if original else _DISTILLED_TRT_SOURCES
+    trt_root = _ORIGINAL_TRT_SOURCES
     if stem.startswith("HR_original_int8_"):
         tag = stem[len("HR_original_int8_"):]
         mapped = {
@@ -110,14 +107,14 @@ def _source_path(checkpoint: Path) -> Path:
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return trt_root / "hr" / f"HR_qfriendly_selectsft1235_{mapped}{checkpoint.suffix}"
+        return trt_root / "hr" / f"HR_original_{mapped}{checkpoint.suffix}"
     if stem.startswith("HR_HG_int8_"):
         tag = stem[len("HR_HG_int8_"):]
         mapped = {
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        return trt_root / "hr_hg" / f"HR_HG_qfriendly_selectsft1235_{mapped}{checkpoint.suffix}"
+        return trt_root / "hr_hg" / f"HR_HG_original_{mapped}{checkpoint.suffix}"
     return trt_root / checkpoint.name
 
 
@@ -125,7 +122,7 @@ def _hg_source_path(checkpoint: Path) -> Path | None:
     stem = checkpoint.stem
     parts = {part.lower() for part in checkpoint.resolve().parts}
     original = "original" in parts
-    trt_root = _ORIGINAL_TRT_SOURCES if original else _DISTILLED_TRT_SOURCES
+    trt_root = _ORIGINAL_TRT_SOURCES
     if stem.startswith("HR_HG_original_int8_"):
         tag = stem[len("HR_HG_original_int8_"):]
         mapped = {
@@ -140,7 +137,7 @@ def _hg_source_path(checkpoint: Path) -> Path | None:
         "mixed": "int8_mixed_ptq",
         "full": "int8_full_ptq",
     }.get(tag, f"int8_{tag}")
-    return trt_root / "hg" / f"HG_qfriendly_directh16_{mapped}{checkpoint.suffix}"
+    return trt_root / "hg" / f"HG_original_{mapped}{checkpoint.suffix}"
 
 
 def _precision_from_name(path: Path) -> str:
@@ -581,8 +578,8 @@ def main() -> int:
         nargs="*",
         type=Path,
         help=(
-            "Runtime INT8 checkpoints. Default: all organized distilled "
-            "weights/pytorch_int8 plus original weights/original/pytorch_int8 .pt files."
+            "Runtime INT8 checkpoints. Default: all original "
+            "weights/original/pytorch_int8 .pt files."
         ),
     )
     parser.add_argument("--resolution", default="256x256", help="Validation frame resolution.")

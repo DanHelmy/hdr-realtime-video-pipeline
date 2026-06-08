@@ -119,15 +119,6 @@ class UiBuilderMixin:
         self._act_predequantize = tools_menu.addAction(
             "INT8 &Pre-dequantization ...", self._choose_predequantize_mode
         )
-        self._act_use_original_model = tools_menu.addAction(
-            "Use Original HR/HR+HG Model ...",
-            self._use_original_model_preset,
-        )
-        self._act_use_original_model.setToolTip(
-            "Explicitly runs the untouched original HR checkpoint; the HG checkbox "
-            "controls whether original/HG.pt is used. This is hidden from normal "
-            "precision lists because it is a slower comparison path."
-        )
         tools_menu.addAction("Model Quality &Benchmark ...", self._open_benchmark_dialog)
         self._act_precompile_kernels = tools_menu.addAction(
             "&Pre-compile Kernels ...", self._precompile_kernels

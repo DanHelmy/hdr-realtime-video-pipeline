@@ -1,8 +1,7 @@
 """Run the TensorRT INT8 readiness matrix on a NVIDIA machine.
 
 This script builds TensorRT INT8 engines with predequantization off. The
-default INT8 path is native TensorRT PTQ calibration, so ONNX artifacts do not
-contain explicit Q/DQ nodes.
+default INT8 path is ModelOpt explicit Q/DQ from the original HR/HG checkpoints.
 """
 
 from __future__ import annotations
@@ -35,64 +34,64 @@ _VARIANTS = {
     "fp32": {
         "builder_precision": "fp32",
         "runtime_precision": "fp32",
-        "model": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
-        "model_nohg": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
+        "model": "original/HR.pt",
+        "model_nohg": "original/HR.pt",
         "cli_run": "fp32",
         "gui_key": "FP32",
     },
     "fp16": {
         "builder_precision": "fp16",
         "runtime_precision": "fp16",
-        "model": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
-        "model_nohg": "distilled/hr/HR_qfriendly_selectsft1235_fp32.pt",
+        "model": "original/HR.pt",
+        "model_nohg": "original/HR.pt",
         "cli_run": "fp16",
         "gui_key": "FP16",
     },
     "int8-mixed-ptq": {
         "builder_precision": "int8-mixed-ptq",
         "runtime_precision": "int8-mixed",
-        "model": "pytorch_int8/hg/HR_HG_int8_mixed.pt",
-        "model_nohg": "pytorch_int8/hr/HR_int8_mixed.pt",
+        "model": "original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt",
+        "model_nohg": "original/pytorch_int8/hr/HR_original_int8_mixed.pt",
         "cli_run": "int8-mixed-ptq",
         "gui_key": "INT8 Mixed (PTQ)",
     },
     "int8-mixed-qat": {
         "builder_precision": "int8-mixed-qat",
         "runtime_precision": "int8-mixed",
-        "model": "pytorch_int8/hg/HR_HG_int8_mixed_qat.pt",
-        "model_nohg": "pytorch_int8/hr/HR_int8_mixed_qat.pt",
+        "model": "original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt",
+        "model_nohg": "original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt",
         "cli_run": "int8-mixed-qat",
         "gui_key": "INT8 Mixed (QAT)",
     },
     "int8-mixed-qat-film": {
         "builder_precision": "int8-mixed-qat-film",
         "runtime_precision": "int8-mixed",
-        "model": "pytorch_int8/hg/HR_HG_int8_mixed_qat_film.pt",
-        "model_nohg": "pytorch_int8/hr/HR_int8_mixed_qat_film.pt",
+        "model": "original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt",
+        "model_nohg": "original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt",
         "cli_run": "int8-mixed-qat-film",
         "gui_key": "INT8 Mixed (QAT) (Film)",
     },
     "int8-full-ptq": {
         "builder_precision": "int8-full-ptq",
         "runtime_precision": "int8-full",
-        "model": "pytorch_int8/hg/HR_HG_int8_full.pt",
-        "model_nohg": "pytorch_int8/hr/HR_int8_full.pt",
+        "model": "original/pytorch_int8/hg/HR_HG_original_int8_full.pt",
+        "model_nohg": "original/pytorch_int8/hr/HR_original_int8_full.pt",
         "cli_run": "int8-full-ptq",
         "gui_key": "INT8 Full (PTQ)",
     },
     "int8-full-qat": {
         "builder_precision": "int8-full-qat",
         "runtime_precision": "int8-full",
-        "model": "pytorch_int8/hg/HR_HG_int8_full_qat.pt",
-        "model_nohg": "pytorch_int8/hr/HR_int8_full_qat.pt",
+        "model": "original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt",
+        "model_nohg": "original/pytorch_int8/hr/HR_original_int8_full_qat.pt",
         "cli_run": "int8-full-qat",
         "gui_key": "INT8 Full (QAT)",
     },
     "int8-full-qat-film": {
         "builder_precision": "int8-full-qat-film",
         "runtime_precision": "int8-full",
-        "model": "pytorch_int8/hg/HR_HG_int8_full_qat_film.pt",
-        "model_nohg": "pytorch_int8/hr/HR_int8_full_qat_film.pt",
+        "model": "original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt",
+        "model_nohg": "original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt",
         "cli_run": "int8-full-qat-film",
         "gui_key": "INT8 Full (QAT) (Film)",
     },

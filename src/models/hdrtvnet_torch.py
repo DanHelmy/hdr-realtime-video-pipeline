@@ -45,7 +45,7 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DEFAULT_HG_WEIGHTS = os.path.join(
     _ROOT, "src", "models", "weights", "original", "HG.pt"
 )
-_TENSORRT_SOURCE_SUBDIR = "distilled"
+_TENSORRT_SOURCE_SUBDIR = "tensorrt"
 _ORIGINAL_TENSORRT_SOURCE_SUBDIR = "tensorrt"
 _TENSORRT_CALIBRATION_SUBDIR = "tensorrt_calibration"
 _TENSORRT_ENGINE_METADATA_SCHEMA = "hdrtvnet_tensorrt_engine_v1"
@@ -1283,7 +1283,7 @@ def _tensorrt_source_candidate_path(model_path: str) -> str:
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        name = f"HR_qfriendly_selectsft1235_{mapped}{ext}"
+        name = f"HR_original_{mapped}{ext}"
     elif stem.startswith("HR_HG_int8_"):
         source_family = "hg"
         tag = stem[len("HR_HG_int8_"):]
@@ -1291,7 +1291,7 @@ def _tensorrt_source_candidate_path(model_path: str) -> str:
             "mixed": "int8_mixed_ptq",
             "full": "int8_full_ptq",
         }.get(tag, f"int8_{tag}")
-        name = f"HG_qfriendly_directh16_{mapped}{ext}"
+        name = f"HG_original_{mapped}{ext}"
 
     if path_obj.parent.name.lower() in {"hr", "hg"} and path_obj.parent.parent.name.lower() in {"int8", "pytorch_int8"}:
         weights_root = path_obj.parent.parent.parent
@@ -1430,7 +1430,7 @@ def tensorrt_source_checkpoint_path(model_path: str) -> str:
 
     The current NVIDIA INT8 path uses ModelOpt/QDQ directly from the selected
     PTQ/QAT/QAT-Film checkpoint, so it must not detour through generated
-    ``weights/distilled`` files. Source checkpoints remain available
+    ``weights/original/tensorrt`` files. Source checkpoints remain available
     only for the older native implicit path when ModelOpt INT8 is disabled.
     """
     if not model_path:
@@ -2000,7 +2000,7 @@ class HDRTVNetTorch:
         return hg
 
     def _resolve_hg_weights(self, model_path):
-        """Find original or distilled HG weights from common locations."""
+        """Find original HG weights from common locations."""
         candidates = []
         seen = set()
 
@@ -2017,12 +2017,6 @@ class HDRTVNetTorch:
         _add(self._hg_weights)
         # Adjacent to the selected model checkpoint.
         _add(os.path.join(os.path.dirname(os.path.abspath(model_path)), "HG.pt"))
-        _add(
-            os.path.join(
-                os.path.dirname(os.path.abspath(model_path)),
-                "HG_qfriendly_directh16_fp32.pt",
-            )
-        )
         # Repo-default runtime path.
         _add(_DEFAULT_HG_WEIGHTS)
         # Relative path from current working directory (when launched outside repo root).

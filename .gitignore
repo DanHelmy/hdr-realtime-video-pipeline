@@ -77,18 +77,6 @@ src/models/weights/original/HG.pt
 !src/models/weights/original/tensorrt/hr/*.pt
 !src/models/weights/original/tensorrt/hr_hg/
 !src/models/weights/original/tensorrt/hr_hg/*.pt
-!src/models/weights/distilled/
-!src/models/weights/distilled/hr/
-!src/models/weights/distilled/hr/*.pt
-!src/models/weights/distilled/hr_hg/
-!src/models/weights/distilled/hr_hg/*.pt
-!src/models/weights/distilled/hg/
-!src/models/weights/distilled/hg/*.pt
-!src/models/weights/pytorch_int8/
-!src/models/weights/pytorch_int8/hr/
-!src/models/weights/pytorch_int8/hr/*.pt
-!src/models/weights/pytorch_int8/hg/
-!src/models/weights/pytorch_int8/hg/*.pt
 
 # Calibration / training dataset (download separately)
 dataset/

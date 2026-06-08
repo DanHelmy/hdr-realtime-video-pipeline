@@ -8,7 +8,7 @@ import time
 import numpy as np
 import torch
 
-from gui_config import VIDEO_PLAYBACK_BUFFER_FRAMES
+from gui_config import VIDEO_PLAYBACK_BUFFER_FRAMES, VIDEO_PLAYBACK_PRESERVE_ORDER
 from gui_mpv_widget import MpvHDRWidget
 from timer import prepare_playback_timing_thread, sleep_until
 
@@ -470,9 +470,13 @@ class PipelineWorkerFeedersMixin:
         buffer_frames = (
             1
             if live_smooth_cadence
-            else max(1, int(getattr(self, "_video_playback_buffer_frames", VIDEO_PLAYBACK_BUFFER_FRAMES)))
+            else min(3, max(1, int(getattr(self, "_video_playback_buffer_frames", VIDEO_PLAYBACK_BUFFER_FRAMES))))
         )
-        preserve_order = bool((not live_smooth_cadence) and buffer_frames > 1)
+        preserve_order = bool(
+            (not live_smooth_cadence)
+            and buffer_frames > 1
+            and VIDEO_PLAYBACK_PRESERVE_ORDER
+        )
         self._hdr_queue = _queue.Queue(maxsize=buffer_frames)
         display_fps = float(getattr(self, "_live_display_fps", 24.0) or 24.0)
         self._hdr_thread = threading.Thread(
@@ -515,9 +519,13 @@ class PipelineWorkerFeedersMixin:
         buffer_frames = (
             1
             if live_smooth_cadence
-            else max(1, int(getattr(self, "_video_playback_buffer_frames", VIDEO_PLAYBACK_BUFFER_FRAMES)))
+            else min(3, max(1, int(getattr(self, "_video_playback_buffer_frames", VIDEO_PLAYBACK_BUFFER_FRAMES))))
         )
-        preserve_order = bool((not live_smooth_cadence) and buffer_frames > 1)
+        preserve_order = bool(
+            (not live_smooth_cadence)
+            and buffer_frames > 1
+            and VIDEO_PLAYBACK_PRESERVE_ORDER
+        )
         self._sdr_queue = _queue.Queue(maxsize=buffer_frames)
         display_fps = float(getattr(self, "_live_display_fps", 24.0) or 24.0)
         self._sdr_thread = threading.Thread(

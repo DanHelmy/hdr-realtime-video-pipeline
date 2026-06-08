@@ -151,14 +151,7 @@ class SettingsPreviewMixin:
             if p in _available_precision_keys():
                 self._cmb_prec.setCurrentText(p)
         elif initial_precision in PRECISIONS:
-            cfg = PRECISIONS.get(initial_precision, {})
-            if bool(cfg.get("hidden", False)):
-                self._precision_override_key = str(initial_precision)
-                if self._cmb_prec.findText("FP16") >= 0:
-                    was_blocked = self._cmb_prec.blockSignals(True)
-                    self._cmb_prec.setCurrentText("FP16")
-                    self._cmb_prec.blockSignals(was_blocked)
-            elif initial_precision in _available_precision_keys():
+            if initial_precision in _available_precision_keys():
                 self._cmb_prec.setCurrentText(initial_precision)
         self._source_mode_prompt_pending = "source_mode" not in data and initial_source_mode is None
         source_mode = _normalize_source_mode(

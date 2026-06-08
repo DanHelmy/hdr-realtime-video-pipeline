@@ -35,7 +35,6 @@ class StateInitMixin:
         self._cur_upscale_target_w = 1920
         self._cur_upscale_target_h = 1080
         self._active_precision = None
-        self._precision_override_key = ""
         self._active_resolution = None
         self._active_use_mpv = False
         self._active_mpv_scale_kernel = BEST_MPV_SCALE
@@ -295,8 +294,8 @@ class StateInitMixin:
         self._benchmark_saved_enabled_states = {}
         self._compile_interaction_locked = False
         self._compile_saved_enabled_states = {}
-        self._original_tensorrt_source_process = None
-        self._original_tensorrt_source_dlg = None
+        self._tensorrt_source_process = None
+        self._tensorrt_source_dlg = None
         try:
             self._startup_seek_frame = (
                 int(initial_start_frame) if initial_start_frame is not None else None
@@ -325,14 +324,7 @@ class StateInitMixin:
             self._source_mode = source_mode
             self._refresh_source_mode_ui()
             if initial_precision in PRECISIONS:
-                cfg = PRECISIONS.get(initial_precision, {})
-                if bool(cfg.get("hidden", False)):
-                    self._precision_override_key = str(initial_precision)
-                    if self._cmb_prec.findText("FP16") >= 0:
-                        was_blocked = self._cmb_prec.blockSignals(True)
-                        self._cmb_prec.setCurrentText("FP16")
-                        self._cmb_prec.blockSignals(was_blocked)
-                else:
+                if initial_precision in _available_precision_keys():
                     self._cmb_prec.setCurrentText(initial_precision)
             legacy_resolution_map = {
                 "Native": "1080p",

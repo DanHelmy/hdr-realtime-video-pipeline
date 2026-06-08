@@ -209,9 +209,8 @@ def main():
             "src",
             "models",
             "weights",
-            "distilled",
-            "hr",
-            "HR_qfriendly_selectsft1235_fp32.pt",
+            "original",
+            "HR.pt",
         ),
                         help="Path to FP32 .pth weights")
     parser.add_argument("--output",
@@ -220,9 +219,10 @@ def main():
                             "src",
                             "models",
                             "weights",
+                            "original",
                             "pytorch_int8",
                             "hg",
-                            "HR_HG_int8_full.pt",
+                            "HR_HG_original_int8_full.pt",
                         ),
                         help="Output path for quantized checkpoint")
     parser.add_argument("--export-tensorrt-source", default="0", choices=["1", "0"],
@@ -257,7 +257,7 @@ def main():
         default=os.path.join(_REPO_ROOT, "dataset", "train_sdr"),
                         help="Directory of SDR images for activation calibration")
     parser.add_argument("--hg-weights",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hg", "HG_qfriendly_directh16_fp32.pt"),
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "original", "HG.pt"),
                         help="Path to HG weights")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"],
                         help="Use HG refinement (1) or base AGCM+LE only (0)")
@@ -282,9 +282,10 @@ def main():
             "src",
             "models",
             "weights",
+            "original",
             "pytorch_int8",
             "hr",
-            "HR_int8_full.pt",
+            "HR_original_int8_full.pt",
         )
 
     compute_dtype = torch.float16 if args.precision == "fp16" else torch.float32
@@ -395,7 +396,7 @@ def main():
         from make_portable_int8_checkpoint import (
             default_tensorrt_source_path,
         )
-        from split_distilled_tensorrt_sources import generate_tensorrt_source
+        from split_tensorrt_sources import generate_tensorrt_source
 
         trt_source_dir = (
             Path(args.tensorrt_source_dir)

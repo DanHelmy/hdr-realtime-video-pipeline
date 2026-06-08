@@ -1704,13 +1704,14 @@ def main():
                             "src",
                             "models",
                             "weights",
+                            "original",
                             "pytorch_int8",
                             "hg",
-                            "HR_HG_int8_mixed.pt",
+                            "HR_HG_original_int8_mixed.pt",
                         ),
                         help="PTQ mixed checkpoint to start from")
     parser.add_argument("--fp32-model",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hr", "HR_qfriendly_selectsft1235_fp32.pt"),
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "original", "HR.pt"),
                         help="FP32 model (for --from-scratch or validation)")
     parser.add_argument("--output",
                         default=os.path.join(
@@ -1718,9 +1719,10 @@ def main():
                             "src",
                             "models",
                             "weights",
+                            "original",
                             "pytorch_int8",
                             "hg",
-                            "HR_HG_int8_mixed_qat.pt",
+                            "HR_HG_original_int8_mixed_qat.pt",
                         ),
                         help="Output path for QAT-finetuned checkpoint")
     parser.add_argument("--export-tensorrt-source", default="0", choices=["1", "0"],
@@ -1756,7 +1758,7 @@ def main():
     parser.add_argument("--w8a8-layers-file", default="",
                         help="Text file of W8A8 layer names for --from-scratch QAT")
     parser.add_argument("--hg-weights",
-                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "distilled", "hg", "HG_qfriendly_directh16_fp32.pt"),
+                        default=os.path.join(_REPO_ROOT, "src", "models", "weights", "original", "HG.pt"),
                         help="Path to HG weights")
     parser.add_argument("--use-hg", default="1", choices=["1", "0"],
                         help="Use HG refinement (1) or base AGCM+LE only (0)")
@@ -1779,7 +1781,7 @@ def main():
     parser.add_argument("--target-loss-weight", type=float, default=1.0,
                         help="Weight for direct HDR ground-truth L1 loss")
     parser.add_argument("--teacher-source", default="ptq", choices=["ptq", "fp32"],
-                        help="Teacher model for distillation losses: starting PTQ checkpoint or FP32 baseline")
+                        help="Teacher model for teacher losses: starting PTQ checkpoint or FP32 baseline")
     parser.add_argument("--teacher-le-arch", default="",
                         help="Optional HDRTVNET_LE_ARCH override for the FP32 teacher only")
     parser.add_argument("--teacher-hg-arch", default="",
@@ -1895,9 +1897,10 @@ def main():
                 "src",
                 "models",
                 "weights",
+                "original",
                 "pytorch_int8",
                 "hr",
-                "HR_int8_mixed.pt",
+                "HR_original_int8_mixed.pt",
             )
         if not output_explicit:
             args.output = os.path.join(
@@ -1905,9 +1908,10 @@ def main():
                 "src",
                 "models",
                 "weights",
+                "original",
                 "pytorch_int8",
                 "hr",
-                "HR_int8_mixed_qat.pt",
+                "HR_original_int8_mixed_qat.pt",
             )
 
     compute_dtype = torch.float16 if args.precision == "fp16" else torch.float32
@@ -2416,7 +2420,7 @@ def main():
         from make_portable_int8_checkpoint import (
             default_tensorrt_source_path,
         )
-        from split_distilled_tensorrt_sources import generate_tensorrt_source
+        from split_tensorrt_sources import generate_tensorrt_source
 
         trt_source_dir = (
             Path(args.tensorrt_source_dir)

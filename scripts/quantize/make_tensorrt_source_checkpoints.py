@@ -16,20 +16,23 @@ import torch
 from make_portable_int8_checkpoint import (
     default_tensorrt_source_path,
 )
-from split_distilled_tensorrt_sources import generate_tensorrt_source
+from split_tensorrt_sources import generate_tensorrt_source
 from models.hdrtvnet_torch import tensorrt_source_checkpoint_validation_error
 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _WEIGHTS_DIR = _REPO_ROOT / "src" / "models" / "weights"
-_DEFAULT_OUTPUT_DIR = _WEIGHTS_DIR / "distilled"
+_DEFAULT_OUTPUT_DIR = _WEIGHTS_DIR / "original" / "tensorrt"
 
 
 def _default_inputs() -> list[Path]:
     return sorted(
         p
-        for folder in (_WEIGHTS_DIR / "pytorch_int8" / "hr", _WEIGHTS_DIR / "pytorch_int8" / "hg")
+        for folder in (
+            _WEIGHTS_DIR / "original" / "pytorch_int8" / "hr",
+            _WEIGHTS_DIR / "original" / "pytorch_int8" / "hg",
+        )
         for p in folder.glob("*.pt")
         if p.is_file()
     )
@@ -90,13 +93,13 @@ def main() -> int:
         "checkpoints",
         nargs="*",
         type=Path,
-        help="Optional checkpoint list. Defaults to every organized .pt under weights/pytorch_int8/hr and weights/pytorch_int8/hg.",
+        help="Optional checkpoint list. Defaults to every .pt under weights/original/pytorch_int8/hr and weights/original/pytorch_int8/hg.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=_DEFAULT_OUTPUT_DIR,
-        help="Output folder. Default: src/models/weights/distilled.",
+        help="Output folder. Default: src/models/weights/original/tensorrt.",
     )
     parser.add_argument(
         "--activation-quant",

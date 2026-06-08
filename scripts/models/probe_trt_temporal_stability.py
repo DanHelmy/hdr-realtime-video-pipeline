@@ -165,11 +165,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument(
         "--reference-model",
-        default=_repo_path("src", "models", "weights", "distilled", "hr", "HR_qfriendly_selectsft1235_fp32.pt"),
+        default=_repo_path("src", "models", "weights", "original", "HR.pt"),
     )
     parser.add_argument(
         "--candidate-model",
-        default=_repo_path("src", "models", "weights", "distilled", "hr", "HR_qfriendly_selectsft1235_fp32.pt"),
+        default=_repo_path("src", "models", "weights", "original", "tensorrt", "hr", "HR_original_int8_mixed_qat.pt"),
     )
     parser.add_argument("--precision", default="int8-mixed")
     parser.add_argument("--use-hg", default="0", choices=["0", "1"])

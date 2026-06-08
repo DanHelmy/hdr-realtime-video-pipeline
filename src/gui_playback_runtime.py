@@ -21,7 +21,6 @@ from PyQt6.QtWidgets import (
 
 from gui_config import (
     LIVE_CAPTURE_PROCESS_FPS,
-    ORIGINAL_PRECISION_KEY,
     PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
@@ -3176,6 +3175,12 @@ class PlaybackRuntimeMixin:
         # Map GUI precision to compile arg
         gui_prec = self._effective_precision_key()
         prec_arg = _precision_to_compile_arg(gui_prec)
+        if not self._ensure_tensorrt_sources_ready_for_playback(
+            gui_prec,
+            use_hg=self._chk_hg.isChecked(),
+            on_ready=self._play,
+        ):
+            return
 
         # Always compile via a clean subprocess - this ensures autotune
         # benchmarks have zero GPU interference from Qt / mpv rendering.
@@ -3759,11 +3764,6 @@ class PlaybackRuntimeMixin:
     # - Slots: settings ---------------------------------------
 
     def _on_precision(self, key):
-        if str(getattr(self, "_precision_override_key", "") or ""):
-            self._precision_override_key = ""
-            self.statusBar().showMessage(
-                "Original model override cleared; using selected precision."
-            )
         self._chk_hg.setEnabled(True)
         warning = _int8_precision_warning(str(key), self._chk_hg.isChecked())
         if warning:
@@ -3772,51 +3772,57 @@ class PlaybackRuntimeMixin:
             self._update_apply_button_state()
 
     def _effective_precision_key(self) -> str:
-        override = str(getattr(self, "_precision_override_key", "") or "").strip()
-        if override in PRECISIONS:
-            return override
         return str(self._cmb_prec.currentText() or "").strip()
 
-    def _use_original_model_preset(self):
-        """Prepare and enable the hidden original HR/HG checkpoint override."""
-        if self._show_export_lock_message("Original model"):
-            return
-        process = getattr(self, "_original_tensorrt_source_process", None)
+    def _selected_tensorrt_source_paths(self, gui_prec: str, use_hg: bool) -> list[str]:
+        cfg = PRECISIONS.get(str(gui_prec), {})
+        precision = str(cfg.get("precision", "")).strip().lower()
+        if not _IS_NVIDIA or not precision.startswith("int8"):
+            return []
+        paths = [_select_tensorrt_model_path(gui_prec, use_hg)]
+        if use_hg:
+            paths.append(_select_hg_weights_path(gui_prec, tensorrt=True))
+        return [str(path) for path in paths if str(path or "").strip()]
+
+    def _ensure_tensorrt_sources_ready_for_playback(
+        self,
+        gui_prec: str,
+        *,
+        use_hg: bool,
+        on_ready,
+    ) -> bool:
+        missing = [
+            path
+            for path in self._selected_tensorrt_source_paths(gui_prec, use_hg)
+            if not os.path.isfile(path)
+        ]
+        if not missing:
+            return True
+        if self._show_export_lock_message("TensorRT source preparation"):
+            return False
+        process = getattr(self, "_tensorrt_source_process", None)
         if (
             process is not None
             and process.state() != QProcess.ProcessState.NotRunning
         ):
             self.statusBar().showMessage(
-                "Original TensorRT source preparation is already running."
+                "TensorRT source preparation is already running."
             )
-            return
-
-        missing = self._missing_original_tensorrt_source_paths()
-        regen_text = ""
-        if _IS_NVIDIA and missing:
-            regen_text = (
-                "\n\nOn this NVIDIA system, the ignored original TensorRT INT8 HG "
-                "source checkpoints are missing. If you continue, HDRTVNet++ will "
-                "generate them locally from the committed original PyTorch INT8 "
-                "checkpoints before enabling the original model path."
-            )
-        elif _IS_NVIDIA:
-            regen_text = (
-                "\n\nThe local original TensorRT source checkpoints are already present."
-            )
+            return False
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Use Original Model")
-        box.setText("Use the untouched original HR/HR+HG reference model?")
+        box.setWindowTitle("Prepare TensorRT Sources")
+        box.setText("Generate local TensorRT source checkpoints?")
         box.setInformativeText(
-            "This is a hidden comparison/debug path. It is expected to be slower "
-            "than the default distilled TensorRT-ready checkpoints, and HG depends "
-            "on original/HG.pt when the HG checkbox is enabled."
-            f"{regen_text}"
+            "This INT8 preset needs TensorRT source checkpoints that are generated "
+            "locally from the committed PyTorch INT8 checkpoints. The large HG "
+            "source files are intentionally not committed, so the first HG INT8 "
+            "run can take a little while before playback starts.\n\n"
+            f"Missing source file(s): {len(missing)}"
         )
         continue_btn = box.addButton(
-            "Continue",
+            "Generate",
             QMessageBox.ButtonRole.AcceptRole,
         )
         cancel_btn = box.addButton(
@@ -3827,38 +3833,13 @@ class PlaybackRuntimeMixin:
         box.setEscapeButton(cancel_btn)
         box.exec()
         if box.clickedButton() is not continue_btn:
-            self.statusBar().showMessage("Original model override canceled.")
-            return
+            self.statusBar().showMessage("TensorRT source preparation canceled.")
+            return False
 
-        if _IS_NVIDIA and missing:
-            self._prepare_original_tensorrt_sources_async(
-                self._activate_original_model_preset
-            )
-            return
-        self._activate_original_model_preset()
+        self._prepare_tensorrt_sources_async(on_ready)
+        return False
 
-    def _activate_original_model_preset(self):
-        """Enable the hidden original HR/HG checkpoint override."""
-        self._precision_override_key = ORIGINAL_PRECISION_KEY
-        if self._cmb_prec is not None and self._cmb_prec.currentText() != "FP16":
-            was_blocked = self._cmb_prec.blockSignals(True)
-            self._cmb_prec.setCurrentText("FP16")
-            self._cmb_prec.blockSignals(was_blocked)
-        self._save_user_settings()
-        if self._playing:
-            self._update_apply_button_state()
-            suffix = " Click Apply to restart with the original checkpoint."
-        else:
-            suffix = " Press Play to use it."
-        message = (
-            "Original HR/HR+HG override enabled. This hidden comparison path "
-            "uses original/HR.pt and, when HG is checked, original/HG.pt."
-            f"{suffix}"
-        )
-        self.statusBar().showMessage(message)
-        QMessageBox.information(self, "Original Model", message)
-
-    def _expected_original_tensorrt_source_paths(self) -> list[str]:
+    def _expected_tensorrt_source_paths(self) -> list[str]:
         base = os.path.join(_ROOT, "src", "models", "weights", "original", "tensorrt")
         paths: list[str] = []
         for tag in _ORIGINAL_TRT_INT8_TAGS:
@@ -3867,25 +3848,25 @@ class PlaybackRuntimeMixin:
             paths.append(os.path.join(base, "hg", f"HG_original_int8_{tag}.pt"))
         return paths
 
-    def _missing_original_tensorrt_source_paths(self) -> list[str]:
+    def _missing_tensorrt_source_paths(self) -> list[str]:
         return [
             path
-            for path in self._expected_original_tensorrt_source_paths()
+            for path in self._expected_tensorrt_source_paths()
             if not os.path.isfile(path)
         ]
 
-    def _prepare_original_tensorrt_sources_async(self, on_ready):
+    def _prepare_tensorrt_sources_async(self, on_ready):
         script = os.path.join(
             _ROOT,
             "scripts",
             "quantize",
-            "split_distilled_tensorrt_sources.py",
+            "split_tensorrt_sources.py",
         )
         if not os.path.isfile(script):
             QMessageBox.warning(
                 self,
-                "Original Model",
-                "Cannot prepare original TensorRT sources because the split script is missing.",
+                "TensorRT Sources",
+                "Cannot prepare TensorRT sources because the split script is missing.",
             )
             return
 
@@ -3895,23 +3876,24 @@ class PlaybackRuntimeMixin:
         if not os.path.isdir(source_dir):
             QMessageBox.warning(
                 self,
-                "Original Model",
-                "Cannot prepare original TensorRT sources because original/pytorch_int8 is missing.",
+                "TensorRT Sources",
+                "Cannot prepare TensorRT sources because original/pytorch_int8 is missing.",
             )
             return
 
         dlg = QProgressDialog(
-            "Preparing original TensorRT HG source checkpoints ...",
+            "Preparing TensorRT source checkpoints ...",
             None,
             0,
             0,
             self,
         )
-        dlg.setWindowTitle("Preparing Original TensorRT Sources")
+        dlg.setWindowTitle("Preparing TensorRT Sources")
         dlg.setCancelButton(None)
         dlg.setMinimumDuration(0)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         configure_independent_window(dlg, maximize=False, close=False)
+        self._set_compile_interaction_locked(True)
         dlg.show()
 
         process = QProcess(self)
@@ -3935,7 +3917,7 @@ class PlaybackRuntimeMixin:
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             if lines:
                 dlg.setLabelText(
-                    "Preparing original TensorRT HG source checkpoints ...\n"
+                    "Preparing TensorRT source checkpoints ...\n"
                     + lines[-1][-160:]
                 )
 
@@ -3946,14 +3928,23 @@ class PlaybackRuntimeMixin:
                 dlg.deleteLater()
             except Exception:
                 pass
-            self._original_tensorrt_source_dlg = None
-            self._original_tensorrt_source_process = None
+            self._set_compile_interaction_locked(False)
+            self._tensorrt_source_dlg = None
+            self._tensorrt_source_process = None
             process.deleteLater()
 
-            missing_after = self._missing_original_tensorrt_source_paths()
-            if int(exit_code) == 0 and not missing_after:
+            missing_after = self._missing_tensorrt_source_paths()
+            selected_missing_after = [
+                path
+                for path in self._selected_tensorrt_source_paths(
+                    self._effective_precision_key(),
+                    self._chk_hg.isChecked(),
+                )
+                if not os.path.isfile(path)
+            ]
+            if int(exit_code) == 0 and not selected_missing_after:
                 self.statusBar().showMessage(
-                    "Original TensorRT sources prepared locally."
+                    "TensorRT sources prepared locally."
                 )
                 on_ready()
                 return
@@ -3968,15 +3959,15 @@ class PlaybackRuntimeMixin:
                 details += f"\n\nLast output:\n{tail}"
             QMessageBox.warning(
                 self,
-                "Original TensorRT Preparation Failed",
-                "Original TensorRT source generation did not complete."
+                "TensorRT Preparation Failed",
+                "TensorRT source generation did not complete."
                 f"{details}",
             )
 
         process.readyReadStandardOutput.connect(_drain_output)
         process.finished.connect(_finish)
-        self._original_tensorrt_source_process = process
-        self._original_tensorrt_source_dlg = dlg
+        self._tensorrt_source_process = process
+        self._tensorrt_source_dlg = dlg
         process.start(
             _python_executable_for_clean_subprocess(),
             [
@@ -3992,13 +3983,14 @@ class PlaybackRuntimeMixin:
                 dlg.deleteLater()
             except Exception:
                 pass
-            self._original_tensorrt_source_dlg = None
-            self._original_tensorrt_source_process = None
+            self._set_compile_interaction_locked(False)
+            self._tensorrt_source_dlg = None
+            self._tensorrt_source_process = None
             process.deleteLater()
             QMessageBox.warning(
                 self,
-                "Original TensorRT Preparation Failed",
-                "Could not start the original TensorRT source generator.",
+                "TensorRT Preparation Failed",
+                "Could not start the TensorRT source generator.",
             )
 
     def _on_resolution(self, scale_key):

@@ -59,22 +59,33 @@ def _weight(name: str) -> str:
 _RUN_PRESETS = {
     "fp16": {
         "precision": "fp16",
-        "model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/HR.pt"),
+        "trt_model_nohg": _weight("original/HR.pt"),
+        "trt_hg_weights": _weight("original/HG.pt"),
         "label": "fp16",
         "gui_key": "FP16",
     },
     "fp32": {
         "precision": "fp32",
-        "model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/HR.pt"),
+        "trt_model_nohg": _weight("original/HR.pt"),
+        "trt_hg_weights": _weight("original/HG.pt"),
         "label": "fp32",
         "gui_key": "FP32",
     },
     "int8-mixed-ptq": {
         "precision": "int8-mixed",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_ptq.pt"),
         "predequantize": "on",
         "label": "int8_mixed_ptq_predeq",
         "trt_predequantize": "off",
@@ -84,8 +95,11 @@ _RUN_PRESETS = {
     },
     "int8-full-ptq": {
         "precision": "int8-full",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_ptq.pt"),
         "predequantize": "on",
         "label": "int8_full_ptq_predeq",
         "trt_predequantize": "off",
@@ -95,8 +109,11 @@ _RUN_PRESETS = {
     },
     "int8-mixed-qat": {
         "precision": "int8-mixed",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat.pt"),
         "predequantize": "on",
         "label": "int8_mixed_qat_predeq",
         "trt_predequantize": "off",
@@ -106,8 +123,11 @@ _RUN_PRESETS = {
     },
     "int8-full-qat": {
         "precision": "int8-full",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_full_qat.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full_qat.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat.pt"),
         "predequantize": "on",
         "label": "int8_full_qat_predeq",
         "trt_predequantize": "off",
@@ -117,8 +137,11 @@ _RUN_PRESETS = {
     },
     "int8-mixed-qat-film": {
         "precision": "int8-mixed",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat_film.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed_qat_film.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat_film.pt"),
         "predequantize": "on",
         "label": "int8_mixed_qat_film_predeq",
         "trt_predequantize": "off",
@@ -128,8 +151,11 @@ _RUN_PRESETS = {
     },
     "int8-full-qat-film": {
         "precision": "int8-full",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_full_qat_film.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full_qat_film.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat_film.pt"),
         "predequantize": "on",
         "label": "int8_full_qat_film_predeq",
         "trt_predequantize": "off",
@@ -142,82 +168,6 @@ _DEFAULT_RUNS = [
     "int8-mixed-qat",
 ]
 
-
-_ORIGINAL_RUN_PATHS = {
-    "fp16": {
-        "model": _weight("original/HR.pt"),
-        "model_nohg": _weight("original/HR.pt"),
-        "hg_weights": _weight("original/HG.pt"),
-        "trt_model": _weight("original/HR.pt"),
-        "trt_model_nohg": _weight("original/HR.pt"),
-        "trt_hg_weights": _weight("original/HG.pt"),
-    },
-    "fp32": {
-        "model": _weight("original/HR.pt"),
-        "model_nohg": _weight("original/HR.pt"),
-        "hg_weights": _weight("original/HG.pt"),
-        "trt_model": _weight("original/HR.pt"),
-        "trt_model_nohg": _weight("original/HR.pt"),
-        "trt_hg_weights": _weight("original/HG.pt"),
-    },
-    "int8-mixed-ptq": {
-        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt"),
-        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed.pt"),
-        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_ptq.pt"),
-        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_ptq.pt"),
-        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_ptq.pt"),
-    },
-    "int8-full-ptq": {
-        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
-        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
-        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_ptq.pt"),
-        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_ptq.pt"),
-        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_ptq.pt"),
-    },
-    "int8-mixed-qat": {
-        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
-        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
-        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat.pt"),
-        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat.pt"),
-        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat.pt"),
-    },
-    "int8-full-qat": {
-        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
-        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
-        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat.pt"),
-        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat.pt"),
-        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat.pt"),
-    },
-    "int8-mixed-qat-film": {
-        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt"),
-        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt"),
-        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat_film.pt"),
-        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat_film.pt"),
-        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat_film.pt"),
-    },
-    "int8-full-qat-film": {
-        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
-        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
-        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat_film.pt"),
-        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat_film.pt"),
-        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat_film.pt"),
-    },
-}
-
-
-def _apply_checkpoint_family(preset: dict, run_key: str, family: str) -> dict:
-    if str(family or "distilled").strip().lower() != "original":
-        return preset
-    override = _ORIGINAL_RUN_PATHS.get(run_key)
-    if not override:
-        return preset
-    preset.update(override)
-    preset["manual_model"] = True
-    preset["mode_name_base"] = f"original_{run_key}"
-    preset["label"] = f"original_{preset.get('label', run_key)}"
-    if preset.get("trt_label"):
-        preset["trt_label"] = f"original_{preset['trt_label']}"
-    return preset
 
 _CSV_FIELDS = [
     "elapsed_s",
@@ -876,16 +826,6 @@ def parse_args():
         choices=tuple(_RUN_PRESETS.keys()),
         help="Precision/model presets to run.",
     )
-    parser.add_argument(
-        "--checkpoint-family",
-        default="distilled",
-        choices=["distilled", "original"],
-        help=(
-            "Checkpoint family to benchmark. Distilled is the quant-friendly "
-            "default; original uses untouched HR/HG and the matching original "
-            "eager/TensorRT INT8 files."
-        ),
-    )
     parser.add_argument("--duration-s", type=float, default=180.0)
     parser.add_argument("--warmup-frames", type=int, default=120)
     parser.add_argument("--sample-interval", type=int, default=120)
@@ -984,16 +924,10 @@ def main() -> int:
     print(f"[bench] Output: {batch_dir}", flush=True)
     if args.display:
         print(f"[bench] Display: {args.display_backend}", flush=True)
-    print(f"[bench] Checkpoint family: {args.checkpoint_family}", flush=True)
-
     results = []
     for resolution in args.resolutions:
         for run_key in args.runs:
-            preset = _apply_checkpoint_family(
-                dict(_RUN_PRESETS[run_key]),
-                run_key,
-                args.checkpoint_family,
-            )
+            preset = dict(_RUN_PRESETS[run_key])
             if (not args.use_hg) and preset.get("model_nohg"):
                 preset["model"] = preset["model_nohg"]
             manual_model = bool(preset.get("manual_model", False))

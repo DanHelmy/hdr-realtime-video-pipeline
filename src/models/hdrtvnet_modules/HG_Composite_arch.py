@@ -60,7 +60,7 @@ class HG_Composite(nn.Module):
                 in_nc=in_nc, out_nc=out_nc, nf=hg_nf, sf=2
             )
             self.hg_arch = "resizeconv"
-        elif hg_arch in {"fusedbn", "fused-bn", "qfriendly", "quant-friendly"}:
+        elif hg_arch in {"fusedbn", "fused-bn"}:
             hg_cls = Hallucination_Generator_FusedBN
             self.hg = hg_cls(
                 in_nc=in_nc, out_nc=out_nc, nf=hg_nf, sf=2

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 
 from windows_runtime import ensure_windows_supported, install_torch_windows_warning_filter
@@ -47,53 +48,53 @@ def _weight(name: str) -> str:
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("original/HR.pt"),
+        _weight("original/HR.pt"),
     ),
     "fp32": (
         "fp32",
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
+        _weight("original/HR.pt"),
+        _weight("original/HR.pt"),
     ),
     "int8-mixed": (
         "int8-mixed",
-        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
-        _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
     ),
     "int8-mixed-ptq": (
         "int8-mixed",
-        _weight("pytorch_int8/hg/HR_HG_int8_mixed.pt"),
-        _weight("pytorch_int8/hr/HR_int8_mixed.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_mixed.pt"),
     ),
     "int8-mixed-qat": (
         "int8-mixed",
-        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
-        _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
     ),
     "int8-mixed-qat-film": (
         "int8-mixed",
-        _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat_film.pt"),
-        _weight("pytorch_int8/hr/HR_int8_mixed_qat_film.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt"),
     ),
     "int8-full": (
         "int8-full",
-        _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
-        _weight("pytorch_int8/hr/HR_int8_full.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
     ),
     "int8-full-ptq": (
         "int8-full",
-        _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
-        _weight("pytorch_int8/hr/HR_int8_full.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
     ),
     "int8-full-qat": (
         "int8-full",
-        _weight("pytorch_int8/hg/HR_HG_int8_full_qat.pt"),
-        _weight("pytorch_int8/hr/HR_int8_full_qat.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
     ),
     "int8-full-qat-film": (
         "int8-full",
-        _weight("pytorch_int8/hg/HR_HG_int8_full_qat_film.pt"),
-        _weight("pytorch_int8/hr/HR_int8_full_qat_film.pt"),
+        _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
+        _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
     ),
 }
 
@@ -131,6 +132,52 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return bool(default)
 
 
+def _ensure_default_tensorrt_sources(gui_precision_key: str | None, use_hg: bool) -> None:
+    if not gui_precision_key:
+        return
+    cfg = PRECISIONS.get(gui_precision_key, {})
+    if not str(cfg.get("precision", "")).strip().lower().startswith("int8"):
+        return
+
+    expected = [_select_tensorrt_model_path(gui_precision_key, use_hg)]
+    if use_hg:
+        expected.append(_select_hg_weights_path(gui_precision_key, tensorrt=True))
+    missing = [
+        path
+        for path in expected
+        if str(path or "").strip() and not os.path.isfile(path)
+    ]
+    if not missing:
+        return
+
+    script = os.path.abspath(
+        os.path.join(
+            os.path.dirname(_HERE),
+            "scripts",
+            "quantize",
+            "split_tensorrt_sources.py",
+        )
+    )
+    if not os.path.isfile(script):
+        print(
+            "[tensorrt] default TensorRT source files are missing, but "
+            f"the split script was not found: {script}",
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        "[tensorrt] preparing missing default TensorRT source checkpoint(s): "
+        f"{len(missing)}",
+        flush=True,
+    )
+    subprocess.run(
+        [sys.executable, "-u", script, "--missing-only"],
+        cwd=os.path.dirname(_HERE),
+        check=False,
+    )
+
+
 def _engine_tag_suffix() -> str:
     tag = str(os.environ.get("HDRTVNET_TRT_ENGINE_TAG", "")).strip()
     if not tag:
@@ -166,7 +213,7 @@ def main() -> int:
     parser.add_argument(
         "--hg-weights",
         default=None,
-        help="Path to original/HG.pt or distilled HG weights (overrides default path).",
+        help="Path to original/HG.pt or a TensorRT HG source checkpoint (overrides default path).",
     )
     parser.add_argument(
         "--predequantize",
@@ -302,6 +349,8 @@ def main() -> int:
         if gui_precision_key
         else default_model
     )
+    if not args.model:
+        _ensure_default_tensorrt_sources(gui_precision_key, use_hg)
     model_path = os.path.abspath(args.model or selected_model)
     selected_hg_weights = args.hg_weights
     if use_hg and not selected_hg_weights and gui_precision_key:

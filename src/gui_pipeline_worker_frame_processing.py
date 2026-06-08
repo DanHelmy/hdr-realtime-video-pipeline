@@ -8,6 +8,7 @@ import time
 import torch
 import torch.nn.functional as F
 
+from gui_config import VIDEO_PLAYBACK_PRESERVE_ORDER
 from gui_scaling import BEST_CV2_INTERP, _letterbox_bgr, _apply_upscale_sharpen
 from timer import sleep_until
 
@@ -42,10 +43,7 @@ class PipelineWorkerFrameProcessingMixin:
     def _preserve_display_queue_order(self) -> bool:
         if getattr(self, "_capture_target", None):
             return False
-        try:
-            return int(getattr(self, "_video_playback_buffer_frames", 1)) > 1
-        except Exception:
-            return False
+        return bool(VIDEO_PLAYBACK_PRESERVE_ORDER)
 
     def _queue_display_item(self, q: _queue.Queue | None, item) -> None:
         if q is None:

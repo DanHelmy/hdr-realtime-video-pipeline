@@ -55,10 +55,10 @@ Core updates include:
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
-- NVIDIA runtime now defaults to quant-friendly TensorRT ModelOpt Torch builds from self-describing HR/ACGM/LE/HG source checkpoints; mixed presets use the current active-compute Q/DQ recipe, while Full INT8 forces all ModelOpt Torch quantizers
-- normal `FP16` / `FP32` now use the quant-friendly distilled HR/HG architecture; untouched original HR/HG checkpoints remain reference assets for manual experiments
-- current RTX 5060 Ti 1080p TensorRT stress checks after the mixed-Q/DQ stability refresh: no-HG FP16 `38.10 ms` / Mixed PTQ `28.94 ms` / Mixed QAT `29.04 ms`; HG FP16 `38.35 ms` / Mixed QAT `31.56 ms`
-- final 1080p mpv playback check on the Daredevil stress clip: FP32 `93.90 ms`, FP16 `39.97 ms`, Mixed QAT `30.82 ms`, Full QAT `30.47 ms`
+- NVIDIA runtime now defaults to original HR/ACGM/LE/HG TensorRT ModelOpt Torch builds; mixed presets use the stable active-compute Q/DQ recipe, while Full INT8 forces all ModelOpt Torch quantizers
+- normal `FP16` / `FP32` use the original HR/HR+HG checkpoints; INT8 PTQ/QAT/QAT Film use matching original eager and TensorRT source checkpoints
+- current RTX 5060 Ti 1080p TensorRT/mpv stress checks: no-HG FP16 `39.68 ms`, Mixed QAT `30.36 ms`, Full QAT `29.55 ms`; HG FP16 `77.96 ms`, Mixed QAT `69.21 ms`, Full QAT `57.56 ms`
+- the final TensorRT sweep did not find a stable 25-28 ms mixed path; more aggressive AGCM quantization was faster by less than a millisecond but failed visual/temporal rolloff checks, so the stable LE/HG recipe remains the shipped mixed baseline. On the current RTX 5060 Ti HG path, strict Full QAT is the fastest INT8 preset while Mixed QAT remains the protected lower-risk composition.
 - Full INT8 verifies the strict checkpoint contract: no-HG `120` W8A8 layers and HG `130` W8A8 layers, with no W8A16 or FP16 fallback layers in the checkpoint composition
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants trained for the same TensorRT composition used at deployment
 - unsupported extra low-precision experiment presets and builder paths have been removed; the supported NVIDIA deployment surface is FP16/FP32 plus INT8 PTQ/QAT/QAT Film
@@ -695,7 +695,7 @@ INT8 TensorRT modes include a versioned ModelOpt Torch/QDQ suffix in the mode po
 
 If the engine is missing, the app loads the selected `.pt` model, exports a temporary ONNX file with the same model/resolution/mode stem, builds a TensorRT engine, saves it, removes the ONNX file, and then runs inference through that engine. Later runs load the `.engine` directly when the cached engine metadata still matches the model, resolution, precision, mode, TensorRT export settings, and CUDA device fingerprint.
 
-Checkpoint source selection is preset-driven. FP32/FP16 modes use `src/models/weights/distilled/hr/HR_qfriendly_selectsft1235_fp32.pt` plus `src/models/weights/distilled/hg/HG_qfriendly_directh16_fp32.pt` when HG is enabled. INT8 no-HG modes use the matching TensorRT source under `distilled/hr`; INT8 HG modes use the HR source split from the exact HR+HG composite under `distilled/hr_hg` plus the matching HG source under `distilled/hg`. Untouched original HR/HG checkpoints are kept under `src/models/weights/original/` as reference/manual-experiment assets; they stay hidden from normal precision, benchmark, and compare lists, and are reached only through `Tools -> Use Original HR/HR+HG Model ...`, `--checkpoint-family original`, or explicit CLI `--model` / `--hg-weights` paths. The Google Drive HG asset can stay named `HG.pt`; the GUI saves it locally as `src/models/weights/original/HG.pt`. When the hidden original path is accepted on NVIDIA and the ignored original TensorRT HG source files are missing, the GUI shows a progress dialog and regenerates those local source files from `original/pytorch_int8`.
+Checkpoint source selection is preset-driven. FP32/FP16 modes use `src/models/weights/original/HR.pt` plus `src/models/weights/original/HG.pt` when HG is enabled. INT8 no-HG modes use matching TensorRT source checkpoints under `src/models/weights/original/tensorrt/hr`; INT8 HG modes use the HR source split from the exact HR+HG composite under `original/tensorrt/hr_hg` plus the matching HG source under `original/tensorrt/hg`. The Google Drive HG asset can stay named `HG.pt`; the GUI saves it locally as `src/models/weights/original/HG.pt`. The large original HG TensorRT source files are intentionally not tracked by Git, so the first NVIDIA INT8+HG activation can show a modal preparation dialog and regenerate those local files from `src/models/weights/original/pytorch_int8` before building the engine.
 
 TensorRT engines are not universal binaries. The same checkpoint and command can be run on other TensorRT-capable NVIDIA GPUs, but each machine should build its own `.engine` because TensorRT chooses tactics for the local GPU architecture, driver, TensorRT version, workspace, and timing cache. Tensor Core GPUs normally benefit most from FP16/INT8. Older or non-Tensor-Core NVIDIA GPUs may still build through TensorRT, but INT8 speedups are not guaranteed and TensorRT may choose DP4A, FP16, or FP32 tactics depending on what the hardware supports. Non-NVIDIA GPUs do not use TensorRT; AMD/CPU use the PyTorch path.
 
@@ -740,8 +740,8 @@ $VIDEO="D:\path\to\your_sdr_video.mkv"
 One-line 1080p mpv playback commands:
 
 ```powershell
-.\venv\Scripts\python.exe src\cli_playback_benchmark.py --checkpoint-family original --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv
-.\venv\Scripts\python.exe src\cli_playback_benchmark.py --checkpoint-family distilled --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_distilled_mpv
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_hg
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_nohg
 ```
 
 Use `--use-hg 0` to benchmark HR/no-HG. Add `2560x1440` or `3840x2160` after `--resolutions` when the source video is at least that large. The script writes GUI-style playback logs under the selected `--out-root` and includes mpv display/feed cost in `render_ms` and total latency.
@@ -879,7 +879,7 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 - Pre-allocated GPU tensor buffers (zero per-frame allocation)
 - Pinned (page-locked) host memory for async H2D/D2H DMA transfers
 - `torch.inference_mode()` throughout
-- NVIDIA TensorRT engines built on demand and cached per model/resolution/mode; default INT8 uses quant-friendly ModelOpt Torch Q/DQ builds, with legacy native-implicit INT8 calibration-cache support kept for experiments
+- NVIDIA TensorRT engines built on demand and cached per model/resolution/mode; default INT8 uses original-family ModelOpt Torch Q/DQ builds, with legacy native-implicit INT8 calibration-cache support kept for experiments
 - AMD PyTorch tensors use contiguous memory format by default, with channels-last available as an opt-in test
 - Async video prefetch queue
 - mpv fast path: skips GPU→CPU postprocess when mpv handles HDR display
@@ -888,16 +888,16 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 
 | Mode | Description | Compression |
 |---|---|---|
-| **FP16** | Half-precision quant-friendly distilled HR/HG path | — |
-| **FP32** | Full-precision quant-friendly distilled HR/HG path | — |
+| **FP16** | Half-precision original HR/HG path | — |
+| **FP32** | Full-precision original HR/HG path | — |
 | **INT8 Full (PTQ)** | W8A8 quantization (HG optional) | strict full-INT8 baseline |
-| **INT8 Full (QAT)** | W8A8 + quantization-aware fine-tuning (HG optional) | faster than FP16 on the current RTX 5060 Ti check, slower than Mixed |
+| **INT8 Full (QAT)** | W8A8 + quantization-aware fine-tuning (HG optional) | faster than FP16 on the current RTX 5060 Ti check; currently fastest for HG on this GPU |
 | **INT8 Full (QAT) (Film)** | W8A8 + movie-accuracy QAT with stronger FP32/HDR anchoring (HG optional) | movie-tuned strict full-INT8 baseline |
-| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16/FP16-sensitive layers (HG optional) | fastest deployable INT8 family varies by GPU |
+| **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16/FP16-sensitive layers (HG optional) | protected mixed INT8 family; fastest deployable preset varies by GPU |
 | **INT8 Mixed (QAT)** | Mixed W8A8/W8A16/FP16-sensitive layers + quantization-aware fine-tuning (HG optional) | current default NVIDIA preset |
 | **INT8 Mixed (QAT) (Film)** | Mixed movie-accuracy QAT with protected tone-control paths (HG optional) | optional movie-domain INT8 preset |
 
-The app includes ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints. On NVIDIA, these presets route through self-describing quant-friendly TensorRT source checkpoints (`HR_qfriendly_*` / `HG_qfriendly_*`) so the engine builder can recreate the HR/ACGM/LE/HG architecture without relying on environment overrides. The Film variants are separate deployable checkpoints rather than runtime color presets.
+The app includes ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints. On NVIDIA, these presets route through self-describing original-family TensorRT source checkpoints under `src/models/weights/original/tensorrt` so the engine builder can recreate the HR/ACGM/LE/HG architecture without relying on environment overrides. The Film variants are separate deployable checkpoints rather than runtime color presets.
 
 ### Checkpoint Selection Guide
 
@@ -905,8 +905,8 @@ There is no single checkpoint that is best for every device, movie, and metric. 
 
 | Preset | Recommended use |
 |---|---|
-| **FP32** | Quant-friendly full-precision reference / teacher / debugging path. It is useful for comparisons and QAT anchoring, but is usually not the practical deployment choice once FP16 or INT8 variants match its quality. |
-| **FP16** | Quant-friendly half-precision fallback when TensorRT INT8 is unavailable or when maximum compatibility is more important than checkpoint size. |
+| **FP32** | Original full-precision reference / teacher / debugging path. It is useful for comparisons and QAT anchoring, but is usually not the practical deployment choice once FP16 or INT8 variants match its quality. |
+| **FP16** | Original half-precision fallback when TensorRT INT8 is unavailable or when maximum compatibility is more important than checkpoint size. |
 | **INT8 Mixed (QAT)** | Current default NVIDIA preset. Mixed precision protects sensitive tone/control layers while QAT recovers accuracy, making it the preferred non-Film INT8 deployment candidate. |
 | **INT8 Full (PTQ)** | Fully quantized W8A8 baseline. It can sometimes score surprisingly well because PTQ clipping/precision loss acts like an implicit regularizer, but that behavior is accidental and not directly controllable. |
 | **INT8 Full (QAT) / QAT (Film)** | Most moldable INT8 path. Full W8A8 gives QAT more low-bit behavior to reshape, so these variants can be useful when a specific dataset or movie-domain look is preferred. |
@@ -916,9 +916,9 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, the selected INT8 preset maps to a quant-friendly TensorRT source checkpoint. No-HG uses `src/models/weights/distilled/hr`; HG uses the composite-split HR source in `src/models/weights/distilled/hr_hg` plus the matching HG source in `src/models/weights/distilled/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). No-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Both use KL-divergence scoring with an `8.25` effective-bit target and enable output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/pytorch_int8/hr` and `src/models/weights/pytorch_int8/hg`.
+On NVIDIA, the selected INT8 preset maps to an original-family TensorRT source checkpoint. No-HG uses `src/models/weights/original/tensorrt/hr`; HG uses the composite-split HR source in `src/models/weights/original/tensorrt/hr_hg` plus the matching HG source in `src/models/weights/original/tensorrt/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). No-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Both use KL-divergence scoring with an `8.25` effective-bit target and enable output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/original/pytorch_int8/hr` and `src/models/weights/original/pytorch_int8/hg`.
 
-The default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly. Quant-friendly HR/ACGM/LE and HR+HG engines export as single-input graphs when the condition path is structurally unused, reducing runtime binding overhead and avoiding stale condition-tensor metadata.
+The default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly.
 
 For the legacy native-implicit INT8 path (`HDRTVNET_TRT_INT8_MODELOPT=0`), calibration still uses SDR/source inputs that match deployment content, not HDR targets. CLI and matrix tools accept `--trt-calibration-dataset` / `--calibration-dataset` for image directories, single images, or text manifests, plus `--trt-calibration-cache` / `--calibration-cache` for a prebuilt TensorRT cache. If no cache or dataset is provided, CLI playback can calibrate from the current video for first-time local engine builds.
 
@@ -952,11 +952,11 @@ python src/main.py --precision fp32
 # NVIDIA default fast path: TensorRT INT8 Mixed QAT no-HG
 python src/main.py --precision int8-mixed --use-hg 0
 
-# NVIDIA HR+HG distilled path
+# NVIDIA HR+HG path
 python src/main.py --precision int8-mixed --use-hg 1
 
 # AMD/CPU eager INT8 checkpoint path
-python src/main.py --precision int8-mixed --model src/models/weights/pytorch_int8/hr/HR_int8_mixed_qat.pt --use-hg 0
+python src/main.py --precision int8-mixed --model src/models/weights/original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt --use-hg 0
 
 # Headless benchmark
 python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 360 --model-stage-timing
@@ -978,11 +978,11 @@ Example from the repo root, using the mpv display path and logging 3 minutes per
 .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "path\to\video.mp4" --resolutions 1280x720 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat int8-mixed-qat-film int8-full-qat-film --duration-s 180 --warmup-frames 120 --sample-interval 120 --use-hg 0 --compile-mode max-autotune --display
 ```
 
-One-line NVIDIA mpv comparisons for the current distilled and original HR+HG families:
+One-line NVIDIA mpv comparisons for the original HR+HG and HR/no-HG paths:
 
 ```powershell
-$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_distilled_mpv
-$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --checkpoint-family original --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv
+$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_hg
+$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_nohg
 ```
 
 `--display` uses the embedded mpv HDR path by default, including the raw RGB48LE feed/display cost in `render_ms` and total frame latency. The CLI prepends the repo `src/` folder to the Windows DLL search path so `src/libmpv-2.dll` is found the same way the GUI finds it. If mpv is unavailable or you explicitly want the older OpenCV display path, add:
@@ -998,9 +998,8 @@ Useful flags:
 | `--video PATH` | Video to benchmark; required |
 | `--resolutions WxH ...` | Processing resolutions, e.g. `1280x720 1920x1080` |
 | `--runs ...` | Presets: `fp32`, `fp16`, `int8-mixed-ptq`, `int8-full-ptq`, `int8-mixed-qat`, `int8-full-qat`, `int8-mixed-qat-film`, `int8-full-qat-film` |
-| `--checkpoint-family distilled\|original` | Checkpoint family to benchmark. `distilled` is the quant-friendly default; `original` uses untouched HR/HG plus matching original INT8 files. |
 | `--model PATH` | HR/model checkpoint override for all selected runs |
-| `--hg-weights PATH` | HG checkpoint override; use with `--model` for original HR/HG playback benchmarks |
+| `--hg-weights PATH` | HG checkpoint override; use with `--model` for custom HR/HG playback benchmarks |
 | `--duration-s N` | Timed duration per run after warmup |
 | `--warmup-frames N` | Frames skipped before logging stats |
 | `--sample-interval N` | Timed frames between console/log samples |
@@ -1013,7 +1012,7 @@ Useful flags:
 
 | Flag | Description |
 |---|---|
-| `--model PATH` | Model weights path (default: `src/models/weights/distilled/hr/HR_qfriendly_selectsft1235_fp32.pt`) |
+| `--model PATH` | Model weights path (default: `src/models/weights/original/HR.pt`) |
 | `--device auto\|cuda\|cpu` | Device selection (default: auto) |
 | `--precision auto\|fp16\|fp32\|int8-full\|int8-mixed` | Inference precision (default: auto → fp16 on GPU) |
 | `--compile-mode auto\|default\|reduce-overhead\|max-autotune\|max-autotune-no-cudagraphs` | PyTorch backend only; torch.compile mode (auto = max-autotune) |
@@ -1054,15 +1053,11 @@ The repo uses one naming scheme for all shipped `.pt` weights:
 |---|---|
 | `src/models/weights/original/HR.pt` | untouched upstream HR/ACGM/LE checkpoint |
 | `src/models/weights/original/HG.pt` | untouched upstream HG checkpoint, downloaded by setup because it is too large for normal git tracking |
-| `src/models/weights/distilled/hr/*.pt` | quant-friendly standalone HR/no-HG TensorRT/FP source checkpoints |
-| `src/models/weights/distilled/hr_hg/*.pt` | quant-friendly HR source split from the exact HR+HG composite INT8 checkpoint |
-| `src/models/weights/distilled/hg/*.pt` | quant-friendly HG TensorRT/FP source checkpoints |
-| `src/models/weights/pytorch_int8/hr/*.pt` | quant-friendly eager PyTorch/AMD HR-only deploy checkpoints |
-| `src/models/weights/pytorch_int8/hg/*.pt` | quant-friendly eager PyTorch/AMD HR+HG deploy checkpoints |
-| `src/models/weights/original/pytorch_int8/*/*.pt` | untouched original eager PyTorch/AMD INT8 checkpoints |
-| `src/models/weights/original/tensorrt/hr/*.pt` | untouched original standalone HR/no-HG TensorRT source checkpoints |
-| `src/models/weights/original/tensorrt/hr_hg/*.pt` | untouched original HR source split from the exact original HR+HG composite INT8 checkpoint |
-| `src/models/weights/original/tensorrt/hg/*.pt` | untouched original HG TensorRT source checkpoints; these are over 100 MB and stay ignored/release-local |
+| `src/models/weights/original/pytorch_int8/hr/*.pt` | original HR/no-HG eager INT8 checkpoints for AMD/CPU/PyTorch |
+| `src/models/weights/original/pytorch_int8/hg/*.pt` | original HR+HG eager INT8 checkpoints for AMD/CPU/PyTorch |
+| `src/models/weights/original/tensorrt/hr/*.pt` | original standalone HR/no-HG TensorRT source checkpoints |
+| `src/models/weights/original/tensorrt/hr_hg/*.pt` | original HR source split from the exact HR+HG composite INT8 checkpoint |
+| `src/models/weights/original/tensorrt/hg/*.pt` | original HG TensorRT source checkpoints; generated locally and ignored because they exceed normal GitHub file-size limits |
 
 `hr` means HR/ACGM/LE only. `hg` means the eager deploy checkpoint contains the combined HR+HG PyTorch path. TensorRT keeps HR and HG source checkpoints split so the builder can load HR and, only when `--use-hg 1`, load the matching HG source separately. `hr_hg` is the HR half of the composite checkpoint; it exists because the standalone HR checkpoint and the HR part of the HR+HG checkpoint can differ after PTQ/QAT.
 
@@ -1071,59 +1066,51 @@ The repo uses one naming scheme for all shipped `.pt` weights:
 The GUI and CLI precision preset picks three paths:
 
 - `model`: eager PyTorch deploy checkpoint, used on AMD/CPU and as the fallback identity for the preset
-- `trt_model`: TensorRT HR source checkpoint under `distilled/hr` for no-HG or `distilled/hr_hg` for HG
-- `trt_hg_weights`: optional TensorRT HG source checkpoint under `distilled/hg`
+- `trt_model`: TensorRT HR source checkpoint under `original/tensorrt/hr` for no-HG or `original/tensorrt/hr_hg` for HG
+- `trt_hg_weights`: optional TensorRT HG source checkpoint under `original/tensorrt/hg`
 
 On NVIDIA, the TensorRT builder uses `trt_model`, the current resolution, precision, and HG toggle to export a temporary ONNX and cache an `.engine` under `src/models/engines/`. PTQ, QAT, and QAT Film are separate source checkpoints. Mixed INT8 uses the selected mixed mask; Full INT8 is the strict contract path and forces all ModelOpt Torch quantizers on.
 
-The distilled FP32 source checkpoint is the selective-SFT quant-friendly HR model. It keeps HR/ACGM/LE behavior close to the untouched original, but removes the worst TensorRT fragmentation by retaining only the SFT/control stages that carried the teacher match. FP32/FP16, PTQ, QAT, and QAT Film all use the same HR/HG layer composition so PyTorch eager checkpoints and TensorRT source checkpoints describe the same model family.
-
-### Distilled/Q-Friendly Base Recipe
-
-The default shipped model is still HDRTVNet++ in function: HR/ACGM/LE maps SDR to HDR and optional HG refines highlights. The deployment architecture is streamlined for TensorRT fusion:
-
-- AGCM uses the original-style `color_condition` conditioning path
-- LE uses selective SFT stage coverage through `selectsft1235`
-- HG uses `directh16wide64x8`
-- there is no extra post-correction head in the shipped FP32 source
-- tensor-side highlight stabilizers/export cleanup passes are disabled; visual stability comes from the model/checkpoints, not a runtime patch layer
-
-The selected FP32 base was chosen by testing quant-friendly graph families, then pulling the best selective-SFT candidate back toward the untouched original HR+HG teacher instead of chasing the smallest possible model. AGCM and LE are trainable; the original HR+HG checkpoint stays the teacher; HDRTV1K provides the target/monitor pairs. This pass used all `1235` HDRTV1K train pairs and all `117` held-out test pairs. It promoted `HR_selectsft1235_teacher_mse_all_from_trunk4_lr1e7_directhg.pt` to the shipped `HR_qfriendly_selectsft1235_fp32.pt` after OpenCV/movie smoke checks on logos, title cards, bright skies, flat bright surfaces, saturated colors, and bright edges.
+If the selected INT8+HG TensorRT HG source is missing, the GUI asks before generating it locally. The same preparation can be run from the terminal:
 
 ```powershell
-.\venv\Scripts\python.exe scripts\models\train_distilled_post_correction.py --classifier color_condition --le-arch selectsft1235 --post-correction none --base-checkpoint src\models\weights\experiments\HR_selectsft1235_teacher_mse_trunk4_refit512_lr5e7.pt --hg-checkpoint src\models\weights\distilled\hg\HG_qfriendly_directh16_fp32.pt --teacher-base src\models\weights\original\HR.pt --teacher-hg src\models\weights\original\HG.pt --train-patterns base.AGCM.,base.LE. --train-sdr-dir dataset\train_sdr --train-hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-train-images 0 --max-val-images 117 --max-long-edge 720 --val-max-long-edge 720 --crop-size 384 --batch-size 4 --epochs 1 --lr 1e-7 --target-weight 0.10 --mse-weight 4.0 --luma-weight 0.05 --chroma-weight 0.02 --gradient-weight 0.0 --teacher-weight 0.05 --teacher-luma-weight 0.2 --teacher-mse-weight 30.0 --hg-loss-weight 0.35 --score-metric teacher_hg_match_psnr --monitor-hg --amp --output src\models\weights\experiments\HR_selectsft1235_teacher_mse_all_from_trunk4_lr1e7_directhg.pt
-Copy-Item src\models\weights\experiments\HR_selectsft1235_teacher_mse_all_from_trunk4_lr1e7_directhg.pt src\models\weights\distilled\hr\HR_qfriendly_selectsft1235_fp32.pt -Force
+.\venv\Scripts\python.exe scripts\quantize\split_tensorrt_sources.py --missing-only
 ```
 
-After changing the FP32 base, rebuild PTQ/QAT eager checkpoints, then run `scripts\quantize\split_distilled_tensorrt_sources.py` so PyTorch eager and TensorRT source checkpoints describe the same layers.
+### Mixed And Full Composition
 
-Behavior checks before INT8 regeneration:
+Mixed INT8 is an explicit W8A8 layer recipe recovered from the original checkpoint metadata and then stress-tested on video. The W8A8 files list the layers that run as W8A8; unlisted quantizable layers stay W8A16 unless the checkpoint metadata keeps them FP16. AGCM stays out of the shipped mixed recipe because aggressive AGCM quantization caused visible rolloff/flicker without a useful speed win.
 
-| Path | Student vs original teacher |
-|---|---|
-| HR/no-HG FP16, `117` HDRTV1K test frames at 720 long edge | `53.95 dB` average PSNR, `41.70 dB` minimum |
-| HR+HG FP16, `117` HDRTV1K test frames at 720 long edge | `51.88 dB` average PSNR, `35.55 dB` minimum |
-| HR/no-HG TensorRT Mixed QAT movie smoke, Dredd + Spider-Man at 1080p | `39.19 dB` average PSNR vs original teacher |
-| HR+HG TensorRT Mixed QAT movie smoke, Dredd + Spider-Man at 1080p | `38.84 dB` average PSNR vs original teacher |
+| Mode | W8A8 file | Composition |
+|---|---|---|
+| HR/no-HG | `configs/qat_layouts/original_nohg_mixed_w8a8.txt` | 29 W8A8, 78 W8A16, 21 FP16 |
+| HR+HG | `configs/qat_layouts/original_hg_composite_mixed_w8a8.txt` | 51 W8A8, 74 W8A16, 24 FP16 |
 
-Regenerate TensorRT sources after replacing eager INT8 checkpoints:
-
-```powershell
-.\venv\Scripts\python.exe scripts\quantize\split_distilled_tensorrt_sources.py
+```text
+HR/no-HG include: LE-heavy layers from original_nohg_mixed_w8a8.txt
+HR+HG include:    base.LE-heavy layers plus stable HG layers from original_hg_composite_mixed_w8a8.txt
+TensorRT policy:  KL-divergence, effective bits 8.25, active output quantizers only
 ```
 
-That command also regenerates original-family TensorRT sources when `src\models\weights\original\pytorch_int8` is present. The generated `original\tensorrt\hg` files are local/release assets because each original HG source is over the normal GitHub file-size limit.
+Full INT8 is not a mask: Full means every quantizable conv/linear in that checkpoint family is W8A8, even if it is slower or less visually stable than Mixed. Full remains the strict baseline.
 
 ### Rebuild PTQ Checkpoints
 
-Default `--use-hg 1` writes to `pytorch_int8/hg/HR_HG_*.pt`. Passing `--use-hg 0` writes to `pytorch_int8/hr/HR_*.pt` unless you override `--output`. PTQ uses the same `1235` HDRTV1K SDR calibration images (`--num-calibrate 0`) for every checkpoint family.
+PTQ uses the same HDRTV1K SDR calibration images (`--num-calibrate 0` means all available training images) for every checkpoint family.
 
 ```powershell
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed.py --model src\models\weights\distilled\hr\HR_qfriendly_selectsft1235_fp32.pt --hg-weights src\models\weights\distilled\hg\HG_qfriendly_directh16_fp32.pt --output src\models\weights\pytorch_int8\hg\HR_HG_int8_mixed.pt --use-hg 1 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16 --layer-selection manual --w8a8-layers-file configs\qat_layouts\selectsft1235_hg_mixed_w8a8.txt --protect-agcm-controls 0 --protect-sft-controls 0 --fp16-sensitive-layers 0
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed.py --model src\models\weights\distilled\hr\HR_qfriendly_selectsft1235_fp32.pt --output src\models\weights\pytorch_int8\hr\HR_int8_mixed.pt --use-hg 0 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16 --layer-selection manual --w8a8-layers-file configs\qat_layouts\selectsft1235_nohg_mixed_w8a8.txt --protect-agcm-controls 0 --protect-sft-controls 0 --fp16-sensitive-layers 0
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed.py --model src\models\weights\original\HR.pt --hg-weights src\models\weights\original\HG.pt --output src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_mixed.pt --use-hg 1 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16 --layer-selection manual --w8a8-layers-file configs\qat_layouts\original_hg_composite_mixed_w8a8.txt
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed.py --model src\models\weights\original\HR.pt --output src\models\weights\original\pytorch_int8\hr\HR_original_int8_mixed.pt --use-hg 0 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16 --layer-selection manual --w8a8-layers-file configs\qat_layouts\original_nohg_mixed_w8a8.txt
 
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full.py --model src\models\weights\distilled\hr\HR_qfriendly_selectsft1235_fp32.pt --hg-weights src\models\weights\distilled\hg\HG_qfriendly_directh16_fp32.pt --output src\models\weights\pytorch_int8\hg\HR_HG_int8_full.pt --use-hg 1 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full.py --model src\models\weights\distilled\hr\HR_qfriendly_selectsft1235_fp32.pt --output src\models\weights\pytorch_int8\hr\HR_int8_full.pt --use-hg 0 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full.py --model src\models\weights\original\HR.pt --hg-weights src\models\weights\original\HG.pt --output src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_full.pt --use-hg 1 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full.py --model src\models\weights\original\HR.pt --output src\models\weights\original\pytorch_int8\hr\HR_original_int8_full.pt --use-hg 0 --device cuda --calibration-device cuda --calibration-dir dataset\train_sdr --num-calibrate 0 --num-validate 16
+```
+
+After replacing eager INT8 checkpoints, regenerate TensorRT sources and validate parity:
+
+```powershell
+.\venv\Scripts\python.exe scripts\quantize\split_tensorrt_sources.py
+.\venv\Scripts\python.exe scripts\validate_tensorrt_sources.py --skip-onnx --resolution 128x128
 ```
 
 ### Rebuild QAT Checkpoints
@@ -1132,63 +1119,32 @@ QAT optimizes toward FP32/HDR accuracy. QAT Film uses the same quantized composi
 
 The QAT recipes expect paired SDR/HDR data staged locally as `dataset/train_sdr`, `dataset/train_hdr`, `dataset/test_sdr`, and `dataset/test_hdr`. These recipes use HDRTV1K by `chxy95`: [huggingface.co/datasets/chxy95/HDRTV1K](https://huggingface.co/datasets/chxy95/HDRTV1K). Follow the dataset page terms when downloading or redistributing the data.
 
-Mixed INT8 is an explicit W8A8 layer recipe:
-
-| Family | Mode | W8A8 file | Composition |
-|---|---|---|---|
-| Distilled/q-friendly | HR/no-HG | `configs/qat_layouts/selectsft1235_nohg_mixed_w8a8.txt` | 104 W8A8, 1 W8A16 (`LE.conv_last`), AGCM FP16 |
-| Distilled/q-friendly | HR+HG | `configs/qat_layouts/selectsft1235_hg_mixed_w8a8.txt` | 113 W8A8, 2 W8A16 (`base.LE.conv_last`, `hg.low_out`), AGCM FP16 |
-| Original | HR/no-HG | `configs/qat_layouts/original_nohg_mixed_w8a8.txt` | 29 W8A8, 78 W8A16, 21 FP16 |
-| Original | HR+HG | `configs/qat_layouts/original_hg_composite_mixed_w8a8.txt` | 51 W8A8, 74 W8A16, 24 FP16 |
-
-The distilled mixed path was selected from the fastest stable TensorRT layout that preserved the original-like output: quantize the LE trunk and HG refinement, keep the final RGB output projections in W8A16, and leave AGCM in FP16. Keeping AGCM out of mixed mode avoided the Daredevil opening-card flicker/highlight rolloff regression while preserving the 1080p TensorRT speed win.
-
-```text
-HR/no-HG include: LE
-HR/no-HG exit:    LE.conv_last -> W8A16
-HR+HG include:    base.LE, hg
-HR+HG exits:      base.LE.conv_last, hg.low_out -> W8A16
-```
-
-Original mixed remains the legacy original-family sensitivity/protection sweep. Full INT8 is not a mask: Full means every quantizable conv/linear in that checkpoint family is W8A8, even if it is slower than Mixed.
-
-When inspecting TensorRT logs, W8A16 layers may not appear as enabled Q/DQ quantizers because they keep FP16 activations. The full mixed recipe is still the table above; TensorRT speed coverage is mostly the W8A8 subset.
-
 QAT defaults:
 
 | Variant | Main settings |
 |---|---|
 | Mixed QAT | `1235` HDRTV1K train pairs, `epochs=10`, `lr=2e-6`, `crop-size=384`, `batch-size=1`, `max-long-edge=720`, `teacher-source=fp32`, `monitor-score=hybrid`, `teacher-loss-weight=0.68`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`, `protect-agcm-controls=0`, `protect-sft-controls=0`, `fp16-sensitive-layers=0`, `early-stop-patience=4` |
 | Full QAT | `1235` HDRTV1K train pairs, `epochs=6`, `lr=1.5e-6`, `max-long-edge=720`, `teacher-source=fp32`, `teacher-loss-weight=0.65`, `highlight-teacher-weight=0.35`, `dark-teacher-weight=0.34`, `freeze-sensitive-layers=0`, `freeze-sft-controls=0`, `early-stop-patience=3` |
-| Mixed QAT Film | same Mixed composition, movie-teacher replay data, `max-long-edge=960`, `197` train frames plus `35` hard validation frames, `teacher-loss-weight=0.72`, `teacher-luma-weight=0.12`, `teacher-chroma-weight=0.07`, `highlight-teacher-weight=0.40`, `dark-teacher-weight=0.38`, and source-chroma/source-shadow auxiliary weights set to `0` |
-| Full QAT Film | same Full composition, movie-teacher replay data, `max-long-edge=960`, `197` train frames plus `35` hard validation frames, `lr=2e-6`, `teacher-loss-weight=0.70`, `teacher-luma-weight=0.11`, `teacher-chroma-weight=0.065`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`, and source-chroma/source-shadow auxiliary weights set to `0` |
-
-For original-family QAT, use the same recipe with `src\models\weights\original\pytorch_int8\...` input/output paths. After replacing eager INT8 checkpoints, regenerate TensorRT sources and validate parity:
+| Mixed QAT Film | same Mixed composition, movie-teacher replay data, `max-long-edge=960`, `teacher-loss-weight=0.72`, `teacher-luma-weight=0.12`, `teacher-chroma-weight=0.07`, `highlight-teacher-weight=0.40`, `dark-teacher-weight=0.38`, and source-chroma/source-shadow auxiliary weights set to `0` |
+| Full QAT Film | same Full composition, movie-teacher replay data, `max-long-edge=960`, `lr=2e-6`, `teacher-loss-weight=0.70`, `teacher-luma-weight=0.11`, `teacher-chroma-weight=0.065`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`, and source-chroma/source-shadow auxiliary weights set to `0` |
 
 ```powershell
-.\venv\Scripts\python.exe scripts\quantize\split_distilled_tensorrt_sources.py
-.\venv\Scripts\python.exe scripts\validate_tensorrt_sources.py --skip-onnx --resolution 128x128
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed_qat.py --device cuda --ptq-checkpoint src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_mixed.pt --output src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_mixed_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 10 --lr 2e-6 --teacher-loss-weight 0.68 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.38 --dark-teacher-weight 0.36 --early-stop-patience 4
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed_qat.py --use-hg 0 --device cuda --ptq-checkpoint src\models\weights\original\pytorch_int8\hr\HR_original_int8_mixed.pt --output src\models\weights\original\pytorch_int8\hr\HR_original_int8_mixed_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 10 --lr 2e-6 --teacher-loss-weight 0.68 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.38 --dark-teacher-weight 0.36 --early-stop-patience 4
+
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full_qat.py --device cuda --ptq-checkpoint src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_full.pt --output src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_full_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 6 --lr 1.5e-6 --teacher-loss-weight 0.65 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.35 --dark-teacher-weight 0.34 --early-stop-patience 3
+.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full_qat.py --use-hg 0 --device cuda --ptq-checkpoint src\models\weights\original\pytorch_int8\hr\HR_original_int8_full.pt --output src\models\weights\original\pytorch_int8\hr\HR_original_int8_full_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 6 --lr 1.5e-6 --teacher-loss-weight 0.65 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.35 --dark-teacher-weight 0.34 --early-stop-patience 3
 ```
 
-The quick-sync target is `metadata=True pt_exact=True` for every source checkpoint.
-
-```powershell
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed_qat.py --device cuda --ptq-checkpoint src\models\weights\pytorch_int8\hg\HR_HG_int8_mixed.pt --output src\models\weights\pytorch_int8\hg\HR_HG_int8_mixed_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 10 --lr 2e-6 --teacher-loss-weight 0.68 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.38 --dark-teacher-weight 0.36 --protect-agcm-controls 0 --protect-sft-controls 0 --fp16-sensitive-layers 0 --early-stop-patience 4
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed_qat.py --use-hg 0 --device cuda --ptq-checkpoint src\models\weights\pytorch_int8\hr\HR_int8_mixed.pt --output src\models\weights\pytorch_int8\hr\HR_int8_mixed_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 10 --lr 2e-6 --teacher-loss-weight 0.68 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.38 --dark-teacher-weight 0.36 --protect-agcm-controls 0 --protect-sft-controls 0 --fp16-sensitive-layers 0 --early-stop-patience 4
-
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full_qat.py --device cuda --ptq-checkpoint src\models\weights\pytorch_int8\hg\HR_HG_int8_full.pt --output src\models\weights\pytorch_int8\hg\HR_HG_int8_full_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 6 --lr 1.5e-6 --teacher-loss-weight 0.65 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.35 --dark-teacher-weight 0.34 --freeze-sensitive-layers 0 --freeze-sft-controls 0 --early-stop-patience 3
-.\venv\Scripts\python.exe scripts\quantize\quantize_int8_full_qat.py --use-hg 0 --device cuda --ptq-checkpoint src\models\weights\pytorch_int8\hr\HR_int8_full.pt --output src\models\weights\pytorch_int8\hr\HR_int8_full_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 6 --lr 1.5e-6 --teacher-loss-weight 0.65 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.35 --dark-teacher-weight 0.34 --freeze-sensitive-layers 0 --freeze-sft-controls 0 --early-stop-patience 3
-```
-
-QAT Film uses the same four commands with the same PTQ inputs and outputs ending in `_qat_film.pt`, but swaps in movie-teacher replay roots generated from the current FP32 teacher. Mixed Film sets `--max-long-edge 960`, uses `dataset\movie_teacher\selectsft1235_hg_960` and `dataset\movie_teacher\selectsft1235_hg_hard_960` for HG, and uses `teacher-loss-weight=0.72`, `teacher-luma-weight=0.12`, `teacher-chroma-weight=0.07`, `highlight-teacher-weight=0.40`, `dark-teacher-weight=0.38`. Full Film uses the same roots with `epochs=6`, `lr=2e-6`, `teacher-loss-weight=0.70`, `teacher-luma-weight=0.11`, `teacher-chroma-weight=0.065`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`. For no-HG Film, keep the same settings but use the `selectsft1235_nohg_960` and `selectsft1235_nohg_hard_960` roots plus the `pytorch_int8\hr\HR_*` PTQ/output paths. The replay roots are reproducibility inputs, not shipped application assets.
+QAT Film uses the same four commands with the same PTQ inputs and outputs ending in `_qat_film.pt`, but swaps in movie-teacher replay roots generated from the current FP32 teacher. The replay roots are reproducibility inputs, not shipped application assets.
 
 ### AMD/CPU Eager INT8
 
-AMD and CPU do not use TensorRT source files. They load the eager checkpoints from `pytorch_int8/hr` or `pytorch_int8/hg`. On AMD, `--predequantize auto` converts INT8 weights to FP16 once at load time when native INT8 convolution is not beneficial.
+AMD and CPU do not use TensorRT source files. They load the eager checkpoints from `src/models/weights/original/pytorch_int8/hr` or `src/models/weights/original/pytorch_int8/hg`. On AMD, `--predequantize auto` converts INT8 weights to FP16 once at load time when native INT8 convolution is not beneficial.
 
 ```powershell
-.\venv\Scripts\python.exe src\main.py --precision int8-mixed --model src\models\weights\pytorch_int8\hr\HR_int8_mixed_qat.pt --use-hg 0 --predequantize auto
-.\venv\Scripts\python.exe src\main.py --precision int8-mixed --model src\models\weights\pytorch_int8\hg\HR_HG_int8_mixed_qat.pt --use-hg 1 --predequantize auto
+.\venv\Scripts\python.exe src\main.py --precision int8-mixed --model src\models\weights\original\pytorch_int8\hr\HR_original_int8_mixed_qat.pt --use-hg 0 --predequantize auto
+.\venv\Scripts\python.exe src\main.py --precision int8-mixed --model src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_mixed_qat.pt --use-hg 1 --predequantize auto
 ```
 
 </details>
@@ -1203,7 +1159,7 @@ AMD and CPU do not use TensorRT source files. They load the eager checkpoints fr
 | Engine/cache behavior | On-demand `.engine` build + cached load | `torch.compile` cache when enabled | N/A |
 | torch.compile | Not used | Auto (Windows: needs HIP SDK) | Not supported |
 | FP16 inference | ✅ | ✅ | Fallback to FP32 |
-| INT8 quantization | Quant-friendly source checkpoints exported through TensorRT ModelOpt Torch Q/DQ by default; legacy native-implicit INT8 with `.calib` support remains available for experiments | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
+| INT8 quantization | Original-family source checkpoints exported through TensorRT ModelOpt Torch Q/DQ by default; legacy native-implicit INT8 with `.calib` support remains available for experiments | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
 | CUDA graphs | Not used | ✅ | N/A |
 | channels_last | Not used in TensorRT engine runtime | Opt-in on AMD PyTorch | N/A |
 

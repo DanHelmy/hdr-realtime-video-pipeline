@@ -14,7 +14,6 @@ from make_portable_int8_checkpoint import convert_checkpoint
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _WEIGHTS = _REPO_ROOT / "src" / "models" / "weights"
-_DISTILLED = _WEIGHTS / "distilled"
 
 
 def _load(path: Path) -> dict:
@@ -184,13 +183,13 @@ def generate_composite_tensorrt_sources(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Normalize distilled TensorRT sources into HR and HG folders."
+        description="Generate TensorRT source checkpoints from original INT8 checkpoints."
     )
     parser.add_argument("--weights-dir", type=Path, default=_WEIGHTS)
     parser.add_argument(
         "--only-original",
         action="store_true",
-        help="Only generate original-model TensorRT source checkpoints.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--missing-only",
@@ -200,7 +199,6 @@ def main() -> int:
     args = parser.parse_args()
 
     weights = args.weights_dir
-    distilled = weights / "distilled"
     mappings = {
         "mixed_ptq": "mixed_ptq",
         "mixed_qat": "mixed_qat",
@@ -209,19 +207,24 @@ def main() -> int:
         "full_qat": "full_qat",
         "full_qat_film": "full_qat_film",
     }
-    int8 = weights / "pytorch_int8"
-    if not args.only_original:
-        for tag, out_tag in mappings.items():
-            runtime_tag = tag.replace("_ptq", "")
-            hr_source = int8 / "hr" / f"HR_int8_{runtime_tag}.pt"
-            hg_source = int8 / "hg" / f"HR_HG_int8_{runtime_tag}.pt"
-            hr_output = distilled / "hr" / f"HR_qfriendly_selectsft1235_int8_{out_tag}.pt"
-            hr_hg_output = distilled / "hr_hg" / f"HR_HG_qfriendly_selectsft1235_int8_{out_tag}.pt"
-            hg_output = distilled / "hg" / f"HG_qfriendly_directh16_int8_{out_tag}.pt"
+
+    original_int8 = weights / "original" / "pytorch_int8"
+    original_trt = weights / "original" / "tensorrt"
+    if not original_int8.is_dir():
+        raise FileNotFoundError(f"Missing original PyTorch INT8 directory: {original_int8}")
+    for tag, out_tag in mappings.items():
+        runtime_tag = tag.replace("_ptq", "")
+        hr_source = original_int8 / "hr" / f"HR_original_int8_{runtime_tag}.pt"
+        hg_source = original_int8 / "hg" / f"HR_HG_original_int8_{runtime_tag}.pt"
+        if hr_source.is_file():
+            hr_output = original_trt / "hr" / f"HR_original_int8_{out_tag}.pt"
             if args.missing_only and hr_output.is_file():
                 print(f"Skipped existing TensorRT source: {hr_output}")
             else:
                 generate_tensorrt_source(hr_source, hr_output)
+        if hg_source.is_file():
+            hr_hg_output = original_trt / "hr_hg" / f"HR_HG_original_int8_{out_tag}.pt"
+            hg_output = original_trt / "hg" / f"HG_original_int8_{out_tag}.pt"
             generate_composite_tensorrt_sources(
                 hg_source,
                 hr_hg_output,
@@ -229,48 +232,6 @@ def main() -> int:
                 write_hr=not (args.missing_only and hr_hg_output.is_file()),
                 write_hg=not (args.missing_only and hg_output.is_file()),
             )
-
-    original_int8 = weights / "original" / "pytorch_int8"
-    original_trt = weights / "original" / "tensorrt"
-    if original_int8.is_dir():
-        for tag, out_tag in mappings.items():
-            runtime_tag = tag.replace("_ptq", "")
-            hr_source = original_int8 / "hr" / f"HR_original_int8_{runtime_tag}.pt"
-            hg_source = original_int8 / "hg" / f"HR_HG_original_int8_{runtime_tag}.pt"
-            if hr_source.is_file():
-                hr_output = original_trt / "hr" / f"HR_original_int8_{out_tag}.pt"
-                if args.missing_only and hr_output.is_file():
-                    print(f"Skipped existing TensorRT source: {hr_output}")
-                else:
-                    generate_tensorrt_source(hr_source, hr_output)
-            if hg_source.is_file():
-                hr_hg_output = original_trt / "hr_hg" / f"HR_HG_original_int8_{out_tag}.pt"
-                hg_output = original_trt / "hg" / f"HG_original_int8_{out_tag}.pt"
-                generate_composite_tensorrt_sources(
-                    hg_source,
-                    hr_hg_output,
-                    hg_output,
-                    write_hr=not (args.missing_only and hr_hg_output.is_file()),
-                    write_hg=not (args.missing_only and hg_output.is_file()),
-                )
-
-    if not args.only_original:
-        for path in (
-            "HR_qfriendly_selectsft1235_fp32.pt",
-            "HG_qfriendly_directh16_fp32.pt",
-        ):
-            family = "hr" if path.startswith("HR_") else "hg"
-            src = distilled / path
-            if not src.is_file():
-                src = distilled / family / path
-            dst = distilled / family / path
-            if src.is_file():
-                if args.missing_only and dst.is_file():
-                    print(f"Skipped existing source checkpoint: {dst}")
-                    continue
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(_load(src), dst)
-                print(f"Copied source checkpoint: {dst}")
     return 0
 
 

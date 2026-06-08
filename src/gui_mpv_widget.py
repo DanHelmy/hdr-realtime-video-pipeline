@@ -779,7 +779,7 @@ class MpvHDRWidget(QWidget):
             if vsync_timed
             else max(1, int(VIDEO_PLAYBACK_BUFFER_FRAMES))
         )
-        self._preserve_feed_order = bool((not live_capture) and buffer_frames > 1)
+        self._preserve_feed_order = bool(live_capture and buffer_frames > 1)
         self._queue = _queue.Queue(maxsize=buffer_frames)
         self._diag_enabled = bool(self._mpv_diag and self._force_hdr_metadata)
         self._last_scale_error = None

@@ -177,20 +177,20 @@ class LifecycleMixin:
 
         self._ui_closing = True
         self._save_user_settings()
-        process = getattr(self, "_original_tensorrt_source_process", None)
+        process = getattr(self, "_tensorrt_source_process", None)
         if process is not None:
             try:
                 _kill_process_tree(process)
             except Exception:
                 pass
-            self._original_tensorrt_source_process = None
-        dlg = getattr(self, "_original_tensorrt_source_dlg", None)
+            self._tensorrt_source_process = None
+        dlg = getattr(self, "_tensorrt_source_dlg", None)
         if dlg is not None:
             try:
                 dlg.close()
             except Exception:
                 pass
-            self._original_tensorrt_source_dlg = None
+            self._tensorrt_source_dlg = None
         if hasattr(self, "_cancel_hdr_ground_truth_validation"):
             self._cancel_hdr_ground_truth_validation(wait=True, invalidate=True)
         if self._export_worker is not None:

@@ -511,7 +511,7 @@ class Ensemble_AGCM_LE(nn.Module):
     def _init_legacy_le(self, le_arch, in_nc, out_nc, nf, act_type, weighting_network):
         if False:
             pass
-        elif le_arch in {"cleantrunk", "clean-trunk", "qfriendly", "quant-friendly"}:
+        elif le_arch in {"cleantrunk", "clean-trunk"}:
             self.LE = HDRUNet3T1CleanTrunk(
                 in_nc=in_nc,
                 out_nc=out_nc,

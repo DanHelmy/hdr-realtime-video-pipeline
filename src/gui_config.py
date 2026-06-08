@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-ORIGINAL_PRECISION_KEY = "Original FP16 (Baseline)"
 
 
 def _weight(name: str) -> str:
@@ -15,25 +14,15 @@ def _weight(name: str) -> str:
 PRECISIONS = {
     "FP16": {
         "precision": "fp16",
-        "model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_fp32.pt"),
-        "trt_model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_fp32.pt"),
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/HR.pt"),
+        "trt_model_nohg": _weight("original/HR.pt"),
+        "trt_hg_weights": _weight("original/HG.pt"),
     },
     "FP32": {
         "precision": "fp32",
-        "model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_fp32.pt"),
-        "trt_model": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_fp32.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_fp32.pt"),
-    },
-    ORIGINAL_PRECISION_KEY: {
-        "precision": "fp16",
-        "hidden": True,
         "model": _weight("original/HR.pt"),
         "model_nohg": _weight("original/HR.pt"),
         "hg_weights": _weight("original/HG.pt"),
@@ -43,51 +32,51 @@ PRECISIONS = {
     },
     "INT8 Mixed (PTQ)": {
         "precision": "int8-mixed",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed.pt"),
-        "trt_model": _weight("distilled/hr_hg/HR_HG_qfriendly_selectsft1235_int8_mixed_ptq.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_int8_mixed_ptq.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_int8_mixed_ptq.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_ptq.pt"),
     },
     "INT8 Mixed (QAT)": {
         "precision": "int8-mixed",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed_qat.pt"),
-        "trt_model": _weight("distilled/hr_hg/HR_HG_qfriendly_selectsft1235_int8_mixed_qat.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_int8_mixed_qat.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_int8_mixed_qat.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat.pt"),
     },
     "INT8 Mixed (QAT) (Film)": {
         "precision": "int8-mixed",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_mixed_qat_film.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_mixed_qat_film.pt"),
-        "trt_model": _weight("distilled/hr_hg/HR_HG_qfriendly_selectsft1235_int8_mixed_qat_film.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_int8_mixed_qat_film.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_int8_mixed_qat_film.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_mixed_qat_film.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_mixed_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_mixed_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_mixed_qat_film.pt"),
     },
     "INT8 Full (PTQ)": {
         "precision": "int8-full",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_full.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full.pt"),
-        "trt_model": _weight("distilled/hr_hg/HR_HG_qfriendly_selectsft1235_int8_full_ptq.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_int8_full_ptq.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_int8_full_ptq.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_ptq.pt"),
     },
     "INT8 Full (QAT)": {
         "precision": "int8-full",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_full_qat.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full_qat.pt"),
-        "trt_model": _weight("distilled/hr_hg/HR_HG_qfriendly_selectsft1235_int8_full_qat.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_int8_full_qat.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_int8_full_qat.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat.pt"),
     },
     "INT8 Full (QAT) (Film)": {
         "precision": "int8-full",
-        "model": _weight("pytorch_int8/hg/HR_HG_int8_full_qat_film.pt"),
-        "model_nohg": _weight("pytorch_int8/hr/HR_int8_full_qat_film.pt"),
-        "trt_model": _weight("distilled/hr_hg/HR_HG_qfriendly_selectsft1235_int8_full_qat_film.pt"),
-        "trt_model_nohg": _weight("distilled/hr/HR_qfriendly_selectsft1235_int8_full_qat_film.pt"),
-        "trt_hg_weights": _weight("distilled/hg/HG_qfriendly_directh16_int8_full_qat_film.pt"),
+        "model": _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
+        "model_nohg": _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
+        "trt_model": _weight("original/tensorrt/hr_hg/HR_HG_original_int8_full_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat_film.pt"),
     },
 }
 
@@ -96,7 +85,7 @@ DEFAULT_RESOLUTION_KEY = "1080p"
 DEFAULT_USE_HG = False
 INT8_HG_WARNING = (
     "INT8 TensorRT speedups depend on the selected graph and GPU generation. "
-    "Mixed QAT presets use the quant-friendly TensorRT path by default; Full "
+    "Mixed QAT presets use the TensorRT source checkpoints by default; Full "
     "INT8 remains a strict all-quantizer baseline for testing."
 )
 
@@ -139,7 +128,7 @@ def _int8_precision_warning(precision_key: str, use_hg: bool) -> str:
         return ""
     if not use_hg:
         return (
-            "No-HG INT8 uses the HR/ACGM/LE quant-friendly TensorRT path. It is "
+            "No-HG INT8 uses the HR/ACGM/LE TensorRT source path. It is "
             "usually the fastest preset when HG reconstruction is not needed."
         )
     return INT8_HG_WARNING
@@ -260,9 +249,15 @@ LIVE_CAPTURE_MPV_BUFFER_FRAMES = _env_live_int(
 )
 VIDEO_PLAYBACK_BUFFER_FRAMES = _env_live_int(
     "HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES",
-    12,
+    3,
     min_value=1,
     max_value=24,
+)
+VIDEO_PLAYBACK_PRESERVE_ORDER = (
+    str(os.environ.get("HDRTVNET_VIDEO_PLAYBACK_PRESERVE_ORDER", "0"))
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
 )
 LIVE_CAPTURE_PRESENT_MAX_FPS = LIVE_CAPTURE_PROCESS_FPS
 LIVE_CAPTURE_DISPLAY_FPS = live_capture_display_fps(LIVE_CAPTURE_PROCESS_FPS)
