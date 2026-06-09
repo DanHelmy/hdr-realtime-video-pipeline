@@ -59,6 +59,7 @@ from gui_config import (
     PRECISIONS,
     RESOLUTION_SCALES,
     _available_precision_keys,
+    _precision_engine_mode_base,
     _processing_preset_dims,
     _select_hg_weights_path,
     _select_model_path,
@@ -1640,7 +1641,10 @@ class _BenchmarkWorker(QObject):
                     cfg.precision_key,
                     bool(cfg.use_hg),
                 )
-                mode_name = f"{cfg.precision_key}_{'hg' if cfg.use_hg else 'nohg'}"
+                mode_name = (
+                    f"{_precision_engine_mode_base(cfg.precision_key)}_"
+                    f"{'hg' if cfg.use_hg else 'nohg'}"
+                )
                 trt_hg_weights = (
                     _select_hg_weights_path(cfg.precision_key, tensorrt=True)
                     if bool(cfg.use_hg)
@@ -3620,7 +3624,10 @@ class ModelBenchmarkDialog(QDialog):
                 trt_model_path = _select_tensorrt_model_path(precision, bool(use_hg))
                 out_w, out_h = _resolution_dims(resolution_key)
                 trt_predeq = False
-                mode_name = f"{precision}_{'hg' if use_hg else 'nohg'}"
+                mode_name = (
+                    f"{_precision_engine_mode_base(precision)}_"
+                    f"{'hg' if use_hg else 'nohg'}"
+                )
                 trt_hg_weights = (
                     _select_hg_weights_path(precision, tensorrt=True)
                     if bool(use_hg)

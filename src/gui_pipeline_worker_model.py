@@ -16,6 +16,7 @@ from models.hdrtvnet_torch import (
 )
 from gui_config import (
     PRECISIONS,
+    _precision_engine_mode_base,
     _select_hg_weights_path,
     _select_model_path,
     _select_tensorrt_model_path,
@@ -79,6 +80,11 @@ class PipelineWorkerModelMixin:
         warmup: bool = True,
     ):
         cfg = PRECISIONS.get(key, {})
+        if not cfg:
+            self.status_message.emit(
+                f"ERROR: precision preset is not defined - {key}"
+            )
+            return False
         path = _select_model_path(key, self._use_hg)
         if not os.path.isfile(path):
             if key in PRECISIONS and PRECISIONS[key].get("precision", "").startswith("int8"):
@@ -121,7 +127,10 @@ class PipelineWorkerModelMixin:
                 if not os.path.isfile(trt_path):
                     self.status_message.emit(f"ERROR: TensorRT model weights not found - {trt_path}")
                     return False
-                mode_name = f"{key}_{'hg' if self._use_hg else 'nohg'}"
+                mode_name = (
+                    f"{_precision_engine_mode_base(key)}_"
+                    f"{'hg' if self._use_hg else 'nohg'}"
+                )
                 trt_hg_weights = (
                     _select_hg_weights_path(key, tensorrt=True)
                     if self._use_hg

@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 from gui_config import (
     PRECISIONS,
     _available_precision_keys,
+    _precision_engine_mode_base,
     _select_hg_weights_path,
     _select_model_path,
     _select_tensorrt_model_path,
@@ -836,7 +837,10 @@ class VideoExportWorker(QObject, PipelineWorkerFrameProcessingMixin):
                     self._config.precision_key,
                     self._config.use_hg,
                 )
-                mode_name = f"{self._config.precision_key}_{'hg' if self._config.use_hg else 'nohg'}"
+                mode_name = (
+                    f"{_precision_engine_mode_base(self._config.precision_key)}_"
+                    f"{'hg' if self._config.use_hg else 'nohg'}"
+                )
                 trt_hg_weights = (
                     _select_hg_weights_path(self._config.precision_key, tensorrt=True)
                     if self._config.use_hg
