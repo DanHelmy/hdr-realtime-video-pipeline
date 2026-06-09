@@ -2623,7 +2623,7 @@ def _resolve_tensorrt_qdq_fusion(precision: str, qdq_fusion: str) -> str:
         return "native"
     if fusion != "auto":
         return fusion
-    if str(precision or "").startswith("int8"):
+    if str(precision or "").startswith(("int8", "fp8")):
         return "native"
     return "none"
 
@@ -2659,7 +2659,8 @@ def _tensorrt_expected_engine_metadata(
     condition_free_single_input = _tensorrt_condition_free_arch_enabled_for_checkpoint(
         model_path
     )
-    effective_modelopt_torch = _tensorrt_int8_modelopt_torch_effective_enabled(
+    effective_modelopt_torch = _tensorrt_lowp_modelopt_torch_effective_enabled(
+        precision,
         mode_name
     )
     if str(precision).startswith("int8-full") and (
@@ -2827,6 +2828,52 @@ def _tensorrt_expected_engine_metadata(
             metadata["build"]["int8_modelopt_prequantized_onnx"] = (
                 _tensorrt_int8_modelopt_prequantized_onnx(None)
             )
+    if str(precision).startswith("fp8"):
+        modelopt_torch_include = _tensorrt_int8_modelopt_torch_include_patterns(
+            precision=precision
+        )
+        modelopt_torch_exclude = _tensorrt_int8_modelopt_torch_exclude_patterns(
+            precision=precision
+        )
+        metadata["build"]["fp8_modelopt_torch"] = effective_modelopt_torch
+        metadata["build"]["fp8_modelopt_torch_requested"] = (
+            _tensorrt_fp8_modelopt_torch_enabled()
+        )
+        metadata["build"]["fp8_modelopt_torch_mode"] = (
+            _tensorrt_int8_modelopt_torch_mode(precision)
+        )
+        metadata["build"]["fp8_modelopt_torch_method"] = (
+            _tensorrt_int8_modelopt_torch_method()
+        )
+        metadata["build"]["fp8_modelopt_torch_effective_bits"] = (
+            _tensorrt_int8_modelopt_torch_effective_bits()
+        )
+        metadata["build"]["fp8_modelopt_torch_calib_steps"] = (
+            _tensorrt_int8_modelopt_torch_calib_steps()
+        )
+        metadata["build"]["fp8_modelopt_torch_score_steps"] = (
+            _tensorrt_int8_modelopt_torch_score_steps()
+        )
+        metadata["build"]["fp8_modelopt_torch_include"] = list(
+            modelopt_torch_include
+        )
+        metadata["build"]["fp8_modelopt_torch_exclude"] = list(
+            modelopt_torch_exclude
+        )
+        metadata["build"]["fp8_modelopt_torch_qdq_dtype"] = (
+            _tensorrt_int8_modelopt_torch_qdq_dtype(torch.float16)
+        )
+        metadata["build"]["fp8_modelopt_torch_output_policy"] = (
+            _tensorrt_int8_modelopt_torch_output_policy()
+        )
+        metadata["build"]["fp8_modelopt_torch_hg_default"] = (
+            _tensorrt_int8_modelopt_torch_hg_default_enabled()
+        )
+        metadata["build"]["fp8_modelopt_torch_hg_mixed_exclude"] = list(
+            modelopt_torch_exclude
+            if str(precision).startswith("fp8-mixed")
+            else _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns()
+        )
     if resolved_qdq_fusion == "native" and str(precision).startswith("int8"):
         metadata["build"]["native_int8_prefer_constraints"] = (
             _tensorrt_native_int8_prefer_constraints()
@@ -3060,6 +3107,22 @@ def _tensorrt_int8_modelopt_torch_enabled() -> bool:
     return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH", _IS_NVIDIA)
 
 
+def _tensorrt_fp8_modelopt_torch_enabled() -> bool:
+    return _env_bool("HDRTVNET_TRT_FP8_MODELOPT_TORCH", _IS_NVIDIA)
+
+
+def _is_tensorrt_int8_precision(precision: str | None) -> bool:
+    return str(precision or "").strip().lower().startswith("int8")
+
+
+def _is_tensorrt_fp8_precision(precision: str | None) -> bool:
+    return str(precision or "").strip().lower().startswith("fp8")
+
+
+def _is_tensorrt_lowp_precision(precision: str | None) -> bool:
+    return _is_tensorrt_int8_precision(precision) or _is_tensorrt_fp8_precision(precision)
+
+
 def _tensorrt_mode_name_is_qat(mode_name: str | None = None) -> bool:
     text = str(mode_name or "").strip().lower()
     return "qat" in text
@@ -3091,13 +3154,31 @@ def _tensorrt_int8_modelopt_torch_effective_enabled(
     )
 
 
+def _tensorrt_lowp_modelopt_torch_effective_enabled(
+    precision: str | None = None,
+    mode_name: str | None = None,
+) -> bool:
+    if _is_tensorrt_fp8_precision(precision):
+        return _tensorrt_fp8_modelopt_torch_enabled()
+    return _tensorrt_int8_modelopt_torch_effective_enabled(mode_name)
+
+
 def _tensorrt_int8_modelopt_torch_mode(precision: str | None = None) -> str:
-    text = str(os.environ.get("HDRTVNET_TRT_INT8_MODELOPT_TORCH_MODE", "")).strip().lower()
+    precision_text = str(precision or "").strip().lower()
+    env_name = (
+        "HDRTVNET_TRT_FP8_MODELOPT_TORCH_MODE"
+        if precision_text.startswith("fp8")
+        else "HDRTVNET_TRT_INT8_MODELOPT_TORCH_MODE"
+    )
+    text = str(os.environ.get(env_name, "")).strip().lower()
     if text in {"full", "all", "int8"}:
         return "full"
     if text in {"auto", "mixed", "balance", "balanced", "search"}:
         return "auto"
-    return "full" if str(precision or "").startswith("int8-full") else "auto"
+    return "full" if (
+        precision_text.startswith("int8-full")
+        or precision_text.startswith("fp8-full")
+    ) else "auto"
 
 
 def _tensorrt_int8_modelopt_torch_method() -> str:
@@ -3198,7 +3279,10 @@ def _tensorrt_int8_modelopt_torch_include_patterns(
     if explicit:
         return explicit
     if (
-        str(precision or "").startswith("int8-mixed")
+        (
+            str(precision or "").startswith("int8-mixed")
+            or str(precision or "").startswith("fp8-mixed")
+        )
         and _tensorrt_modelopt_torch_is_selective_sft_model(model)
     ):
         if _tensorrt_modelopt_torch_has_composite_base(model):
@@ -3242,7 +3326,10 @@ def _tensorrt_int8_modelopt_torch_exclude_patterns(
     if explicit:
         return explicit
     if (
-        str(precision or "").startswith("int8-mixed")
+        (
+            str(precision or "").startswith("int8-mixed")
+            or str(precision or "").startswith("fp8-mixed")
+        )
         and _tensorrt_modelopt_torch_is_selective_sft_model(model)
     ):
         if _tensorrt_modelopt_torch_has_composite_base(model):
@@ -3258,7 +3345,10 @@ def _tensorrt_int8_modelopt_torch_outputs_enabled(
     if "HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUTS" in os.environ:
         return _env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUTS", False)
     return (
-        str(precision or "").startswith("int8-mixed")
+        (
+            str(precision or "").startswith("int8-mixed")
+            or str(precision or "").startswith("fp8-mixed")
+        )
         and _tensorrt_modelopt_torch_is_selective_sft_model(model)
     )
 
@@ -4081,6 +4171,15 @@ def tensorrt_mode_name(
     qdq_fusion: str = "auto",
 ) -> str:
     mode_name = str(mode or precision or "mode")
+    if str(precision).startswith("fp8"):
+        lower = mode_name.lower()
+        suffix = "modelopttorchfp8"
+        if _tensorrt_fp8_modelopt_torch_enabled() and suffix not in lower:
+            mode_name = f"{mode_name}_{suffix}v1"
+            lower = mode_name.lower()
+        if _tensorrt_int8_modelopt_torch_outputs_enabled(None, precision) and "outactive" not in lower:
+            mode_name = f"{mode_name}_outactivev1"
+        return mode_name
     if str(precision).startswith("int8"):
         lower = mode_name.lower()
         if _resolve_tensorrt_predequantize(precision, predequantize):
@@ -6058,19 +6157,27 @@ def _summarize_tensorrt_modelopt_torch_quantizers(
     return summary
 
 
-def _print_tensorrt_modelopt_torch_quantizer_summary(model: nn.Module) -> None:
+def _print_tensorrt_modelopt_torch_quantizer_summary(
+    model: nn.Module,
+    *,
+    precision_label: str = "INT8",
+) -> None:
     summary = _summarize_tensorrt_modelopt_torch_quantizers(model)
     for kind in ("input_quantizer", "weight_quantizer", "output_quantizer", "other"):
         entry = summary.get(kind)
         if not entry:
             continue
         print(
-            "TensorRT INT8 ModelOpt Torch "
+            f"TensorRT {precision_label} ModelOpt Torch "
             f"{kind}: {int(entry['enabled'])}/{int(entry['total'])} enabled"
         )
 
 
-def _enable_tensorrt_modelopt_torch_output_quantizers(model: nn.Module) -> int:
+def _enable_tensorrt_modelopt_torch_output_quantizers(
+    model: nn.Module,
+    *,
+    precision_label: str = "INT8",
+) -> int:
     changed = 0
     failed: list[str] = []
     for name, module in model.named_modules():
@@ -6097,12 +6204,12 @@ def _enable_tensorrt_modelopt_torch_output_quantizers(model: nn.Module) -> int:
         preview = ", ".join(failed[:12])
         more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
         raise RuntimeError(
-            "TensorRT INT8 Full contract failed: could not enable "
+            f"TensorRT {precision_label} Full contract failed: could not enable "
             f"{len(failed)} output quantizer(s) ({preview}{more})."
         )
     if changed:
         print(
-            "TensorRT INT8 Full contract: enabled "
+            f"TensorRT {precision_label} Full contract: enabled "
             f"{changed} output quantizer(s)"
         )
     return changed
@@ -6113,6 +6220,7 @@ def _enable_tensorrt_modelopt_torch_quantizers(
     *,
     kinds: tuple[str, ...],
     label: str,
+    precision_label: str = "INT8",
 ) -> int:
     changed = 0
     failed: list[str] = []
@@ -6141,12 +6249,12 @@ def _enable_tensorrt_modelopt_torch_quantizers(
         preview = ", ".join(failed[:12])
         more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
         raise RuntimeError(
-            f"TensorRT INT8 {label} contract failed: could not enable "
+            f"TensorRT {precision_label} {label} contract failed: could not enable "
             f"{len(failed)} quantizer(s) ({preview}{more})."
         )
     if changed:
         print(
-            f"TensorRT INT8 {label} contract: enabled "
+            f"TensorRT {precision_label} {label} contract: enabled "
             f"{changed} quantizer(s)"
         )
     return changed
@@ -6156,6 +6264,7 @@ def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
     model: nn.Module,
     precision: str | None = None,
 ) -> int:
+    precision_label = "FP8" if str(precision or "").startswith("fp8") else "INT8"
     include = _tensorrt_int8_modelopt_torch_include_patterns(model, precision)
     exclude = _tensorrt_int8_modelopt_torch_exclude_patterns(model, precision)
     output_policy = _tensorrt_int8_modelopt_torch_output_policy()
@@ -6209,12 +6318,12 @@ def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
         preview = ", ".join(failed[:12])
         more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
         raise RuntimeError(
-            "TensorRT INT8 mixed output quantizer request failed: could not "
+            f"TensorRT {precision_label} mixed output quantizer request failed: could not "
             f"enable {len(failed)} output quantizer(s) ({preview}{more})."
         )
     if changed:
         print(
-            "TensorRT INT8 ModelOpt Torch mixed outputs: enabled "
+            f"TensorRT {precision_label} ModelOpt Torch mixed outputs: enabled "
             f"{changed} included output quantizer(s)"
             + (" with active-compute policy" if active_compute_only else "")
         )
@@ -6224,12 +6333,14 @@ def _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
 def _calibrate_tensorrt_modelopt_torch_enabled_output_quantizers(
     model: nn.Module,
     forward_loop,
+    precision: str | None = None,
 ) -> int:
     return _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
         model,
         forward_loop,
         kinds=("output_quantizer",),
         label="mixed output",
+        precision_label="FP8" if str(precision or "").startswith("fp8") else "INT8",
     )
 
 
@@ -6239,6 +6350,7 @@ def _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
     *,
     kinds: tuple[str, ...],
     label: str,
+    precision_label: str = "INT8",
 ) -> int:
     targets = []
     wanted = set(kinds)
@@ -6306,18 +6418,22 @@ def _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
         preview = ", ".join(failed[:12])
         more = "" if len(failed) <= 12 else f", +{len(failed) - 12} more"
         raise RuntimeError(
-            f"TensorRT INT8 {label} quantizer calibration failed for "
+            f"TensorRT {precision_label} {label} quantizer calibration failed for "
             f"{len(failed)} quantizer(s) ({preview}{more})."
         )
     if calibrated:
         print(
-            f"TensorRT INT8 ModelOpt Torch {label}: calibrated "
+            f"TensorRT {precision_label} ModelOpt Torch {label}: calibrated "
             f"{calibrated} quantizer(s)"
         )
     return calibrated
 
 
-def _enforce_tensorrt_modelopt_torch_full_quantizers(model: nn.Module) -> None:
+def _enforce_tensorrt_modelopt_torch_full_quantizers(
+    model: nn.Module,
+    *,
+    label: str = "INT8",
+) -> None:
     summary = _summarize_tensorrt_modelopt_torch_quantizers(model)
     disabled_compute: list[str] = []
     for kind in ("input_quantizer", "weight_quantizer", "output_quantizer"):
@@ -6330,14 +6446,28 @@ def _enforce_tensorrt_modelopt_torch_full_quantizers(model: nn.Module) -> None:
     preview = ", ".join(disabled_compute[:12])
     more = "" if len(disabled_compute) <= 12 else f", +{len(disabled_compute) - 12} more"
     raise RuntimeError(
-        "TensorRT INT8 Full contract failed: ModelOpt left "
+        f"TensorRT {label} Full contract failed: ModelOpt left "
         f"{len(disabled_compute)} quantizer(s) disabled "
-        f"({preview}{more}). Use int8-mixed for partial quantization."
+        f"({preview}{more}). Use mixed precision for partial quantization."
     )
 
 
-def _tensorrt_modelopt_torch_int8_config(mtq_module, *, full_outputs: bool = False):
-    cfg = copy.deepcopy(mtq_module.INT8_DEFAULT_CFG)
+def _tensorrt_modelopt_torch_int8_config(
+    mtq_module,
+    *,
+    full_outputs: bool = False,
+    precision: str | None = None,
+):
+    is_fp8 = str(precision or "").strip().lower().startswith("fp8")
+    if is_fp8:
+        if not hasattr(mtq_module, "FP8_DEFAULT_CFG"):
+            raise RuntimeError(
+                "ModelOpt FP8_DEFAULT_CFG is unavailable. Update NVIDIA ModelOpt "
+                "to use TensorRT FP8 presets."
+            )
+        cfg = copy.deepcopy(mtq_module.FP8_DEFAULT_CFG)
+    else:
+        cfg = copy.deepcopy(mtq_module.INT8_DEFAULT_CFG)
     if full_outputs:
         quant_cfg = cfg.setdefault("quant_cfg", [])
         if isinstance(quant_cfg, list):
@@ -6345,9 +6475,14 @@ def _tensorrt_modelopt_torch_int8_config(mtq_module, *, full_outputs: bool = Fal
                 3,
                 {
                     "quantizer_name": "*output_quantizer",
-                    "cfg": {"num_bits": 8, "axis": None},
+                    "cfg": {
+                        "num_bits": (4, 3) if is_fp8 else 8,
+                        "axis": None,
+                    },
                 },
             )
+    if is_fp8:
+        return cfg
     quant_scheme = _tensorrt_int8_modelopt_torch_quant_scheme()
     for entry in cfg.get("quant_cfg", []):
         if not isinstance(entry, dict):
@@ -6435,7 +6570,7 @@ def _apply_tensorrt_modelopt_torch_quantizer_filters(
         and _tensorrt_int8_modelopt_torch_hg_default_enabled()
     ):
         include = ("hg",)
-        if str(precision or "").startswith("int8-mixed"):
+        if str(precision or "").startswith(("int8-mixed", "fp8-mixed")):
             exclude = _tensorrt_int8_modelopt_torch_hg_mixed_exclude_patterns()
 
     if not include and not exclude:
@@ -6476,15 +6611,16 @@ def _apply_tensorrt_modelopt_torch_quantizer_filters(
         if is_enabled and parent_name not in enabled_parents:
             enabled_parents.append(parent_name)
 
+    label = "FP8" if str(precision or "").startswith("fp8") else "INT8"
     print(
-        "TensorRT INT8 ModelOpt Torch quantizer filter: "
+        f"TensorRT {label} ModelOpt Torch quantizer filter: "
         f"include={list(include) or '*'}, exclude={list(exclude) or 'none'}, "
         f"enabled={enabled}/{total}, changed={changed}"
     )
     if enabled_parents:
         preview = ", ".join(enabled_parents[:12])
         more = "" if len(enabled_parents) <= 12 else f", +{len(enabled_parents) - 12} more"
-        print(f"TensorRT INT8 ModelOpt Torch enabled blocks: {preview}{more}")
+        print(f"TensorRT {label} ModelOpt Torch enabled blocks: {preview}{more}")
     return enabled, total, changed
 
 
@@ -6521,7 +6657,7 @@ def _disable_tensorrt_modelopt_torch_inplace_activations(model: nn.Module) -> in
             pass
     if changed:
         print(
-            "TensorRT INT8 ModelOpt Torch auto_quantize: "
+            "TensorRT ModelOpt Torch auto_quantize: "
             f"disabled {changed} in-place activation module(s) for scoring"
         )
     return changed
@@ -6543,9 +6679,74 @@ def _set_tensorrt_modelopt_torch_export_dtype(
             pass
     if changed:
         print(
-            "TensorRT INT8 ModelOpt Torch export dtype: "
+            "TensorRT ModelOpt Torch export dtype: "
             f"{high_precision} Q/DQ high precision on {changed} quantizer(s)"
         )
+
+
+def _tensorrt_modelopt_torch_enabled_conv_weight_modules(
+    model: nn.Module,
+) -> set[str]:
+    enabled: set[str] = set()
+    conv_types = (
+        nn.Conv1d,
+        nn.Conv2d,
+        nn.Conv3d,
+        nn.ConvTranspose1d,
+        nn.ConvTranspose2d,
+        nn.ConvTranspose3d,
+    )
+    for name, module in model.named_modules():
+        if not isinstance(module, conv_types):
+            continue
+        quantizer = getattr(module, "weight_quantizer", None)
+        if quantizer is None:
+            continue
+        if _tensorrt_modelopt_torch_quantizer_enabled(quantizer):
+            enabled.add(name)
+    return enabled
+
+
+@contextlib.contextmanager
+def _disable_tensorrt_modelopt_torch_conv_weight_export(model: nn.Module):
+    states: list[tuple[nn.Module, bool]] = []
+    conv_types = (
+        nn.Conv1d,
+        nn.Conv2d,
+        nn.Conv3d,
+        nn.ConvTranspose1d,
+        nn.ConvTranspose2d,
+        nn.ConvTranspose3d,
+    )
+    for module in model.modules():
+        if not isinstance(module, conv_types):
+            continue
+        quantizer = getattr(module, "weight_quantizer", None)
+        if quantizer is None:
+            continue
+        was_enabled = _tensorrt_modelopt_torch_quantizer_enabled(quantizer)
+        states.append((quantizer, was_enabled))
+        try:
+            quantizer.disable()
+        except Exception:
+            setattr(quantizer, "_disabled", True)
+    if states:
+        print(
+            "TensorRT FP8 ModelOpt Torch ONNX export: "
+            f"temporarily disabled {len(states)} Conv weight quantizer(s); "
+            "ONNX post-process will restore selected FP8 Conv weights"
+        )
+    try:
+        yield
+    finally:
+        for quantizer, was_enabled in states:
+            try:
+                if was_enabled:
+                    quantizer.enable()
+                else:
+                    quantizer.disable()
+            except Exception:
+                setattr(quantizer, "_disabled", not was_enabled)
 
 
 def _apply_tensorrt_modelopt_torch_int8_quantization(
@@ -6562,24 +6763,27 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
     except Exception as exc:
         raise RuntimeError(
             "ModelOpt PyTorch quantization is not installed. "
-            "Install nvidia-modelopt to use HDRTVNET_TRT_INT8_MODELOPT_TORCH=1."
+            "Install nvidia-modelopt to use TensorRT ModelOpt Torch quantization."
         ) from exc
 
+    is_fp8 = str(precision or "").strip().lower().startswith("fp8")
+    label = "FP8" if is_fp8 else "INT8"
     mode = _tensorrt_int8_modelopt_torch_mode(precision)
     method = _tensorrt_int8_modelopt_torch_method()
     quant_scheme = _tensorrt_int8_modelopt_torch_quant_scheme()
-    full_precision = str(precision or "").startswith("int8-full")
+    full_precision = str(precision or "").startswith(("int8-full", "fp8-full"))
     quant_config = _tensorrt_modelopt_torch_int8_config(
         mtq,
         full_outputs=full_precision,
+        precision=precision,
     )
     calib_steps = _tensorrt_int8_modelopt_torch_calib_steps()
     score_steps = _tensorrt_int8_modelopt_torch_score_steps()
     total_steps = calib_steps if mode == "full" else max(calib_steps, score_steps)
-    include_targets = mode == "auto" and method == "gradient"
+    include_targets = (not is_fp8) and mode == "auto" and method == "gradient"
     _disable_tensorrt_modelopt_torch_inplace_activations(model)
     fallback_model = None
-    if mode == "auto" and method == "gradient":
+    if (not is_fp8) and mode == "auto" and method == "gradient":
         try:
             fallback_model = copy.deepcopy(model).eval()
         except Exception:
@@ -6602,16 +6806,21 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
                 _tensorrt_modelopt_torch_forward_step(qmodel, batch)
 
     print(
-        "TensorRT INT8 ModelOpt Torch quantization: "
-        f"mode={mode}, scheme={quant_scheme}, "
+        f"TensorRT {label} ModelOpt Torch quantization: "
+        f"mode={mode}, scheme={quant_scheme if not is_fp8 else 'e4m3'}, "
         f"calib_steps={calib_steps}, score_steps={score_steps}"
     )
-    if mode == "full":
+    if mode == "full" or is_fp8:
         with _tensorrt_modelopt_torch_no_inplace_functionals():
             quantized = mtq.quantize(
                 model,
                 copy.deepcopy(quant_config),
                 forward_loop,
+            )
+        if is_fp8 and mode != "full":
+            print(
+                "TensorRT FP8 ModelOpt Torch mixed: calibrated full FP8 graph, "
+                "then applying the same mixed include/exclude filter used by INT8"
             )
     else:
         constraints = {"effective_bits": _tensorrt_int8_modelopt_torch_effective_bits()}
@@ -6638,7 +6847,7 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
             if method == "kl_div" or fallback_model is None:
                 raise
             print(
-                "TensorRT INT8 ModelOpt Torch gradient search failed; "
+                f"TensorRT {label} ModelOpt Torch gradient search failed; "
                 f"retrying kl_div search ({exc})"
             )
             _disable_tensorrt_modelopt_torch_inplace_activations(fallback_model)
@@ -6664,7 +6873,7 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
                     verbose=_env_bool("HDRTVNET_TRT_INT8_MODELOPT_TORCH_VERBOSE", False),
                 )
         print(
-            "TensorRT INT8 ModelOpt Torch auto_quantize: "
+            f"TensorRT {label} ModelOpt Torch auto_quantize: "
             f"effective_bits={constraints['effective_bits']:g}, method={method}"
         )
 
@@ -6674,13 +6883,18 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
             quantized,
             kinds=("input_quantizer", "weight_quantizer", "output_quantizer"),
             label="Full",
+            precision_label=label,
         )
-        _enable_tensorrt_modelopt_torch_output_quantizers(quantized)
+        _enable_tensorrt_modelopt_torch_output_quantizers(
+            quantized,
+            precision_label=label,
+        )
         _calibrate_tensorrt_modelopt_torch_enabled_activation_quantizers(
             quantized,
             forward_loop,
             kinds=("input_quantizer", "output_quantizer"),
             label="full activation",
+            precision_label=label,
         )
     elif _tensorrt_int8_modelopt_torch_outputs_enabled(quantized, precision):
         _enable_tensorrt_modelopt_torch_filtered_output_quantizers(
@@ -6690,6 +6904,7 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
         _calibrate_tensorrt_modelopt_torch_enabled_output_quantizers(
             quantized,
             forward_loop,
+            precision,
         )
     enabled, total = _count_tensorrt_modelopt_torch_quantizers(quantized)
     if total:
@@ -6698,10 +6913,16 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
             if full_precision
             else "all, output quantizers may stay disabled"
         )
-        print(f"TensorRT INT8 ModelOpt Torch quantizers ({suffix}): {enabled}/{total} enabled")
-        _print_tensorrt_modelopt_torch_quantizer_summary(quantized)
+        print(f"TensorRT {label} ModelOpt Torch quantizers ({suffix}): {enabled}/{total} enabled")
+        _print_tensorrt_modelopt_torch_quantizer_summary(
+            quantized,
+            precision_label=label,
+        )
     if full_precision:
-        _enforce_tensorrt_modelopt_torch_full_quantizers(quantized)
+        _enforce_tensorrt_modelopt_torch_full_quantizers(
+            quantized,
+            label=label,
+        )
     try:
         quantized.eval()
     except Exception:
@@ -6709,6 +6930,179 @@ def _apply_tensorrt_modelopt_torch_int8_quantization(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return quantized
+
+
+def _tensorrt_fp8_conv_weight_node_allowed(
+    node_name: str,
+    weight_name: str | None,
+    enabled_modules: set[str],
+) -> tuple[bool, str | None]:
+    module_name = _onnx_weight_module_name(weight_name)
+    if module_name and module_name in enabled_modules:
+        return True, module_name
+    normalized_node = str(node_name or "").replace("/", ".").strip(".")
+    if normalized_node.startswith("model."):
+        normalized_node = normalized_node[len("model."):]
+    for candidate in enabled_modules:
+        if candidate and candidate in normalized_node:
+            return True, candidate
+    return False, module_name
+
+
+def _insert_tensorrt_fp8_conv_weight_dq(
+    graph,
+    *,
+    enabled_conv_weight_modules: set[str],
+    output_dtype,
+) -> tuple[int, int]:
+    try:
+        import onnx
+        import onnx_graphsurgeon as gs
+        from onnx_graphsurgeon.ir.tensor import LazyValues
+    except Exception as exc:
+        raise RuntimeError(
+            "onnx and onnx-graphsurgeon are required for TensorRT FP8 export post-processing."
+        ) from exc
+
+    inserted = 0
+    skipped = 0
+    for node in list(graph.nodes):
+        if node.op != "Conv" or len(node.inputs) < 2:
+            continue
+        weight_input = node.inputs[1]
+        if not isinstance(weight_input, gs.Constant):
+            skipped += 1
+            continue
+        if any(producer.op == "DequantizeLinear" for producer in getattr(weight_input, "inputs", [])):
+            continue
+        allowed, module_name = _tensorrt_fp8_conv_weight_node_allowed(
+            str(getattr(node, "name", "")),
+            str(getattr(weight_input, "name", "")),
+            enabled_conv_weight_modules,
+        )
+        if not allowed:
+            skipped += 1
+            continue
+
+        weight_values = np.asarray(weight_input.values).copy()
+        torch_weights = torch.from_numpy(weight_values)
+        amax = torch_weights.abs().max().float()
+        if not torch.isfinite(amax) or float(amax.item()) <= 0.0:
+            skipped += 1
+            continue
+        scale_val = float(amax.item()) / 448.0
+        fp8_data = (
+            (torch_weights / scale_val)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .cpu()
+            .numpy()
+        )
+
+        fp8_tensor = onnx.TensorProto()
+        fp8_tensor.data_type = onnx.TensorProto.FLOAT8E4M3FN
+        fp8_tensor.dims.extend(fp8_data.shape)
+        fp8_tensor.raw_data = fp8_data.tobytes()
+        fp8_constant = gs.Constant(
+            f"{node.name}/weight_quantizer/fp8_weights",
+            LazyValues(fp8_tensor),
+        )
+        scale_constant = gs.Constant(
+            f"{node.name}/weight_quantizer/scale",
+            np.array(scale_val, dtype=output_dtype),
+        )
+        dq_output = gs.Variable(
+            f"{node.name}/weight_quantizer/dq_output",
+            dtype=output_dtype,
+            shape=list(fp8_data.shape),
+        )
+        dq_node = gs.Node(
+            op="DequantizeLinear",
+            name=f"{node.name}/weight_quantizer/DequantizeLinear",
+            inputs=[fp8_constant, scale_constant],
+            outputs=[dq_output],
+        )
+        graph.nodes.append(dq_node)
+        node.inputs[1] = dq_output
+        inserted += 1
+
+    graph.cleanup().toposort()
+    return inserted, skipped
+
+
+def _postprocess_tensorrt_modelopt_torch_fp8_onnx(
+    onnx_path: str,
+    *,
+    enabled_conv_weight_modules: set[str],
+    dtype: torch.dtype,
+) -> None:
+    try:
+        import onnx
+        import onnx_graphsurgeon as gs
+        from onnx_graphsurgeon.ir.tensor import LazyValues
+        from modelopt.onnx.export.fp8_exporter import FP8QuantExporter
+    except Exception as exc:
+        raise RuntimeError(
+            "onnx, onnx-graphsurgeon, and NVIDIA ModelOpt are required for TensorRT FP8 ONNX post-processing."
+        ) from exc
+
+    model = onnx.load(onnx_path, load_external_data=True)
+    graph = gs.import_onnx(model)
+    converted_q = 0
+    converted_dq = 0
+    for node in graph.nodes:
+        if node.op == "TRT_FP8QuantizeLinear":
+            node.op = "QuantizeLinear"
+            if len(node.inputs) == 2:
+                zp_tensor = onnx.TensorProto()
+                zp_tensor.data_type = onnx.TensorProto.FLOAT8E4M3FN
+                zp_tensor.dims.extend([1])
+                zp_tensor.raw_data = b"\x00"
+                node.inputs.append(
+                    gs.Constant(f"{node.name}_zero_point", LazyValues(zp_tensor))
+                )
+            node.attrs["saturate"] = 1
+            converted_q += 1
+        elif node.op == "TRT_FP8DequantizeLinear":
+            node.op = "DequantizeLinear"
+            converted_dq += 1
+
+    output_dtype = np.float16 if dtype == torch.float16 else np.float32
+    inserted_weights, skipped_weights = _insert_tensorrt_fp8_conv_weight_dq(
+        graph,
+        enabled_conv_weight_modules=enabled_conv_weight_modules,
+        output_dtype=output_dtype,
+    )
+    moved_mul = FP8QuantExporter._move_mul_before_qdq(graph)
+    moved_transpose = FP8QuantExporter._move_transpose_before_qdq(graph)
+    inserted_softmax = FP8QuantExporter._insert_qdq_after_softmax(graph)
+    graph.cleanup().toposort()
+    processed = gs.export_onnx(graph)
+
+    data_path = f"{onnx_path}.data"
+    try:
+        if os.path.isfile(data_path):
+            os.remove(data_path)
+    except Exception:
+        pass
+    try:
+        onnx.checker.check_model(processed)
+    except Exception as exc:
+        print(f"TensorRT FP8 ONNX post-process check warning: {exc}")
+    onnx.save_model(
+        processed,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+    )
+    print(
+        "TensorRT FP8 ONNX post-process: "
+        f"converted Q/DQ={converted_q}/{converted_dq}, "
+        f"Conv weights FP8={inserted_weights}, skipped={skipped_weights}, "
+        f"attention rewrites mul={moved_mul}, transpose={moved_transpose}, softmax={inserted_softmax}"
+    )
 
 
 def _export_tensorrt_modelopt_torch_onnx_from_model(
@@ -6719,6 +7113,7 @@ def _export_tensorrt_modelopt_torch_onnx_from_model(
     height: int,
     dtype: torch.dtype,
     device: torch.device,
+    precision: str | None = None,
     flat_model: bool,
     single_input_graph: bool = False,
 ) -> str:
@@ -6784,9 +7179,20 @@ def _export_tensorrt_modelopt_torch_onnx_from_model(
         if configure_linear_module_onnx_quantizers is not None
         else contextlib.nullcontext()
     )
+    is_fp8 = _is_tensorrt_fp8_precision(precision)
+    fp8_conv_weight_modules = (
+        _tensorrt_modelopt_torch_enabled_conv_weight_modules(export_model)
+        if is_fp8
+        else set()
+    )
+    conv_weight_export_cm = (
+        _disable_tensorrt_modelopt_torch_conv_weight_export(export_model)
+        if is_fp8
+        else contextlib.nullcontext()
+    )
     with torch.inference_mode():
         try:
-            with export_cm, quantizer_cm:
+            with export_cm, quantizer_cm, conv_weight_export_cm:
                 export_args = (tensor,) if single_input_graph else (tensor, cond)
                 input_names = ["input"] if single_input_graph else ["input", "cond"]
                 with _suppress_expected_instancenorm_onnx_warning():
@@ -6804,7 +7210,14 @@ def _export_tensorrt_modelopt_torch_onnx_from_model(
         finally:
             if modelopt_tensor_quant is not None and original_quantize_op is not None:
                 modelopt_tensor_quant.quantize_op = original_quantize_op
-    _patch_tensorrt_qdq_zero_points(onnx_path)
+    if is_fp8:
+        _postprocess_tensorrt_modelopt_torch_fp8_onnx(
+            onnx_path,
+            enabled_conv_weight_modules=fp8_conv_weight_modules,
+            dtype=dtype,
+        )
+    else:
+        _patch_tensorrt_qdq_zero_points(onnx_path)
     if dtype == torch.float16:
         _patch_tensorrt_fp16_constants(onnx_path)
     return onnx_path
@@ -7596,8 +8009,11 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         model_path = tensorrt_source_checkpoint_path(model_path)
         precision_text = str(precision or "").strip().lower()
         self._trt_direct_fp_int8 = (
-            precision_text.startswith("int8")
-            and not _is_int8_checkpoint_path(model_path)
+            (
+                precision_text.startswith("int8")
+                and not _is_int8_checkpoint_path(model_path)
+            )
+            or precision_text.startswith("fp8")
         )
         self._engine_width = int(engine_width)
         self._engine_height = int(engine_height)
@@ -7612,6 +8028,10 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             and not self._trt_predequantize_int8
             and _tensorrt_int8_modelopt_enabled()
         )
+        self._trt_modelopt_fp8 = (
+            precision_text.startswith("fp8")
+            and _tensorrt_fp8_modelopt_torch_enabled()
+        )
         self._trt_qat_checkpoint_composition = (
             self._trt_modelopt_int8
             and _tensorrt_int8_qat_checkpoint_composition_enabled(
@@ -7619,10 +8039,13 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             )
         )
         self._trt_modelopt_torch_int8 = (
-            self._trt_modelopt_int8
-            and _tensorrt_int8_modelopt_torch_effective_enabled(
-                self._trt_base_mode_name
+            (
+                self._trt_modelopt_int8
+                and _tensorrt_int8_modelopt_torch_effective_enabled(
+                    self._trt_base_mode_name
+                )
             )
+            or self._trt_modelopt_fp8
         )
         self._trt_int8_agcm_only = (
             precision_text.startswith("int8")
@@ -7715,7 +8138,13 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             force_channels_last=False,
             predequantize=(
                 True
-                if (self._trt_predequantize_int8 or self._trt_modelopt_int8)
+                if (
+                    self._trt_predequantize_int8
+                    or (
+                        self._trt_modelopt_int8
+                        and not getattr(self, "_trt_modelopt_fp8", False)
+                    )
+                )
                 else False
             ),
             hg_weights=hg_weights,
@@ -7749,8 +8178,9 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     "engine for the selected INT8 mixed preset"
                 )
         elif self._trt_modelopt_torch_int8:
+            label = "FP8" if precision_text.startswith("fp8") else "INT8"
             print(
-                "TensorRT INT8 ModelOpt Torch: quantizing the PyTorch model "
+                f"TensorRT {label} ModelOpt Torch: quantizing the PyTorch model "
                 "before ONNX export, then building a native TensorRT engine"
             )
         elif self._trt_modelopt_int8:
@@ -7878,6 +8308,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 height=self._engine_height,
                 dtype=self._dtype,
                 device=self.device,
+                precision=self.precision,
                 flat_model=getattr(self, "_is_flat_model", False),
                 single_input_graph=single_input_graph,
             )
@@ -7959,9 +8390,18 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         builder_precision = str(
             getattr(self, "_trt_builder_precision", self.precision)
         ).strip().lower()
+        modelopt_torch_lowp = bool(getattr(self, "_trt_modelopt_torch_int8", False))
         strongly_typed = bool(
-            builder_precision.startswith("int8")
-            and getattr(self, "_trt_modelopt_int8", False)
+            (
+                (
+                    builder_precision.startswith("int8")
+                    and getattr(self, "_trt_modelopt_int8", False)
+                )
+                or (
+                    builder_precision.startswith("fp8")
+                    and modelopt_torch_lowp
+                )
+            )
             and _tensorrt_int8_modelopt_strongly_typed()
         )
         explicit_batch = getattr(
@@ -8032,6 +8472,9 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         platform_has_fast_int8 = bool(
             getattr(builder, "platform_has_fast_int8", True)
         )
+        platform_has_fast_fp8 = bool(
+            getattr(builder, "platform_has_fast_fp8", True)
+        )
         if (
             builder_precision != "fp32"
             and not strongly_typed
@@ -8051,6 +8494,20 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 print("TensorRT full INT8 safety: FP16 islands enabled")
             else:
                 print("TensorRT full INT8 safety: all-out INT8, FP16 tactics disabled")
+        if builder_precision.startswith("fp8") and not strongly_typed:
+            fp8_flag = getattr(getattr(trt, "BuilderFlag", object), "FP8", None)
+            if fp8_flag is None:
+                raise RuntimeError(
+                    "TensorRT FP8 BuilderFlag is unavailable. Install a TensorRT "
+                    "version with FP8 support for FP8 presets."
+                )
+            if not platform_has_fast_fp8:
+                raise RuntimeError(
+                    "This NVIDIA GPU/runtime does not report fast FP8 support. "
+                    "FP8 presets are intentionally restricted to Ada/Blackwell-class GPUs."
+                )
+            config.set_flag(fp8_flag)
+            print("TensorRT FP8 builder flag enabled")
         if native_int8 and platform_has_fast_int8:
             config.set_flag(trt.BuilderFlag.INT8)
             if native_int8:

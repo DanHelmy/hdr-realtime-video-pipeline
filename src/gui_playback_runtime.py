@@ -26,6 +26,7 @@ from gui_config import (
     SOURCE_MODE_WINDOW,
     _int8_precision_warning,
     _precision_engine_mode_base,
+    _precision_is_quantized_tensorrt,
     _select_hg_weights_path,
     _select_model_path,
     _select_tensorrt_model_path,
@@ -3879,12 +3880,54 @@ class PlaybackRuntimeMixin:
     def _selected_tensorrt_source_paths(self, gui_prec: str, use_hg: bool) -> list[str]:
         cfg = PRECISIONS.get(str(gui_prec), {})
         precision = str(cfg.get("precision", "")).strip().lower()
-        if not _IS_NVIDIA or not precision.startswith("int8"):
+        if not _IS_NVIDIA or not _precision_is_quantized_tensorrt(gui_prec):
             return []
         paths = [_select_tensorrt_model_path(gui_prec, use_hg)]
         if use_hg:
             paths.append(_select_hg_weights_path(gui_prec, tensorrt=True))
         return [str(path) for path in paths if str(path or "").strip()]
+
+    def _tensorrt_source_generator_args(
+        self,
+        gui_prec: str,
+        use_hg: bool,
+    ) -> tuple[str, list[str], str, str]:
+        cfg = PRECISIONS.get(str(gui_prec), {})
+        precision = str(cfg.get("precision", "")).strip().lower()
+        if precision.startswith("fp8"):
+            script = os.path.join(
+                _ROOT,
+                "scripts",
+                "quantize",
+                "make_tensorrt_fp8_source_checkpoints.py",
+            )
+            args = ["-u", script, "--missing-only", "--family", "hr"]
+            if use_hg:
+                args.extend(["--family", "hr_hg", "--family", "hg"])
+            source_dir = os.path.join(
+                _ROOT, "src", "models", "weights", "original", "tensorrt"
+            )
+            return (
+                script,
+                args,
+                source_dir,
+                "FP8 TensorRT source checkpoints",
+            )
+        script = os.path.join(
+            _ROOT,
+            "scripts",
+            "quantize",
+            "split_tensorrt_sources.py",
+        )
+        source_dir = os.path.join(
+            _ROOT, "src", "models", "weights", "original", "pytorch_int8"
+        )
+        return (
+            script,
+            ["-u", script, "--only-original", "--missing-only"],
+            source_dir,
+            "INT8 TensorRT source checkpoints",
+        )
 
     def _ensure_tensorrt_sources_ready_for_playback(
         self,
@@ -3916,14 +3959,15 @@ class PlaybackRuntimeMixin:
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Prepare TensorRT Sources")
         box.setText("Generate local TensorRT source checkpoints?")
+        label = "FP8" if str(PRECISIONS.get(gui_prec, {}).get("precision", "")).startswith("fp8") else "INT8"
         box.setInformativeText(
-            "This INT8 preset needs TensorRT source checkpoints that are generated "
-            "locally from the committed PyTorch INT8 checkpoints. With HG enabled, "
-            "the app may need to generate the local HG TensorRT source model "
+            f"This {label} preset needs TensorRT source checkpoints generated "
+            "locally from the committed checkpoint recipe. With HG enabled, the "
+            "app may need to generate the local HG TensorRT source model "
             "checkpoint first, then build the specific TensorRT engine for the "
             "selected precision and resolution. The large HG source files are "
-            "intentionally not committed, so the first HG INT8 run can take a "
-            "little while before playback starts.\n\n"
+            "intentionally not committed, so the first HG low-precision run can "
+            "take a little while before playback starts.\n\n"
             f"Missing source file(s): {len(missing)}"
         )
         continue_btn = box.addButton(
@@ -3941,7 +3985,7 @@ class PlaybackRuntimeMixin:
             self.statusBar().showMessage("TensorRT source preparation canceled.")
             return False
 
-        self._prepare_tensorrt_sources_async(on_ready)
+        self._prepare_tensorrt_sources_async(gui_prec, use_hg, on_ready)
         return False
 
     def _expected_tensorrt_source_paths(self) -> list[str]:
@@ -3960,34 +4004,29 @@ class PlaybackRuntimeMixin:
             if not os.path.isfile(path)
         ]
 
-    def _prepare_tensorrt_sources_async(self, on_ready):
-        script = os.path.join(
-            _ROOT,
-            "scripts",
-            "quantize",
-            "split_tensorrt_sources.py",
+    def _prepare_tensorrt_sources_async(self, gui_prec, use_hg, on_ready):
+        script, args, source_dir, label = self._tensorrt_source_generator_args(
+            gui_prec,
+            use_hg,
         )
         if not os.path.isfile(script):
             QMessageBox.warning(
                 self,
                 "TensorRT Sources",
-                "Cannot prepare TensorRT sources because the split script is missing.",
+                "Cannot prepare TensorRT sources because the generator script is missing.",
             )
             return
 
-        source_dir = os.path.join(
-            _ROOT, "src", "models", "weights", "original", "pytorch_int8"
-        )
         if not os.path.isdir(source_dir):
             QMessageBox.warning(
                 self,
                 "TensorRT Sources",
-                "Cannot prepare TensorRT sources because original/pytorch_int8 is missing.",
+                f"Cannot prepare TensorRT sources because this source directory is missing:\n{source_dir}",
             )
             return
 
         dlg = QProgressDialog(
-            "Preparing TensorRT source checkpoints ...",
+            f"Preparing {label} ...",
             None,
             0,
             0,
@@ -4022,7 +4061,7 @@ class PlaybackRuntimeMixin:
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             if lines:
                 dlg.setLabelText(
-                    "Preparing TensorRT source checkpoints ...\n"
+                    f"Preparing {label} ...\n"
                     + lines[-1][-160:]
                 )
 
@@ -4038,7 +4077,6 @@ class PlaybackRuntimeMixin:
             self._tensorrt_source_process = None
             process.deleteLater()
 
-            missing_after = self._missing_tensorrt_source_paths()
             selected_missing_after = [
                 path
                 for path in self._selected_tensorrt_source_paths(
@@ -4056,8 +4094,8 @@ class PlaybackRuntimeMixin:
 
             tail = "".join(output_chunks)[-3000:].strip()
             details = (
-                f"\n\nStill missing {len(missing_after)} source file(s)."
-                if missing_after
+                f"\n\nStill missing {len(selected_missing_after)} selected source file(s)."
+                if selected_missing_after
                 else ""
             )
             if tail:
@@ -4075,12 +4113,7 @@ class PlaybackRuntimeMixin:
         self._tensorrt_source_dlg = dlg
         process.start(
             _python_executable_for_clean_subprocess(),
-            [
-                "-u",
-                script,
-                "--only-original",
-                "--missing-only",
-            ],
+            args,
         )
         if not process.waitForStarted(5000):
             try:

@@ -52,8 +52,8 @@ Core updates include:
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
 - benchmark queues can add the current setup once or add precision sweeps in one click; the all-precision action asks whether to queue the main FP32/FP16/Mixed QAT/Full QAT set or literally every visible preset
-- deterministic video frame detection now requires FFmpeg keyframe timestamps plus bounded low-resolution preview scoring, returns large requested pools from the keyframe timeline without decoding every candidate, caches the scored pool, and avoids OpenCV random-seek QC passes
-- compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path for requested noncurrent video frames instead of falling back to OpenCV video seeking
+- deterministic video frame detection uses OpenCV frame-index reads again so benchmark frame labels stay in the same address space used by post-verify, with the scored pool cached for repeated runs
+- compare and objective metrics use a guarded FFmpeg SDR frame fast-seek path; Model Quality Benchmark SDR reads use OpenCV frame-index access to match detected benchmark frame labels
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - playback performance benchmarking uses the same interaction lock: normal playback is paused/locked while the realtime mpv benchmark owns the GPU/display path, then restored when the benchmark window closes
@@ -64,14 +64,14 @@ Core updates include:
 - the final TensorRT sweep did not find a stable 25-28 ms mixed path; more aggressive AGCM quantization was faster by less than a millisecond but failed visual/temporal rolloff checks, so the stable LE/HG recipe remains the shipped mixed baseline. On the current RTX 5060 Ti HG path, strict Full QAT is the fastest INT8 preset while Mixed QAT remains the protected lower-risk composition.
 - Full INT8 verifies the strict checkpoint contract: no-HG `128` W8A8 layers and HG `149` W8A8 layers, with no W8A16 or FP16 fallback layers in the checkpoint composition
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants trained for the same TensorRT composition used at deployment
-- unsupported extra low-precision experiment presets and builder paths have been removed; the supported NVIDIA deployment surface is FP16/FP32 plus INT8 PTQ/QAT/QAT Film
+- experimental FP8 TensorRT presets are available only on detected RTX 40/50 GPUs; they reuse the INT8 mixed/full composition but emit FP8 ModelOpt Q/DQ during engine build
 - HDR GT fast path processing for significantly faster ground-truth video alignment and frame mapping
 - optimized GT sync algorithm with improved frame scanning and alignment detection
 - HDR GT status indicator in the GUI status line showing when fast path is active
 - cached GT alignment results to avoid redundant processing for the same video pairs
 - HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and conservative cached constant frame offsets
 - compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
-- benchmark video runs now post-verify GT frames by batched presentation-time exact decode and local frame alignment before final metrics are reported
+- benchmark video runs now post-verify GT frames by batched exact decode and local frame alignment before final metrics are reported
 - queued video benchmarks reuse a bounded in-memory post-verify GT cache for repeated SDR/HDR/frame/resolution pairs, skipping redundant exact GT decode/alignment while still recomputing HDR Convert outputs and metrics per checkpoint
 - compare preparation now uses a cancelable application-modal progress dialog so pending compare seeks can be canceled cleanly
 - native `Browser Window Capture (Experimental)` video path
@@ -197,7 +197,7 @@ cd hdr-realtime-video-pipeline
 - On AMD, benchmark uses cached `torch.compile` / `max-autotune` kernels on an exact cache hit and falls back to eager mode on a miss
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
 - Video frame selection can detect a larger deterministic candidate pool, then use the same average-mode workflow as datasets (`selected`, `all`, or deterministic subset) for final scoring
-- Video benchmark metrics are finalized by a batched presentation-time exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
+- Video benchmark metrics are finalized by a batched exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
 - Queued video runs reuse a bounded in-memory post-verify GT cache for repeated source/GT/frame/resolution pairs. This reuses only the verified GT frame/alignment side; HDR Convert outputs and metrics are still recomputed for every checkpoint.
 - Dataset image pairs stay on the image decoder path; video sync/crop probes are only used for actual video files
 
@@ -429,7 +429,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - queue controls can add the current run or add all visible precision presets for the current source/resolution/HG setup
   - runs quality benchmarking through TensorRT on NVIDIA, cached max-autotune on AMD when available, or eager fallback when no safe compile cache exists
   - video workflow includes deterministic distinct-frame candidate pools, average modes (`selected`, `all`, deterministic subset), and manual frame checkboxes
-  - video frame detection now prefers FFmpeg packet-level keyframe timestamps plus bounded tiny preview-frame scoring, then reuses cached scores for deterministic subset/all-frame modes instead of re-reading every detected frame through OpenCV
+  - video frame detection now uses OpenCV frame-index reads for deterministic candidate scoring, then reuses cached scores for deterministic subset/all-frame modes
   - dataset workflow includes paired-file scanning with the same averaging modes (`selected`, `all`, deterministic subset)
   - result page shows run info (`source name`, `precision`, `resolution`) and supports loading existing JSON/CSV summaries
   - result previews now use the same compare-style color-managed display path for `SDR`, `HDR GT`, and `HDR Convert`
@@ -568,13 +568,12 @@ python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1440p 
   - `HDRTVNET_GT_SYNC_OFFSET_MIN_GAIN` controls how much better a nonzero global offset must be before it replaces frame offset `0`. Default: `0.06`; tiny offsets require a stronger gain to avoid false `+/-1` to `+/-5` frame shifts.
   - the detected offset is cached per file signature and used by Compare, objective logging, and benchmark frame reads.
   - if a movie starts more than two seconds apart between SDR and HDR GT files, raise `HDRTVNET_GT_SYNC_OFFSET_SEARCH_S` before launch.
-- Compare recompare, benchmark previews, and deterministic video frame display use guarded FFmpeg fast seeks for SDR video frame reads instead of OpenCV video seeking:
+- Compare recompare and objective metric video frame reads use guarded FFmpeg fast seeks for SDR video frame reads:
   - `HDRTVNET_SDR_FRAME_FAST_SEEK=0` disables the SDR fast-seek reader; requested video frames then report unavailable.
   - `HDRTVNET_SDR_FRAME_FAST_SEEK_PTS_GUARD=0` disables timestamp verification for the fast reader.
   - `HDRTVNET_SDR_FRAME_CACHE_MAX` controls the small repeated-frame cache. Default: `8`.
-- Model Quality Benchmark video candidate detection uses FFmpeg packet-level keyframe timestamps and tiny preview-frame scoring when available, then stores the deterministic scored pool:
-  - `HDRTVNET_FRAME_DETECT_FFMPEG=0` disables this keyframe detector. Video candidate detection then reports unavailable instead of falling back to OpenCV random seeking.
-- Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames by presentation-time windows in bounded batches before final metrics:
+- Model Quality Benchmark video candidate detection uses OpenCV frame-index reads and stores the deterministic scored pool.
+- Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames in bounded batches before final metrics:
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY` enables/disables this pass. Default: `1`.
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS` limits verified rows, or `all` verifies every video row. Default: `all`.
   - `HDRTVNET_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES` controls post-verify exact-decode chunk size. Default: `20`.
@@ -712,11 +711,11 @@ The first time you play, export, or benchmark a given model/resolution/mode comb
 
 `src/models/engines/{model}_{resolution}_{mode}.engine`
 
-INT8 TensorRT modes include a versioned ModelOpt Torch/QDQ suffix in the mode portion of the filename. Mixed INT8 uses the runtime include mask, KL-divergence scoring, an `8.25` effective-bit target, and active-compute output quantizers so TensorRT does not inherit orphaned Q/DQ outputs. Full INT8 turns every ModelOpt Torch quantizer on and disables FP16 tactics when FP16 islands are off.
+INT8 TensorRT modes include a versioned ModelOpt Torch/QDQ suffix in the mode portion of the filename. Mixed INT8 uses the runtime include mask, KL-divergence scoring, an `8.25` effective-bit target, and active-compute output quantizers so TensorRT does not inherit orphaned Q/DQ outputs. Full INT8 turns every ModelOpt Torch quantizer on and disables FP16 tactics when FP16 islands are off. FP8 TensorRT modes use their own ModelOpt Torch FP8 suffix and are shown only on RTX 40/50-class GPUs.
 
 If the engine is missing, the app loads the selected `.pt` model, exports a temporary ONNX file with the same model/resolution/mode stem, builds a TensorRT engine, saves it, removes the ONNX file, and then runs inference through that engine. Later runs load the `.engine` directly when the cached engine metadata still matches the model, resolution, precision, mode, TensorRT export settings, and CUDA device fingerprint.
 
-Checkpoint source selection is preset-driven. FP32/FP16 modes use `src/models/weights/original/HR.pt` plus `src/models/weights/original/HG.pt` when HG is enabled. INT8 no-HG modes use matching TensorRT source checkpoints under `src/models/weights/original/tensorrt/hr`; INT8 HG modes use the HR source split from the exact HR+HG composite under `original/tensorrt/hr_hg` plus the matching HG source under `original/tensorrt/hg`. The Google Drive HG asset can stay named `HG.pt`; the GUI saves it locally as `src/models/weights/original/HG.pt`. The large original HG TensorRT source files are intentionally not tracked by Git, so the first NVIDIA INT8+HG run can warn the user, regenerate the missing local HG TensorRT source checkpoint from `src/models/weights/original/pytorch_int8`, and then build the selected engine.
+Checkpoint source selection is preset-driven. FP32/FP16 modes use `src/models/weights/original/HR.pt` plus `src/models/weights/original/HG.pt` when HG is enabled. INT8 no-HG modes use matching TensorRT source checkpoints under `src/models/weights/original/tensorrt/hr`; INT8 HG modes use the HR source split from the exact HR+HG composite under `original/tensorrt/hr_hg` plus the matching HG source under `original/tensorrt/hg`. FP8 uses the same family split under `src/models/weights/original/tensorrt_fp8/hr` and `hr_hg`; standalone FP8 HG sources are generated locally only when an HG FP8 mode is activated. The Google Drive HG asset can stay named `HG.pt`; the GUI saves it locally as `src/models/weights/original/HG.pt`. The large original HG TensorRT source files are intentionally not tracked by Git, so the first NVIDIA INT8/FP8+HG run can warn the user, regenerate the missing local HG TensorRT source checkpoint from the existing source families, and then build the selected engine.
 
 TensorRT engines are not universal binaries. The same checkpoint and command can be run on other TensorRT-capable NVIDIA GPUs, but each machine should build its own `.engine` because TensorRT chooses tactics for the local GPU architecture, driver, TensorRT version, workspace, and timing cache. Tensor Core GPUs normally benefit most from FP16/INT8. Older or non-Tensor-Core NVIDIA GPUs may still build through TensorRT, but INT8 speedups are not guaranteed and TensorRT may choose DP4A, FP16, or FP32 tactics depending on what the hardware supports. Non-NVIDIA GPUs do not use TensorRT; AMD/CPU use the PyTorch path.
 
@@ -727,6 +726,7 @@ python src/build_tensorrt_engines.py 3840x2160 --precision fp16 --use-hg 1 --ben
 python src/build_tensorrt_engines.py 3840x2160 --precision int8-mixed-qat --use-hg 0 --benchmark-runs 20
 python src/build_tensorrt_engines.py 3840x2160 --precision int8-mixed-qat --use-hg 1 --benchmark-runs 20
 python src/build_tensorrt_engines.py 3840x2160 --precision int8-full-qat --use-hg 1 --benchmark-runs 10
+python src/build_tensorrt_engines.py 1920x1080 --precision fp8-mixed-qat --use-hg 0 --benchmark-runs 20
 ```
 
 TensorRT performs optimization during engine build time and caches the result. No PyTorch max-autotune warning is shown on NVIDIA.
@@ -743,6 +743,7 @@ Advanced TensorRT build environment overrides:
 - `HDRTVNET_TRT_INT8_MODELOPT_TORCH_EFFECTIVE_BITS=8.25` adjusts the mixed INT8 ModelOpt target; lower values quantize more layers but can reintroduce highlight rolloff/flicker.
 - `HDRTVNET_TRT_INT8_MODELOPT_TORCH_METHOD=kl_div|gradient` changes mixed INT8 scoring; the shipped default is `kl_div`.
 - `HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUT_POLICY=active|include` controls mixed output Q/DQ. The shipped default is `active`, meaning output quantizers are enabled only for layers whose input/weight quantizers stayed active.
+- `HDRTVNET_SHOW_FP8=1|0` overrides RTX 40/50 FP8 preset visibility for debugging. Normal users should leave it unset.
 
 The manual prebuild script also exposes `--opt-level`, `--workspace-gb`, `--timing-cache`, `--aux-streams`, `--force-onnx`, and `--benchmark-runs` so NVIDIA test machines can rebuild and report comparable numbers from one command. `--force-onnx` is mainly for clearing stale ONNX files left by older builds.
 
@@ -925,8 +926,10 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 | **INT8 Mixed (PTQ)** | Mixed W8A8/W8A16/FP16-sensitive layers (HG optional) | protected mixed INT8 family; fastest deployable preset varies by GPU |
 | **INT8 Mixed (QAT)** | Mixed W8A8/W8A16/FP16-sensitive layers + quantization-aware fine-tuning (HG optional) | current default NVIDIA preset |
 | **INT8 Mixed (QAT) (Film)** | Mixed movie-accuracy QAT with protected tone-control paths (HG optional) | optional movie-domain INT8 preset |
+| **FP8 Mixed (PTQ/QAT/QAT Film)** | RTX 40/50 TensorRT-only FP8 version of the mixed composition | experimental Ada/Blackwell comparison path |
+| **FP8 Full (PTQ/QAT/QAT Film)** | RTX 40/50 TensorRT-only FP8 version of the full composition | experimental strict full-FP8 baseline |
 
-The app includes ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints. On NVIDIA, these presets route through self-describing original-family TensorRT source checkpoints under `src/models/weights/original/tensorrt` so the engine builder can recreate the HR/ACGM/LE/HG architecture without relying on environment overrides. The Film variants are separate deployable checkpoints rather than runtime color presets.
+The app includes ready-to-use PTQ, QAT, and QAT (Film) INT8 checkpoints. On NVIDIA, these presets route through self-describing original-family TensorRT source checkpoints under `src/models/weights/original/tensorrt` so the engine builder can recreate the HR/ACGM/LE/HG architecture without relying on environment overrides. FP8 source checkpoints live under `src/models/weights/original/tensorrt_fp8` and are TensorRT-only; they are hidden unless the runtime detects an RTX 40/50-class GPU. The Film variants are separate deployable checkpoints rather than runtime color presets.
 
 ### Checkpoint Selection Guide
 
@@ -940,12 +943,13 @@ There is no single checkpoint that is best for every device, movie, and metric. 
 | **INT8 Full (PTQ)** | Fully quantized W8A8 baseline. It can sometimes score surprisingly well because PTQ clipping/precision loss acts like an implicit regularizer, but that behavior is accidental and not directly controllable. |
 | **INT8 Full (QAT) / QAT (Film)** | Most moldable INT8 path. Full W8A8 gives QAT more low-bit behavior to reshape, so these variants can be useful when a specific dataset or movie-domain look is preferred. |
 | **INT8 Mixed (QAT) (Film)** | Optional movie-domain preset. It keeps the same mixed-precision structure, but nudges the output toward the Film objective. |
+| **FP8 Mixed / Full** | Experimental NVIDIA-only RTX 40/50 comparison presets. Use them to test whether FP8 beats INT8 on Ada/Blackwell; they are not AMD/eager checkpoints. |
 
 For thesis interpretation, treat quantization as more than compression. PTQ can accidentally improve agreement with HDR targets by suppressing FP32 biases, while QAT makes that behavior controllable by optimizing the quantized checkpoint toward a chosen objective. In practice, use whichever checkpoint gives the best FPS and the visual style you prefer on the target runtime.
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, the selected INT8 preset maps to an original-family TensorRT source checkpoint. No-HG uses `src/models/weights/original/tensorrt/hr`; HG uses the composite-split HR source in `src/models/weights/original/tensorrt/hr_hg` plus the matching HG source in `src/models/weights/original/tensorrt/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). No-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Both use KL-divergence scoring with an `8.25` effective-bit target and enable output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/original/pytorch_int8/hr` and `src/models/weights/original/pytorch_int8/hg`.
+On NVIDIA, the selected INT8 preset maps to an original-family TensorRT source checkpoint. No-HG uses `src/models/weights/original/tensorrt/hr`; HG uses the composite-split HR source in `src/models/weights/original/tensorrt/hr_hg` plus the matching HG source in `src/models/weights/original/tensorrt/hg`. **ModelOpt Torch** inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). No-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Both use KL-divergence scoring with an `8.25` effective-bit target and enable output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on, enables output quantizers, and disables FP16 tactics by default. FP8 presets use the same mixed/full layer composition and source families but emit FP8 E4M3 Q/DQ during TensorRT export; no eager FP8 checkpoints are shipped. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/original/pytorch_int8/hr` and `src/models/weights/original/pytorch_int8/hg`.
 
 The default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly.
 
@@ -1005,6 +1009,7 @@ Example from the repo root, using the mpv display path and logging 3 realtime mi
 
 ```cmd
 .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "path\to\video.mp4" --resolutions 1280x720 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat int8-mixed-qat-film int8-full-qat-film --duration-s 180 --warmup-frames 120 --sample-interval 120 --use-hg 0 --compile-mode max-autotune --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "path\to\video.mp4" --resolutions 1920x1080 --runs fp8-mixed-qat fp8-full-qat --duration-s 90 --warmup-frames 60 --sample-interval 60 --use-hg 0 --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source
 ```
 
 One-line NVIDIA mpv comparisons for the original HR+HG and HR/no-HG paths:
@@ -1026,7 +1031,7 @@ Useful flags:
 |---|---|
 | `--video PATH` | Video to benchmark; required |
 | `--resolutions WxH ...` | Processing resolutions, e.g. `1280x720 1920x1080` |
-| `--runs ...` | Presets: `fp32`, `fp16`, `int8-mixed-ptq`, `int8-full-ptq`, `int8-mixed-qat`, `int8-full-qat`, `int8-mixed-qat-film`, `int8-full-qat-film` |
+| `--runs ...` | Presets: `fp32`, `fp16`, `int8-mixed-ptq`, `int8-full-ptq`, `int8-mixed-qat`, `int8-full-qat`, `int8-mixed-qat-film`, `int8-full-qat-film`; RTX 40/50 TensorRT also accepts `fp8-mixed-ptq`, `fp8-full-ptq`, `fp8-mixed-qat`, `fp8-full-qat`, `fp8-mixed-qat-film`, `fp8-full-qat-film` |
 | `--model PATH` | HR/model checkpoint override for all selected runs |
 | `--hg-weights PATH` | HG checkpoint override; use with `--model` for custom HR/HG playback benchmarks |
 | `--duration-s N` | Timed duration per run after warmup |
@@ -1046,7 +1051,7 @@ Useful flags:
 |---|---|
 | `--model PATH` | Model weights path (default: `src/models/weights/original/HR.pt`) |
 | `--device auto\|cuda\|cpu` | Device selection (default: auto) |
-| `--precision auto\|fp16\|fp32\|int8-full\|int8-mixed` | Inference precision (default: auto → fp16 on GPU) |
+| `--precision auto\|fp16\|fp32\|int8-full\|int8-mixed\|fp8-full\|fp8-mixed` | Inference precision (default: auto → fp16 on GPU; FP8 is NVIDIA TensorRT-only) |
 | `--compile-mode auto\|default\|reduce-overhead\|max-autotune\|max-autotune-no-cudagraphs` | PyTorch backend only; torch.compile mode (auto = max-autotune) |
 | `--force-compile` | AMD PyTorch only; force `torch.compile` on ROCm-Windows when HIP SDK auto-detection fails |
 | `--no-compile` | PyTorch backend only; disable `torch.compile` entirely |
@@ -1090,6 +1095,9 @@ The repo uses one naming scheme for all shipped `.pt` weights:
 | `src/models/weights/original/tensorrt/hr/*.pt` | original standalone HR/no-HG TensorRT source checkpoints |
 | `src/models/weights/original/tensorrt/hr_hg/*.pt` | original HR source split from the exact HR+HG composite INT8 checkpoint |
 | `src/models/weights/original/tensorrt/hg/*.pt` | original HG TensorRT source checkpoints; generated locally and ignored because they exceed normal GitHub file-size limits |
+| `src/models/weights/original/tensorrt_fp8/hr/*.pt` | original standalone HR/no-HG FP8 TensorRT source checkpoints for RTX 40/50 experiments |
+| `src/models/weights/original/tensorrt_fp8/hr_hg/*.pt` | original HR source split from the exact HR+HG FP8 TensorRT source checkpoint |
+| `src/models/weights/original/tensorrt_fp8/hg/*.pt` | original HG FP8 TensorRT source checkpoints; generated locally only when FP8+HG is activated |
 
 `hr` means HR/ACGM/LE only. `hg` means the eager deploy checkpoint contains the combined HR+HG PyTorch path. TensorRT keeps HR and HG source checkpoints split so the builder can load HR and, only when `--use-hg 1`, load the matching HG source separately. `hr_hg` is the HR half of the composite checkpoint; it exists because the standalone HR checkpoint and the HR part of the HR+HG checkpoint can differ after PTQ/QAT.
 
@@ -1101,7 +1109,7 @@ The GUI and CLI precision preset picks three paths:
 - `trt_model`: TensorRT HR source checkpoint under `original/tensorrt/hr` for no-HG or `original/tensorrt/hr_hg` for HG
 - `trt_hg_weights`: optional TensorRT HG source checkpoint under `original/tensorrt/hg`
 
-On NVIDIA, the TensorRT builder uses `trt_model`, the current resolution, precision, and HG toggle to export a temporary ONNX and cache an `.engine` under `src/models/engines/`. PTQ, QAT, and QAT Film are separate source checkpoints. Mixed INT8 uses the selected mixed mask; Full INT8 is the strict contract path and forces all ModelOpt Torch quantizers on.
+On NVIDIA, the TensorRT builder uses `trt_model`, the current resolution, precision, and HG toggle to export a temporary ONNX and cache an `.engine` under `src/models/engines/`. PTQ, QAT, and QAT Film are separate source checkpoints. Mixed INT8 uses the selected mixed mask; Full INT8 is the strict contract path and forces all ModelOpt Torch quantizers on. FP8 Mixed/Full reuse the same mixed/full composition but emit FP8 ModelOpt Torch Q/DQ and are not loaded by AMD/eager runtime paths.
 
 If the selected INT8+HG TensorRT HG source is missing, the GUI asks when that HG setting is applied, then generates the source locally before the engine build starts. The same preparation can be run from the terminal:
 

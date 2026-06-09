@@ -53,6 +53,10 @@ def _weight(name: str) -> str:
     return os.path.join(_HERE, "models", "weights", name)
 
 
+def _fp8_source(folder: str, name: str) -> str:
+    return _weight(os.path.join("original", "tensorrt_fp8", folder, name))
+
+
 _PRECISION_MAP = {
     "fp16": (
         "fp16",
@@ -104,6 +108,46 @@ _PRECISION_MAP = {
         _weight("original/pytorch_int8/hg/HR_HG_original_int8_full_qat_film.pt"),
         _weight("original/pytorch_int8/hr/HR_original_int8_full_qat_film.pt"),
     ),
+    "fp8-mixed": (
+        "fp8-mixed",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_qat.pt"),
+        _fp8_source("hr", "HR_original_fp8_mixed_qat.pt"),
+    ),
+    "fp8-mixed-ptq": (
+        "fp8-mixed",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_ptq.pt"),
+        _fp8_source("hr", "HR_original_fp8_mixed_ptq.pt"),
+    ),
+    "fp8-mixed-qat": (
+        "fp8-mixed",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_qat.pt"),
+        _fp8_source("hr", "HR_original_fp8_mixed_qat.pt"),
+    ),
+    "fp8-mixed-qat-film": (
+        "fp8-mixed",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_qat_film.pt"),
+        _fp8_source("hr", "HR_original_fp8_mixed_qat_film.pt"),
+    ),
+    "fp8-full": (
+        "fp8-full",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_full_qat.pt"),
+        _fp8_source("hr", "HR_original_fp8_full_qat.pt"),
+    ),
+    "fp8-full-ptq": (
+        "fp8-full",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_full_ptq.pt"),
+        _fp8_source("hr", "HR_original_fp8_full_ptq.pt"),
+    ),
+    "fp8-full-qat": (
+        "fp8-full",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_full_qat.pt"),
+        _fp8_source("hr", "HR_original_fp8_full_qat.pt"),
+    ),
+    "fp8-full-qat-film": (
+        "fp8-full",
+        _fp8_source("hr_hg", "HR_HG_original_fp8_full_qat_film.pt"),
+        _fp8_source("hr", "HR_original_fp8_full_qat_film.pt"),
+    ),
 }
 
 
@@ -112,8 +156,11 @@ def _gui_precision_key_for_model(precision: str, model_path: str, use_hg: bool) 
     for key, cfg in PRECISIONS.items():
         if str(cfg.get("precision", "")).strip().lower() != str(precision).strip().lower():
             continue
-        candidate = _select_model_path(key, use_hg)
-        if os.path.abspath(os.path.normcase(candidate)) == target:
+        candidates = (
+            _select_model_path(key, use_hg),
+            _select_tensorrt_model_path(key, use_hg),
+        )
+        if any(os.path.abspath(os.path.normcase(candidate)) == target for candidate in candidates):
             return key
     return None
 
@@ -144,7 +191,8 @@ def _ensure_default_tensorrt_sources(gui_precision_key: str | None, use_hg: bool
     if not gui_precision_key:
         return
     cfg = PRECISIONS.get(gui_precision_key, {})
-    if not str(cfg.get("precision", "")).strip().lower().startswith("int8"):
+    precision = str(cfg.get("precision", "")).strip().lower()
+    if not precision.startswith(("int8", "fp8")):
         return
 
     expected = [_select_tensorrt_model_path(gui_precision_key, use_hg)]
@@ -158,18 +206,32 @@ def _ensure_default_tensorrt_sources(gui_precision_key: str | None, use_hg: bool
     if not missing:
         return
 
-    script = os.path.abspath(
-        os.path.join(
-            os.path.dirname(_HERE),
-            "scripts",
-            "quantize",
-            "split_tensorrt_sources.py",
+    if precision.startswith("fp8"):
+        script = os.path.abspath(
+            os.path.join(
+                os.path.dirname(_HERE),
+                "scripts",
+                "quantize",
+                "make_tensorrt_fp8_source_checkpoints.py",
+            )
         )
-    )
+        cmd = [sys.executable, "-u", script, "--missing-only", "--family", "hr"]
+        if use_hg:
+            cmd.extend(["--family", "hr_hg", "--family", "hg"])
+    else:
+        script = os.path.abspath(
+            os.path.join(
+                os.path.dirname(_HERE),
+                "scripts",
+                "quantize",
+                "split_tensorrt_sources.py",
+            )
+        )
+        cmd = [sys.executable, "-u", script, "--missing-only"]
     if not os.path.isfile(script):
         print(
             "[tensorrt] default TensorRT source files are missing, but "
-            f"the split script was not found: {script}",
+            f"the source generator was not found: {script}",
             file=sys.stderr,
         )
         return
@@ -180,7 +242,7 @@ def _ensure_default_tensorrt_sources(gui_precision_key: str | None, use_hg: bool
         flush=True,
     )
     subprocess.run(
-        [sys.executable, "-u", script, "--missing-only"],
+        cmd,
         cwd=os.path.dirname(_HERE),
         check=False,
     )

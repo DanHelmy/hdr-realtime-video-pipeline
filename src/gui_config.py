@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
+import re
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _weight(name: str) -> str:
     return os.path.join(_HERE, "models", "weights", name)
+
+
+def _fp8_source(folder: str, name: str) -> str:
+    return _weight(os.path.join("original", "tensorrt_fp8", folder, name))
 
 
 PRECISIONS = {
@@ -86,6 +91,72 @@ PRECISIONS = {
         "trt_model_nohg": _weight("original/tensorrt/hr/HR_original_int8_full_qat_film.pt"),
         "trt_hg_weights": _weight("original/tensorrt/hg/HG_original_int8_full_qat_film.pt"),
     },
+    "FP8 Mixed (PTQ)": {
+        "precision": "fp8-mixed",
+        "engine_mode": "original_fp8-mixed-ptq",
+        "requires_fp8": True,
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_ptq.pt"),
+        "trt_model_nohg": _fp8_source("hr", "HR_original_fp8_mixed_ptq.pt"),
+        "trt_hg_weights": _fp8_source("hg", "HG_original_fp8_mixed_ptq.pt"),
+    },
+    "FP8 Mixed (QAT)": {
+        "precision": "fp8-mixed",
+        "engine_mode": "original_fp8-mixed-qat",
+        "requires_fp8": True,
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_qat.pt"),
+        "trt_model_nohg": _fp8_source("hr", "HR_original_fp8_mixed_qat.pt"),
+        "trt_hg_weights": _fp8_source("hg", "HG_original_fp8_mixed_qat.pt"),
+    },
+    "FP8 Mixed (QAT) (Film)": {
+        "precision": "fp8-mixed",
+        "engine_mode": "original_fp8-mixed-qat-film",
+        "requires_fp8": True,
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _fp8_source("hr_hg", "HR_HG_original_fp8_mixed_qat_film.pt"),
+        "trt_model_nohg": _fp8_source("hr", "HR_original_fp8_mixed_qat_film.pt"),
+        "trt_hg_weights": _fp8_source("hg", "HG_original_fp8_mixed_qat_film.pt"),
+    },
+    "FP8 Full (PTQ)": {
+        "precision": "fp8-full",
+        "engine_mode": "original_fp8-full-ptq",
+        "requires_fp8": True,
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _fp8_source("hr_hg", "HR_HG_original_fp8_full_ptq.pt"),
+        "trt_model_nohg": _fp8_source("hr", "HR_original_fp8_full_ptq.pt"),
+        "trt_hg_weights": _fp8_source("hg", "HG_original_fp8_full_ptq.pt"),
+    },
+    "FP8 Full (QAT)": {
+        "precision": "fp8-full",
+        "engine_mode": "original_fp8-full-qat",
+        "requires_fp8": True,
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _fp8_source("hr_hg", "HR_HG_original_fp8_full_qat.pt"),
+        "trt_model_nohg": _fp8_source("hr", "HR_original_fp8_full_qat.pt"),
+        "trt_hg_weights": _fp8_source("hg", "HG_original_fp8_full_qat.pt"),
+    },
+    "FP8 Full (QAT) (Film)": {
+        "precision": "fp8-full",
+        "engine_mode": "original_fp8-full-qat-film",
+        "requires_fp8": True,
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _fp8_source("hr_hg", "HR_HG_original_fp8_full_qat_film.pt"),
+        "trt_model_nohg": _fp8_source("hr", "HR_original_fp8_full_qat_film.pt"),
+        "trt_hg_weights": _fp8_source("hg", "HG_original_fp8_full_qat_film.pt"),
+    },
 }
 
 DEFAULT_PRECISION_KEY = "INT8 Mixed (QAT)"
@@ -143,7 +214,22 @@ def _precision_is_int8(precision_key: str) -> bool:
     return str(PRECISIONS.get(precision_key, {}).get("precision", "")).startswith("int8")
 
 
+def _precision_is_fp8(precision_key: str) -> bool:
+    return str(PRECISIONS.get(precision_key, {}).get("precision", "")).startswith("fp8")
+
+
+def _precision_is_quantized_tensorrt(precision_key: str) -> bool:
+    text = str(PRECISIONS.get(precision_key, {}).get("precision", "")).strip().lower()
+    return text.startswith("int8") or text.startswith("fp8")
+
+
 def _int8_precision_warning(precision_key: str, use_hg: bool) -> str:
+    if _precision_is_fp8(precision_key):
+        return (
+            "FP8 TensorRT is an experimental RTX 40/50-only path. It uses "
+            "the matching INT8 mixed/full composition, but emits FP8 ModelOpt "
+            "Q/DQ during TensorRT engine build."
+        )
     if not _precision_is_int8(precision_key):
         return ""
     if not use_hg:
@@ -154,8 +240,27 @@ def _int8_precision_warning(precision_key: str, use_hg: bool) -> str:
     return INT8_HG_WARNING
 
 
+def _runtime_has_rtx_40_or_50() -> bool:
+    override = str(os.environ.get("HDRTVNET_SHOW_FP8", "")).strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        name = str(torch.cuda.get_device_name(0) or "")
+    except Exception:
+        return False
+    return bool(re.search(r"\brtx\s*40\d{2}\b|\brtx\s*50\d{2}\b", name, re.I))
+
+
 def _precision_is_available(precision_key: str) -> bool:
     cfg = PRECISIONS.get(precision_key, {})
+    if bool(cfg.get("requires_fp8", False)) and not _runtime_has_rtx_40_or_50():
+        return False
     model_paths = [
         cfg.get("model"),
         cfg.get("model_nohg"),

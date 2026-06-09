@@ -7,6 +7,7 @@ import math
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import time
 import warnings
@@ -47,7 +48,9 @@ import torch
 from cli_display import CliDisplaySink
 from gui_compile_cache import _mark_compiled
 from gui_config import (
+    PRECISIONS,
     _precision_engine_mode_base,
+    _precision_is_quantized_tensorrt,
     _select_hg_weights_path,
     _select_tensorrt_model_path,
 )
@@ -172,6 +175,96 @@ _RUN_PRESETS = {
         "trt_qdq_fusion": "native",
         "trt_label": "int8_full_qat_film_trt_native",
         "gui_key": "INT8 Full (QAT) (Film)",
+    },
+    "fp8-mixed-ptq": {
+        "precision": "fp8-mixed",
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/tensorrt_fp8/hr_hg/HR_HG_original_fp8_mixed_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt_fp8/hr/HR_original_fp8_mixed_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt_fp8/hg/HG_original_fp8_mixed_ptq.pt"),
+        "predequantize": "off",
+        "label": "fp8_mixed_ptq_trt_native",
+        "trt_predequantize": "off",
+        "trt_qdq_fusion": "native",
+        "trt_label": "fp8_mixed_ptq_trt_native",
+        "gui_key": "FP8 Mixed (PTQ)",
+    },
+    "fp8-mixed-qat": {
+        "precision": "fp8-mixed",
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/tensorrt_fp8/hr_hg/HR_HG_original_fp8_mixed_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt_fp8/hr/HR_original_fp8_mixed_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt_fp8/hg/HG_original_fp8_mixed_qat.pt"),
+        "predequantize": "off",
+        "label": "fp8_mixed_qat_trt_native",
+        "trt_predequantize": "off",
+        "trt_qdq_fusion": "native",
+        "trt_label": "fp8_mixed_qat_trt_native",
+        "gui_key": "FP8 Mixed (QAT)",
+    },
+    "fp8-mixed-qat-film": {
+        "precision": "fp8-mixed",
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/tensorrt_fp8/hr_hg/HR_HG_original_fp8_mixed_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt_fp8/hr/HR_original_fp8_mixed_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt_fp8/hg/HG_original_fp8_mixed_qat_film.pt"),
+        "predequantize": "off",
+        "label": "fp8_mixed_qat_film_trt_native",
+        "trt_predequantize": "off",
+        "trt_qdq_fusion": "native",
+        "trt_label": "fp8_mixed_qat_film_trt_native",
+        "gui_key": "FP8 Mixed (QAT) (Film)",
+    },
+    "fp8-full-ptq": {
+        "precision": "fp8-full",
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/tensorrt_fp8/hr_hg/HR_HG_original_fp8_full_ptq.pt"),
+        "trt_model_nohg": _weight("original/tensorrt_fp8/hr/HR_original_fp8_full_ptq.pt"),
+        "trt_hg_weights": _weight("original/tensorrt_fp8/hg/HG_original_fp8_full_ptq.pt"),
+        "predequantize": "off",
+        "label": "fp8_full_ptq_trt_native",
+        "trt_predequantize": "off",
+        "trt_qdq_fusion": "native",
+        "trt_label": "fp8_full_ptq_trt_native",
+        "gui_key": "FP8 Full (PTQ)",
+    },
+    "fp8-full-qat": {
+        "precision": "fp8-full",
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/tensorrt_fp8/hr_hg/HR_HG_original_fp8_full_qat.pt"),
+        "trt_model_nohg": _weight("original/tensorrt_fp8/hr/HR_original_fp8_full_qat.pt"),
+        "trt_hg_weights": _weight("original/tensorrt_fp8/hg/HG_original_fp8_full_qat.pt"),
+        "predequantize": "off",
+        "label": "fp8_full_qat_trt_native",
+        "trt_predequantize": "off",
+        "trt_qdq_fusion": "native",
+        "trt_label": "fp8_full_qat_trt_native",
+        "gui_key": "FP8 Full (QAT)",
+    },
+    "fp8-full-qat-film": {
+        "precision": "fp8-full",
+        "model": _weight("original/HR.pt"),
+        "model_nohg": _weight("original/HR.pt"),
+        "hg_weights": _weight("original/HG.pt"),
+        "trt_model": _weight("original/tensorrt_fp8/hr_hg/HR_HG_original_fp8_full_qat_film.pt"),
+        "trt_model_nohg": _weight("original/tensorrt_fp8/hr/HR_original_fp8_full_qat_film.pt"),
+        "trt_hg_weights": _weight("original/tensorrt_fp8/hg/HG_original_fp8_full_qat_film.pt"),
+        "predequantize": "off",
+        "label": "fp8_full_qat_film_trt_native",
+        "trt_predequantize": "off",
+        "trt_qdq_fusion": "native",
+        "trt_label": "fp8_full_qat_film_trt_native",
+        "gui_key": "FP8 Full (QAT) (Film)",
     },
 }
 _DEFAULT_RUNS = [
@@ -354,6 +447,43 @@ def _runtime_artifact_size_mb(processor, run: dict) -> float:
         if engine_path and os.path.isfile(engine_path):
             return os.path.getsize(engine_path) / (1024 * 1024)
     return os.path.getsize(run["model"]) / (1024 * 1024)
+
+
+def _selected_tensorrt_source_paths_for_cli(gui_key: str, use_hg: bool) -> list[str]:
+    if not _IS_NVIDIA or not gui_key or not _precision_is_quantized_tensorrt(gui_key):
+        return []
+    paths = [_select_tensorrt_model_path(gui_key, use_hg)]
+    if use_hg:
+        paths.append(_select_hg_weights_path(gui_key, tensorrt=True))
+    return [str(path) for path in paths if str(path or "").strip()]
+
+
+def _ensure_tensorrt_sources_for_cli(gui_key: str, use_hg: bool) -> None:
+    missing = [
+        path
+        for path in _selected_tensorrt_source_paths_for_cli(gui_key, use_hg)
+        if not os.path.isfile(path)
+    ]
+    if not missing:
+        return
+    cfg = PRECISIONS.get(str(gui_key), {})
+    precision = str(cfg.get("precision", "")).strip().lower()
+    if precision.startswith("fp8"):
+        script = _ROOT / "scripts" / "quantize" / "make_tensorrt_fp8_source_checkpoints.py"
+        cmd = [sys.executable, "-u", str(script), "--missing-only", "--family", "hr"]
+        if use_hg:
+            cmd.extend(["--family", "hr_hg", "--family", "hg"])
+    else:
+        script = _ROOT / "scripts" / "quantize" / "split_tensorrt_sources.py"
+        cmd = [sys.executable, "-u", str(script), "--only-original", "--missing-only"]
+    if not script.is_file():
+        raise FileNotFoundError(f"TensorRT source generator not found: {script}")
+    print(
+        "[bench] Preparing missing TensorRT source checkpoint(s): "
+        f"{len(missing)}",
+        flush=True,
+    )
+    subprocess.run(cmd, cwd=str(_ROOT), check=True)
 
 
 def _make_processor(args, run: dict, width: int, height: int):
@@ -1316,6 +1446,8 @@ def main() -> int:
                 preset["qdq_fusion"] = str(args.trt_qdq_fusion)
             elif _IS_NVIDIA and str(args.device).lower() != "cpu":
                 gui_key = str(preset.get("gui_key") or "").strip()
+                if gui_key:
+                    _ensure_tensorrt_sources_for_cli(gui_key, bool(args.use_hg))
                 if (not manual_model) and gui_key:
                     preset["model"] = _select_tensorrt_model_path(
                         gui_key,

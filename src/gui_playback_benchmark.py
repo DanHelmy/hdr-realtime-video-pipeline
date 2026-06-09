@@ -58,6 +58,12 @@ _PRECISION_TO_RUN = {
     "INT8 Full (PTQ)": "int8-full-ptq",
     "INT8 Full (QAT)": "int8-full-qat",
     "INT8 Full (QAT) (Film)": "int8-full-qat-film",
+    "FP8 Mixed (PTQ)": "fp8-mixed-ptq",
+    "FP8 Mixed (QAT)": "fp8-mixed-qat",
+    "FP8 Mixed (QAT) (Film)": "fp8-mixed-qat-film",
+    "FP8 Full (PTQ)": "fp8-full-ptq",
+    "FP8 Full (QAT)": "fp8-full-qat",
+    "FP8 Full (QAT) (Film)": "fp8-full-qat-film",
 }
 
 
@@ -122,6 +128,18 @@ _PRECISION_DISPLAY_LABELS = {
     "int8-full-qat": "INT8 Full QAT",
     "int8_full_qat_film_trt_native": "INT8 Full QAT Film",
     "int8-full-qat-film": "INT8 Full QAT Film",
+    "fp8_mixed_ptq_trt_native": "FP8 Mixed PTQ",
+    "fp8-mixed-ptq": "FP8 Mixed PTQ",
+    "fp8_mixed_qat_trt_native": "FP8 Mixed QAT",
+    "fp8-mixed-qat": "FP8 Mixed QAT",
+    "fp8_mixed_qat_film_trt_native": "FP8 Mixed QAT Film",
+    "fp8-mixed-qat-film": "FP8 Mixed QAT Film",
+    "fp8_full_ptq_trt_native": "FP8 Full PTQ",
+    "fp8-full-ptq": "FP8 Full PTQ",
+    "fp8_full_qat_trt_native": "FP8 Full QAT",
+    "fp8-full-qat": "FP8 Full QAT",
+    "fp8_full_qat_film_trt_native": "FP8 Full QAT Film",
+    "fp8-full-qat-film": "FP8 Full QAT Film",
 }
 
 
@@ -136,6 +154,7 @@ def _display_precision_label(value) -> str:
         return _PRECISION_DISPLAY_LABELS[raw]
     label = raw.replace("_trt_native", "").replace("_", " ").replace("-", " ")
     label = re.sub(r"\bint8\b", "INT8", label, flags=re.IGNORECASE)
+    label = re.sub(r"\bfp8\b", "FP8", label, flags=re.IGNORECASE)
     label = re.sub(r"\bfp16\b", "FP16", label, flags=re.IGNORECASE)
     label = re.sub(r"\bfp32\b", "FP32", label, flags=re.IGNORECASE)
     label = re.sub(r"\bqat\b", "QAT", label, flags=re.IGNORECASE)
