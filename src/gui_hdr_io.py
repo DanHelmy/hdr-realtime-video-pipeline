@@ -413,6 +413,205 @@ def _decode_rgb48_frames_batch(
     return out
 
 
+def _decode_rgb48_frames_batch_with_pts(
+    cmd: list[str],
+    width: int,
+    height: int,
+    cancel_check=None,
+) -> tuple[list[np.ndarray], list[float | None]]:
+    frame_bytes = int(width) * int(height) * 3 * 2
+    if frame_bytes <= 0:
+        return [], []
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        while True:
+            try:
+                data, stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if callable(cancel_check):
+                    try:
+                        if bool(cancel_check()):
+                            proc.kill()
+                            proc.communicate()
+                            return [], []
+                    except Exception:
+                        pass
+        if proc.returncode != 0:
+            return [], []
+    except Exception:
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        return [], []
+
+    data = data or b""
+    frames: list[np.ndarray] = []
+    frame_count = len(data) // frame_bytes
+    for pos in range(frame_count):
+        start = int(pos) * frame_bytes
+        end = start + frame_bytes
+        try:
+            frame = np.frombuffer(data[start:end], dtype=np.uint16).reshape(
+                (height, width, 3)
+            )
+            frames.append(np.ascontiguousarray(frame))
+        except Exception:
+            break
+
+    pts_values: list[float | None] = []
+    try:
+        stderr_text = (stderr or b"").decode("utf-8", errors="ignore")
+        matches = re.findall(
+            r"pts_time:([+-]?(?:\d+\.?\d*|\.\d+))",
+            stderr_text,
+        )
+        for raw in matches:
+            try:
+                value = float(raw)
+                pts_values.append(float(value) if math.isfinite(value) else None)
+            except Exception:
+                pts_values.append(None)
+    except Exception:
+        pts_values = []
+
+    if len(pts_values) < len(frames):
+        pts_values.extend([None] * (len(frames) - len(pts_values)))
+    return frames, pts_values[: len(frames)]
+
+
+def read_hdr_video_frame_rgb16_exact_time(
+    path: str,
+    frame_idx: int,
+    cancel_check=None,
+) -> np.ndarray | None:
+    frames = read_hdr_video_frames_rgb16_exact_time(
+        path,
+        [max(0, int(frame_idx))],
+        cancel_check=cancel_check,
+    )
+    frame = frames.get(max(0, int(frame_idx)))
+    return None if frame is None else np.ascontiguousarray(frame)
+
+
+def read_hdr_video_frames_rgb16_exact_time(
+    path: str,
+    frame_indices,
+    cancel_check=None,
+) -> dict[int, np.ndarray | None]:
+    """Decode HDR frames by presentation-time windows, not decoded frame numbers."""
+    try:
+        indices = sorted({max(0, int(v)) for v in frame_indices})
+    except Exception:
+        indices = []
+    if not indices:
+        return {}
+
+    result: dict[int, np.ndarray | None] = {int(v): None for v in indices}
+    ffmpeg = shutil.which("ffmpeg")
+    stream_info = _ffprobe_video_stream_info(path)
+    if not ffmpeg or not isinstance(stream_info, dict):
+        return result
+
+    width = int(stream_info.get("width") or 0)
+    height = int(stream_info.get("height") or 0)
+    fps = float(stream_info.get("fps") or 0.0)
+    if width <= 0 or height <= 0 or fps <= 0.0 or not math.isfinite(fps):
+        return result
+
+    frame_s = 1.0 / float(fps)
+    max_chunk = int(_HDR_EXACT_BATCH_MAX_FRAMES)
+    for start in range(0, len(indices), max_chunk):
+        if callable(cancel_check):
+            try:
+                if bool(cancel_check()):
+                    return result
+            except Exception:
+                pass
+        chunk = indices[start:start + max_chunk]
+        targets: dict[int, tuple[float, float, float]] = {}
+        expr_parts: list[str] = []
+        half_window_s = frame_s * 0.49
+        for idx in chunk:
+            idx_i = max(0, int(idx))
+            target_ts = float(idx_i) * frame_s
+            window_start = max(0.0, target_ts - half_window_s)
+            window_end = target_ts + half_window_s
+            targets[idx_i] = (window_start, window_end, target_ts)
+            expr_parts.append(
+                f"lte(abs(t-{target_ts:.9f})\\,{half_window_s:.9f})"
+            )
+        if not expr_parts:
+            continue
+
+        cmd = [
+            ffmpeg,
+            "-v",
+            "info",
+            "-i",
+            path,
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"select={'+'.join(expr_parts)},showinfo",
+            "-vsync",
+            "0",
+            "-frames:v",
+            str(len(chunk)),
+            "-an",
+            "-sn",
+            "-dn",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb48le",
+            "-",
+        ]
+        frames, pts_values = _decode_rgb48_frames_batch_with_pts(
+            cmd,
+            width,
+            height,
+            cancel_check=cancel_check,
+        )
+        assigned: set[int] = set()
+        for frame, pts_time in zip(frames, pts_values):
+            target_idx = None
+            if pts_time is not None:
+                pts_f = float(pts_time)
+                for idx_i, (window_start, window_end, _center) in targets.items():
+                    if idx_i in assigned:
+                        continue
+                    if window_start <= pts_f < window_end:
+                        target_idx = int(idx_i)
+                        break
+                if target_idx is None:
+                    nearest_idx = None
+                    nearest_dist = None
+                    for idx_i, (_window_start, _window_end, center) in targets.items():
+                        if idx_i in assigned:
+                            continue
+                        dist = abs(pts_f - float(center))
+                        if nearest_dist is None or dist < nearest_dist:
+                            nearest_idx = int(idx_i)
+                            nearest_dist = float(dist)
+                    if nearest_idx is not None and nearest_dist is not None:
+                        if nearest_dist <= (frame_s * 0.55):
+                            target_idx = int(nearest_idx)
+            if target_idx is not None:
+                result[int(target_idx)] = np.ascontiguousarray(frame)
+                assigned.add(int(target_idx))
+
+    return result
+
+
 def read_hdr_video_frames_rgb16_exact(
     path: str,
     frame_indices,

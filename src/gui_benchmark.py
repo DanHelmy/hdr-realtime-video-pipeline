@@ -69,7 +69,8 @@ from gui_hdr_io import (
     FFMPEG_WINDOWS_DOWNLOAD_URL,
     _ffprobe_video_stream_info,
     hdr_ffmpeg_ready,
-    read_hdr_video_frames_rgb16_exact,
+    read_hdr_video_frame_rgb16_exact_time,
+    read_hdr_video_frames_rgb16_exact_time,
     read_hdr_video_frame_rgb16,
     read_image_any,
     write_hdr_tiff,
@@ -286,7 +287,7 @@ try:
     )
 except Exception:
     _BENCHMARK_QUEUE_TASK_CACHE_MAX = 32
-_BENCHMARK_POST_VERIFY_CACHE_VERSION = "gt-postverify-v1"
+_BENCHMARK_POST_VERIFY_CACHE_VERSION = "gt-postverify-v2-time"
 _BENCHMARK_POST_VERIFY_CACHE: OrderedDict[tuple, dict] = OrderedDict()
 _BENCHMARK_POST_VERIFY_CACHE_BYTES = 0
 _BENCHMARK_POST_VERIFY_CACHE_LOCK = threading.Lock()
@@ -2316,7 +2317,7 @@ class _BenchmarkWorker(QObject):
                             f"Post-verify exact GT batch{suffix}: {len(chunk)} frame(s)",
                         )
                         decoded_batch, canceled_now = self._run_blocking_with_cancel(
-                            read_hdr_video_frames_rgb16_exact,
+                            read_hdr_video_frames_rgb16_exact_time,
                             gt_path,
                             chunk,
                             cancel_check=self._is_canceled,
@@ -2423,10 +2424,9 @@ class _BenchmarkWorker(QObject):
                         canceled_now = False
                         if strict_rgb16 is None:
                             strict_rgb16, canceled_now = self._run_blocking_with_cancel(
-                                read_hdr_video_frame_rgb16,
+                                read_hdr_video_frame_rgb16_exact_time,
                                 task.gt_path,
                                 max(0, int(strict_gt_frame_idx or 0)),
-                                prefer_fast_seek=False,
                                 canceled_fallback=None,
                             )
                             if canceled_now or self._is_canceled():
@@ -2440,10 +2440,9 @@ class _BenchmarkWorker(QObject):
                             strict_rgb16 = decoded_for_gt.get(strict_gt_frame_idx)
                             if strict_rgb16 is None:
                                 strict_rgb16, canceled_now = self._run_blocking_with_cancel(
-                                    read_hdr_video_frame_rgb16,
+                                    read_hdr_video_frame_rgb16_exact_time,
                                     task.gt_path,
                                     strict_gt_frame_idx,
-                                    prefer_fast_seek=False,
                                     canceled_fallback=None,
                                 )
                                 if canceled_now or self._is_canceled():
