@@ -1081,6 +1081,135 @@ def _ffprobe_video_keyframe_times(video_path: str) -> list[float]:
     return list(times)
 
 
+def _parse_ffprobe_rate_local(raw) -> float | None:
+    text = str(raw or "").strip()
+    if not text or text in {"0/0", "N/A"}:
+        return None
+    try:
+        if "/" in text:
+            num_s, den_s = text.split("/", 1)
+            num = float(num_s)
+            den = float(den_s)
+            if den == 0.0:
+                return None
+            value = num / den
+        else:
+            value = float(text)
+    except Exception:
+        return None
+    if not np.isfinite(value) or value <= 0.0 or value > 1000.0:
+        return None
+    return float(value)
+
+
+def _parse_ffprobe_positive_float(raw) -> float:
+    try:
+        value = float(raw)
+    except Exception:
+        return 0.0
+    if not np.isfinite(value) or value <= 0.0:
+        return 0.0
+    return float(value)
+
+
+def _parse_ffprobe_positive_int(raw) -> int:
+    try:
+        text = str(raw or "").strip()
+        if not text or text == "N/A":
+            return 0
+        value = int(float(text))
+    except Exception:
+        return 0
+    return max(0, int(value))
+
+
+def _ffprobe_video_detection_info(video_path: str) -> dict | None:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not video_path or not os.path.isfile(video_path):
+        return None
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        (
+            "stream=width,height,avg_frame_rate,r_frame_rate,"
+            "nb_frames,nb_read_frames,duration:format=duration"
+        ),
+        "-of",
+        "json",
+        video_path,
+    ]
+    try:
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        payload = json.loads(cp.stdout or "{}")
+    except Exception:
+        return None
+
+    streams = payload.get("streams") or []
+    if not streams or not isinstance(streams[0], dict):
+        return None
+    stream = streams[0]
+    try:
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+    except Exception:
+        width = 0
+        height = 0
+    fps = _parse_ffprobe_rate_local(stream.get("avg_frame_rate"))
+    if fps is None:
+        fps = _parse_ffprobe_rate_local(stream.get("r_frame_rate"))
+    duration_s = _parse_ffprobe_positive_float(stream.get("duration"))
+    fmt = payload.get("format") or {}
+    if duration_s <= 0.0 and isinstance(fmt, dict):
+        duration_s = _parse_ffprobe_positive_float(fmt.get("duration"))
+    frame_count = _parse_ffprobe_positive_int(stream.get("nb_frames"))
+    if frame_count <= 0:
+        frame_count = _parse_ffprobe_positive_int(stream.get("nb_read_frames"))
+    if duration_s <= 0.0 and frame_count > 0 and fps and fps > 0.0:
+        duration_s = float(frame_count) / float(fps)
+    if frame_count <= 0 and duration_s > 0.0 and fps and fps > 0.0:
+        frame_count = int(round(duration_s * float(fps)))
+
+    if width <= 0 or height <= 0 or not fps or fps <= 0.0:
+        base_info = _ffprobe_video_stream_info(video_path)
+        if isinstance(base_info, dict):
+            width = max(width, int(base_info.get("width") or 0))
+            height = max(height, int(base_info.get("height") or 0))
+            try:
+                base_fps = float(base_info.get("fps") or 0.0)
+            except Exception:
+                base_fps = 0.0
+            if base_fps > 0.0 and np.isfinite(base_fps):
+                fps = base_fps
+
+    if (
+        width <= 0
+        or height <= 0
+        or not fps
+        or fps <= 0.0
+        or not np.isfinite(float(fps))
+        or duration_s <= 0.0
+    ):
+        return None
+    frame_count = max(2, int(frame_count or round(duration_s * float(fps))))
+    return {
+        "width": int(width),
+        "height": int(height),
+        "fps": float(fps),
+        "duration_s": float(duration_s),
+        "frame_count": int(frame_count),
+    }
+
+
 def _ffmpeg_read_bgr_preview_frame(
     video_path: str,
     timestamp_s: float,
@@ -1128,6 +1257,156 @@ def _ffmpeg_read_bgr_preview_frame(
     except Exception:
         return None
     return np.ascontiguousarray(frame)
+
+
+def _detect_distinct_video_frames_ffmpeg_timestamps(
+    video_path: str,
+    desired_count: int,
+    *,
+    total_frames: int,
+    fps: float,
+    start_idx: int,
+    end_idx: int,
+    duration_s: float,
+    max_scan_points: int = 240,
+    source_width: int = 0,
+    source_height: int = 0,
+) -> tuple[list[int], dict[int, float]]:
+    if str(os.environ.get("HDRTVNET_FRAME_DETECT_FFMPEG", "1")).strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return [], {}
+    if not hdr_ffmpeg_ready():
+        return [], {}
+    fps_f = float(fps or 0.0)
+    if not np.isfinite(fps_f) or fps_f <= 0.0:
+        return [], {}
+    total_i = max(2, int(total_frames or 0))
+    start_i = max(0, min(total_i - 1, int(start_idx)))
+    end_i = max(start_i, min(total_i - 1, int(end_idx)))
+    max_source_dim = max(0, int(source_width or 0), int(source_height or 0))
+    preview_upper = 32 if max_source_dim >= 2160 else 48
+    desired_i = max(1, int(desired_count))
+    scan_cap = max(desired_i, min(max(8, int(max_scan_points or 0)), 240))
+    region_span = max(1, end_i - start_i + 1)
+    candidate_count = min(region_span, scan_cap)
+    if candidate_count <= 0:
+        return [], {}
+    if candidate_count == 1:
+        candidate_idxs = [start_i + (region_span // 2)]
+    else:
+        candidate_idxs = [
+            int(v)
+            for v in np.linspace(
+                start_i,
+                end_i,
+                num=candidate_count,
+                dtype=np.int64,
+            )
+        ]
+    candidate_idxs = sorted({max(0, min(total_i - 1, int(v))) for v in candidate_idxs})
+    if not candidate_idxs:
+        return [], {}
+    duration_f = float(duration_s or 0.0)
+    max_seek_s = max(0.0, duration_f - (0.5 / max(fps_f, 1e-6))) if duration_f > 0.0 else 0.0
+
+    def _idx_to_time(idx: int) -> float:
+        ts = (float(max(0, int(idx))) + 0.5) / fps_f
+        if max_seek_s > 0.0:
+            ts = min(ts, max_seek_s)
+        return max(0.0, ts)
+
+    preview_count = min(
+        len(candidate_idxs),
+        max(8, min(preview_upper, desired_i)),
+    )
+    if preview_count == len(candidate_idxs):
+        preview_idxs = list(candidate_idxs)
+    elif preview_count <= 1:
+        preview_idxs = [candidate_idxs[len(candidate_idxs) // 2]]
+    else:
+        sample_positions = np.linspace(
+            0,
+            len(candidate_idxs) - 1,
+            num=preview_count,
+            dtype=np.int64,
+        )
+        preview_idxs = [candidate_idxs[int(i)] for i in sample_positions]
+    preview_times = [_idx_to_time(idx) for idx in preview_idxs]
+
+    max_workers = min(2 if max_source_dim >= 2160 else 4, max(1, len(preview_times)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        preview_frames = list(
+            executor.map(
+                lambda ts: _ffmpeg_read_bgr_preview_frame(video_path, ts),
+                preview_times,
+            )
+        )
+
+    prev_hist = None
+    prev_luma = None
+    scored: list[tuple[float, int]] = []
+    for frame_idx, frame in zip(preview_idxs, preview_frames):
+        frame_idx_i = max(0, min(total_i - 1, int(frame_idx)))
+        if frame is None:
+            continue
+        if not _video_frame_idx_passes_movie_region_qc(frame_idx_i, total_i, fps_f):
+            continue
+        passed_qc, _reason = _benchmark_frame_qc(frame)
+        if not passed_qc:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        luma = float(np.mean(gray))
+        texture = float(np.std(gray)) / 64.0
+        interest = _frame_visual_interest_score(frame)
+        scene_score = 0.0
+        if prev_hist is not None:
+            scene = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+            luma_jump = abs(luma - float(prev_luma or 0.0)) / 255.0
+            scene_score = (scene * 0.78) + (luma_jump * 0.18)
+        score = (
+            (0.62 * interest)
+            + (0.28 * scene_score)
+            + (0.10 * min(max(texture, 0.0), 1.5))
+        )
+        scored.append((float(score), int(frame_idx_i)))
+        prev_hist = hist
+        prev_luma = luma
+
+    scored_idxs = {int(idx) for _score, idx in scored}
+    if len(scored) < min(desired_i, len(candidate_idxs)):
+        supplement_idxs = _select_spread_from_scored_frames(
+            [(0.0, int(idx)) for idx in candidate_idxs],
+            min(desired_i, len(candidate_idxs)),
+        )
+        for idx in supplement_idxs:
+            idx_i = int(idx)
+            if idx_i in scored_idxs:
+                continue
+            if not _video_frame_idx_passes_movie_region_qc(idx_i, total_i, fps_f):
+                continue
+            scored.append((0.0, idx_i))
+            scored_idxs.add(idx_i)
+            if len(scored) >= min(desired_i, len(candidate_idxs)):
+                break
+
+    if not scored:
+        return [], {}
+    chosen = _select_spread_from_scored_frames(scored, desired_i)
+    score_by_idx = {int(idx): float(score) for score, idx in scored}
+    chosen = sorted({max(0, min(total_i - 1, int(v))) for v in chosen})
+    if len(chosen) > desired_i:
+        chosen = chosen[:desired_i]
+    frames_1b = [int(v) + 1 for v in chosen]
+    return frames_1b, {
+        int(v) + 1: float(score_by_idx.get(int(v), 0.0))
+        for v in chosen
+    }
 
 
 def _detect_distinct_video_frames_ffmpeg_keyframes(
@@ -1294,8 +1573,8 @@ def _detect_distinct_video_frames_with_scores(
     max_scan_points: int = 240,
 ) -> tuple[list[int], dict[int, float]]:
     global _FRAME_DETECT_LAST_METHOD
-    _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes"
-    stream_info = _ffprobe_video_stream_info(video_path)
+    _FRAME_DETECT_LAST_METHOD = "ffmpeg timestamp scan"
+    stream_info = _ffprobe_video_detection_info(video_path)
     if not isinstance(stream_info, dict):
         _FRAME_DETECT_LAST_METHOD = "metadata unavailable"
         return [], {}
@@ -1310,36 +1589,44 @@ def _detect_distinct_video_frames_with_scores(
         fps = float(stream_info.get("fps") or 0.0)
     except Exception:
         fps = 0.0
-    if source_width <= 0 or source_height <= 0 or fps <= 0.0 or not np.isfinite(fps):
+    try:
+        duration_s = float(stream_info.get("duration_s") or 0.0)
+    except Exception:
+        duration_s = 0.0
+    try:
+        total = int(stream_info.get("frame_count") or 0)
+    except Exception:
+        total = 0
+    if (
+        source_width <= 0
+        or source_height <= 0
+        or fps <= 0.0
+        or not np.isfinite(fps)
+        or duration_s <= 0.0
+    ):
         _FRAME_DETECT_LAST_METHOD = "metadata unavailable"
         return [], {}
-
-    keyframe_times = _ffprobe_video_keyframe_times(video_path)
-    if not keyframe_times:
-        _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes unavailable"
-        return [], {}
-    total = max(
-        2,
-        int(round((float(max(keyframe_times)) + (1.0 / max(float(fps), 1e-6))) * float(fps))) + 1,
-    )
+    total = max(2, int(total or round(duration_s * float(fps))))
 
     start_idx, end_idx = _benchmark_movie_frame_bounds(total, fps)
     if end_idx < start_idx:
         start_idx, end_idx = 0, total - 1
-    fast_frames, fast_scores = _detect_distinct_video_frames_ffmpeg_keyframes(
+    fast_frames, fast_scores = _detect_distinct_video_frames_ffmpeg_timestamps(
         video_path,
         desired_count,
         total_frames=total,
         fps=fps,
         start_idx=start_idx,
         end_idx=end_idx,
+        duration_s=duration_s,
+        max_scan_points=max_scan_points,
         source_width=source_width,
         source_height=source_height,
     )
     if fast_frames:
-        _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes"
+        _FRAME_DETECT_LAST_METHOD = "ffmpeg timestamp scan"
         return fast_frames, fast_scores
-    _FRAME_DETECT_LAST_METHOD = "ffmpeg keyframes unavailable"
+    _FRAME_DETECT_LAST_METHOD = "ffmpeg timestamp scan unavailable"
     return [], {}
 
 
@@ -4670,7 +4957,7 @@ class ModelBenchmarkDialog(QDialog):
                 self,
                 "Video Benchmark",
                 "Could not detect representative frames from the selected video.\n\n"
-                "FFmpeg keyframe detection is required for video frame detection; "
+                "FFmpeg timestamp decoding is required for video frame detection; "
                 f"last detector path: {_FRAME_DETECT_LAST_METHOD or 'unknown'}.",
             )
             return
