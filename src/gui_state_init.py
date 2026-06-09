@@ -231,6 +231,7 @@ class StateInitMixin:
         self._video_transition_anim = None
         self._video_transition_track_timer = None
         self._video_transition_forced_rect = None
+        self._video_transition_target_widget = None
         self._ui_anim_effects = {}
         self._ui_anim_running = {}
         self._ui_anim_duration_ms = 0

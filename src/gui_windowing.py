@@ -62,8 +62,14 @@ class WindowingMixin:
 
     def _current_screen_geometry(self) -> QRect:
         """Get full monitor geometry (not availableGeometry) to cover taskbar."""
+        screen = None
+        try:
+            screen = QApplication.screenAt(self.frameGeometry().center())
+        except Exception:
+            screen = None
         win_handle = self.windowHandle()
-        screen = win_handle.screen() if win_handle is not None else None
+        if screen is None:
+            screen = win_handle.screen() if win_handle is not None else None
         if screen is None:
             screen = self.screen()
         if screen is None:
@@ -145,7 +151,7 @@ class WindowingMixin:
         return visible
 
     def _video_transition_target(self) -> QWidget | None:
-        return self
+        return getattr(self, "_video_transition_target_widget", None) or self
 
     def _position_video_transition_overlay(self):
         overlay = getattr(self, "_video_transition_overlay", None)
@@ -159,11 +165,16 @@ class WindowingMixin:
         if isinstance(forced_rect, QRect) and forced_rect.isValid():
             rect = forced_rect
         else:
-            try:
+            if target is self:
                 rect = self.frameGeometry()
-            except Exception:
-                pos = target.mapToGlobal(QPoint(0, 0))
-                rect = QRect(pos, target.size())
+            else:
+                try:
+                    pos = target.mapToGlobal(QPoint(0, 0))
+                    rect = QRect(pos, target.size())
+                except Exception:
+                    rect = self.frameGeometry()
+        if not rect.isValid() or rect.width() <= 1 or rect.height() <= 1:
+            rect = self.frameGeometry()
         overlay.setGeometry(rect)
         overlay.raise_()
 
@@ -192,13 +203,20 @@ class WindowingMixin:
         duration_ms: int = 1000,
         start_opacity: float = 1.0,
         cover_rect: QRect | None = None,
+        target_widget: QWidget | None = None,
     ):
+        previous_target = getattr(self, "_video_transition_target_widget", None)
+        self._video_transition_target_widget = target_widget
         target = self._video_transition_target()
         if target is None or not target.isVisible():
+            self._video_transition_target_widget = previous_target
             return
         overlay = getattr(self, "_video_transition_overlay", None)
         if overlay is None:
-            overlay = VideoTransitionOverlay(self)
+            # Keep this parentless: it is a native top-level cover positioned in
+            # global desktop coordinates. Parenting it to the main window can
+            # leave a stale child-sized square during fullscreen/layout moves.
+            overlay = VideoTransitionOverlay(None)
             self._video_transition_overlay = overlay
         anim = getattr(self, "_video_transition_anim", None)
         if anim is not None:
@@ -224,6 +242,7 @@ class WindowingMixin:
             overlay.hide()
             overlay.setFadeOpacity(0.0)
             self._video_transition_forced_rect = None
+            self._video_transition_target_widget = None
             track_timer = getattr(self, "_video_transition_track_timer", None)
             if track_timer is not None:
                 track_timer.stop()
@@ -238,6 +257,7 @@ class WindowingMixin:
         start_opacity: float = 1.0,
         delay_ms: int = 16,
         cover_rect: QRect | None = None,
+        target_widget: QWidget | None = None,
     ):
         def _start():
             try:
@@ -251,9 +271,21 @@ class WindowingMixin:
                 duration_ms=duration_ms,
                 start_opacity=start_opacity,
                 cover_rect=cover_rect,
+                target_widget=target_widget,
             )
 
         QTimer.singleShot(max(0, int(delay_ms)), _start)
+
+    def _begin_video_pane_fade(
+        self,
+        duration_ms: int = 1000,
+        start_opacity: float = 1.0,
+    ):
+        self._begin_video_surface_fade(
+            duration_ms=duration_ms,
+            start_opacity=start_opacity,
+            target_widget=self._video_tabs,
+        )
 
     def _schedule_sdr_reactivation_relock(self):
         """Recover metrics after showing SDR; the pane is kept warm already."""
@@ -272,7 +304,7 @@ class WindowingMixin:
         new_label = str(self._video_tabs.tabText(index) or "")
         old_label = str(getattr(self, "_active_video_tab_label", "") or "")
         reactivate_sdr = old_label == "HDR" and new_label in {"SDR", "Side by Side"}
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_tab_switch():
             label = new_label
@@ -334,7 +366,7 @@ class WindowingMixin:
         if self._sdr_float_window is not None:
             self._dock_video_pane("sdr")
             return
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_pop():
             win = DetachedVideoWindow("sdr", "SDR View")
@@ -356,7 +388,7 @@ class WindowingMixin:
         if self._hdr_float_window is not None:
             self._dock_video_pane("hdr")
             return
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_pop():
             win = DetachedVideoWindow("hdr", "HDR View")
@@ -379,7 +411,7 @@ class WindowingMixin:
             )
 
     def _dock_video_pane(self, key: str, from_signal: bool = False):
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_dock():
             side_mode = (
@@ -1456,7 +1488,7 @@ class WindowingMixin:
         return self._disp_hdr_mpv is not None
 
     def _on_view(self, mode):
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
         if self._video_tabs is not None:
             self._video_tabs.tabBar().setVisible(True)
         if self._disp_sdr_mpv is not None:
