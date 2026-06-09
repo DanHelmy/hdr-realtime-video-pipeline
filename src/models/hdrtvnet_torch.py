@@ -5887,16 +5887,17 @@ def _export_tensorrt_onnx_from_model(
     with torch.inference_mode():
         export_args = (tensor,) if single_input else (tensor, cond)
         input_names = ["input"] if single_input else ["input", "cond"]
-        torch.onnx.export(
-            wrapper,
-            export_args,
-            onnx_path,
-            verbose=False,
-            input_names=input_names,
-            output_names=["output"],
-            opset_version=19 if (int8_export and not native_int8_export) else 18,
-            do_constant_folding=True,
-        )
+        with _suppress_expected_instancenorm_onnx_warning():
+            torch.onnx.export(
+                wrapper,
+                export_args,
+                onnx_path,
+                verbose=False,
+                input_names=input_names,
+                output_names=["output"],
+                opset_version=19 if (int8_export and not native_int8_export) else 18,
+                do_constant_folding=True,
+            )
     if int8_export and native_int8_export:
         print("TensorRT native INT8 export: Q/DQ graph patches skipped")
     elif int8_export:
@@ -5930,6 +5931,26 @@ def _unwrap_model_output(output):
     if isinstance(output, (tuple, list)):
         return output[0]
     return output
+
+
+@contextlib.contextmanager
+def _suppress_expected_instancenorm_onnx_warning():
+    """Hide PyTorch's harmless InstanceNorm export-mode wording.
+
+    AGCM uses InstanceNorm2d without running stats, so eval inference still
+    computes per-input statistics. PyTorch's ONNX symbolic reports that as
+    `train=True`, but it is not putting the model in training mode.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r"ONNX export mode is set to TrainingMode\.EVAL, but operator "
+                r"'instance_norm' is set to train=True\. Exporting with train=True\."
+            ),
+            category=UserWarning,
+        )
+        yield
 
 
 def _make_tensorrt_modelopt_torch_batches(
@@ -6768,17 +6789,18 @@ def _export_tensorrt_modelopt_torch_onnx_from_model(
             with export_cm, quantizer_cm:
                 export_args = (tensor,) if single_input_graph else (tensor, cond)
                 input_names = ["input"] if single_input_graph else ["input", "cond"]
-                torch.onnx.export(
-                    wrapper,
-                    export_args,
-                    onnx_path,
-                    verbose=False,
-                    input_names=input_names,
-                    output_names=["output"],
-                    opset_version=19,
-                    do_constant_folding=True,
-                    dynamo=False,
-                )
+                with _suppress_expected_instancenorm_onnx_warning():
+                    torch.onnx.export(
+                        wrapper,
+                        export_args,
+                        onnx_path,
+                        verbose=False,
+                        input_names=input_names,
+                        output_names=["output"],
+                        opset_version=19,
+                        do_constant_folding=True,
+                        dynamo=False,
+                    )
         finally:
             if modelopt_tensor_quant is not None and original_quantize_op is not None:
                 modelopt_tensor_quant.quantize_op = original_quantize_op
