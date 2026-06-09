@@ -24,7 +24,6 @@ from gui_config import (
 )
 from gui_mpv_widget import MpvHDRWidget
 from gui_pipeline_worker_model import PipelineWorkerModelMixin
-from gui_pipeline_worker_vram import PipelineWorkerVramMixin
 from gui_pipeline_worker_feeders import PipelineWorkerFeedersMixin
 from gui_pipeline_worker_compare import PipelineWorkerCompareMixin
 from gui_pipeline_worker_objective import PipelineWorkerObjectiveMixin
@@ -55,7 +54,6 @@ def _normalize_runtime_execution_mode(mode: str | None) -> str:
 
 class PipelineWorker(
     PipelineWorkerModelMixin,
-    PipelineWorkerVramMixin,
     PipelineWorkerFeedersMixin,
     PipelineWorkerCompareMixin,
     PipelineWorkerObjectiveMixin,
@@ -128,10 +126,6 @@ class PipelineWorker(
         self._sdr_drop_until_frame: int = 0
         self._frame_idx: int = 0
         self._hold_until_t: float = 0.0
-        # App-level dedicated GPU memory (VRAM) from Windows perf counters.
-        self._app_vram_mb: float = 0.0
-        self._app_vram_poll_stop = threading.Event()
-        self._app_vram_poll_thread: threading.Thread | None = None
         self._realtime_drop_frames: int = 0
         self._predequantize_mode: str = "auto"
         self._runtime_execution_mode: str = "compile"
@@ -561,9 +555,8 @@ class PipelineWorker(
     def is_paused(self):
         return self._user_paused
 
-    # Model/VRAM/feeder helpers moved to:
+    # Model/feeder helpers moved to:
     # - gui_pipeline_worker_model.py
-    # - gui_pipeline_worker_vram.py
     # - gui_pipeline_worker_feeders.py
 
     # Main loop
@@ -615,7 +608,6 @@ class PipelineWorker(
             self._start_hdr_feeder()
         if self._sdr_mpv_widget is not None:
             self._start_sdr_feeder()
-        self._start_app_vram_poll()
 
         # A small decode-ahead buffer smooths content-dependent decode spikes
         # without making seeks feel sluggish.
@@ -1152,7 +1144,6 @@ class PipelineWorker(
         gt_source = self._close_gt_source(gt_source)
         self._stop_hdr_feeder()
         self._stop_sdr_feeder()
-        self._stop_app_vram_poll()
         self.playback_finished.emit()
         self.status_message.emit("Playback finished.")
 
