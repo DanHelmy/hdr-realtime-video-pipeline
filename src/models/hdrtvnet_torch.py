@@ -14,9 +14,15 @@ import time
 import warnings
 
 try:
-    from windows_runtime import install_torch_windows_warning_filter
+    from windows_runtime import (
+        configure_cuda_environment,
+        configure_msvc_build_environment,
+        install_torch_windows_warning_filter,
+    )
 
     install_torch_windows_warning_filter()
+    configure_msvc_build_environment()
+    configure_cuda_environment()
 except Exception:
     pass
 
@@ -24,6 +30,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from windows_runtime import configure_torch_msvc_extension_flags
+
+    configure_torch_msvc_extension_flags()
+except Exception:
+    pass
 
 from hip_sdk_detection import detect_hip_sdk_windows
 from models.hdrtvnet_modules.Ensemble_AGCM_LE_arch import Ensemble_AGCM_LE

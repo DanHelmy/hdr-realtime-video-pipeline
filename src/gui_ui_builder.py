@@ -119,6 +119,10 @@ class UiBuilderMixin:
         self._act_predequantize = tools_menu.addAction(
             "INT8 &Pre-dequantization ...", self._choose_predequantize_mode
         )
+        tools_menu.addAction(
+            "Playback Performance &Benchmark ...",
+            self._open_playback_performance_benchmark_dialog,
+        )
         tools_menu.addAction("Model Quality &Benchmark ...", self._open_benchmark_dialog)
         self._act_precompile_kernels = tools_menu.addAction(
             "&Pre-compile Kernels ...", self._precompile_kernels

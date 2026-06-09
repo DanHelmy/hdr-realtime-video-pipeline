@@ -761,6 +761,7 @@ class MpvHDRWidget(QWidget):
         sdr_transfer: str = "bt1886",
         live_capture: bool | None = None,
         raw_format: str | None = None,
+        target_wid: str | int | None = None,
     ) -> bool:
         self.stop_playback()
         self._shutdown.clear()
@@ -807,12 +808,17 @@ class MpvHDRWidget(QWidget):
             "sdr_transfer": self._sdr_transfer,
             "live_capture": live_capture,
             "raw_format": self._raw_video_format,
+            "target_wid": None if target_wid is None else str(target_wid),
         }
 
         pipe_id = id(self)
         self._pipe_name = rf"\\.\pipe\hdrtvnet_mpv_{pipe_id}"
 
-        wid = str(int(self.winId()))
+        wid = (
+            str(target_wid)
+            if target_wid is not None and str(target_wid).strip()
+            else str(int(self.winId()))
+        )
         self._target_wid = wid
         pipe_url = f"lavf://file:{self._pipe_name}"
 
@@ -1409,6 +1415,7 @@ class MpvHDRWidget(QWidget):
             "sdr_transfer",
             "live_capture",
             "raw_format",
+            "target_wid",
         }
         safe_cfg = {k: v for k, v in cfg.items() if k in allowed}
         self.start_playback(**safe_cfg)

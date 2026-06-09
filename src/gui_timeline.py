@@ -223,6 +223,61 @@ class TimelineSeekMixin:
         else:
             _do()
 
+    def _clear_deferred_playhead_relock(self):
+        self._deferred_playhead_relock_token = (
+            int(getattr(self, "_deferred_playhead_relock_token", 0)) + 1
+        )
+        self._playhead_relock_token = int(getattr(self, "_playhead_relock_token", 0)) + 1
+        self._pending_playhead_relock_on_unmute = False
+        self._pending_playhead_relock_started_t = 0.0
+        self._pending_playhead_relock_pre_delay_ms = -1
+        self._relock_hold_muted = False
+        try:
+            self._apply_volume_to_backends()
+        except Exception:
+            pass
+
+    def _schedule_state_change_relock(
+        self,
+        delay_ms: int = 0,
+        drop_frames: int = 2,
+        settle_delay_ms: int | None = None,
+        settle_drop_frames: int = 1,
+    ):
+        """Bounded relock batch for visual state changes."""
+        if not self._playing:
+            return
+        if self._is_live_window_capture_active():
+            return
+        if bool(getattr(self, "_video_prebuffer_pending", False)):
+            return
+        token = int(getattr(self, "_state_relock_token", 0)) + 1
+        self._state_relock_token = token
+        if not bool(getattr(self, "_resume_audio_after_seek", False)):
+            self._clear_deferred_playhead_relock()
+
+        def _do(expected_token: int, frames_to_drop: int):
+            if expected_token != int(getattr(self, "_state_relock_token", 0)):
+                return
+            if not self._playing:
+                return
+            if self._is_live_window_capture_active():
+                return
+            if bool(getattr(self, "_video_prebuffer_pending", False)):
+                return
+            self._flush_display_queues(drop_frames=frames_to_drop)
+            self._resync_audio_to_current_timeline()
+
+        QTimer.singleShot(
+            max(0, int(delay_ms)),
+            lambda expected=token: _do(expected, int(drop_frames)),
+        )
+        if settle_delay_ms is not None:
+            QTimer.singleShot(
+                max(0, int(settle_delay_ms)),
+                lambda expected=token: _do(expected, int(settle_drop_frames)),
+            )
+
     def _schedule_playhead_skip_relock(
         self,
         first_delay_ms: int = 35,
@@ -257,6 +312,7 @@ class TimelineSeekMixin:
             )
             return
         self._pending_playhead_relock_on_unmute = True
+        self._pending_playhead_relock_started_t = time.perf_counter()
         self._pending_playhead_relock_pre_delay_ms = -1
         self._pending_playhead_relock_first_ms = int(first_delay_ms)
         self._pending_playhead_relock_settle_ms = int(settle_delay_ms)

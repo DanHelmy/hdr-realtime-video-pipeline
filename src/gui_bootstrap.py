@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 from windows_runtime import (
+    configure_cuda_environment,
+    configure_msvc_build_environment,
     configure_rocm_sdk_environment,
     project_cache_root,
     enable_high_resolution_timer,
@@ -121,6 +123,8 @@ def prepare_runtime_environment(current_file: str) -> tuple[str, str]:
     ensure_windows_supported("HDRTVNet++ GUI")
     enable_high_resolution_timer(1)
     install_torch_windows_warning_filter()
+    configure_msvc_build_environment()
+    configure_cuda_environment()
     configure_rocm_sdk_environment()
     cache_root = project_cache_root(current_file)
     try:

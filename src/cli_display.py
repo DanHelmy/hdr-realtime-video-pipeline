@@ -62,6 +62,7 @@ class CliDisplaySink:
         scale_antiring: float | None = 0.0,
         force_hdr_metadata: bool = True,
         vsync_timed: bool = False,
+        embed_wid: str | int | None = None,
     ):
         self.enabled = bool(enabled)
         self.backend = str(backend or "mpv").strip().lower()
@@ -73,6 +74,7 @@ class CliDisplaySink:
         self._async_thread: threading.Thread | None = None
         self._async_shutdown = threading.Event()
         self._last_event_pump_s = 0.0
+        self._embed_wid = str(embed_wid).strip() if embed_wid is not None else ""
         self._event_pump_interval_s = max(
             0.0,
             float(os.environ.get("HDRTVNET_CLI_MPV_EVENT_INTERVAL_MS", "8.0"))
@@ -93,6 +95,7 @@ class CliDisplaySink:
             scale_antiring=scale_antiring,
             force_hdr_metadata=bool(force_hdr_metadata),
             vsync_timed=bool(vsync_timed),
+            embed_wid=self._embed_wid,
         )
 
     def _start_mpv(
@@ -105,6 +108,7 @@ class CliDisplaySink:
         scale_antiring: float | None,
         force_hdr_metadata: bool,
         vsync_timed: bool,
+        embed_wid: str | None,
     ) -> None:
         _prepend_dll_search_path(_HERE)
         try:
@@ -162,9 +166,12 @@ class CliDisplaySink:
             filmgrain_shader_path=FILMGRAIN_SHADER_PATH,
             ssim_downscaler_shader_path=SSIM_DOWNSCALER_SHADER_PATH,
         )
-        widget.setWindowTitle(self.window_name)
-        widget.resize(int(width), int(height))
-        widget.show()
+        if str(embed_wid or "").strip():
+            widget.resize(1, 1)
+        else:
+            widget.setWindowTitle(self.window_name)
+            widget.resize(int(width), int(height))
+            widget.show()
         app.processEvents()
 
         started = widget.start_playback(
@@ -175,6 +182,7 @@ class CliDisplaySink:
             scale_antiring=scale_antiring,
             force_hdr_metadata=force_hdr_metadata,
             vsync_timed=vsync_timed,
+            target_wid=(str(embed_wid).strip() or None),
         )
         if not started:
             widget.close()
@@ -246,7 +254,7 @@ class CliDisplaySink:
         ):
             app.processEvents()
             self._last_event_pump_s = now_s
-        return bool(widget.isVisible())
+        return True if self._embed_wid else bool(widget.isVisible())
 
     def close(self) -> None:
         if self.backend == "opencv":

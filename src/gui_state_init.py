@@ -11,6 +11,7 @@ from gui_config import (
     RESOLUTION_SCALES,
     SOURCE_MODE_VIDEO,
     VIDEO_PLAYBACK_BUFFER_FRAMES,
+    _available_precision_keys,
     _normalize_source_mode,
 )
 from window_capture_source import target_from_hwnd
@@ -226,6 +227,9 @@ class StateInitMixin:
         self._ui_overlay_btn = None
         self._ui_overlay_timer = None
         self._ui_overlay_hide_ms = 1200
+        self._video_transition_overlay = None
+        self._video_transition_anim = None
+        self._video_transition_track_timer = None
         self._ui_anim_effects = {}
         self._ui_anim_running = {}
         self._ui_anim_duration_ms = 0
@@ -265,7 +269,14 @@ class StateInitMixin:
             0.0, float(os.environ.get("HDRTVNET_PERIODIC_RELOCK_DRIFT_S", "0.045"))
         )
         self._playhead_relock_token = 0
+        self._state_relock_token = 0
+        self._deferred_playhead_relock_token = 0
         self._pending_playhead_relock_on_unmute = False
+        self._pending_playhead_relock_started_t = 0.0
+        self._pending_playhead_relock_stale_s = max(
+            1.0,
+            float(os.environ.get("HDRTVNET_PENDING_RELOCK_STALE_S", "3.5")),
+        )
         self._pending_playhead_relock_pre_delay_ms = -1
         self._pending_playhead_relock_first_ms = 35
         self._pending_playhead_relock_settle_ms = 220

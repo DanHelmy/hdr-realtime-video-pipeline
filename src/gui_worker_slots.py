@@ -177,6 +177,7 @@ class WorkerSlotsMixin:
                     if self._active_use_mpv:
                         if not self._pending_playhead_relock_on_unmute:
                             self._pending_playhead_relock_on_unmute = True
+                            self._pending_playhead_relock_started_t = time.perf_counter()
                             self._pending_playhead_relock_pre_delay_ms = int(
                                 getattr(self, "_stability_relock_pre_delay_ms", 0)
                             )

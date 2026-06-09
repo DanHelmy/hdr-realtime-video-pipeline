@@ -14,10 +14,17 @@ import re
 import subprocess
 import sys
 
-from windows_runtime import ensure_windows_supported, install_torch_windows_warning_filter
+from windows_runtime import (
+    configure_cuda_environment,
+    configure_msvc_build_environment,
+    ensure_windows_supported,
+    install_torch_windows_warning_filter,
+)
 
 ensure_windows_supported("HDRTVNet++ TensorRT engine builder")
 install_torch_windows_warning_filter()
+configure_msvc_build_environment()
+configure_cuda_environment()
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:

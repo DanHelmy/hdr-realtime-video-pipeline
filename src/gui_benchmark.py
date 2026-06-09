@@ -5141,12 +5141,83 @@ class ModelBenchmarkDialog(QDialog):
         self._refresh_queue_list()
         self._set_status(f"Queued benchmark: {title}")
 
+    def _main_precision_keys_for_queue(self) -> list[str]:
+        available = _available_precision_keys()
+
+        def _first_available(candidates: tuple[str, ...]) -> str | None:
+            for candidate in candidates:
+                if candidate in available:
+                    return candidate
+            return None
+
+        selected = {
+            key
+            for key in (
+                _first_available(("FP16",)),
+                _first_available(("FP32",)),
+                _first_available(
+                    (
+                        "INT8 Mixed (QAT)",
+                        "INT8 Mixed (PTQ)",
+                        "INT8 Mixed (QAT) (Film)",
+                    )
+                ),
+                _first_available(
+                    (
+                        "INT8 Full (QAT)",
+                        "INT8 Full (PTQ)",
+                        "INT8 Full (QAT) (Film)",
+                    )
+                ),
+            )
+            if key
+        }
+        return [key for key in available if key in selected]
+
+    def _choose_precision_queue_keys(self) -> tuple[list[str], str] | None:
+        available = _available_precision_keys()
+        if not available:
+            return None
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Add All Precisions")
+        box.setText("Queue which precision set?")
+        box.setInformativeText(
+            "Main Ones queues one representative run for each family: "
+            "FP16, FP32, INT8 Mixed, and INT8 Full. "
+            "Literally All queues every available precision preset, including PTQ and Film variants."
+        )
+        main_btn = box.addButton("Main Ones", QMessageBox.ButtonRole.AcceptRole)
+        all_btn = box.addButton("Literally All", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(main_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is main_btn:
+            main_keys = self._main_precision_keys_for_queue()
+            if not main_keys:
+                QMessageBox.warning(
+                    self,
+                    "Benchmark Queue",
+                    "No main precision presets are currently available.",
+                )
+                return None
+            return main_keys, "main"
+        if clicked is all_btn:
+            return available, "all"
+        return None
+
     def _add_all_precisions_to_queue(self):
         if self._worker_thread is not None:
             return
+        choice = self._choose_precision_queue_keys()
+        if choice is None:
+            return
+        precision_keys, scope_label = choice
         added = 0
         last_error = None
-        for precision_key in _available_precision_keys():
+        for precision_key in precision_keys:
             try:
                 cfg = self._build_current_run_config(precision_key=precision_key)
             except Exception as exc:
@@ -5160,7 +5231,7 @@ class ModelBenchmarkDialog(QDialog):
                 QMessageBox.warning(self, "Benchmark Queue", str(last_error))
             return
         self._refresh_queue_list()
-        self._set_status(f"Queued {added} precision benchmark runs.")
+        self._set_status(f"Queued {added} {scope_label} precision benchmark runs.")
         if last_error is not None:
             QMessageBox.warning(
                 self,

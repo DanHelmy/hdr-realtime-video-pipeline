@@ -96,8 +96,32 @@ class AutoMuteMixin:
         """Dispatch deferred seek relock once mute guards have actually cleared."""
         if not self._pending_playhead_relock_on_unmute:
             return False
-        if not self._playing or not getattr(self, "_active_use_mpv", False):
+        now_t = time.perf_counter()
+        started_t = float(getattr(self, "_pending_playhead_relock_started_t", 0.0))
+        if started_t <= 0.0:
+            self._pending_playhead_relock_started_t = now_t
+            started_t = now_t
+        stale_s = float(getattr(self, "_pending_playhead_relock_stale_s", 3.5))
+        if (
+            stale_s > 0.0
+            and (now_t - started_t) > stale_s
+            and not self._seek_slider.isSliderDown()
+        ):
+            self._deferred_playhead_relock_token = (
+                int(getattr(self, "_deferred_playhead_relock_token", 0)) + 1
+            )
             self._pending_playhead_relock_on_unmute = False
+            self._pending_playhead_relock_started_t = 0.0
+            self._pending_playhead_relock_pre_delay_ms = -1
+            self._relock_hold_muted = False
+            self._apply_volume_to_backends()
+            return False
+        if not self._playing or not getattr(self, "_active_use_mpv", False):
+            self._deferred_playhead_relock_token = (
+                int(getattr(self, "_deferred_playhead_relock_token", 0)) + 1
+            )
+            self._pending_playhead_relock_on_unmute = False
+            self._pending_playhead_relock_started_t = 0.0
             self._pending_playhead_relock_pre_delay_ms = -1
             return False
         if (
@@ -119,6 +143,9 @@ class AutoMuteMixin:
             return False
 
         self._pending_playhead_relock_on_unmute = False
+        self._pending_playhead_relock_started_t = 0.0
+        token = int(getattr(self, "_deferred_playhead_relock_token", 0)) + 1
+        self._deferred_playhead_relock_token = token
         pending_pre_ms = int(getattr(self, "_pending_playhead_relock_pre_delay_ms", -1))
         self._pending_playhead_relock_pre_delay_ms = -1
         first_ms = int(getattr(self, "_pending_playhead_relock_first_ms", 35))
@@ -137,11 +164,14 @@ class AutoMuteMixin:
             self._set_audio_paused(True)
 
         def _run_relock():
+            if token != int(getattr(self, "_deferred_playhead_relock_token", 0)):
+                return
             if not self._playing:
                 self._relock_hold_muted = False
                 return
             if self._auto_muted_low_fps or self._scrub_muted:
                 self._pending_playhead_relock_on_unmute = True
+                self._pending_playhead_relock_started_t = time.perf_counter()
                 self._pending_playhead_relock_pre_delay_ms = int(pre_delay_ms)
                 self._pending_playhead_relock_first_ms = first_ms
                 self._pending_playhead_relock_settle_ms = settle_ms
@@ -155,6 +185,8 @@ class AutoMuteMixin:
 
             # Release hold after relock settle and apply a short fade-in.
             def _release_after_relock():
+                if token != int(getattr(self, "_deferred_playhead_relock_token", 0)):
+                    return
                 if not self._playing:
                     self._relock_hold_muted = False
                     return
@@ -230,6 +262,7 @@ class AutoMuteMixin:
                     and not self._pending_playhead_relock_on_unmute
                 ):
                     self._pending_playhead_relock_on_unmute = True
+                    self._pending_playhead_relock_started_t = time.perf_counter()
                     self._pending_playhead_relock_pre_delay_ms = int(
                         getattr(self, "_stability_relock_pre_delay_ms", 0)
                     )

@@ -5,7 +5,14 @@ import time
 
 import psutil
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QTimer, Qt
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QTimer,
+    Qt,
+)
 from PyQt6.QtWidgets import QApplication, QGraphicsOpacityEffect, QVBoxLayout, QWidget
 
 from gui_config import (
@@ -21,6 +28,33 @@ from gui_scaling import (
     _select_mpv_cas_strength,
 )
 from gui_widgets import DetachedVideoWindow
+
+
+class VideoTransitionOverlay(QWidget):
+    """Top-level black overlay that fades away above native mpv child windows."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("VideoTransitionOverlay")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet("background-color: #000000;")
+        self.setWindowOpacity(0.0)
+        self.hide()
+
+    def getFadeOpacity(self) -> float:
+        return float(self.windowOpacity())
+
+    def setFadeOpacity(self, value: float):
+        self.setWindowOpacity(max(0.0, min(1.0, float(value))))
 
 
 class WindowingMixin:
@@ -110,6 +144,104 @@ class WindowingMixin:
             pass
         return visible
 
+    def _video_transition_target(self) -> QWidget | None:
+        return self._video_tabs
+
+    def _position_video_transition_overlay(self):
+        overlay = getattr(self, "_video_transition_overlay", None)
+        target = self._video_transition_target()
+        if overlay is None or target is None:
+            return
+        if not target.isVisible():
+            overlay.hide()
+            return
+        pos = target.mapToGlobal(QPoint(0, 0))
+        overlay.setGeometry(QRect(pos, target.size()))
+        overlay.raise_()
+        if self._ui_overlay_btn is not None and self._ui_overlay_btn.isVisible():
+            self._ui_overlay_btn.raise_()
+
+    def _ensure_video_transition_track_timer(self):
+        if getattr(self, "_video_transition_track_timer", None) is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(False)
+        timer.timeout.connect(self._position_video_transition_overlay)
+        self._video_transition_track_timer = timer
+
+    def _track_video_transition_overlay_for(self, duration_ms: int):
+        self._ensure_video_transition_track_timer()
+        timer = getattr(self, "_video_transition_track_timer", None)
+        if timer is None:
+            return
+        timer.stop()
+        timer.start(16)
+        QTimer.singleShot(
+            max(80, int(duration_ms) + 80),
+            lambda: timer.stop() if timer is self._video_transition_track_timer else None,
+        )
+
+    def _begin_video_surface_fade(
+        self,
+        duration_ms: int = 1000,
+        start_opacity: float = 1.0,
+    ):
+        target = self._video_transition_target()
+        if target is None or not target.isVisible():
+            return
+        overlay = getattr(self, "_video_transition_overlay", None)
+        if overlay is None:
+            overlay = VideoTransitionOverlay(self)
+            self._video_transition_overlay = overlay
+        anim = getattr(self, "_video_transition_anim", None)
+        if anim is not None:
+            anim.stop()
+        self._position_video_transition_overlay()
+        overlay.show()
+        overlay.raise_()
+        overlay.setFadeOpacity(max(0.0, min(1.0, float(start_opacity))))
+        QTimer.singleShot(0, self._position_video_transition_overlay)
+        QTimer.singleShot(40, self._position_video_transition_overlay)
+        QTimer.singleShot(120, self._position_video_transition_overlay)
+        self._track_video_transition_overlay_for(duration_ms)
+        anim = QPropertyAnimation(overlay, b"windowOpacity", self)
+        anim.setDuration(max(90, int(duration_ms)))
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.setStartValue(overlay.getFadeOpacity())
+        anim.setEndValue(0.0)
+
+        def _finish():
+            overlay.hide()
+            overlay.setFadeOpacity(0.0)
+            track_timer = getattr(self, "_video_transition_track_timer", None)
+            if track_timer is not None:
+                track_timer.stop()
+
+        anim.finished.connect(_finish)
+        self._video_transition_anim = anim
+        anim.start()
+
+    def _begin_video_surface_fade_after_layout(
+        self,
+        duration_ms: int = 1000,
+        start_opacity: float = 1.0,
+        delay_ms: int = 16,
+    ):
+        def _start():
+            try:
+                if self._root_layout is not None:
+                    self._root_layout.activate()
+                if self._video_tabs is not None:
+                    self._video_tabs.updateGeometry()
+            except Exception:
+                pass
+            self._begin_video_surface_fade(
+                duration_ms=duration_ms,
+                start_opacity=start_opacity,
+            )
+
+        QTimer.singleShot(max(0, int(delay_ms)), _start)
+
     def _schedule_sdr_reactivation_relock(self):
         """Recover metrics after showing SDR; the pane is kept warm already."""
         if not self._playing:
@@ -119,10 +251,7 @@ class WindowingMixin:
             self._worker.reset_runtime_metrics()
         except Exception:
             pass
-        if self._is_live_window_capture_active():
-            self._schedule_window_state_refresh(40, soft_only=True)
-        else:
-            self._relock_timeline(delay_ms=90, drop_frames=1)
+        self._schedule_window_state_refresh(40, soft_only=True)
 
     def _on_video_tab_changed(self, index: int):
         if self._video_tabs is None or index < 0:
@@ -130,8 +259,7 @@ class WindowingMixin:
         new_label = str(self._video_tabs.tabText(index) or "")
         old_label = str(getattr(self, "_active_video_tab_label", "") or "")
         reactivate_sdr = old_label == "HDR" and new_label in {"SDR", "Side by Side"}
-        if self._playing and not self._is_live_window_capture_active():
-            self._pause_for_ui_transition(duration_ms=120, wait_for_stable=True)
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_tab_switch():
             label = new_label
@@ -165,11 +293,14 @@ class WindowingMixin:
         self._active_video_tab_label = new_label
         if self._playing:
             self._sync_worker_sdr_visibility()
-            self._start_periodic_relock()
+            if new_label == "Side by Side":
+                self._stop_periodic_relock()
+            else:
+                self._start_periodic_relock()
         if self._playing and reactivate_sdr:
             self._schedule_sdr_reactivation_relock()
-        elif self._playing:
-            self._relock_timeline(delay_ms=140, drop_frames=1)
+        if self._playing:
+            self._schedule_state_change_relock(delay_ms=140, drop_frames=3)
 
     def _on_app_state_changed(self, state: Qt.ApplicationState):
         active = state == Qt.ApplicationState.ApplicationActive
@@ -183,12 +314,14 @@ class WindowingMixin:
             except Exception:
                 pass
             if active:
-                self._relock_timeline(delay_ms=80, drop_frames=1)
+                self._pause_for_ui_transition()
+                self._schedule_state_change_relock(delay_ms=140, drop_frames=2)
 
     def _toggle_sdr_popout(self):
         if self._sdr_float_window is not None:
             self._dock_video_pane("sdr")
             return
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_pop():
             win = DetachedVideoWindow("sdr", "SDR View")
@@ -204,14 +337,13 @@ class WindowingMixin:
         self._with_layout_freeze(_apply_pop, refresh_delay=40)
         if self._playing:
             self._sync_worker_sdr_visibility()
-            self._start_periodic_relock()
-        if self._playing:
-            self._relock_timeline(delay_ms=160, drop_frames=3)
+            self._schedule_state_change_relock(delay_ms=160, drop_frames=3)
 
     def _toggle_hdr_popout(self):
         if self._hdr_float_window is not None:
             self._dock_video_pane("hdr")
             return
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
 
         def _apply_pop():
             win = DetachedVideoWindow("hdr", "HDR View")
@@ -226,11 +358,16 @@ class WindowingMixin:
 
         self._with_layout_freeze(_apply_pop, refresh_delay=40)
         if self._playing:
-            self._relock_timeline(delay_ms=160, drop_frames=3)
-            # Follow-up relock after next position update to prevent stale-frame audio lag.
-            QTimer.singleShot(520, lambda: self._relock_timeline(drop_frames=1))
+            self._schedule_state_change_relock(
+                delay_ms=160,
+                drop_frames=3,
+                settle_delay_ms=520,
+                settle_drop_frames=1,
+            )
 
     def _dock_video_pane(self, key: str, from_signal: bool = False):
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+
         def _apply_dock():
             side_mode = (
                 self._video_tabs is not None
@@ -275,10 +412,13 @@ class WindowingMixin:
         if self._playing and str(key).lower() == "sdr":
             self._sync_worker_sdr_visibility()
         if self._playing:
-            self._relock_timeline(delay_ms=160, drop_frames=3)
-            if str(key).lower() == "hdr":
-                # Follow-up relock after next position update to prevent stale-frame audio lag.
-                QTimer.singleShot(520, lambda: self._relock_timeline(drop_frames=1))
+            settle_ms = 520 if str(key).lower() == "hdr" else None
+            self._schedule_state_change_relock(
+                delay_ms=160,
+                drop_frames=3,
+                settle_delay_ms=settle_ms,
+                settle_drop_frames=1,
+            )
 
     def _on_video_window_closed(self, key: str):
         if self._ui_closing:
@@ -567,6 +707,7 @@ class WindowingMixin:
         self._position_immersive_metrics_overlay()
 
     def _position_ui_overlay(self):
+        self._position_video_transition_overlay()
         self._position_immersive_timeline_overlay()
         self._position_immersive_metrics_overlay()
         if self._ui_overlay_btn is None:
@@ -634,10 +775,13 @@ class WindowingMixin:
                 self._ui_overlay_btn.hide()
         if self._btn_toggle_ui is not None:
             self._btn_toggle_ui.setText("Show UI" if self._ui_hidden else "Hide UI")
-        # Layout changes can momentarily stall video presentation.
-        # Re-anchor audio to the current timeline after the UI toggle.
+        self._begin_video_surface_fade_after_layout(
+            duration_ms=1000,
+            start_opacity=1.0,
+            delay_ms=20,
+        )
         if self._playing:
-            self._relock_timeline(delay_ms=120, drop_frames=2)
+            self._schedule_state_change_relock(delay_ms=120, drop_frames=2)
 
     def _set_pause_button_labels(self, paused: bool):
         if paused:
@@ -1018,6 +1162,9 @@ class WindowingMixin:
             == SOURCE_MODE_WINDOW
         ):
             return
+        if self._current_video_tab_label() == "Side by Side":
+            self._stop_periodic_relock()
+            return
         if self._worker is None or self._worker.is_paused:
             return
         if self._startup_sync_pending:
@@ -1087,6 +1234,8 @@ class WindowingMixin:
             _normalize_source_mode(getattr(self, "_source_mode", None))
             == SOURCE_MODE_WINDOW
         ):
+            return
+        if self._current_video_tab_label() == "Side by Side":
             return
         if self._audio_available and self._audio_player is not None:
             return
@@ -1203,7 +1352,7 @@ class WindowingMixin:
             )
             self._apply_mpv_runtime_filters(2)
             if source_mode != SOURCE_MODE_WINDOW:
-                self._relock_timeline(delay_ms=140, drop_frames=2)
+                self._schedule_state_change_relock(delay_ms=140, drop_frames=2)
 
         _soft_warm()
         QTimer.singleShot(220, _soft_warm)
@@ -1223,6 +1372,7 @@ class WindowingMixin:
     def _enter_borderless_full_window(self):
         if self._borderless_full_window:
             return
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
         self._pause_for_ui_transition()
 
         def _apply_full():
@@ -1247,11 +1397,12 @@ class WindowingMixin:
             self._schedule_overlay_position(0)
 
         self._with_layout_freeze(_apply_full, refresh_delay=140, refresh_soft_only=True)
-        self._relock_timeline(delay_ms=180, drop_frames=3)
+        self._schedule_state_change_relock(delay_ms=180, drop_frames=3)
 
     def _exit_borderless_full_window(self):
         if not self._borderless_full_window:
             return
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
         self._pause_for_ui_transition()
 
         def _apply_exit():
@@ -1279,12 +1430,13 @@ class WindowingMixin:
             self._schedule_overlay_position(0)
 
         self._with_layout_freeze(_apply_exit, refresh_delay=140, refresh_soft_only=True)
-        self._relock_timeline(delay_ms=180, drop_frames=3)
+        self._schedule_state_change_relock(delay_ms=180, drop_frames=3)
 
     def _should_use_mpv_pipeline(self) -> bool:
         return self._disp_hdr_mpv is not None
 
     def _on_view(self, mode):
+        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
         if self._video_tabs is not None:
             self._video_tabs.tabBar().setVisible(True)
         if self._disp_sdr_mpv is not None:
@@ -1301,12 +1453,10 @@ class WindowingMixin:
         # Let the worker skip unnecessary copies / postprocess
         if self._playing:
             sdr_visible = self._sync_worker_sdr_visibility()
-            self._start_periodic_relock()
             if sdr_visible and self._last_sdr_frame is not None:
                 if self._disp_sdr_cpu is not None:
                     self._disp_sdr_cpu.update_frame(self._last_sdr_frame)
-            # Any view change can desync; relock the timeline.
-            self._relock_timeline(delay_ms=140, drop_frames=3)
+            self._schedule_state_change_relock(delay_ms=140, drop_frames=3)
 
     def _refresh_mpv_after_window_state_change(self):
         if not self._playing:
@@ -1363,5 +1513,4 @@ class WindowingMixin:
                 pass
             if display_changed:
                 self._apply_mpv_runtime_filters(2)
-        # Relock video/audio after any window/layout refresh.
-        self._relock_timeline(drop_frames=3)
+        self._schedule_state_change_relock(drop_frames=3)

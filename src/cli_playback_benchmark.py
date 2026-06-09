@@ -18,6 +18,8 @@ if os.name == "nt" and hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from windows_runtime import (
+    configure_cuda_environment,
+    configure_msvc_build_environment,
     configure_rocm_sdk_environment,
     ensure_windows_supported,
     install_torch_windows_warning_filter,
@@ -26,6 +28,8 @@ from windows_runtime import (
 
 ensure_windows_supported("HDRTVNet++ CLI playback benchmark")
 install_torch_windows_warning_filter()
+configure_msvc_build_environment()
+configure_cuda_environment()
 configure_rocm_sdk_environment()
 
 _HERE = pathlib.Path(__file__).resolve().parent
@@ -47,12 +51,14 @@ from gui_config import (
     _select_hg_weights_path,
     _select_tensorrt_model_path,
 )
+from gui_scaling import _limited_playback_fps
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     HDRTVNetTorch,
     _IS_NVIDIA,
     tensorrt_prebuilt_calibration_cache_path,
 )
+from timer import sleep_until
 from video_source import VideoSource
 
 
@@ -171,6 +177,9 @@ _RUN_PRESETS = {
 _DEFAULT_RUNS = [
     "int8-mixed-qat",
 ]
+_REALTIME_CATCHUP_ENABLED = True
+_REALTIME_SKIP_LAG_FRAMES = 1.1
+_REALTIME_MAX_CATCHUP_SKIP = 6
 
 
 _CSV_FIELDS = [
@@ -201,7 +210,13 @@ _CSV_FIELDS = [
     "pre_ms",
     "run_ms",
     "post_ms",
+    "render_ms",
     "fps_1p_low",
+    "dropped_frames",
+    "catchup_dropped_frames",
+    "fps_limiter_dropped_frames",
+    "source_loops",
+    "playback_mode",
 ]
 
 
@@ -481,6 +496,18 @@ def _write_session_files(
             "gpu_mb",
             "cpu_mb",
             "model_mb",
+            "decode_ms",
+            "resize_ms",
+            "infer_ms",
+            "pre_ms",
+            "run_ms",
+            "post_ms",
+            "render_ms",
+            "fps_1p_low",
+            "dropped_frames",
+            "catchup_dropped_frames",
+            "fps_limiter_dropped_frames",
+            "source_loops",
             "psnr_db",
             "sssim",
             "delta_e_itp",
@@ -515,6 +542,7 @@ def _write_session_files(
         "Runtime Metrics:",
         f"  Samples Saved: {len(runtime_samples)}",
         "  " + _fmt_stats("FPS", runtime_summary.get("fps"), ""),
+        "  " + _fmt_stats("1% Low FPS", runtime_summary.get("fps_1p_low"), ""),
         "  " + _fmt_stats("Latency", runtime_summary.get("latency_ms"), " ms"),
         "  "
         + _fmt_stats(
@@ -522,6 +550,7 @@ def _write_session_files(
             runtime_summary.get("model_latency_ms"),
             " ms",
         ),
+        "  " + _fmt_stats("Render/Display", runtime_summary.get("render_ms"), " ms"),
         "  " + _fmt_stats("GPU Memory", runtime_summary.get("gpu_mb"), " MB"),
         "  " + _fmt_stats("CPU Memory", runtime_summary.get("cpu_mb"), " MB"),
     ]
@@ -577,15 +606,182 @@ def _write_session_files(
         "runtime_metrics_csv": str(session_dir / "runtime_metrics.csv"),
         "avg_model_latency_ms": exact_avg,
         "avg_fps": (runtime_summary.get("fps") or {}).get("avg"),
+        "avg_fps_1p_low": (runtime_summary.get("fps_1p_low") or {}).get("avg"),
+        "avg_latency_ms": (runtime_summary.get("latency_ms") or {}).get("avg"),
+        "avg_render_ms": (runtime_summary.get("render_ms") or {}).get("avg"),
+        "max_gpu_mb": (runtime_summary.get("gpu_mb") or {}).get("max"),
+        "max_cpu_mb": (runtime_summary.get("cpu_mb") or {}).get("max"),
+        "model_mb": (runtime_summary.get("model_mb") or {}).get("last"),
+        "settings": dict(settings),
+        "worker_summary": dict(worker_summary),
     }
+
+
+def _write_batch_summary(batch_dir: pathlib.Path, args, results: list[dict]) -> None:
+    fields = [
+        "precision",
+        "resolution",
+        "use_hg",
+        "playback_mode",
+        "target_fps",
+        "avg_fps",
+        "avg_fps_1p_low",
+        "avg_latency_ms",
+        "avg_model_latency_ms",
+        "avg_render_ms",
+        "max_gpu_mb",
+        "max_cpu_mb",
+        "model_mb",
+        "dropped_frames",
+        "catchup_dropped_frames",
+        "fps_limiter_dropped_frames",
+        "source_loops",
+        "timed_frames",
+        "processed_frames",
+        "session_elapsed_s",
+        "timed_elapsed_s",
+        "session_dir",
+        "summary_txt",
+        "session_json",
+        "runtime_metrics_csv",
+    ]
+
+    rows: list[dict] = []
+    for result in results:
+        settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+        worker = (
+            result.get("worker_summary")
+            if isinstance(result.get("worker_summary"), dict)
+            else {}
+        )
+        rows.append(
+            {
+                "precision": settings.get("precision"),
+                "resolution": settings.get("resolution"),
+                "use_hg": settings.get("use_hg"),
+                "playback_mode": settings.get("playback_mode"),
+                "target_fps": settings.get("target_fps"),
+                "avg_fps": result.get("avg_fps"),
+                "avg_fps_1p_low": result.get("avg_fps_1p_low"),
+                "avg_latency_ms": result.get("avg_latency_ms"),
+                "avg_model_latency_ms": result.get("avg_model_latency_ms"),
+                "avg_render_ms": result.get("avg_render_ms"),
+                "max_gpu_mb": result.get("max_gpu_mb"),
+                "max_cpu_mb": result.get("max_cpu_mb"),
+                "model_mb": result.get("model_mb"),
+                "dropped_frames": worker.get("dropped_frames"),
+                "catchup_dropped_frames": worker.get("catchup_dropped_frames"),
+                "fps_limiter_dropped_frames": worker.get("fps_limiter_dropped_frames"),
+                "source_loops": worker.get("source_loops"),
+                "timed_frames": worker.get("timed_frames"),
+                "processed_frames": worker.get("processed_frames"),
+                "session_elapsed_s": worker.get("session_elapsed_s"),
+                "timed_elapsed_s": worker.get("timed_elapsed_s"),
+                "session_dir": result.get("session_dir"),
+                "summary_txt": result.get("summary_txt"),
+                "session_json": result.get("session_json"),
+                "runtime_metrics_csv": result.get("runtime_metrics_csv"),
+            }
+        )
+
+    csv_paths = [
+        batch_dir / "playback_benchmark_summary.csv",
+        batch_dir / "batch_summary.csv",
+    ]
+    for csv_path in csv_paths:
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fields})
+
+    payload = {
+        "benchmark": "playback_performance",
+        "video": args.video,
+        "display_backend": str(args.display_backend) if bool(args.display) else None,
+        "wall_clock": bool(getattr(args, "wall_clock", False)),
+        "playback_mode": str(getattr(args, "playback_mode", "throughput")),
+        "loop_source": bool(getattr(args, "loop_source", False)),
+        "duration_s": float(args.duration_s),
+        "warmup_frames": int(args.warmup_frames),
+        "sample_interval": int(args.sample_interval),
+        "out_root": str(args.out_root),
+        "batch_dir": str(batch_dir),
+        "results": rows,
+        "run_artifacts": results,
+    }
+    for json_path in (
+        batch_dir / "playback_benchmark_summary.json",
+        batch_dir / "batch_summary.json",
+    ):
+        with json_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    lines = [
+        "HDRTVNet++ Playback Performance Benchmark",
+        f"Video: {args.video}",
+        f"Display: {str(args.display_backend) if bool(args.display) else 'headless'}",
+        f"Wall Clock: {bool(getattr(args, 'wall_clock', False))}",
+        f"Playback Mode: {str(getattr(args, 'playback_mode', 'throughput'))}",
+        f"Duration: {float(args.duration_s):.1f} s",
+        f"Batch Folder: {batch_dir}",
+        "",
+        (
+            "Precision | Resolution | HG | FPS | 1% Low | Latency ms | "
+            "Model ms | Render ms | VRAM MB | CPU MB | Engine MB | Frames | Dropped"
+        ),
+        "-" * 120,
+    ]
+    for row in rows:
+        lines.append(
+            f"{row.get('precision') or '-'} | "
+            f"{row.get('resolution') or '-'} | "
+            f"{'on' if bool(row.get('use_hg')) else 'off'} | "
+            f"{_fmt_num(row.get('avg_fps'), 2)} | "
+            f"{_fmt_num(row.get('avg_fps_1p_low'), 2)} | "
+            f"{_fmt_num(row.get('avg_latency_ms'), 2)} | "
+            f"{_fmt_num(row.get('avg_model_latency_ms'), 2)} | "
+            f"{_fmt_num(row.get('avg_render_ms'), 2)} | "
+            f"{_fmt_num(row.get('max_gpu_mb'), 0)} | "
+            f"{_fmt_num(row.get('max_cpu_mb'), 0)} | "
+            f"{_fmt_num(row.get('model_mb'), 2)} | "
+            f"{row.get('timed_frames') or '-'} | "
+            f"{row.get('dropped_frames') or 0}"
+        )
+    (batch_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _fmt_num(value, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "-"
+    if not math.isfinite(number):
+        return "-"
+    return f"{number:.{digits}f}"
 
 
 def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Path) -> dict:
     width, height = resolution
     source = VideoSource(args.video, prefetch=args.prefetch)
     fps = float(source.fps or 30.0)
-    timed_frames_target = max(1, int(round(float(args.duration_s) * fps)))
-    max_frames = int(args.warmup_frames) + timed_frames_target
+    playback_mode = str(getattr(args, "playback_mode", "throughput") or "throughput").lower()
+    realtime_mode = playback_mode == "realtime"
+    out_fps = _limited_playback_fps(fps)
+    frame_stride = max(1, int(round(fps / out_fps))) if realtime_mode else 1
+    frame_interval_s = 1.0 / max(1e-6, fps)
+    next_frame_t = 0.0
+    wall_clock = bool(getattr(args, "wall_clock", False))
+    timed_frames_target = (
+        None
+        if wall_clock
+        else max(1, int(round(float(args.duration_s) * fps)))
+    )
+    max_frames = (
+        None
+        if wall_clock
+        else int(args.warmup_frames) + int(timed_frames_target)
+    )
     source_label = pathlib.Path(args.video).name
     run_label = f"{width}x{height}_{run['label']}_{'hg' if args.use_hg else 'nohg'}"
     session_dir = batch_dir / run_label
@@ -594,6 +790,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
     if bool(getattr(processor, "_compiled", False)) and not args.skip_cache_warmup:
         processor.warmup_compile(int(width), int(height))
         _mark_cache(processor, width, height, args, run)
+    next_frame_t = time.perf_counter()
 
     process = psutil.Process(os.getpid())
     use_cuda = torch.cuda.is_available() and str(args.device).lower() != "cpu"
@@ -610,6 +807,28 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
     model_latency_values: list[float] = []
     runtime_samples: list[dict] = []
     display = None
+    timed_started_t: float | None = None
+    timed_deadline_t: float | None = None
+    last_presentation_stamp: float | None = None
+    source_loops = 0
+    dropped_frames = 0
+    catchup_dropped_frames = 0
+    fps_limiter_dropped_frames = 0
+
+    def _read_source_frame():
+        nonlocal source, source_loops
+        while True:
+            ok_read, frame_read = source.read()
+            if ok_read:
+                return True, frame_read
+            if not bool(getattr(args, "loop_source", False)):
+                return False, None
+            try:
+                source.release()
+            except Exception:
+                pass
+            source = VideoSource(args.video, prefetch=args.prefetch)
+            source_loops += 1
 
     try:
         if args.display:
@@ -620,13 +839,85 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                 height=height,
                 fps=fps,
                 window_name="HDRTVNet++ CLI Benchmark",
+                # Match the GUI HDR mpv raw-video display path while leaving
+                # the user's upscale shader out of the benchmark. The widget
+                # still applies normal HDR metadata, dither/deband, and the
+                # automatic downscaler path when mpv needs to downscale.
+                scale_kernel="bicubic",
+                scale_antiring=0.0,
+                force_hdr_metadata=True,
+                vsync_timed=False,
+                embed_wid=str(getattr(args, "display_wid", "") or "").strip() or None,
             )
-        while frame_idx < max_frames:
+        while True:
+            if max_frames is not None and frame_idx >= int(max_frames):
+                break
+            if (
+                wall_clock
+                and timed_deadline_t is not None
+                and time.perf_counter() >= timed_deadline_t
+            ):
+                break
+            if (
+                wall_clock
+                and frame_idx >= int(args.warmup_frames)
+                and timed_started_t is None
+            ):
+                timed_started_t = time.perf_counter()
+                timed_deadline_t = timed_started_t + max(0.001, float(args.duration_s))
+                next_frame_t = timed_started_t
+                last_presentation_stamp = None
+
+            lag_s = 0.0
+            if realtime_mode:
+                now = time.perf_counter()
+                if now < next_frame_t:
+                    sleep_until(next_frame_t)
+                    now = time.perf_counter()
+                else:
+                    lag_s = now - next_frame_t
+
             t0 = time.perf_counter()
-            ok, frame = source.read()
+            ok, frame = _read_source_frame()
             t1 = time.perf_counter()
             if not ok:
                 break
+            frame_idx += 1
+
+            if (
+                realtime_mode
+                and _REALTIME_CATCHUP_ENABLED
+                and lag_s > (frame_interval_s * _REALTIME_SKIP_LAG_FRAMES)
+            ):
+                skip_n = min(
+                    _REALTIME_MAX_CATCHUP_SKIP,
+                    max(0, int(lag_s / frame_interval_s)),
+                )
+                while skip_n > 0:
+                    ok_skip, frame_skip = _read_source_frame()
+                    if not ok_skip:
+                        ok = False
+                        break
+                    frame = frame_skip
+                    frame_idx += 1
+                    dropped_frames += 1
+                    catchup_dropped_frames += 1
+                    next_frame_t += frame_interval_s
+                    skip_n -= 1
+                if not ok:
+                    break
+
+            if realtime_mode and frame_stride > 1 and (frame_idx % frame_stride) != 0:
+                dropped_frames += 1
+                fps_limiter_dropped_frames += 1
+                next_frame_t += frame_interval_s
+                continue
+
+            present_t = (
+                max(next_frame_t, time.perf_counter())
+                if realtime_mode
+                else None
+            )
             frame = _resize_frame(frame, width, height)
             t2 = time.perf_counter()
             if bool(getattr(args, "model_stage_timing", False)):
@@ -641,8 +932,17 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                 if not display.show(out):
                     break
             t4 = time.perf_counter()
+            if realtime_mode:
+                presentation_stamp = max(t4, float(present_t or t4))
+                if (
+                    frame_idx > int(args.warmup_frames)
+                    and last_presentation_stamp is not None
+                    and presentation_stamp > last_presentation_stamp
+                ):
+                    fps_samples.append(1.0 / (presentation_stamp - last_presentation_stamp))
+                last_presentation_stamp = presentation_stamp
+                next_frame_t += frame_interval_s
 
-            frame_idx += 1
             if frame_idx <= int(args.warmup_frames):
                 continue
 
@@ -659,9 +959,11 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                 else infer_elapsed_ms
             )
             post_ms += float(post_t)
-            frame_ms = (t4 - t0) * 1000.0
+            frame_ms = (
+                ((t4 - t1) if realtime_mode else (t4 - t0)) * 1000.0
+            )
             frame_ms_sum += frame_ms
-            if frame_ms > 0:
+            if frame_ms > 0 and not realtime_mode:
                 fps_samples.append(1000.0 / frame_ms)
             model_latency = (
                 float(run_t)
@@ -671,15 +973,24 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
             )
             model_latency_values.append(model_latency)
 
-            if stats_frames % int(args.sample_interval) == 0 or stats_frames == timed_frames_target:
+            sample_due = stats_frames % int(args.sample_interval) == 0
+            if wall_clock and timed_deadline_t is not None:
+                sample_due = sample_due or time.perf_counter() >= timed_deadline_t
+            elif timed_frames_target is not None:
+                sample_due = sample_due or stats_frames == int(timed_frames_target)
+            if sample_due:
                 avg_frame_ms = frame_ms_sum / max(1, stats_frames)
-                avg_fps = 1000.0 / avg_frame_ms if avg_frame_ms > 0 else 0.0
+                if realtime_mode and timed_started_t is not None:
+                    timed_elapsed = max(1e-9, time.perf_counter() - timed_started_t)
+                    avg_fps = stats_frames / timed_elapsed
+                else:
+                    avg_fps = 1000.0 / avg_frame_ms if avg_frame_ms > 0 else 0.0
                 sorted_fps = sorted(fps_samples)
                 if sorted_fps:
                     k = max(1, int(len(sorted_fps) * 0.01))
                     one_percent_low = sum(sorted_fps[:k]) / k
                 else:
-                    one_percent_low = 0.0
+                    one_percent_low = avg_fps
                 gpu_mb = 0.0
                 if use_cuda:
                     if trt_device_mb is not None:
@@ -719,14 +1030,26 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                     "post_ms": post_ms / max(1, stats_frames),
                     "render_ms": render_ms / max(1, stats_frames),
                     "fps_1p_low": float(one_percent_low),
+                    "dropped_frames": int(dropped_frames),
+                    "catchup_dropped_frames": int(catchup_dropped_frames),
+                    "fps_limiter_dropped_frames": int(fps_limiter_dropped_frames),
+                    "source_loops": int(source_loops),
+                    "playback_mode": str(playback_mode),
                 }
                 runtime_samples.append(sample)
                 print(
                     f"[bench] {run_label}: frames={stats_frames} "
-                    f"fps={avg_fps:.2f} model={sample['model_latency_ms']:.3f}ms",
+                    f"fps={avg_fps:.2f} model={sample['model_latency_ms']:.3f}ms "
+                    f"dropped={dropped_frames}",
                     flush=True,
                 )
-            if stats_frames >= timed_frames_target:
+            if (
+                wall_clock
+                and timed_deadline_t is not None
+                and time.perf_counter() >= timed_deadline_t
+            ):
+                break
+            if timed_frames_target is not None and stats_frames >= int(timed_frames_target):
                 break
     finally:
         try:
@@ -767,6 +1090,10 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
         "hdr_ground_truth_path": None,
         "model_path": str(run["model"]),
         "duration_s": float(args.duration_s),
+        "wall_clock": bool(wall_clock),
+        "playback_mode": str(playback_mode),
+        "target_fps": float(out_fps if realtime_mode else fps),
+        "loop_source": bool(getattr(args, "loop_source", False)),
         "warmup_frames": int(args.warmup_frames),
         "display_backend": str(args.display_backend) if bool(args.display) else None,
         "model_stage_timing": bool(getattr(args, "model_stage_timing", False)),
@@ -779,8 +1106,17 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
         "avg_model_latency_ms": avg_model_latency,
         "model_latency_samples": len(model_latency_values),
         "session_elapsed_s": elapsed_s,
+        "timed_elapsed_s": (
+            round(max(0.0, time.perf_counter() - timed_started_t), 3)
+            if timed_started_t is not None
+            else None
+        ),
         "processed_frames": int(frame_idx),
         "timed_frames": int(stats_frames),
+        "source_loops": int(source_loops),
+        "dropped_frames": int(dropped_frames),
+        "catchup_dropped_frames": int(catchup_dropped_frames),
+        "fps_limiter_dropped_frames": int(fps_limiter_dropped_frames),
     }
     return _write_session_files(
         session_dir=session_dir,
@@ -835,6 +1171,28 @@ def parse_args():
         help="Precision/model presets to run.",
     )
     parser.add_argument("--duration-s", type=float, default=180.0)
+    parser.add_argument(
+        "--wall-clock",
+        action="store_true",
+        help=(
+            "Run timed measurement for true wall-clock duration after warmup "
+            "instead of duration_s * source_fps frames."
+        ),
+    )
+    parser.add_argument(
+        "--loop-source",
+        action="store_true",
+        help="Loop the input video if EOF is reached before the benchmark finishes.",
+    )
+    parser.add_argument(
+        "--playback-mode",
+        default="throughput",
+        choices=["throughput", "realtime"],
+        help=(
+            "throughput runs as fast as possible. realtime mirrors GUI video "
+            "playback: source-FPS pacing plus catch-up frame skips when behind."
+        ),
+    )
     parser.add_argument("--warmup-frames", type=int, default=120)
     parser.add_argument("--sample-interval", type=int, default=120)
     parser.add_argument("--prefetch", type=int, default=8)
@@ -861,6 +1219,14 @@ def parse_args():
         default="mpv",
         choices=["mpv", "opencv"],
         help="Display backend used with --display. Defaults to mpv, matching the GUI HDR path.",
+    )
+    parser.add_argument(
+        "--display-wid",
+        default=None,
+        help=(
+            "Advanced: native window handle for embedding the mpv display "
+            "inside an existing GUI widget."
+        ),
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument(
@@ -970,20 +1336,7 @@ def main() -> int:
             )
             results.append(_run_one(args, preset, resolution, batch_dir))
 
-    summary_csv = batch_dir / "batch_summary.csv"
-    with summary_csv.open("w", encoding="utf-8", newline="") as handle:
-        fields = [
-            "session_dir",
-            "runtime_metrics_csv",
-            "avg_model_latency_ms",
-            "avg_fps",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        for result in results:
-            writer.writerow({key: result.get(key) for key in fields})
-    with (batch_dir / "batch_summary.json").open("w", encoding="utf-8") as handle:
-        json.dump({"video": args.video, "results": results}, handle, indent=2)
+    _write_batch_summary(batch_dir, args, results)
     print(f"[bench] Done: {batch_dir}", flush=True)
     return 0
 

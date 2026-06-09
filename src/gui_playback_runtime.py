@@ -53,6 +53,7 @@ from gui_compile_dialogs import (
     _python_executable_for_clean_subprocess,
 )
 from gui_benchmark import ModelBenchmarkDialog
+from gui_playback_benchmark import PlaybackPerformanceBenchmarkDialog
 from gui_export import ExportOptionsDialog, VideoExportWorker
 from gui_media_probe import (
     _probe_hdr_input,
@@ -2359,6 +2360,97 @@ class PlaybackRuntimeMixin:
             if last_session and os.path.isdir(last_session):
                 self.statusBar().showMessage(
                     f"Benchmark session saved: {last_session}"
+                )
+        finally:
+            self._set_benchmark_interaction_locked(False)
+            if (
+                resume_after_dialog
+                and self._playing
+                and self._worker is not None
+                and self._worker.is_paused
+            ):
+                if source_mode == SOURCE_MODE_WINDOW and paused_live_directly:
+                    self._worker.resume()
+                    if self._disp_hdr_mpv is not None:
+                        self._disp_hdr_mpv.set_paused(False)
+                    if self._disp_sdr_mpv is not None:
+                        self._disp_sdr_mpv.set_paused(False)
+                elif source_mode != SOURCE_MODE_WINDOW:
+                    self._toggle_pause()
+
+    def _open_playback_performance_benchmark_dialog(self):
+        if self._show_export_lock_message("Playback benchmark"):
+            return
+        if self._export_thread is not None:
+            QMessageBox.information(
+                self,
+                "Playback Benchmark",
+                "Export is currently running. Finish or cancel export before opening benchmark.",
+            )
+            return
+
+        source_mode = _normalize_source_mode(
+            getattr(self, "_source_mode", SOURCE_MODE_VIDEO)
+        )
+        was_running = bool(self._playing and self._worker is not None)
+        resume_after_dialog = False
+        paused_live_directly = False
+
+        if was_running:
+            answer = QMessageBox.question(
+                self,
+                "Open Playback Benchmark",
+                "Playback will be frozen and controls will be locked while the playback benchmark is open.\n\n"
+                "The benchmark runs a separate wall-clock mpv playback test so normal playback does not fight it for the GPU.\n"
+                "When the benchmark finishes, a runtime summary table is shown and logs are saved.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        if was_running:
+            if source_mode == SOURCE_MODE_WINDOW:
+                if not self._worker.is_paused:
+                    self._worker.pause()
+                    if self._disp_hdr_mpv is not None:
+                        self._disp_hdr_mpv.set_paused(True)
+                    if self._disp_sdr_mpv is not None:
+                        self._disp_sdr_mpv.set_paused(True)
+                    if self._audio_available:
+                        self._set_audio_paused(True)
+                    paused_live_directly = True
+                    resume_after_dialog = True
+            else:
+                if not self._worker.is_paused:
+                    self._toggle_pause()
+                    resume_after_dialog = True
+
+        logs_root = os.path.join(_ROOT, "logs", "playback_benchmark_sessions")
+        self._set_benchmark_interaction_locked(True)
+        try:
+            dlg = PlaybackPerformanceBenchmarkDialog(
+                initial_video_path=self._video_path if self._video_path else None,
+                suggested_dir=(
+                    self._last_open_dir
+                    if os.path.isdir(self._last_open_dir)
+                    else _ROOT
+                ),
+                initial_precision_key=self._cmb_prec.currentText(),
+                initial_use_hg=self._chk_hg.isChecked(),
+                logs_root=logs_root,
+                parent=self,
+            )
+            dlg.exec()
+            last_source_dir = dlg.last_source_dir()
+            if last_source_dir and os.path.isdir(last_source_dir):
+                self._last_open_dir = last_source_dir
+                self._save_user_settings()
+            last_session = dlg.last_session_dir()
+            if last_session and os.path.isdir(last_session):
+                self.statusBar().showMessage(
+                    f"Playback benchmark session saved: {last_session}"
                 )
         finally:
             self._set_benchmark_interaction_locked(False)

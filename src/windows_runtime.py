@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import pathlib
+import subprocess
 import sys
 import threading
 
@@ -150,6 +151,292 @@ def rocm_sdk_include_dirs() -> list[str]:
         seen.add(key)
         includes.append(str(include_dir))
     return includes
+
+
+def _has_cuda_toolkit_root(root: str | os.PathLike[str]) -> bool:
+    try:
+        p = pathlib.Path(root)
+    except Exception:
+        return False
+    if not p.is_dir():
+        return False
+    exe_name = "nvcc.exe" if os.name == "nt" else "nvcc"
+    return (p / "bin" / exe_name).is_file()
+
+
+def _cuda_env_candidate_roots() -> list[pathlib.Path]:
+    roots: list[pathlib.Path] = []
+    for env_key in ("CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"):
+        value = os.environ.get(env_key)
+        if value:
+            roots.append(pathlib.Path(value))
+
+    base = pathlib.Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    cuda_base = base / "NVIDIA GPU Computing Toolkit" / "CUDA"
+    if cuda_base.is_dir():
+        try:
+            children = [p for p in cuda_base.iterdir() if p.is_dir()]
+        except Exception:
+            children = []
+
+        def _version_key(path: pathlib.Path) -> tuple[int, ...]:
+            text = path.name.lower().lstrip("v")
+            parts: list[int] = []
+            for item in text.split("."):
+                try:
+                    parts.append(int(item))
+                except Exception:
+                    parts.append(0)
+            return tuple(parts)
+
+        roots.extend(sorted(children, key=_version_key, reverse=True))
+        roots.append(cuda_base)
+
+    uniq: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            normalized = os.path.normcase(str(root.resolve()))
+        except Exception:
+            normalized = os.path.normcase(str(root))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        uniq.append(root)
+    return uniq
+
+
+def configure_cuda_environment() -> str | None:
+    """Populate CUDA_HOME/CUDA_PATH from an installed CUDA Toolkit when found."""
+    if os.name != "nt":
+        return None
+    selected: pathlib.Path | None = None
+    for root in _cuda_env_candidate_roots():
+        if _has_cuda_toolkit_root(root):
+            selected = root
+            break
+    if selected is None:
+        return None
+
+    selected_str = str(selected)
+    os.environ["CUDA_HOME"] = selected_str
+    os.environ["CUDA_PATH"] = selected_str
+    bin_dir = selected / "bin"
+    if bin_dir.is_dir():
+        bin_text = str(bin_dir)
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        normalized = {os.path.normcase(os.path.normpath(p)) for p in path_parts if p}
+        key = os.path.normcase(os.path.normpath(bin_text))
+        if key not in normalized:
+            os.environ["PATH"] = bin_text + os.pathsep + os.environ.get("PATH", "")
+    return selected_str
+
+
+_MSVC_ENV_CONFIGURED = False
+
+
+def _exe_on_path(name: str) -> bool:
+    try:
+        search = name
+        if not search.lower().endswith(".exe"):
+            search += ".exe"
+        for folder in os.environ.get("PATH", "").split(os.pathsep):
+            if folder and (pathlib.Path(folder) / search).is_file():
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _vswhere_path() -> pathlib.Path | None:
+    candidates = []
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    program_files = os.environ.get("ProgramFiles")
+    if program_files_x86:
+        candidates.append(
+            pathlib.Path(program_files_x86)
+            / "Microsoft Visual Studio"
+            / "Installer"
+            / "vswhere.exe"
+        )
+    if program_files:
+        candidates.append(
+            pathlib.Path(program_files)
+            / "Microsoft Visual Studio"
+            / "Installer"
+            / "vswhere.exe"
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _visual_studio_installations() -> list[pathlib.Path]:
+    installs: list[pathlib.Path] = []
+    vswhere = _vswhere_path()
+    if vswhere is not None:
+        try:
+            out = subprocess.check_output(
+                [
+                    str(vswhere),
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+            installs.extend(pathlib.Path(line.strip()) for line in out.splitlines() if line.strip())
+        except Exception:
+            pass
+
+    for base_env in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(base_env)
+        if not base:
+            continue
+        vs_base = pathlib.Path(base) / "Microsoft Visual Studio"
+        if not vs_base.is_dir():
+            continue
+        for year in ("2022", "2019", "2017"):
+            year_dir = vs_base / year
+            if not year_dir.is_dir():
+                continue
+            try:
+                installs.extend(p for p in year_dir.iterdir() if p.is_dir())
+            except Exception:
+                pass
+
+    uniq: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for install in installs:
+        try:
+            key = os.path.normcase(str(install.resolve()))
+        except Exception:
+            key = os.path.normcase(str(install))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(install)
+    return uniq
+
+
+def _vcvars_candidates() -> list[pathlib.Path]:
+    candidates: list[pathlib.Path] = []
+    for install in _visual_studio_installations():
+        candidates.append(install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+        candidates.append(install / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat")
+    return [p for p in candidates if p.is_file()]
+
+
+def _apply_msvc_env_from_vcvars(vcvars: pathlib.Path) -> bool:
+    try:
+        if vcvars.name.lower() == "vcvarsall.bat":
+            cmd = f'cmd.exe /s /c ""{vcvars}" x64 >nul && set"'
+        else:
+            cmd = f'cmd.exe /s /c ""{vcvars}" >nul && set"'
+        out = subprocess.check_output(
+            cmd,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        return False
+
+    env: dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            env[key] = value
+
+    if not env.get("PATH"):
+        return False
+    os.environ.update(env)
+    return _exe_on_path("cl")
+
+
+def _add_latest_msvc_bin_to_path() -> bool:
+    installs = _visual_studio_installations()
+    tool_dirs: list[pathlib.Path] = []
+    for install in installs:
+        tools_root = install / "VC" / "Tools" / "MSVC"
+        if not tools_root.is_dir():
+            continue
+        try:
+            tool_dirs.extend(p for p in tools_root.iterdir() if p.is_dir())
+        except Exception:
+            pass
+    if not tool_dirs:
+        return False
+
+    def _version_key(path: pathlib.Path) -> tuple[int, ...]:
+        parts: list[int] = []
+        for part in path.name.split("."):
+            try:
+                parts.append(int(part))
+            except Exception:
+                parts.append(0)
+        return tuple(parts)
+
+    for tool_dir in sorted(tool_dirs, key=_version_key, reverse=True):
+        for host in ("Hostx64", "HostX64", "Hostx86", "HostX86"):
+            bin_dir = tool_dir / "bin" / host / "x64"
+            if (bin_dir / "cl.exe").is_file():
+                bin_text = str(bin_dir)
+                os.environ["PATH"] = bin_text + os.pathsep + os.environ.get("PATH", "")
+                return _exe_on_path("cl")
+    return False
+
+
+def configure_msvc_build_environment() -> str | None:
+    """Initialize MSVC Build Tools so Torch/ModelOpt extensions can find `cl`.
+
+    A normal GUI launch does not run from a Visual Studio Developer Prompt, so
+    Windows often has Build Tools installed but leaves `cl.exe`, INCLUDE, and
+    LIB undiscoverable. This mirrors vcvars64 for the current process only.
+    """
+    global _MSVC_ENV_CONFIGURED
+    if os.name != "nt":
+        return None
+    if _MSVC_ENV_CONFIGURED and _exe_on_path("cl"):
+        return os.environ.get("VCINSTALLDIR") or "PATH"
+    if _exe_on_path("cl"):
+        _MSVC_ENV_CONFIGURED = True
+        return os.environ.get("VCINSTALLDIR") or "PATH"
+
+    for vcvars in _vcvars_candidates():
+        if _apply_msvc_env_from_vcvars(vcvars):
+            _MSVC_ENV_CONFIGURED = True
+            return str(vcvars)
+
+    if _add_latest_msvc_bin_to_path():
+        _MSVC_ENV_CONFIGURED = True
+        return "PATH"
+    return None
+
+
+def configure_torch_msvc_extension_flags() -> bool:
+    """Patch Torch's Windows extension flags for ModelOpt CUDA builds."""
+    if os.name != "nt":
+        return False
+    try:
+        from torch.utils import cpp_extension
+    except Exception:
+        return False
+    flags = getattr(cpp_extension, "COMMON_MSVC_FLAGS", None)
+    if not isinstance(flags, list):
+        return False
+    if not any(str(flag).lower() == "/zc:preprocessor" for flag in flags):
+        flags.append("/Zc:preprocessor")
+    return True
 
 
 _COMPILE_NAMESPACE_VERSION = "v2"

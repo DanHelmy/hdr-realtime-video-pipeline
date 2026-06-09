@@ -30,6 +30,7 @@ Core updates include:
 - AMD benchmark runs use cached `max-autotune` PyTorch kernels when the exact compile cache is already present, otherwise they stay eager to avoid surprise compile stalls
 - AMD INT8 `Auto` pre-dequantization behavior is preserved
 - new `Model Quality Benchmark` tool in `Tools` for both single-video and dataset benchmarking, including queued multi-run benchmark batches
+- new `Playback Performance Benchmark` tool in `Tools` for embedded-preview wall-clock realtime mpv playback testing through the GUI HDR raw-video display path, with source-FPS pacing, GUI-style catch-up frame skipping, no upscale shader, and per-run FPS/latency/VRAM/CPU/engine/drop summaries
 - deterministic frame/pair selection options with eager-mode quality runs for repeatable objective comparisons
 - objective metric domains are now explicit and shared across compare and benchmark:
   - `PSNR` / `SSIM` run on linear HDR frames
@@ -49,11 +50,12 @@ Core updates include:
 - built-in `HDR-VDP3` bridge now converts BT.2100 PQ inputs back to absolute display luminance before scoring
 - benchmark result viewer with SDR/HDR GT/HDR Convert previews, run metadata, and summary reloading
 - benchmark session hierarchy (`source_name/timestamp__precision__resolution__n<count>/...`) plus exportable metrics and sample images
-- benchmark queue can add the current setup once or add every visible precision preset in one click, making FP32/FP16/INT8 sweeps less tedious
+- benchmark queues can add the current setup once or add precision sweeps in one click; the all-precision action asks whether to queue the main FP32/FP16/Mixed QAT/Full QAT set or literally every visible preset
 - deterministic video frame detection now requires FFmpeg keyframe timestamps plus bounded low-resolution preview scoring, returns large requested pools from the keyframe timeline without decoding every candidate, caches the scored pool, and avoids OpenCV random-seek QC passes
 - compare, objective metrics, and benchmark frame previews share a guarded FFmpeg SDR frame fast-seek path for requested noncurrent video frames instead of falling back to OpenCV video seeking
 - mpv-preview thesis figure renderer for benchmark PNG/TIFF frames, using the same embedded libmpv display path instead of FFmpeg tone-map approximations
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
+- playback performance benchmarking uses the same interaction lock: normal playback is paused/locked while the realtime mpv benchmark owns the GPU/display path, then restored when the benchmark window closes
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
 - NVIDIA runtime now defaults to original HR/ACGM/LE/HG TensorRT ModelOpt Torch builds; mixed presets use the stable active-compute Q/DQ recipe, while Full INT8 forces all ModelOpt Torch quantizers
 - normal `FP16` / `FP32` use the original HR/HR+HG checkpoints; INT8 PTQ/QAT/QAT Film use matching original eager and TensorRT source checkpoints
@@ -189,6 +191,7 @@ cd hdr-realtime-video-pipeline
 - Open from `Tools -> Model Quality Benchmark ...`
 - Benchmark a single `SDR video + HDR GT` pair or paired `SDR/HDR GT` dataset folders
 - Queue multiple benchmark configurations, preview/remove individual queued runs, and run the remaining queue back-to-back without manually restarting each run
+- `Add All Precisions` asks whether to queue the main FP32/FP16/Mixed QAT/Full QAT set or literally every visible PTQ/QAT/QAT Film variant
 - Review objective results with SDR/HDR GT/HDR Convert previews and run metadata (`source`, `precision`, `resolution`)
 - On AMD, benchmark uses cached `torch.compile` / `max-autotune` kernels on an exact cache hit and falls back to eager mode on a miss
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
@@ -198,6 +201,20 @@ cd hdr-realtime-video-pipeline
 - Dataset image pairs stay on the image decoder path; video sync/crop probes are only used for actual video files
 
 ![Benchmark Tab](docs/images/v5-benchmark-tab.png)
+
+### 6. Playback Performance Benchmark Tool
+
+- Open from `Tools -> Playback Performance Benchmark ...`
+- Benchmark real playback speed for one video across selected precisions, resolutions, and HG/no-HG mode
+- Runs through the mpv display backend with wall-clock timing, so the numbers include the same display feed cost users feel during playback instead of a pure headless throughput loop
+- Shows the active benchmark run in an embedded mpv preview pane inside the dialog, so the visible display path stays attached to the GUI instead of opening a separate CLI window
+- The preview uses the same HDR raw-video mpv sink as normal playback, but intentionally leaves the selected FSR/SSimSuperRes upscale shader out of the benchmark
+- Uses source-FPS pacing and the GUI player's catch-up frame skipping; when the model falls behind, dropped-frame counts are reported instead of pretending every source frame was presented
+- The normal video player is paused and locked while this benchmark window is open so the benchmark owns the GPU/display path; playback resumes when the benchmark closes
+- `Log every N frames` controls how often runtime samples are written to the per-run CSV/log. It does not choose which video frames are benchmarked.
+- `Check All ...` on precision selection asks for the main FP32/FP16/Mixed QAT/Full QAT set or literally every visible preset
+- Results show FPS, 1% low, latency, model time, render/feed time, VRAM, CPU memory, engine/checkpoint size, processed frames, and dropped frames
+- Logs are written under `logs/playback_sessions/` by default, with batch summaries plus per-run `summary.txt`, `session.json`, and `runtime_metrics.csv`
 
 ---
 
@@ -499,6 +516,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint size, precision, processing resolution; in hide-UI playback it joins the temporary cursor-triggered overlay with the playhead and `Show UI` button |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, queued multi-run batches, one-click all-precision queueing, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
+| **Playback Performance Benchmark tool** | Tools-menu realtime mpv playback benchmark for FPS/latency/VRAM/CPU/engine/drop summaries across selected precision and resolution queues |
 | **Deterministic compare snapshots** | Compare recomputes the selected frame in an isolated path so the first snapshot matches refresh behavior more reliably |
 | **Playback session logs** | `Log Session` saves full runtime metric samples plus compare metrics to `logs/playback_sessions/` as text/JSON/CSV |
 | **HDR metadata panel** | Color primaries, transfer function, peak luminance (nits), VO/GPU API |
@@ -740,11 +758,11 @@ $VIDEO="D:\path\to\your_sdr_video.mkv"
 One-line 1080p mpv playback commands:
 
 ```powershell
-.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_hg
-.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_nohg
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source --out-root logs\playback_sessions\cli_original_mpv_hg
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source --out-root logs\playback_sessions\cli_original_mpv_nohg
 ```
 
-Use `--use-hg 0` to benchmark HR/no-HG. Add `2560x1440` or `3840x2160` after `--resolutions` when the source video is at least that large. The script writes GUI-style playback logs under the selected `--out-root` and includes mpv display/feed cost in `render_ms` and total latency.
+Use `--use-hg 0` to benchmark HR/no-HG. Add `2560x1440` or `3840x2160` after `--resolutions` when the source video is at least that large. The script writes GUI-style playback logs under the selected `--out-root`, includes mpv display/feed cost in `render_ms` and total latency, and reports catch-up drops when realtime playback cannot keep up.
 
 On NVIDIA, missing TensorRT engines are built on first use before the timed playback window. With the default ModelOpt path, `--trt-qdq-fusion native` still exports explicit Q/DQ and lets TensorRT fuse it natively. If ModelOpt is disabled for legacy implicit INT8 experiments, calibration defaults to the benchmark video unless you pass `--trt-calibration-dataset` or `--trt-calibration-cache`.
 
@@ -778,7 +796,7 @@ PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, 
 
 - Python 3.12 (setup scripts target 3.12 for all backends)
 - Backend-specific PyTorch wheels from the requirement files
-- NVIDIA: CUDA 12.6 PyTorch wheels plus TensorRT CUDA 12 bindings/libs and ONNX export dependencies
+- NVIDIA: CUDA Toolkit 13.x with `nvcc.exe`, CUDA 13 PyTorch wheels, TensorRT bindings/libs, and ONNX export dependencies
 - AMD: ROCm-Windows 7.2.1 PyTorch stack plus optional HIP SDK for compiled PyTorch kernels
 - OpenCV, NumPy
 
@@ -802,7 +820,7 @@ Optional flags:
 
 This repo now provides backend-specific requirement files under `requirements/`:
 
-- `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`torch==2.9.1+cu126`, `torchvision==0.24.1`, `torchaudio==2.9.1`) + ONNX/TensorRT engine build/runtime deps
+- `requirements/requirements-nvidia.txt` -> common deps + CUDA PyTorch (`torch==2.9.1`, `torchvision==0.24.1`, `torchaudio==2.9.1` from the CUDA 13.0 wheel index) + ONNX/TensorRT/ModelOpt engine build/runtime deps + `triton-windows`
 - `requirements/requirements-amd.txt` -> common deps + ROCm-Windows 7.2.1 SDK/PyTorch wheels (`torch==2.9.1+rocm7.2.1`, `torchvision==0.24.1+rocm7.2.1`, `torchaudio==2.9.1+rocm7.2.1`) + `triton-windows`
 - `requirements/requirements-common.txt` -> shared app deps only (use with manual CPU PyTorch install)
 
@@ -819,21 +837,29 @@ Equivalent setup scripts:
 ```bash
 .\venv\Scripts\python.exe -m pip install --prefer-binary -r requirements/requirements-nvidia.txt
 ```
-NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export temporary ONNX artifacts during first-time model/resolution/mode builds, but Triton is not required for NVIDIA inference.
+NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export temporary ONNX artifacts during first-time model/resolution/mode builds. A full CUDA Toolkit 13.x install is required on NVIDIA systems so ModelOpt/Torch extension builds can find `nvcc.exe`. `triton-windows` is installed for ModelOpt/Torch quantization helpers on Windows; TensorRT playback itself does not depend on Triton kernels.
 
-The NVIDIA requirement file installs PyTorch from the CUDA 12.6 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `tensorrt_cu12_bindings>=10.0`, and `tensorrt_cu12_libs>=10.0`. The Python import name remains `tensorrt`; the split package names are the NVIDIA CUDA 12 wheel names.
+The NVIDIA requirement file installs PyTorch from the CUDA 13.0 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `nvidia-modelopt[onnx]>=0.44.0`, `triton-windows`, `tensorrt_cu12_bindings==10.16.1.11`, and `tensorrt_cu12_libs==10.16.1.11`. The Python import name remains `tensorrt`; the split package names are NVIDIA's TensorRT wheel names.
 
 `setup.bat` / `scripts/setup_nvidia.ps1` performs a post-install NVIDIA runtime check:
 
 - NVIDIA CUDA driver DLL
 - `torch.cuda`
+- MSVC Build Tools environment discovery for ModelOpt/Torch CUDA extensions
+- CUDA Toolkit 13.x discovery through `CUDA_HOME` / `CUDA_PATH`, including `bin\nvcc.exe`
 - `onnx`
 - `onnxscript`
 - `tensorrt_libs`
-- `tensorrt` import from the CUDA 12 bindings wheel
+- `tensorrt` import
 - TensorRT builder creation
 
-A separate CUDA Toolkit/SDK is not required in the AMD HIP SDK sense when the pip wheels provide the needed runtime libraries. If the TensorRT check fails, update the NVIDIA driver first, then rerun setup with a fresh venv. If the wheel-provided TensorRT runtime still cannot import/build, install the matching NVIDIA CUDA Toolkit / TensorRT runtime from NVIDIA and rerun setup.
+Install CUDA Toolkit 13.3 from NVIDIA or winget before running the NVIDIA backend:
+
+```powershell
+winget install --id Nvidia.CUDA --version 13.3 --exact
+```
+
+The app auto-detects the Toolkit and fills `CUDA_HOME`/`CUDA_PATH` before ModelOpt/Torch helpers import. On Windows, it also tries to initialize Visual Studio Build Tools through `vcvars64.bat` before Torch/ModelOpt imports so `cl.exe`, headers, and linker paths are visible during first-time quantized engine creation. If the TensorRT check fails, update the NVIDIA driver, install CUDA Toolkit 13.x, then rerun setup with a fresh venv.
 
 **AMD ROCm-Windows (Python 3.12):**
 ```bash
@@ -964,25 +990,25 @@ python src/main.py --no-display --warmup 30 --timing-interval 120 --max-frames 3
 
 ### Playback Log Batch Benchmark
 
-For unattended runtime logging, use `src/cli_playback_benchmark.py`. This is intentionally a CLI workflow rather than a GUI feature: the GUI `Model Quality Benchmark` is still the main tool for objective quality metrics and preview-based comparisons, while this script is for collecting playback-style FPS/latency logs across several precision/resolution combinations without babysitting the app.
+For unattended runtime logging, use `src/cli_playback_benchmark.py` or open `Tools -> Playback Performance Benchmark ...` in the GUI. The GUI tool wraps the same script in wall-clock realtime mpv mode, embeds the active mpv output into the benchmark dialog through the normal HDR raw-video display sink, and locks normal playback while it runs. The benchmark preview does not apply the selected FSR/SSimSuperRes upscale shader. The `Model Quality Benchmark` remains the tool for objective quality metrics and preview-based comparisons; playback benchmarking is for FPS, latency, display-feed cost, memory, engine size, and dropped-frame behavior.
 
 The script writes the same playback-session style files used by the GUI:
 
-- batch summary: `logs/playback_sessions/<timestamp>_<source>_cli_batch/batch_summary.csv`
+- batch summary: `logs/playback_sessions/<timestamp>_<source>_cli_batch/playback_benchmark_summary.csv` plus compatibility `batch_summary.csv`
 - per run: `summary.txt`, `session.json`, and `runtime_metrics.csv`
 - per-run folders: `<resolution>_<preset>_<hg|nohg>/`
 
-Example from the repo root, using the mpv display path and logging 3 minutes per run:
+Example from the repo root, using the mpv display path and logging 3 realtime minutes per run:
 
 ```cmd
-.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "path\to\video.mp4" --resolutions 1280x720 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat int8-mixed-qat-film int8-full-qat-film --duration-s 180 --warmup-frames 120 --sample-interval 120 --use-hg 0 --compile-mode max-autotune --display
+.\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "path\to\video.mp4" --resolutions 1280x720 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat int8-mixed-qat-film int8-full-qat-film --duration-s 180 --warmup-frames 120 --sample-interval 120 --use-hg 0 --compile-mode max-autotune --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source
 ```
 
 One-line NVIDIA mpv comparisons for the original HR+HG and HR/no-HG paths:
 
 ```powershell
-$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_hg
-$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --out-root logs\playback_sessions\cli_original_mpv_nohg
+$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 1 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source --out-root logs\playback_sessions\cli_original_mpv_hg
+$VIDEO="path\to\video.mkv"; .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source --out-root logs\playback_sessions\cli_original_mpv_nohg
 ```
 
 `--display` uses the embedded mpv HDR path by default, including the raw RGB48LE feed/display cost in `render_ms` and total frame latency. The CLI prepends the repo `src/` folder to the Windows DLL search path so `src/libmpv-2.dll` is found the same way the GUI finds it. If mpv is unavailable or you explicitly want the older OpenCV display path, add:
@@ -1002,10 +1028,13 @@ Useful flags:
 | `--hg-weights PATH` | HG checkpoint override; use with `--model` for custom HR/HG playback benchmarks |
 | `--duration-s N` | Timed duration per run after warmup |
 | `--warmup-frames N` | Frames skipped before logging stats |
-| `--sample-interval N` | Timed frames between console/log samples |
+| `--sample-interval N` | Processed frames between console/log samples; this is log cadence, not frame selection |
 | `--use-hg 1\|0` | Enable/disable HG refinement |
 | `--display` | Show processed frames and include display cost |
 | `--display-backend mpv\|opencv` | Display backend used with `--display`; default is `mpv` |
+| `--wall-clock` | Run for true elapsed seconds after warmup instead of a fixed processed-frame count |
+| `--playback-mode throughput\|realtime` | `throughput` runs as fast as possible; `realtime` mirrors GUI source-FPS pacing and catch-up skips |
+| `--loop-source` | Loop the selected source if a wall-clock run reaches the end of the clip |
 
 <details>
 <summary><strong>All CLI Flags</strong></summary>
