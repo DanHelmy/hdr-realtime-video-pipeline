@@ -8,7 +8,7 @@ import sys
 import time
 
 from PyQt6.QtGui import QTextCursor
-from PyQt6.QtCore import QProcess, Qt
+from PyQt6.QtCore import QDir, QProcess, Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QListView,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -379,6 +381,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         self._btn_run = QPushButton("Run Benchmark")
         self._btn_cancel = QPushButton("Cancel")
         self._btn_cancel.setEnabled(False)
+        self._btn_load_results = QPushButton("Load Results ...")
         self._btn_open_logs = QPushButton("Open Result Folder")
         self._btn_open_logs.setEnabled(False)
         self._btn_close = QPushButton("Close")
@@ -386,6 +389,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         footer.addWidget(self._progress, 0)
         footer.addWidget(self._btn_run)
         footer.addWidget(self._btn_cancel)
+        footer.addWidget(self._btn_load_results)
         footer.addWidget(self._btn_open_logs)
         footer.addWidget(self._btn_close)
         root.addLayout(footer)
@@ -398,6 +402,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         self._btn_clear_resolutions.clicked.connect(lambda: self._check_all(self._lst_resolutions, False))
         self._btn_run.clicked.connect(self._run_benchmark)
         self._btn_cancel.clicked.connect(self._cancel_benchmark)
+        self._btn_load_results.clicked.connect(self._load_existing_results)
         self._btn_open_logs.clicked.connect(self._open_result_folder)
         self._btn_close.clicked.connect(self.close)
 
@@ -580,6 +585,80 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         except Exception:
             QMessageBox.information(self, "Open Result Folder", target)
 
+    def _load_existing_results(self):
+        start = (
+            str(self._batch_dir)
+            if self._batch_dir is not None and self._batch_dir.is_dir()
+            else (self._txt_logs_root.text().strip() or self._logs_root)
+        )
+        if not os.path.isdir(start):
+            start = self._logs_root if os.path.isdir(self._logs_root) else str(_ROOT)
+        paths = self._pick_result_folders_multi(start)
+        if not paths:
+            return
+
+        rows: list[dict] = []
+        loaded_roots: list[pathlib.Path] = []
+        empty_roots: list[str] = []
+        seen_sessions: set[str] = set()
+        for path in paths:
+            root = pathlib.Path(path)
+            root_rows = self._load_result_rows(root)
+            if not root_rows:
+                empty_roots.append(str(root))
+                continue
+            loaded_roots.append(root)
+            for row in root_rows:
+                session_key = os.path.normcase(
+                    os.path.normpath(str(row.get("session_dir") or ""))
+                )
+                if session_key and session_key in seen_sessions:
+                    continue
+                if session_key:
+                    seen_sessions.add(session_key)
+                rows.append(row)
+
+        if not rows:
+            QMessageBox.warning(
+                self,
+                "Playback Benchmark Results",
+                "No playback benchmark session.json files were found in the selected folder(s).",
+            )
+            return
+        self._batch_dir = loaded_roots[0] if len(loaded_roots) == 1 else None
+        self._populate_result_table(rows)
+        self._btn_open_logs.setEnabled(True)
+        skipped = f" Skipped {len(empty_roots)} empty folder(s)." if empty_roots else ""
+        self._lbl_status.setText(
+            f"Loaded {len(rows)} completed run(s) from {len(loaded_roots)} folder(s).{skipped}"
+        )
+
+    def _pick_result_folders_multi(self, start_dir: str) -> list[str]:
+        dlg = QFileDialog(self, "Select Playback Benchmark Result Folder(s)", start_dir)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot | QDir.Filter.Drives)
+        dlg.setNameFilter("Folders")
+        for view in dlg.findChildren(QListView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for view in dlg.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if not dlg.exec():
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for path in dlg.selectedFiles():
+            norm = os.path.normpath(str(path))
+            if not os.path.isdir(norm):
+                continue
+            key = os.path.normcase(norm)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(norm)
+        return out
+
     def _set_running(self, running: bool):
         for widget in (
             self._txt_video,
@@ -597,6 +676,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
             self._btn_clear_precisions,
             self._btn_all_resolutions,
             self._btn_clear_resolutions,
+            self._btn_load_results,
         ):
             widget.setEnabled(not running)
         self._btn_run.setEnabled(not running)
