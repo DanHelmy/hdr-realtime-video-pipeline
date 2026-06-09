@@ -11,11 +11,14 @@ from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from gui_config import (
     DEFAULT_LIVE_CAPTURE_PROCESS_FPS,
+    DEFAULT_PRECISION_KEY,
     DEFAULT_USE_HG,
     PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
     _available_precision_keys,
+    _precision_is_fp8,
+    _runtime_has_rtx_40_or_50,
     MAX_W,
     MAX_H,
     RESOLUTION_SCALES,
@@ -48,6 +51,45 @@ _PREFS_PATH = os.path.join(_ROOT, ".gui_prefs.json")
 
 class SettingsPreviewMixin:
     """Settings persistence and idle preview/timeline helpers for MainWindow."""
+
+    def _set_fp8_experimental_enabled(self, enabled: bool):
+        enabled = bool(enabled) and _runtime_has_rtx_40_or_50()
+        self._experimental_fp8_enabled = enabled
+        os.environ["HDRTVNET_SHOW_FP8"] = "1" if enabled else "0"
+        action = getattr(self, "_act_fp8_experimental", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+    def _refresh_precision_options(self, preferred_precision: str | None = None):
+        if not hasattr(self, "_cmb_prec") or self._cmb_prec is None:
+            return
+        current = str(
+            preferred_precision
+            if preferred_precision is not None
+            else self._cmb_prec.currentText()
+        ).strip()
+        available = _available_precision_keys()
+        if not available:
+            available = [k for k in PRECISIONS.keys()]
+        fallback = (
+            DEFAULT_PRECISION_KEY
+            if DEFAULT_PRECISION_KEY in available
+            else (available[0] if available else "")
+        )
+        selected = current if current in available else fallback
+        old = str(self._cmb_prec.currentText() or "").strip()
+        self._cmb_prec.blockSignals(True)
+        self._cmb_prec.clear()
+        self._cmb_prec.addItems(available)
+        if selected:
+            self._cmb_prec.setCurrentText(selected)
+        self._cmb_prec.blockSignals(False)
+        if selected and selected != old and hasattr(self, "_on_precision"):
+            self._on_precision(selected)
+        if hasattr(self, "_update_apply_button_state"):
+            self._update_apply_button_state()
 
     def _resolution_upscale_allowed(self, scale_key: str | None = None) -> bool:
         """Whether the selected processing preset will upscale on this monitor."""
@@ -146,13 +188,26 @@ class SettingsPreviewMixin:
             except Exception:
                 data = {}
 
-        if initial_precision is None:
-            p = data.get("precision")
-            if p in _available_precision_keys():
-                self._cmb_prec.setCurrentText(p)
-        elif initial_precision in PRECISIONS:
-            if initial_precision in _available_precision_keys():
-                self._cmb_prec.setCurrentText(initial_precision)
+        explicit_fp8_precision = bool(
+            initial_precision in PRECISIONS and _precision_is_fp8(str(initial_precision))
+        )
+        fp8_env = str(os.environ.get("HDRTVNET_SHOW_FP8", "")).strip().lower()
+        if fp8_env in {"1", "true", "yes", "on"}:
+            fp8_enabled = True
+        elif fp8_env in {"0", "false", "no", "off"}:
+            fp8_enabled = False
+        else:
+            fp8_enabled = (
+                bool(data.get("experimental_fp8_enabled", False))
+                or explicit_fp8_precision
+            )
+        self._set_fp8_experimental_enabled(fp8_enabled)
+        preferred_precision = (
+            initial_precision
+            if initial_precision in PRECISIONS
+            else data.get("precision")
+        )
+        self._refresh_precision_options(str(preferred_precision or ""))
         self._source_mode_prompt_pending = "source_mode" not in data and initial_source_mode is None
         source_mode = _normalize_source_mode(
             initial_source_mode
@@ -305,6 +360,9 @@ class SettingsPreviewMixin:
                 _normalize_runtime_execution_mode(
                     getattr(self, "_runtime_execution_mode", "compile")
                 )
+            ),
+            "experimental_fp8_enabled": bool(
+                getattr(self, "_experimental_fp8_enabled", False)
             ),
             "suppress_hip_sdk_warning": bool(
                 getattr(self, "_suppress_hip_sdk_warning", False)

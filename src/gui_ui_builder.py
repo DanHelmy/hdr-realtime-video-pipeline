@@ -30,6 +30,8 @@ from gui_config import (
     INT8_HG_WARNING,
     LIVE_CAPTURE_FPS_CHOICES,
     _available_precision_keys,
+    _fp8_experimental_enabled,
+    _runtime_has_rtx_40_or_50,
     RESOLUTION_SCALES,
     SOURCE_MODE_LABELS,
 )
@@ -119,6 +121,11 @@ class UiBuilderMixin:
         self._act_predequantize = tools_menu.addAction(
             "INT8 &Pre-dequantization ...", self._choose_predequantize_mode
         )
+        self._act_fp8_experimental = tools_menu.addAction(
+            "FP8 &Experimental Presets", self._toggle_fp8_experimental
+        )
+        self._act_fp8_experimental.setCheckable(True)
+        self._act_fp8_experimental.setChecked(_fp8_experimental_enabled())
         tools_menu.addAction(
             "Playback Performance &Benchmark ...",
             self._open_playback_performance_benchmark_dialog,
@@ -144,7 +151,9 @@ class UiBuilderMixin:
                 self._act_clear_kernel_cache,
             ):
                 action.setVisible(False)
+            self._act_fp8_experimental.setVisible(_runtime_has_rtx_40_or_50())
         else:
+            self._act_fp8_experimental.setVisible(False)
             self._act_clear_tensorrt_engine_cache.setVisible(False)
 
         view_menu = menu_bar.addMenu("&View")

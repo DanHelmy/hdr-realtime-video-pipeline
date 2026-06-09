@@ -323,7 +323,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
                 "Render",
                 "VRAM",
                 "CPU",
-                "Engine",
+                "Artifact",
                 "Frames",
                 "Dropped",
             ]

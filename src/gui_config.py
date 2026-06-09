@@ -241,11 +241,6 @@ def _int8_precision_warning(precision_key: str, use_hg: bool) -> str:
 
 
 def _runtime_has_rtx_40_or_50() -> bool:
-    override = str(os.environ.get("HDRTVNET_SHOW_FP8", "")).strip().lower()
-    if override in {"1", "true", "yes", "on"}:
-        return True
-    if override in {"0", "false", "no", "off"}:
-        return False
     try:
         import torch
 
@@ -257,10 +252,16 @@ def _runtime_has_rtx_40_or_50() -> bool:
     return bool(re.search(r"\brtx\s*40\d{2}\b|\brtx\s*50\d{2}\b", name, re.I))
 
 
+def _fp8_experimental_enabled() -> bool:
+    value = str(os.environ.get("HDRTVNET_SHOW_FP8", "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _precision_is_available(precision_key: str) -> bool:
     cfg = PRECISIONS.get(precision_key, {})
-    if bool(cfg.get("requires_fp8", False)) and not _runtime_has_rtx_40_or_50():
-        return False
+    if bool(cfg.get("requires_fp8", False)):
+        if not (_fp8_experimental_enabled() and _runtime_has_rtx_40_or_50()):
+            return False
     model_paths = [
         cfg.get("model"),
         cfg.get("model_nohg"),
@@ -283,9 +284,17 @@ def _available_precision_keys() -> list[str]:
         for k, cfg in PRECISIONS.items()
         if not bool(cfg.get("hidden", False)) and _precision_is_available(k)
     ]
-    return keys or [
-        k for k, cfg in PRECISIONS.items() if not bool(cfg.get("hidden", False))
-    ]
+    if keys:
+        return keys
+    fallback: list[str] = []
+    for k, cfg in PRECISIONS.items():
+        if bool(cfg.get("hidden", False)):
+            continue
+        if bool(cfg.get("requires_fp8", False)):
+            if not (_fp8_experimental_enabled() and _runtime_has_rtx_40_or_50()):
+                continue
+        fallback.append(k)
+    return fallback
 
 
 MAX_W, MAX_H = 3840, 2160

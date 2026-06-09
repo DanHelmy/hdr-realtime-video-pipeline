@@ -205,6 +205,10 @@ class StateInitMixin:
         self._predequantize_mode = "auto"
         os.environ["HDRTVNET_TRT_FULL_INT8_FP16_ISLANDS"] = "0"
         self._runtime_execution_mode = "compile"
+        self._experimental_fp8_enabled = (
+            os.environ.get("HDRTVNET_SHOW_FP8", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self._suppress_hip_sdk_warning = False
         self._startup_hip_sdk_warning_shown = False
         self._suppress_octave_compare_warning = False
@@ -283,6 +287,7 @@ class StateInitMixin:
         self._pending_playhead_relock_first_ms = 35
         self._pending_playhead_relock_settle_ms = 220
         self._act_borderless_full_window = None
+        self._act_fp8_experimental = None
         self._root_layout = None
         self._immersive_saved_margins = None
         self._immersive_saved_spacing = None

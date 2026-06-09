@@ -20,17 +20,20 @@ from PyQt6.QtWidgets import (
 )
 
 from gui_config import (
+    DEFAULT_PRECISION_KEY,
     LIVE_CAPTURE_PROCESS_FPS,
     PRECISIONS,
     SOURCE_MODE_VIDEO,
     SOURCE_MODE_WINDOW,
     _int8_precision_warning,
     _precision_engine_mode_base,
+    _precision_is_fp8,
     _precision_is_quantized_tensorrt,
     _select_hg_weights_path,
     _select_model_path,
     _select_tensorrt_model_path,
     _available_precision_keys,
+    _runtime_has_rtx_40_or_50,
     _normalize_source_mode,
     live_capture_display_fps,
     live_capture_observe_fps,
@@ -2165,6 +2168,31 @@ class PlaybackRuntimeMixin:
                 "TensorRT Engine Cache",
                 f"Removed {removed} TensorRT engine file(s).",
             )
+
+    def _toggle_fp8_experimental(self, checked: bool):
+        if checked and (not _IS_NVIDIA or not _runtime_has_rtx_40_or_50()):
+            self._set_fp8_experimental_enabled(False)
+            QMessageBox.information(
+                self,
+                "FP8 Experimental Presets",
+                "FP8 TensorRT presets are only exposed on RTX 40/50 GPUs.",
+            )
+            return
+
+        previous = self._effective_precision_key()
+        self._set_fp8_experimental_enabled(bool(checked))
+        preferred = previous
+        if not checked and _precision_is_fp8(previous):
+            preferred = DEFAULT_PRECISION_KEY
+        self._refresh_precision_options(preferred)
+        self._save_user_settings()
+
+        if checked:
+            self.statusBar().showMessage(
+                "FP8 experimental presets enabled. They are research-only and may be slower or less stable than INT8."
+            )
+        else:
+            self.statusBar().showMessage("FP8 experimental presets hidden.")
 
     def _open_file(self):
         action_name = "Choose browser window" if self._source_mode == SOURCE_MODE_WINDOW else "Open video"

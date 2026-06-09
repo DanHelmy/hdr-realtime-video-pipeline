@@ -858,7 +858,7 @@ def _write_batch_summary(batch_dir: pathlib.Path, args, results: list[dict]) -> 
         "",
         (
             "Precision | Resolution | HG | FPS | 1% Low | Latency ms | "
-            "Model ms | Render ms | VRAM MB | CPU MB | Engine MB | Frames | Dropped"
+            "Model ms | Render ms | VRAM MB | CPU MB | Artifact MB | Frames | Dropped"
         ),
         "-" * 120,
     ]
@@ -925,6 +925,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
     process = psutil.Process(os.getpid())
     use_cuda = torch.cuda.is_available() and str(args.device).lower() != "cpu"
     model_size_mb = _runtime_artifact_size_mb(processor, run)
+    model_size_label = "Engine" if isinstance(processor, HDRTVNetTensorRT) else "Checkpoint"
     trt_device_mb = _tensorrt_device_memory_mb(processor)
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     started_t = time.perf_counter()
@@ -1142,7 +1143,7 @@ def _run_one(args, run: dict, resolution: tuple[int, int], batch_dir: pathlib.Pa
                     "cpu_mb": process.memory_info().rss / (1024 * 1024),
                     "gpu_mb": float(gpu_mb),
                     "model_mb": float(model_size_mb),
-                    "model_size_label": "Checkpoint",
+                    "model_size_label": model_size_label,
                     "precision": str(run["label"]),
                     "proc_res": f"{width}x{height}",
                     "psnr_db": None,

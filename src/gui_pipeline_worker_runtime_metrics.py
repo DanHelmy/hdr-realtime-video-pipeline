@@ -159,6 +159,7 @@ class PipelineWorkerRuntimeMetricsMixin:
                 cached_label = "Checkpoint"
                 if _IS_NVIDIA and engine_path and os.path.isfile(engine_path):
                     model_mb = os.path.getsize(engine_path) / (1024 * 1024)
+                    cached_label = "Engine"
                 else:
                     model_path = _select_model_path(self._precision_key, self._use_hg)
                     model_mb = os.path.getsize(model_path) / (1024 * 1024)
