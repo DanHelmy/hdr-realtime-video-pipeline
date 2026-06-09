@@ -71,7 +71,7 @@ Core updates include:
 - cached GT alignment results to avoid redundant processing for the same video pairs
 - HDR GT pairing now tolerates small duration/frame-count differences, encoded black bars vs cropped active-picture sources, and conservative cached constant frame offsets
 - compare, objective metrics, and benchmark now map SDR frames to the matching HDR GT frame instead of assuming raw frame numbers always line up
-- benchmark video runs now post-verify GT frames by exact decode and local frame alignment before final metrics are reported
+- benchmark video runs now post-verify GT frames by batched exact decode and local frame alignment before final metrics are reported
 - queued video benchmarks reuse a bounded in-memory post-verify GT cache for repeated SDR/HDR/frame/resolution pairs, skipping redundant exact GT decode/alignment while still recomputing HDR Convert outputs and metrics per checkpoint
 - compare preparation now uses a cancelable application-modal progress dialog so pending compare seeks can be canceled cleanly
 - native `Browser Window Capture (Experimental)` video path
@@ -197,7 +197,7 @@ cd hdr-realtime-video-pipeline
 - On AMD, benchmark uses cached `torch.compile` / `max-autotune` kernels on an exact cache hit and falls back to eager mode on a miss
 - Video pairs can differ slightly in length, start offset, or encoded black bars as long as the active content matches
 - Video frame selection can detect a larger deterministic candidate pool, then use the same average-mode workflow as datasets (`selected`, `all`, or deterministic subset) for final scoring
-- Video benchmark metrics are finalized by an exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
+- Video benchmark metrics are finalized by a batched exact GT decode/post-verify pass; JSON/CSV results include the GT frame, alignment offset, and alignment score used for each row
 - Queued video runs reuse a bounded in-memory post-verify GT cache for repeated source/GT/frame/resolution pairs. This reuses only the verified GT frame/alignment side; HDR Convert outputs and metrics are still recomputed for every checkpoint.
 - Dataset image pairs stay on the image decoder path; video sync/crop probes are only used for actual video files
 
@@ -574,9 +574,10 @@ python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1440p 
   - `HDRTVNET_SDR_FRAME_CACHE_MAX` controls the small repeated-frame cache. Default: `8`.
 - Model Quality Benchmark video candidate detection uses FFmpeg packet-level keyframe timestamps and tiny preview-frame scoring when available, then stores the deterministic scored pool:
   - `HDRTVNET_FRAME_DETECT_FFMPEG=0` disables this keyframe detector. Video candidate detection then reports unavailable instead of falling back to OpenCV random seeking.
-- Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames before final metrics:
+- Benchmark video post-verification keeps the first pass fast, then exact-decodes GT frames in bounded batches before final metrics:
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY` enables/disables this pass. Default: `1`.
   - `HDRTVNET_BENCHMARK_AUTO_POST_VERIFY_MAX_ITEMS` limits verified rows, or `all` verifies every video row. Default: `all`.
+  - `HDRTVNET_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES` controls post-verify exact-decode chunk size. Default: `20`.
   - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_FRAMES` controls the per-sample local GT search radius around the mapped frame. Default: `0`.
   - `HDRTVNET_BENCHMARK_GT_LOCAL_SEARCH_MIN_GAIN` controls how much better a nearby GT frame must be before it replaces the mapped frame. Default: `0.035`.
   - benchmark summaries and CSV exports include `gt_frame`, `gt_alignment_offset_frames`, and `gt_alignment_score` for auditability.

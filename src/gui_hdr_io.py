@@ -35,10 +35,10 @@ except Exception:
 try:
     _HDR_EXACT_BATCH_MAX_FRAMES = max(
         1,
-        min(16, int(os.environ.get("HDRTVNET_HDR_EXACT_BATCH_MAX_FRAMES", "10"))),
+        min(64, int(os.environ.get("HDRTVNET_HDR_EXACT_BATCH_MAX_FRAMES", "20"))),
     )
 except Exception:
-    _HDR_EXACT_BATCH_MAX_FRAMES = 10
+    _HDR_EXACT_BATCH_MAX_FRAMES = 20
 
 
 def hdr_ffmpeg_ready() -> bool:
@@ -422,7 +422,7 @@ def read_hdr_video_frames_rgb16_exact(
 
     This intentionally uses the same `select=eq(n,idx)` + `rgb48le` path as
     read_hdr_video_frame_rgb16(..., prefer_fast_seek=False), but amortizes the
-    decoder scan across sorted benchmark post-verify frames.
+    decoder scan across sorted exact-frame requests.
     """
     try:
         indices = sorted({max(0, int(v)) for v in frame_indices})

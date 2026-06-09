@@ -244,12 +244,12 @@ try:
     _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES = max(
         0,
         min(
-            32,
-            int(os.environ.get("HDRTVNET_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES", "12")),
+            128,
+            int(os.environ.get("HDRTVNET_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES", "20")),
         ),
     )
 except Exception:
-    _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES = 12
+    _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES = 20
 try:
     _BENCHMARK_POST_VERIFY_CACHE_MAX_FRAMES = max(
         0,
@@ -2297,26 +2297,37 @@ class _BenchmarkWorker(QObject):
                     if (
                         not idxs
                         or _BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES <= 0
-                        or len(idxs) > int(_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES)
                     ):
                         continue
-                    self.progress.emit(
-                        90,
-                        f"Post-verify exact GT batch: {len(idxs)} frame(s)",
-                    )
-                    decoded_batch, canceled_now = self._run_blocking_with_cancel(
-                        read_hdr_video_frames_rgb16_exact,
-                        gt_path,
-                        idxs,
-                        cancel_check=self._is_canceled,
-                        canceled_fallback={},
-                        poll_interval_s=0.20,
-                    )
-                    if canceled_now or self._is_canceled():
-                        self.canceled.emit("Benchmark canceled during post verification.")
-                        return
-                    if isinstance(decoded_batch, dict):
-                        exact_gt_frames_by_path[gt_path] = decoded_batch
+                    batch_max = max(1, int(_BENCHMARK_POST_VERIFY_BATCH_MAX_FRAMES))
+                    chunks = [
+                        idxs[start:start + batch_max]
+                        for start in range(0, len(idxs), batch_max)
+                    ]
+                    exact_gt_frames_by_path.setdefault(gt_path, {})
+                    for chunk_idx, chunk in enumerate(chunks, start=1):
+                        suffix = (
+                            f" ({chunk_idx}/{len(chunks)})"
+                            if len(chunks) > 1
+                            else ""
+                        )
+                        self.progress.emit(
+                            90,
+                            f"Post-verify exact GT batch{suffix}: {len(chunk)} frame(s)",
+                        )
+                        decoded_batch, canceled_now = self._run_blocking_with_cancel(
+                            read_hdr_video_frames_rgb16_exact,
+                            gt_path,
+                            chunk,
+                            cancel_check=self._is_canceled,
+                            canceled_fallback={},
+                            poll_interval_s=0.20,
+                        )
+                        if canceled_now or self._is_canceled():
+                            self.canceled.emit("Benchmark canceled during post verification.")
+                            return
+                        if isinstance(decoded_batch, dict):
+                            exact_gt_frames_by_path[gt_path].update(decoded_batch)
 
                 for j, (row_idx, task, fast_score) in enumerate(suspects):
                     if self._is_canceled():
