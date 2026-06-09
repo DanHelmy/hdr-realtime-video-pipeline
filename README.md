@@ -43,7 +43,8 @@ Core updates include:
 - SDR preview panes feed mpv as BGR24 instead of RGB48 when HDR metadata is not forced, cutting SDR-only/side-by-side pipe bandwidth and conversion cost
 - SDR and HDR mpv panes now start and stay fed together from playback startup, so switching among `SDR`, `HDR`, and `Side by Side` is a warm UI change instead of enabling a cold pane after the click
 - tab, pop-out, and side-by-side layout refreshes avoid restarting mpv unless Qt actually recreates the native video surface, preventing the SDR-only flash-to-black and drift after view switches
-- normal video playback now uses a fixed small mpv/worker frame buffer before startup, seek, and resume release, so audio and both panes restart together instead of relying on a mute-until-stable gate
+- normal video playback now uses a fixed small mpv/worker frame buffer before startup, seek, and resume release; default is `HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES=3`, so audio and both panes restart together without a long jitter delay
+- HDR mpv delivery uses a small pinned RGB48 host ring (`HDRTVNET_FEEDER_GPU_RGB48_RING_FRAMES=3` by default) with CUDA-event handoff, reducing final pipe-write stalls without adding playback lookahead
 - timeline scrubbing uses a paused mpv file preview for exact seek thumbnails while the main HDR/SDR raw-video pipes stay isolated
 - the status bar now keeps the live pane upscale state visible during playback instead of only reporting it on monitor moves; audio recovery notices yield to that persistent scaling state
 - live HDR playback and export use raw model output; the old high-highlight debanding and sky/temporal cleanup bandaids are no longer part of the app/export path
@@ -257,7 +258,7 @@ Browser capture pacing:
 - Playback, capture, and feeder timing threads opt into Windows high-resolution timers plus MMCSS `Playback` scheduling so frame-deadline wakeups are less likely to slip under CPU load.
 - Once a live feeder has a frame to repeat, it uses precise short-slice polling instead of relying on coarse `Queue.get(timeout=...)` wakeups for presentation deadlines.
 - Both browser-capture mpv panes are attached and fed at startup; the GUI performs a soft surface warm-up after handoff instead of relying on a manual or simulated tab switch.
-- The mpv named-pipe writer avoids per-chunk `bytes` copies when writing frame buffers, reducing avoidable jitter in the final delivery step.
+- The mpv named-pipe writer can write directly from release-aware pinned RGB48 frame slots, reducing avoidable copies and jitter in the final delivery step.
 - mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
 - Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
 - Static browser windows keep feeding by repeating the latest visible frame at process FPS. If WinRT has no compositor frame yet, a visible-window fallback captures one startup seed frame so playback can start even before the tab video is moving.
@@ -408,7 +409,8 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - moving or resizing the main window or popped-out HDR view updates the mpv scale/shader settings without restarting inference
 
 - **Smoother normal video playback**
-  - startup, seek, and resume fill a fixed `HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES` buffer before releasing audio and HDR/SDR panes together; default is `12`
+  - startup, seek, and resume fill a fixed `HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES` buffer before releasing audio and HDR/SDR panes together; default is `3`
+  - HDR mpv feed uses a default 3-slot pinned RGB48 ring with CUDA-event handoff, separate from the playback jitter buffer
   - side-by-side SDR/HDR mpv feeds preserve ordered frames during normal video playback, while Browser Window Capture keeps its low-delay latest-frame stabilizer
   - SDR and HDR mpv panes stay active across `SDR`, `HDR`, and `Side by Side`; ordinary layout switches no longer tear down mpv, so switching to SDR-only should not flash black or drift out of sync
   - dragging the playhead shows an exact mpv scrub preview from the source file instead of relying on OpenCV seeking
@@ -513,7 +515,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **Playback controls** | Play / Pause / Resume / Stop |
 | **Seek bar** | Drag to seek; when paused, seek is queued and applied on Resume for frame-accurate preview |
 | **Paused hot-swap preview** | Precision changes can redraw the current paused frame without resuming playback; AMD pre-dequantize changes can do the same on PyTorch runtimes |
-| **Performance metrics panel** | FPS, model-stage latency, frame count, app VRAM/CPU memory, checkpoint size, precision, processing resolution; in hide-UI playback it joins the temporary cursor-triggered overlay with the playhead and `Show UI` button |
+| **Performance metrics panel** | FPS, model-stage latency, frame count, runtime VRAM/CPU memory, checkpoint or engine size, precision, processing resolution; in hide-UI playback it joins the temporary cursor-triggered overlay with the playhead and `Show UI` button |
 | **Compare metrics dialog** | Pauses playback and opens 3-way frame compare (SDR, HDR GT, HDR Convert) with PSNR/SSIM on linear HDR frames, DeltaEITP on the color-managed HDR path, normalized variants, and optional HDR-VDP3 |
 | **Model Quality Benchmark tool** | Tools-menu benchmark dialog for video or dataset objective evaluation, queued multi-run batches, one-click all-precision queueing, deterministic selection, GT sync/crop handling, run metadata display, preview images, and summary export/load |
 | **Playback Performance Benchmark tool** | Tools-menu realtime mpv playback benchmark for FPS/latency/VRAM/CPU/engine/drop summaries across selected precision and resolution queues |

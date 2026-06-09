@@ -31,7 +31,7 @@ from gui_widgets import DetachedVideoWindow
 
 
 class VideoTransitionOverlay(QWidget):
-    """Top-level black overlay that fades away above native mpv child windows."""
+    """Top-level black overlay that fades away above native child windows."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -145,7 +145,7 @@ class WindowingMixin:
         return visible
 
     def _video_transition_target(self) -> QWidget | None:
-        return self._video_tabs
+        return self
 
     def _position_video_transition_overlay(self):
         overlay = getattr(self, "_video_transition_overlay", None)
@@ -155,11 +155,17 @@ class WindowingMixin:
         if not target.isVisible():
             overlay.hide()
             return
-        pos = target.mapToGlobal(QPoint(0, 0))
-        overlay.setGeometry(QRect(pos, target.size()))
+        forced_rect = getattr(self, "_video_transition_forced_rect", None)
+        if isinstance(forced_rect, QRect) and forced_rect.isValid():
+            rect = forced_rect
+        else:
+            try:
+                rect = self.frameGeometry()
+            except Exception:
+                pos = target.mapToGlobal(QPoint(0, 0))
+                rect = QRect(pos, target.size())
+        overlay.setGeometry(rect)
         overlay.raise_()
-        if self._ui_overlay_btn is not None and self._ui_overlay_btn.isVisible():
-            self._ui_overlay_btn.raise_()
 
     def _ensure_video_transition_track_timer(self):
         if getattr(self, "_video_transition_track_timer", None) is not None:
@@ -185,6 +191,7 @@ class WindowingMixin:
         self,
         duration_ms: int = 1000,
         start_opacity: float = 1.0,
+        cover_rect: QRect | None = None,
     ):
         target = self._video_transition_target()
         if target is None or not target.isVisible():
@@ -196,10 +203,13 @@ class WindowingMixin:
         anim = getattr(self, "_video_transition_anim", None)
         if anim is not None:
             anim.stop()
+        self._video_transition_forced_rect = cover_rect
         self._position_video_transition_overlay()
         overlay.show()
         overlay.raise_()
         overlay.setFadeOpacity(max(0.0, min(1.0, float(start_opacity))))
+        overlay.repaint()
+        QApplication.processEvents()
         QTimer.singleShot(0, self._position_video_transition_overlay)
         QTimer.singleShot(40, self._position_video_transition_overlay)
         QTimer.singleShot(120, self._position_video_transition_overlay)
@@ -213,6 +223,7 @@ class WindowingMixin:
         def _finish():
             overlay.hide()
             overlay.setFadeOpacity(0.0)
+            self._video_transition_forced_rect = None
             track_timer = getattr(self, "_video_transition_track_timer", None)
             if track_timer is not None:
                 track_timer.stop()
@@ -226,6 +237,7 @@ class WindowingMixin:
         duration_ms: int = 1000,
         start_opacity: float = 1.0,
         delay_ms: int = 16,
+        cover_rect: QRect | None = None,
     ):
         def _start():
             try:
@@ -238,6 +250,7 @@ class WindowingMixin:
             self._begin_video_surface_fade(
                 duration_ms=duration_ms,
                 start_opacity=start_opacity,
+                cover_rect=cover_rect,
             )
 
         QTimer.singleShot(max(0, int(delay_ms)), _start)
@@ -758,6 +771,10 @@ class WindowingMixin:
     def _toggle_ui_visibility(self):
         if not self._playing:
             return
+        self._begin_video_surface_fade(
+            duration_ms=1000,
+            start_opacity=1.0,
+        )
         self._ui_hidden = not self._ui_hidden
         self._set_immersive_video_ui(self._ui_hidden)
         if self._ui_hidden:
@@ -775,11 +792,6 @@ class WindowingMixin:
                 self._ui_overlay_btn.hide()
         if self._btn_toggle_ui is not None:
             self._btn_toggle_ui.setText("Show UI" if self._ui_hidden else "Hide UI")
-        self._begin_video_surface_fade_after_layout(
-            duration_ms=1000,
-            start_opacity=1.0,
-            delay_ms=20,
-        )
         if self._playing:
             self._schedule_state_change_relock(delay_ms=120, drop_frames=2)
 
@@ -1372,7 +1384,11 @@ class WindowingMixin:
     def _enter_borderless_full_window(self):
         if self._borderless_full_window:
             return
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_surface_fade(
+            duration_ms=1000,
+            start_opacity=1.0,
+            cover_rect=self._current_screen_geometry(),
+        )
         self._pause_for_ui_transition()
 
         def _apply_full():
@@ -1402,7 +1418,11 @@ class WindowingMixin:
     def _exit_borderless_full_window(self):
         if not self._borderless_full_window:
             return
-        self._begin_video_surface_fade(duration_ms=1000, start_opacity=1.0)
+        self._begin_video_surface_fade(
+            duration_ms=1000,
+            start_opacity=1.0,
+            cover_rect=self._current_screen_geometry(),
+        )
         self._pause_for_ui_transition()
 
         def _apply_exit():
