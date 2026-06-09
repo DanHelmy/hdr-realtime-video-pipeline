@@ -43,6 +43,13 @@ try:
     )
 except Exception:
     _SDR_FRAME_CACHE_MAX = 8
+try:
+    _SDR_FRAME_EXACT_SELECT_MAX_FRAME = max(
+        0,
+        int(os.environ.get("HDRTVNET_SDR_FRAME_EXACT_SELECT_MAX_FRAME", "2400")),
+    )
+except Exception:
+    _SDR_FRAME_EXACT_SELECT_MAX_FRAME = 2400
 _SDR_FRAME_CACHE: OrderedDict[tuple[str, int], np.ndarray | None] = OrderedDict()
 try:
     _OBJECTIVE_HDR_METRIC_PEAK_NITS = float(
@@ -153,6 +160,7 @@ def _read_video_frame_at_ffmpeg(path: str, frame_idx: int) -> np.ndarray | None:
     if seek_ts is None:
         return None
 
+    fast_frame = None
     vf = "showinfo,format=bgr24" if _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED else "format=bgr24"
     cmd = [
         ffmpeg,
@@ -181,12 +189,26 @@ def _read_video_frame_at_ffmpeg(path: str, frame_idx: int) -> np.ndarray | None:
     if frame is None:
         pass
     elif _SDR_FRAME_FAST_SEEK_PTS_GUARD_ENABLED:
+        fast_frame = frame
         target_pts = float(idx) / float(fps)
         tol_s = max(1e-3, float(_SDR_FRAME_FAST_SEEK_PTS_TOL_FRAMES) / float(fps))
-        if pts_time is not None and abs(float(pts_time) - target_pts) <= tol_s:
+        # With input-side -ss, some FFmpeg builds/containers report showinfo
+        # PTS relative to the seek point. That made perfectly valid late-frame
+        # fast seeks fall through to an expensive decode-from-frame-0 exact
+        # selector, which timed out and produced "Missing frame/image data" in
+        # video benchmarks. Trust the decoded fast frame when PTS is absent, or
+        # when an exact selector would be too expensive for random access.
+        if pts_time is None:
+            return frame
+        if abs(float(pts_time) - target_pts) <= tol_s:
+            return frame
+        if idx > _SDR_FRAME_EXACT_SELECT_MAX_FRAME:
             return frame
     else:
         return frame
+
+    if idx > _SDR_FRAME_EXACT_SELECT_MAX_FRAME:
+        return fast_frame
 
     select_expr = f"select=eq(n\\,{idx}),format=bgr24"
     exact_cmd = [
