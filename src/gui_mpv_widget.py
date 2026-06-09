@@ -628,6 +628,21 @@ class MpvHDRWidget(QWidget):
             pass
 
     @staticmethod
+    def _release_frame_payload(item) -> None:
+        if (
+            isinstance(item, tuple)
+            and len(item) == 3
+            and item[0] == "frame"
+        ):
+            item = item[2]
+        release = getattr(item, "release", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                pass
+
+    @staticmethod
     def _pipe_feeder_fn(
         pipe_name: str,
         frame_queue: _queue.Queue,
@@ -658,7 +673,41 @@ class MpvHDRWidget(QWidget):
         ]
         kernel32.WriteFile.restype = wt.BOOL
 
+        class _BufferKeepalive:
+            def __init__(self, payload, release=None):
+                self.payload = payload
+                self.release = release
+
         def _buffer_ptr(item):
+            wait_ready = getattr(item, "wait_ready", None)
+            if callable(wait_ready):
+                wait_ready()
+            buffer_view = getattr(item, "buffer_view", None)
+            release = getattr(item, "release", None)
+            if callable(buffer_view):
+                view = memoryview(buffer_view())
+                if not view.c_contiguous:
+                    data = bytes(view)
+                    return (
+                        py_bytes_as_string(data),
+                        len(data),
+                        _BufferKeepalive(data, release),
+                    )
+                view = view.cast("B")
+                try:
+                    c_buf = (ctypes.c_ubyte * view.nbytes).from_buffer(view)
+                    return (
+                        ctypes.addressof(c_buf),
+                        int(view.nbytes),
+                        _BufferKeepalive((item, view, c_buf), release),
+                    )
+                except TypeError:
+                    data = bytes(view)
+                    return (
+                        py_bytes_as_string(data),
+                        len(data),
+                        _BufferKeepalive(data, release),
+                    )
             if isinstance(item, bytes):
                 return py_bytes_as_string(item), len(item), item
             view = memoryview(item)
@@ -717,26 +766,36 @@ class MpvHDRWidget(QWidget):
                 else 0
             )
             if frame_generation < current_generation:
+                MpvHDRWidget._release_frame_payload(item)
                 continue
             ptr, buf_len, keepalive = _buffer_ptr(item)
             if not ptr or buf_len <= 0:
+                MpvHDRWidget._release_frame_payload(item)
                 continue
             off = 0
-            while off < buf_len and not shutdown.is_set():
-                write_len = min(PIPE_BUF, buf_len - off)
-                written.value = 0
-                ok = kernel32.WriteFile(
-                    h,
-                    ctypes.c_void_p(ptr + off),
-                    write_len,
-                    ctypes.byref(written),
-                    None,
-                )
-                if not ok or written.value <= 0:
-                    shutdown.set()
-                    break
-                off += written.value
-            del keepalive
+            try:
+                while off < buf_len and not shutdown.is_set():
+                    write_len = min(PIPE_BUF, buf_len - off)
+                    written.value = 0
+                    ok = kernel32.WriteFile(
+                        h,
+                        ctypes.c_void_p(ptr + off),
+                        write_len,
+                        ctypes.byref(written),
+                        None,
+                    )
+                    if not ok or written.value <= 0:
+                        shutdown.set()
+                        break
+                    off += written.value
+            finally:
+                release = getattr(keepalive, "release", None)
+                if callable(release):
+                    try:
+                        release()
+                    except Exception:
+                        pass
+                del keepalive
 
         if not shutdown.is_set():
             try:
@@ -1100,6 +1159,7 @@ class MpvHDRWidget(QWidget):
     def feed_frame(self, rgb48_bytes):
         q = self._queue
         if q is None:
+            self._release_frame_payload(rgb48_bytes)
             return
         item = (
             "frame",
@@ -1113,17 +1173,20 @@ class MpvHDRWidget(QWidget):
                     return
                 except _queue.Full:
                     continue
+            self._release_frame_payload(item)
             return
         try:
             q.put_nowait(item)
         except _queue.Full:
             try:
-                q.get_nowait()
+                dropped = q.get_nowait()
+                self._release_frame_payload(dropped)
             except _queue.Empty:
                 pass
             try:
                 q.put_nowait(item)
             except _queue.Full:
+                self._release_frame_payload(item)
                 pass
 
     def flush_frames(self, *, drop_mpv_buffers: bool = True):
@@ -1138,7 +1201,8 @@ class MpvHDRWidget(QWidget):
         if q is not None:
             try:
                 while True:
-                    q.get_nowait()
+                    dropped = q.get_nowait()
+                    self._release_frame_payload(dropped)
             except _queue.Empty:
                 pass
         if drop_mpv_buffers and self._player is not None:
@@ -1386,6 +1450,13 @@ class MpvHDRWidget(QWidget):
         if self._feeder is not None:
             self._feeder.join(timeout=max(0.0, float(wait_timeout)))
             self._feeder = None
+        if q is not None:
+            try:
+                while True:
+                    dropped = q.get_nowait()
+                    self._release_frame_payload(dropped)
+            except _queue.Empty:
+                pass
         self._queue = None
         self._target_wid = None
 

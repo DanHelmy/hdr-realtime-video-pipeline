@@ -21,6 +21,55 @@ _FEEDER_GPU_RGB48 = str(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _gpu_rgb48_ring_frames() -> int:
+    try:
+        value = int(
+            str(os.environ.get("HDRTVNET_FEEDER_GPU_RGB48_RING_FRAMES", "3")).strip()
+            or "3"
+        )
+    except Exception:
+        value = 3
+    return max(2, min(8, value))
+
+
+_GPU_RGB48_RING_FRAMES = _gpu_rgb48_ring_frames()
+
+
+class _PinnedMpvFrame:
+    """A CUDA-ready pinned host frame whose slot is released after mpv writes it."""
+
+    def __init__(self, slot: dict, ready_event) -> None:
+        self._slot = slot
+        self._ready_event = ready_event
+        self._ready_waited = False
+        self._released = False
+
+    def wait_ready(self) -> None:
+        if self._ready_waited:
+            return
+        event = self._ready_event
+        if event is not None:
+            event.synchronize()
+        self._ready_waited = True
+
+    def buffer_view(self):
+        self.wait_ready()
+        return memoryview(self._slot["numpy"]).cast("B")
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            self.wait_ready()
+        except Exception:
+            pass
+        try:
+            self._slot["free"].set()
+        except Exception:
+            pass
+
+
 def _live_present_interval_s(display_fps: float) -> float:
     return 1.0 / max(1.0, float(display_fps or 24.0))
 
@@ -73,6 +122,54 @@ def _pinned_u16_host_buffer(state: dict, shape: tuple[int, int, int]):
     return tensor, arr
 
 
+def _pinned_u16_host_ring(state: dict, shape: tuple[int, int, int]):
+    key = (shape, int(_GPU_RGB48_RING_FRAMES))
+    if state.get("ring_key") == key and state.get("ring_slots"):
+        return state["ring_slots"]
+    slots = []
+    for _ in range(int(_GPU_RGB48_RING_FRAMES)):
+        tensor = None
+        try:
+            if torch.cuda.is_available():
+                tensor = torch.empty(shape, dtype=torch.uint16, pin_memory=True)
+        except Exception:
+            tensor = None
+        if tensor is None:
+            tensor = torch.empty(shape, dtype=torch.uint16)
+        free = threading.Event()
+        free.set()
+        slots.append({
+            "tensor": tensor,
+            "numpy": tensor.numpy(),
+            "free": free,
+        })
+    state["ring_key"] = key
+    state["ring_slots"] = slots
+    state["ring_index"] = 0
+    return slots
+
+
+def _acquire_pinned_u16_slot(state: dict, shape: tuple[int, int, int]):
+    slots = _pinned_u16_host_ring(state, shape)
+    if not slots:
+        return None
+    start = int(state.get("ring_index", 0) or 0) % len(slots)
+    for offset in range(len(slots)):
+        idx = (start + offset) % len(slots)
+        slot = slots[idx]
+        if slot["free"].is_set():
+            slot["free"].clear()
+            state["ring_index"] = (idx + 1) % len(slots)
+            return slot
+    idx = start
+    slot = slots[idx]
+    if not slot["free"].wait(timeout=0.25):
+        return None
+    slot["free"].clear()
+    state["ring_index"] = (idx + 1) % len(slots)
+    return slot
+
+
 def _cuda_rgb48_state(state: dict, shape: tuple[int, int, int], device):
     key = (shape, str(device))
     if (
@@ -93,7 +190,7 @@ def _cuda_rgb48_state(state: dict, shape: tuple[int, int, int], device):
     return stream, rgb_f32, rgb_u16
 
 
-def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
+def _tensor_to_rgb48_bytes(tensor, host_state: dict):
     with torch.inference_mode():
         prepared = tensor[0] if isinstance(tensor, (tuple, list)) else tensor
         rgb = prepared.squeeze(0).permute(1, 2, 0)
@@ -109,10 +206,12 @@ def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
             shape,
             rgb.device,
         )
-        host_tensor, host_np = _pinned_u16_host_buffer(
-            host_state,
-            shape,
-        )
+        slot = _acquire_pinned_u16_slot(host_state, shape)
+        if slot is None:
+            host_tensor, host_np = _pinned_u16_host_buffer(host_state, shape)
+        else:
+            host_tensor = slot["tensor"]
+            host_np = slot["numpy"]
         non_blocking = False
         try:
             non_blocking = bool(host_tensor.is_pinned())
@@ -126,7 +225,13 @@ def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
             rgb_f32.clamp_(0.0, 1.0).mul_(65535.0).add_(0.5)
             rgb_u16.copy_(rgb_f32, non_blocking=True)
             host_tensor.copy_(rgb_u16, non_blocking=non_blocking)
+            ready_event = torch.cuda.Event(enable_timing=False)
+            ready_event.record(stream)
+        if slot is not None and non_blocking:
+            return _PinnedMpvFrame(slot, ready_event)
         stream.synchronize()
+        if slot is not None:
+            slot["free"].set()
         return host_np.tobytes()
 
     rgb_cpu = rgb.clamp(0.0, 1.0).contiguous().cpu().numpy()
@@ -142,6 +247,18 @@ def _tensor_to_rgb48_bytes(tensor, host_state: dict) -> bytes:
     np.clip(rgb_f32, 0.0, 65535.0, out=rgb_f32)
     arr[:] = rgb_f32.astype(np.uint16)
     return arr.tobytes()
+
+
+def _repeatable_mpv_payload(payload):
+    if hasattr(payload, "buffer_view") and hasattr(payload, "release"):
+        try:
+            return bytes(payload.buffer_view())
+        finally:
+            try:
+                payload.release()
+            except Exception:
+                pass
+    return payload
 
 
 def _bgr_to_rgb48_bytes(frame: np.ndarray, host_state: dict) -> bytes:
@@ -262,9 +379,11 @@ class PipelineWorkerFeedersMixin:
                         except Exception:
                             pass
 
-                    latest_rgb48_bytes = _tensor_to_rgb48_bytes(
-                        tensor,
-                        rgb48_host_state,
+                    latest_rgb48_bytes = _repeatable_mpv_payload(
+                        _tensor_to_rgb48_bytes(
+                            tensor,
+                            rgb48_host_state,
+                        )
                     )
                     try:
                         item_present_t = float(source_t) if source_t is not None else 0.0
