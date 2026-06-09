@@ -41,7 +41,7 @@ try:
         ok = False
     nvcc = os.path.join(cuda_home or "", "bin", "nvcc.exe")
     if not cuda_home or not os.path.isfile(nvcc):
-        print("[setup-nvidia] WARNING: CUDA Toolkit 13.x with nvcc.exe was not found.")
+        print("[setup-nvidia] WARNING: CUDA Toolkit 13.3 with nvcc.exe was not found.")
         print("[setup-nvidia]          Install with: winget install --id Nvidia.CUDA --version 13.3 --exact")
         ok = False
     else:
@@ -49,8 +49,9 @@ try:
         release = re.search(r"release\s+([0-9]+(?:\.[0-9]+)?)", nvcc_text)
         release_text = release.group(1) if release else "unknown"
         print(f"[setup-nvidia] CUDA Toolkit nvcc release: {release_text}")
-        if not release_text.startswith("13."):
-            print("[setup-nvidia] WARNING: CUDA Toolkit must be 13.x for this NVIDIA setup.")
+        if release_text != "13.3":
+            print("[setup-nvidia] WARNING: CUDA Toolkit must be 13.3 for this NVIDIA setup.")
+            print("[setup-nvidia]          Install with: winget install --id Nvidia.CUDA --version 13.3 --exact")
             ok = False
 except Exception as exc:
     print(f"[setup-nvidia] WARNING: CUDA/MSVC environment bootstrap failed: {exc}")
@@ -175,7 +176,7 @@ if (-not $trtReady) {
     Write-Warning @"
 NVIDIA TensorRT runtime check did not fully pass.
 
-The NVIDIA path now requires the CUDA 13 Toolkit with nvcc.exe, CUDA 13 PyTorch
+The NVIDIA path now requires the CUDA 13.3 Toolkit with nvcc.exe, CUDA 13 PyTorch
 wheels, and TensorRT. This keeps ModelOpt/TensorRT engine creation on one
 compiler/runtime family instead of falling back through partial local toolkits.
 

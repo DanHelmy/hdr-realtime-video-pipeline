@@ -796,7 +796,7 @@ PyTorch compile defaults are tuned for fixed-resolution video: `dynamic=False`, 
 
 - Python 3.12 (setup scripts target 3.12 for all backends)
 - Backend-specific PyTorch wheels from the requirement files
-- NVIDIA: CUDA Toolkit 13.x with `nvcc.exe`, CUDA 13 PyTorch wheels, TensorRT bindings/libs, and ONNX export dependencies
+- NVIDIA: CUDA Toolkit 13.3 with `nvcc.exe`, CUDA 13 PyTorch wheels, TensorRT bindings/libs, and ONNX export dependencies
 - AMD: ROCm-Windows 7.2.1 PyTorch stack plus optional HIP SDK for compiled PyTorch kernels
 - OpenCV, NumPy
 
@@ -837,7 +837,7 @@ Equivalent setup scripts:
 ```bash
 .\venv\Scripts\python.exe -m pip install --prefer-binary -r requirements/requirements-nvidia.txt
 ```
-NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export temporary ONNX artifacts during first-time model/resolution/mode builds. A full CUDA Toolkit 13.x install is required on NVIDIA systems so ModelOpt/Torch extension builds can find `nvcc.exe`. `triton-windows` is installed for ModelOpt/Torch quantization helpers on Windows; TensorRT playback itself does not depend on Triton kernels.
+NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export temporary ONNX artifacts during first-time model/resolution/mode builds. A full CUDA Toolkit 13.3 install is required on NVIDIA systems so ModelOpt/Torch extension builds can find `nvcc.exe`. `triton-windows` is installed for ModelOpt/Torch quantization helpers on Windows; TensorRT playback itself does not depend on Triton kernels.
 
 The NVIDIA requirement file installs PyTorch from the CUDA 13.0 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `nvidia-modelopt[onnx]>=0.44.0`, `triton-windows`, `tensorrt_cu12_bindings==10.16.1.11`, and `tensorrt_cu12_libs==10.16.1.11`. The Python import name remains `tensorrt`; the split package names are NVIDIA's TensorRT wheel names.
 
@@ -846,7 +846,7 @@ The NVIDIA requirement file installs PyTorch from the CUDA 13.0 wheel index, the
 - NVIDIA CUDA driver DLL
 - `torch.cuda`
 - MSVC Build Tools environment discovery for ModelOpt/Torch CUDA extensions
-- CUDA Toolkit 13.x discovery through `CUDA_HOME` / `CUDA_PATH`, including `bin\nvcc.exe`
+- CUDA Toolkit 13.3 discovery through `CUDA_HOME` / `CUDA_PATH`, including `bin\nvcc.exe`
 - `onnx`
 - `onnxscript`
 - `tensorrt_libs`
@@ -859,7 +859,7 @@ Install CUDA Toolkit 13.3 from NVIDIA or winget before running the NVIDIA backen
 winget install --id Nvidia.CUDA --version 13.3 --exact
 ```
 
-The app auto-detects the Toolkit and fills `CUDA_HOME`/`CUDA_PATH` before ModelOpt/Torch helpers import. On Windows, it also tries to initialize Visual Studio Build Tools through `vcvars64.bat` before Torch/ModelOpt imports so `cl.exe`, headers, and linker paths are visible during first-time quantized engine creation. If the TensorRT check fails, update the NVIDIA driver, install CUDA Toolkit 13.x, then rerun setup with a fresh venv.
+The app auto-detects the Toolkit and fills `CUDA_HOME`/`CUDA_PATH` before ModelOpt/Torch helpers import. On Windows, it also tries to initialize Visual Studio Build Tools through `vcvars64.bat` before Torch/ModelOpt imports so `cl.exe`, headers, and linker paths are visible during first-time quantized engine creation. If the TensorRT check fails, update the NVIDIA driver, install CUDA Toolkit 13.3, then rerun setup with a fresh venv.
 
 **AMD ROCm-Windows (Python 3.12):**
 ```bash
