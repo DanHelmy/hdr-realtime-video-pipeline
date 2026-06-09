@@ -45,6 +45,8 @@ from gui_window_utils import configure_independent_window
 
 _HERE = pathlib.Path(__file__).resolve().parent
 _ROOT = _HERE.parent
+_SORT_ROLE = int(Qt.ItemDataRole.UserRole.value) + 1
+_SESSION_ROLE = int(Qt.ItemDataRole.UserRole.value) + 2
 
 
 _PRECISION_TO_RUN = {
@@ -57,6 +59,19 @@ _PRECISION_TO_RUN = {
     "INT8 Full (QAT)": "int8-full-qat",
     "INT8 Full (QAT) (Film)": "int8-full-qat-film",
 }
+
+
+class _ResultTableItem(QTableWidgetItem):
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            left = self.data(_SORT_ROLE)
+            right = other.data(_SORT_ROLE)
+            if left is not None and right is not None:
+                try:
+                    return float(left) < float(right)
+                except Exception:
+                    pass
+        return super().__lt__(other)
 
 
 def _fmt_float(value, digits: int = 2, suffix: str = "") -> str:
@@ -90,6 +105,42 @@ def _metric_max(payload: dict, key: str):
         if isinstance(stat, dict):
             return stat.get("max", stat.get("last", stat.get("avg")))
     return _metric_last(payload, key)
+
+
+_PRECISION_DISPLAY_LABELS = {
+    "fp32": "FP32",
+    "fp16": "FP16",
+    "int8_mixed_ptq_trt_native": "INT8 Mixed PTQ",
+    "int8-mixed-ptq": "INT8 Mixed PTQ",
+    "int8_mixed_qat_trt_native": "INT8 Mixed QAT",
+    "int8-mixed-qat": "INT8 Mixed QAT",
+    "int8_mixed_qat_film_trt_native": "INT8 Mixed QAT Film",
+    "int8-mixed-qat-film": "INT8 Mixed QAT Film",
+    "int8_full_ptq_trt_native": "INT8 Full PTQ",
+    "int8-full-ptq": "INT8 Full PTQ",
+    "int8_full_qat_trt_native": "INT8 Full QAT",
+    "int8-full-qat": "INT8 Full QAT",
+    "int8_full_qat_film_trt_native": "INT8 Full QAT Film",
+    "int8-full-qat-film": "INT8 Full QAT Film",
+}
+
+
+def _display_precision_label(value) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    key = raw.lower().replace("-", "_")
+    if key in _PRECISION_DISPLAY_LABELS:
+        return _PRECISION_DISPLAY_LABELS[key]
+    if raw in _PRECISION_DISPLAY_LABELS:
+        return _PRECISION_DISPLAY_LABELS[raw]
+    label = raw.replace("_trt_native", "").replace("_", " ").replace("-", " ")
+    label = re.sub(r"\bint8\b", "INT8", label, flags=re.IGNORECASE)
+    label = re.sub(r"\bfp16\b", "FP16", label, flags=re.IGNORECASE)
+    label = re.sub(r"\bfp32\b", "FP32", label, flags=re.IGNORECASE)
+    label = re.sub(r"\bqat\b", "QAT", label, flags=re.IGNORECASE)
+    label = re.sub(r"\bptq\b", "PTQ", label, flags=re.IGNORECASE)
+    return " ".join(part for part in label.split() if part)
 
 
 def _session_sort_key(path: pathlib.Path) -> tuple[str, str, str]:
@@ -244,7 +295,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         self._tbl_results.setHorizontalHeaderLabels(
             [
                 "Precision",
-                "Resolution",
+                "Res",
                 "HG",
                 "FPS",
                 "1% Low",
@@ -261,9 +312,13 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         self._tbl_results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tbl_results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._tbl_results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._tbl_results.setAlternatingRowColors(True)
+        self._tbl_results.setSortingEnabled(True)
+        self._tbl_results.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         header = self._tbl_results.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        self._apply_result_column_defaults()
         results_left_layout.addWidget(self._tbl_results, 1)
 
         self._txt_output = QPlainTextEdit()
@@ -334,6 +389,13 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         if self._batch_dir is not None and self._batch_dir.is_dir():
             return str(self._batch_dir)
         return None
+
+    def _apply_result_column_defaults(self):
+        widths = (150, 88, 42, 72, 76, 86, 82, 78, 78, 76, 82, 70, 76)
+        header = self._tbl_results.horizontalHeader()
+        header.setMinimumSectionSize(38)
+        for col, width in enumerate(widths):
+            self._tbl_results.setColumnWidth(col, width)
 
     def _populate_precision_list(self, initial_precision_key: str | None):
         available = [
@@ -483,7 +545,7 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         item = self._tbl_results.item(row, 0)
         if item is None:
             return None
-        session_dir = item.data(Qt.ItemDataRole.UserRole)
+        session_dir = item.data(_SESSION_ROLE)
         if session_dir and os.path.isdir(str(session_dir)):
             return str(session_dir)
         return None
@@ -682,8 +744,10 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
             worker_summary = payload.get("worker_summary")
             if not isinstance(settings, dict) or not isinstance(worker_summary, dict):
                 continue
+            precision_raw = str(settings.get("precision") or "-")
             row = {
-                "precision": str(settings.get("precision") or "-"),
+                "precision": _display_precision_label(precision_raw),
+                "precision_raw": precision_raw,
                 "resolution": str(settings.get("resolution") or "-"),
                 "hg": "on" if bool(settings.get("use_hg")) else "off",
                 "fps": _metric_last(payload, "fps"),
@@ -706,36 +770,45 @@ class PlaybackPerformanceBenchmarkDialog(QDialog):
         return rows
 
     def _populate_result_table(self, rows: list[dict]):
+        self._tbl_results.setSortingEnabled(False)
         self._tbl_results.setRowCount(0)
         self._result_session_dirs = []
         for row_data in rows:
             row = self._tbl_results.rowCount()
             self._tbl_results.insertRow(row)
-            values = [
-                row_data["precision"],
-                row_data["resolution"],
-                row_data["hg"],
-                _fmt_float(row_data["fps"], 2),
-                _fmt_float(row_data["fps_1p_low"], 2),
-                _fmt_float(row_data["latency_ms"], 2, " ms"),
-                _fmt_float(row_data["model_ms"], 2, " ms"),
-                _fmt_float(row_data["render_ms"], 2, " ms"),
-                _fmt_float(row_data["gpu_mb"], 0, " MB"),
-                _fmt_float(row_data["cpu_mb"], 0, " MB"),
-                _fmt_float(row_data["model_mb"], 2, " MB"),
-                str(row_data["frames"] or "-"),
-                str(row_data["dropped"] or 0),
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
+            values = (
+                (row_data["precision"], None),
+                (row_data["resolution"], None),
+                (row_data["hg"], 1 if row_data["hg"] == "on" else 0),
+                (_fmt_float(row_data["fps"], 2), row_data["fps"]),
+                (_fmt_float(row_data["fps_1p_low"], 2), row_data["fps_1p_low"]),
+                (_fmt_float(row_data["latency_ms"], 2, " ms"), row_data["latency_ms"]),
+                (_fmt_float(row_data["model_ms"], 2, " ms"), row_data["model_ms"]),
+                (_fmt_float(row_data["render_ms"], 2, " ms"), row_data["render_ms"]),
+                (_fmt_float(row_data["gpu_mb"], 0, " MB"), row_data["gpu_mb"]),
+                (_fmt_float(row_data["cpu_mb"], 0, " MB"), row_data["cpu_mb"]),
+                (_fmt_float(row_data["model_mb"], 2, " MB"), row_data["model_mb"]),
+                (str(row_data["frames"] or "-"), row_data["frames"]),
+                (str(row_data["dropped"] or 0), row_data["dropped"]),
+            )
+            tooltip = (
+                f"Run id: {row_data.get('precision_raw') or row_data['precision']}\n"
+                f"Resolution: {row_data['resolution']} | HG: {row_data['hg']}\n"
+                f"Session: {row_data['session_dir']}"
+            )
+            for col, (value, sort_value) in enumerate(values):
+                item = _ResultTableItem(value)
                 if col == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, row_data["session_dir"])
+                    item.setData(_SESSION_ROLE, row_data["session_dir"])
+                if sort_value is not None:
+                    item.setData(_SORT_ROLE, sort_value)
+                item.setToolTip(tooltip)
                 if col >= 3:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self._tbl_results.setItem(row, col, item)
             self._result_session_dirs.append(row_data["session_dir"])
-        self._tbl_results.resizeColumnsToContents()
-        self._tbl_results.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._apply_result_column_defaults()
+        self._tbl_results.setSortingEnabled(True)
         if rows:
             self._tbl_results.selectRow(0)
 
