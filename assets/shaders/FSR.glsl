@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-// FidelityFX FSR v1.0.2 EASU + RCAS by AMD, adapted for this app's RGB48 mpv feed.
+// FidelityFX FSR v1.0.2 by AMD, adapted for this app's RGB48 mpv feed.
 // The original mpv port operated on LUMA only. This version hooks MAIN so it
 // runs after conversion to RGB and before mpv's scaler, which is the correct
 // resizable hook point for raw RGB video.
@@ -281,26 +281,29 @@ vec4 hook() {
 //!HOOK MAIN
 //!BIND EASUTEX
 //!DESC FidelityFX Super Resolution v1.0.2 RGB (RCAS)
+//!WHEN OUTPUT.w OUTPUT.h * MAIN.w MAIN.h * / 1.0 >
 //!WIDTH EASUTEX.w
 //!HEIGHT EASUTEX.h
 //!COMPONENTS 3
 
-#define FSR_RCAS_SHARPNESS 0.2
+// User variables - RCAS
+#define SHARPNESS 0.20
 #define FSR_RCAS_DENOISE 1
+#define FSR_PQ 0
+
 #define FSR_RCAS_LIMIT (0.25 - (1.0 / 16.0))
 
-float FsrRcasRcp(float a) {
-    float b = uintBitsToFloat(uint(0x7ef19fff) - floatBitsToUint(a));
-    return b * (-b * a + 2.0);
+vec3 AMax3RcasF3(vec3 x, vec3 y, vec3 z) {
+    return max(x, max(y, z));
 }
 
-float FsrRcasLuma(vec3 c) {
-    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+vec3 AMin3RcasF3(vec3 x, vec3 y, vec3 z) {
+    return min(x, min(y, z));
 }
 
 #if (FSR_PQ == 1)
 
-vec3 FsrRcasFromGamma2(vec3 a) {
+vec3 FromGamma2(vec3 a) {
     return sqrt(sqrt(max(a, vec3(0.0))));
 }
 
@@ -313,36 +316,27 @@ vec4 hook() {
     vec3 f = EASUTEX_texOff(vec2( 1.0,  0.0)).rgb;
     vec3 h = EASUTEX_texOff(vec2( 0.0,  1.0)).rgb;
 
-    float bL = FsrRcasLuma(b);
-    float dL = FsrRcasLuma(d);
-    float eL = FsrRcasLuma(e);
-    float fL = FsrRcasLuma(f);
-    float hL = FsrRcasLuma(h);
+    vec3 mn1 = min(AMin3RcasF3(b, d, f), h);
+    vec3 mx1 = max(AMax3RcasF3(b, d, f), h);
 
-    float mn1L = min(AMin3F1(bL, dL, fL), hL);
-    float mx1L = max(AMax3F1(bL, dL, fL), hL);
-    float hitMinL = min(mn1L, eL) / max(4.0 * mx1L, 1e-6);
-    float hitMaxL = (1.0 - max(mx1L, eL)) / min(4.0 * mn1L - 4.0, -1e-6);
-    float lobeL = max(-hitMinL, hitMaxL);
-    float lobe = max(float(-FSR_RCAS_LIMIT), min(lobeL, 0.0));
-    lobe *= exp2(-clamp(float(FSR_RCAS_SHARPNESS), 0.0, 2.0));
+    vec3 hitMin = min(mn1, e) / max(4.0 * mx1, vec3(1e-6));
+    vec3 hitMax = (vec3(1.0) - max(mx1, e)) / min(4.0 * mn1 - vec3(4.0), vec3(-1e-6));
+    vec3 lobeL = max(-hitMin, hitMax);
+    vec3 lobe = max(vec3(-FSR_RCAS_LIMIT), min(lobeL, vec3(0.0))) *
+        exp2(-clamp(float(SHARPNESS), 0.0, 2.0));
 
 #if (FSR_RCAS_DENOISE == 1)
-    float nz = 0.25 * (bL + dL + fL + hL) - eL;
-    float rangeL = max(
-        AMax3F1(AMax3F1(bL, dL, eL), fL, hL) - AMin3F1(AMin3F1(bL, dL, eL), fL, hL),
-        1e-6
-    );
-    nz = clamp(abs(nz) * FsrRcasRcp(rangeL), 0.0, 1.0);
-    lobe *= -0.5 * nz + 1.0;
+    vec3 range = AMax3RcasF3(AMax3RcasF3(b, d, e), f, h) -
+        AMin3RcasF3(AMin3RcasF3(b, d, e), f, h);
+    vec3 nz = abs(0.25 * (b + d + f + h) - e) / max(range, vec3(1e-6));
+    float nzMax = clamp(max(nz.r, max(nz.g, nz.b)), 0.0, 1.0);
+    lobe *= (-0.5 * nzMax + 1.0);
 #endif
 
-    float rcpL = FsrRcasRcp(4.0 * lobe + 1.0);
-    vec3 pix = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
-
+    vec3 rcp = 1.0 / (4.0 * lobe + vec3(1.0));
+    vec3 pix = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcp;
 #if (FSR_PQ == 1)
-    pix = FsrRcasFromGamma2(pix);
+    pix = FromGamma2(pix);
 #endif
-
     return vec4(clamp(pix, vec3(0.0), vec3(1.0)), 1.0);
 }
