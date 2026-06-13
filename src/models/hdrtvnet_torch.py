@@ -1452,7 +1452,7 @@ def tensorrt_source_checkpoint_path(model_path: str) -> str:
         path = os.path.abspath(os.path.expanduser(str(model_path)))
         if not _is_int8_checkpoint_path(path):
             return path
-        if _env_bool("HDRTVNET_TRT_INT8_MODELOPT", _IS_NVIDIA):
+        if _tensorrt_int8_modelopt_enabled():
             return path
         if _is_tensorrt_source_path(path):
             reason = tensorrt_source_checkpoint_validation_error(path)
@@ -3099,8 +3099,27 @@ def _tensorrt_fp16_enabled() -> bool:
     return _env_bool("HDRTVNET_TRT_FP16", True)
 
 
+def _tensorrt_rtx50_or_newer_default() -> bool:
+    if not _IS_NVIDIA:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        if int(getattr(props, "major", 0)) >= 12:
+            return True
+    except Exception:
+        pass
+    try:
+        name = str(torch.cuda.get_device_name(0) or "").lower()
+    except Exception:
+        name = ""
+    return bool(re.search(r"\bgeforce\s+rtx\s+50\d{2}\b", name))
+
+
 def _tensorrt_int8_modelopt_enabled() -> bool:
-    return _env_bool("HDRTVNET_TRT_INT8_MODELOPT", _IS_NVIDIA)
+    return _env_bool(
+        "HDRTVNET_TRT_INT8_MODELOPT",
+        _tensorrt_rtx50_or_newer_default(),
+    )
 
 
 def _tensorrt_int8_modelopt_torch_enabled() -> bool:
@@ -3148,6 +3167,8 @@ def _tensorrt_int8_qat_checkpoint_composition_enabled(
 def _tensorrt_int8_modelopt_torch_effective_enabled(
     mode_name: str | None = None,
 ) -> bool:
+    if not _tensorrt_int8_modelopt_enabled():
+        return False
     return (
         _tensorrt_int8_modelopt_torch_enabled()
         and not _tensorrt_int8_qat_checkpoint_composition_enabled(mode_name)

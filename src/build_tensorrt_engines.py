@@ -32,6 +32,7 @@ if _HERE not in sys.path:
 
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
+    _tensorrt_int8_modelopt_enabled,
     cleanup_tensorrt_onnx_after_engine,
     tensorrt_engine_path,
     tensorrt_engine_is_valid,
@@ -461,7 +462,7 @@ def main() -> int:
             and str(args.qdq_fusion) == "native"
             and not (
                 str(precision).startswith("int8")
-                and _env_bool("HDRTVNET_TRT_INT8_MODELOPT", True)
+                and _tensorrt_int8_modelopt_enabled()
             )
         ):
             calibration_cache = tensorrt_prebuilt_calibration_cache_path(
