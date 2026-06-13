@@ -4527,7 +4527,7 @@ def _tensorrt_collect_runtime_module_ranges(
     calibration_video: str | None,
     calibration_frames: int | None,
 ) -> tuple[dict[str, float], int]:
-    module_ranges: dict[str, float] = {}
+    module_ranges: dict[str, torch.Tensor] = {}
     hook_types = (
         W8Conv2d,
         W8A8Conv2d,
@@ -4535,12 +4535,6 @@ def _tensorrt_collect_runtime_module_ranges(
         W8A8Linear,
         nn.Conv2d,
         nn.Linear,
-        nn.ReLU,
-        nn.LeakyReLU,
-        nn.PixelShuffle,
-        nn.InstanceNorm2d,
-        nn.AvgPool2d,
-        nn.AdaptiveAvgPool2d,
     )
     handles = []
 
@@ -4552,11 +4546,12 @@ def _tensorrt_collect_runtime_module_ranges(
         if not isinstance(output, torch.Tensor):
             return
         try:
-            value = float(output.detach().float().abs().amax().cpu().item())
+            value = output.detach().float().abs().amax()
         except Exception:
             return
-        if math.isfinite(value):
-            module_ranges[name] = max(float(module_ranges.get(name, 0.0)), value, 1e-5)
+        value = torch.nan_to_num(value, nan=0.0, posinf=1024.0, neginf=0.0)
+        previous = module_ranges.get(name)
+        module_ranges[name] = value if previous is None else torch.maximum(previous, value)
 
     for name, module in processor.model.named_modules():
         if isinstance(module, hook_types):
@@ -4592,24 +4587,78 @@ def _tensorrt_collect_runtime_module_ranges(
                 frame_count=max(8, frames),
             )
 
+        try:
+            batch_size = int(os.environ.get("HDRTVNET_TRT_CALIBRATION_BATCH_SIZE", "2"))
+        except (TypeError, ValueError):
+            batch_size = 2
+        batch_size = max(1, batch_size)
+        if batch_size > 1:
+            print(f"TensorRT native INT8 calibration batch size: {batch_size}")
+        try:
+            progress_interval = int(
+                os.environ.get("HDRTVNET_TRT_CALIBRATION_PROGRESS_INTERVAL", "256")
+            )
+        except (TypeError, ValueError):
+            progress_interval = 256
+        progress_interval = max(0, progress_interval)
+        next_progress = progress_interval
+
+        def _forward_pending(
+            pending_tensors: list[torch.Tensor],
+            pending_conds: list[torch.Tensor],
+        ) -> int:
+            if not pending_tensors or not pending_conds:
+                return 0
+            if len(pending_tensors) == 1:
+                tensor = pending_tensors[0]
+                cond = pending_conds[0]
+            else:
+                tensor = torch.cat(pending_tensors, dim=0)
+                cond = torch.cat(pending_conds, dim=0)
+            if getattr(processor, "_is_flat_model", False):
+                processor.model(tensor, cond)
+            else:
+                processor.model((tensor, cond))
+            return int(tensor.shape[0])
+
         seen = 0
+        pending_tensors: list[torch.Tensor] = []
+        pending_conds: list[torch.Tensor] = []
         with torch.inference_mode():
             while True:
                 batch = source.next_batch()
                 if batch is None:
+                    seen += _forward_pending(pending_tensors, pending_conds)
                     break
                 tensor = batch.get("input")
                 cond = batch.get("cond")
                 if tensor is None or cond is None:
                     continue
-                if getattr(processor, "_is_flat_model", False):
-                    processor.model(tensor, cond)
-                else:
-                    processor.model((tensor, cond))
-                seen += 1
+                pending_tensors.append(tensor)
+                pending_conds.append(cond)
+                if len(pending_tensors) >= batch_size:
+                    seen += _forward_pending(pending_tensors, pending_conds)
+                    pending_tensors.clear()
+                    pending_conds.clear()
+                    if progress_interval and seen >= next_progress:
+                        print(
+                            "TensorRT native INT8 calibration progress: "
+                            f"{seen} frame(s)",
+                            flush=True,
+                        )
+                        while next_progress <= seen:
+                            next_progress += progress_interval
         if torch.cuda.is_available():
             torch.cuda.synchronize(processor.device)
-        return module_ranges, seen
+        resolved_ranges: dict[str, float] = {}
+        for name, value in module_ranges.items():
+            try:
+                scalar = float(value.detach().float().cpu().item())
+            except Exception:
+                continue
+            if math.isfinite(scalar):
+                resolved_ranges[name] = max(scalar, 1e-5)
+        return resolved_ranges, seen
     finally:
         for handle in handles:
             try:
@@ -4646,8 +4695,24 @@ def _tensorrt_map_conv_nodes_to_modules(
 ) -> tuple[list[dict[str, object]], list[str]]:
     conv_nodes = [node for node in onnx_model.graph.node if node.op_type == "Conv"]
     used_modules: set[int] = set()
+    modules_by_name = {str(entry["name"]): index for index, entry in enumerate(modules)}
     mappings: list[dict[str, object]] = []
     failures: list[str] = []
+
+    def _append_mapping(node, entry: dict[str, object], diff: float) -> None:
+        mappings.append(
+            {
+                "node": node,
+                "node_name": node.name or (node.output[0] if node.output else "<conv>"),
+                "input": node.input[0] if node.input else "",
+                "output": node.output[0] if node.output else "",
+                "weight": node.input[1] if len(node.input) > 1 else "",
+                "bias": node.input[2] if len(node.input) > 2 else "",
+                "module": str(entry["name"]),
+                "module_entry": entry,
+                "weight_max_abs_diff": diff,
+            }
+        )
 
     for node in conv_nodes:
         if len(node.input) < 2:
@@ -4658,6 +4723,18 @@ def _tensorrt_map_conv_nodes_to_modules(
             failures.append(f"{node.name or node.output[0]}: unresolved weight tensor")
             continue
         weight = onnx_weight.astype(np.float32, copy=False)
+        direct_module_name = str(node.input[1] or "")
+        if direct_module_name.startswith("model.") and direct_module_name.endswith(".weight"):
+            direct_module_name = direct_module_name[len("model."):-len(".weight")]
+            direct_index = modules_by_name.get(direct_module_name)
+            if direct_index is not None and direct_index not in used_modules:
+                direct_entry = modules[direct_index]
+                candidate = direct_entry["weight"]
+                if candidate.shape == weight.shape:
+                    diff = float(np.max(np.abs(weight - candidate)))
+                    used_modules.add(direct_index)
+                    _append_mapping(node, direct_entry, diff)
+                    continue
         best: tuple[float, int, dict[str, object]] | None = None
         for index, entry in enumerate(modules):
             if index in used_modules:
@@ -4674,19 +4751,7 @@ def _tensorrt_map_conv_nodes_to_modules(
             continue
         diff, index, entry = best
         used_modules.add(index)
-        mappings.append(
-            {
-                "node": node,
-                "node_name": node.name or (node.output[0] if node.output else "<conv>"),
-                "input": node.input[0] if node.input else "",
-                "output": node.output[0] if node.output else "",
-                "weight": node.input[1] if len(node.input) > 1 else "",
-                "bias": node.input[2] if len(node.input) > 2 else "",
-                "module": str(entry["name"]),
-                "module_entry": entry,
-                "weight_max_abs_diff": diff,
-            }
-        )
+        _append_mapping(node, entry, diff)
     return mappings, failures
 
 
@@ -4968,7 +5033,8 @@ def build_tensorrt_native_int8_speed_calibration_cache(
     print(
         "TensorRT native INT8 speed calibration cache: "
         f"{cache_path} ({frame_count} frame(s), {mapped} Conv, "
-        f"{len(ranges)} tensor range(s), protected={protected_count})"
+        f"{len(ranges)} tensor range(s), protected={protected_count})",
+        flush=True,
     )
     return {
         "cache_path": os.path.abspath(cache_path),
@@ -7710,7 +7776,8 @@ class _TensorRTDatasetCalibrationSource(_TensorRTCalibrationSource):
         print(
             "TensorRT native INT8 calibration: "
             f"streaming {len(self._paths)} image(s) from {dataset_path} "
-            f"({selection_mode} selection)"
+            f"({selection_mode} selection)",
+            flush=True,
         )
 
     def next_batch(self) -> dict[str, torch.Tensor] | None:
@@ -7773,7 +7840,8 @@ class _TensorRTVideoCalibrationSource(_TensorRTCalibrationSource):
         self._index = 0
         print(
             "TensorRT native INT8 calibration: "
-            f"streaming {label_count} frame(s) from {video_path}"
+            f"streaming {label_count} frame(s) from {video_path}",
+            flush=True,
         )
 
     def close(self) -> None:
@@ -7836,7 +7904,8 @@ class _TensorRTSyntheticCalibrationSource(_TensorRTCalibrationSource):
             self._ramp_y = self._ramp_y.view(1, 1, h, 1).expand(1, 3, h, w)
         print(
             "TensorRT native INT8 calibration: "
-            f"using {self._count} synthetic frame(s)"
+            f"using {self._count} synthetic frame(s)",
+            flush=True,
         )
 
     def next_batch(self) -> dict[str, torch.Tensor] | None:

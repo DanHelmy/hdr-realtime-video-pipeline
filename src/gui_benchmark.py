@@ -5009,7 +5009,7 @@ class ModelBenchmarkDialog(QDialog):
         used_cache = bool(frames)
         if not frames:
             # Oversample enough to find visually distinct candidates, without
-            # turning 4K/HEVC videos into hundreds of random decoder seeks.
+            # turning large HEVC videos into hundreds of random decoder seeks.
             scan_cap = min(240, max(96, pool_count * 3))
             frames, interest_by_frame = _detect_distinct_video_frames_with_scores(
                 sdr_path,

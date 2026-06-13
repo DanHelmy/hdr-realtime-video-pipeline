@@ -45,7 +45,7 @@ from models.hdrtvnet_torch import (
     tensorrt_prebuilt_calibration_cache_path,
 )
 
-VIDEO_PATH = r"testmovies\Marvels Daredevil S03E13 A New Napkin (2160p x265 10bit FS94 Joy).mkv"
+VIDEO_PATH = r"testmovies\sample_sdr_video.mkv"
 MODEL_PATH = "src/models/weights/original/HR.pt"
 
 TARGET_WIDTH = 1280

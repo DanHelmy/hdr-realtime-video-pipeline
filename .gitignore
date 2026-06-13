@@ -82,6 +82,8 @@ src/models/weights/original/HG.pt
 !src/models/weights/original/tensorrt_fp8/hr/*.pt
 !src/models/weights/original/tensorrt_fp8/hr_hg/
 !src/models/weights/original/tensorrt_fp8/hr_hg/*.pt
+!src/models/tensorrt_calibration/
+!src/models/tensorrt_calibration/*.calib
 
 # Calibration / training dataset (download separately)
 dataset/

@@ -542,6 +542,15 @@ def _make_processor(args, run: dict, width: int, height: int):
                 qdq_fusion=args.trt_qdq_fusion,
                 require_exists=True,
             )
+        calibration_video = (
+            None
+            if (
+                args.trt_calibration_dataset
+                or args.trt_calibration_cache
+                or calibration_cache
+            )
+            else args.video
+        )
         return HDRTVNetTensorRT(
             run["model"],
             device=args.device,
@@ -554,11 +563,7 @@ def _make_processor(args, run: dict, width: int, height: int):
             predequantize=predeq,
             qdq_fusion=args.trt_qdq_fusion,
             calibration_dataset=args.trt_calibration_dataset,
-            calibration_video=(
-                None
-                if args.trt_calibration_dataset or args.trt_calibration_cache
-                else args.video
-            ),
+            calibration_video=calibration_video,
             calibration_frames=args.trt_calibration_frames,
             calibration_cache=calibration_cache,
         )

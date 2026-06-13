@@ -297,7 +297,7 @@ def _available_precision_keys() -> list[str]:
     return fallback
 
 
-MAX_W, MAX_H = 3840, 2160
+MAX_W, MAX_H = 1920, 1080
 
 SOURCE_MODE_VIDEO = "video"
 SOURCE_MODE_WINDOW = "window_capture"
@@ -427,9 +427,7 @@ def _source_mode_label(mode: str | None) -> str:
 
 # Resolution-scale presets (process lower resolution).
 RESOLUTION_SCALES = {
-    "2160p": None,  # full processing/output preset; monitor upscale is separate
-    "1440p": (2560, 1440),
-    "1080p": (1920, 1080),
+    "1080p": None,  # full processing/output preset; monitor upscale is separate
     "720p": (1280, 720),
     "540p": (960, 540),
 }
@@ -452,7 +450,7 @@ def _max_processing_preset_for_source(src_w: int, src_h: int) -> str:
         pw, ph = _processing_preset_dims(key)
         if src_w <= pw and src_h <= ph:
             return key
-    return "2160p"
+    return "1080p"
 
 
 def _processing_preset_options_for_source(src_w: int, src_h: int) -> list[str]:

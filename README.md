@@ -60,7 +60,7 @@ Core updates include:
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
 - NVIDIA INT8 now chooses the TensorRT export path by GPU generation: RTX 50/Blackwell-class devices default to the current ModelOpt Torch Q/DQ builds, while older NVIDIA GPUs default to native-implicit INT8 calibration unless `HDRTVNET_TRT_INT8_MODELOPT` is explicitly set
 - normal `FP16` / `FP32` use the original HR/HR+HG checkpoints; INT8 PTQ/QAT/QAT Film use matching original eager and TensorRT source checkpoints
-- current RTX 5060 Ti TensorRT/mpv 30-second stress checks on the Daredevil 2160p SDR clip: 1080p no-HG FP16 `34.23 ms`, Mixed QAT `30.68 ms`, Full QAT `29.96 ms`; 1080p HG FP16 `72.74 ms`, Mixed QAT `66.16 ms`, Full QAT `58.63 ms`; 720p no-HG remains FP16-favored (`15.64 ms` FP16 vs `18.44 ms` Mixed QAT) because the no-HG graph is small enough that INT8 overhead dominates
+- current RTX 5060 Ti TensorRT/mpv 30-second stress checks on the Daredevil SDR clip: 1080p no-HG FP16 `34.23 ms`, Mixed QAT `30.68 ms`, Full QAT `29.96 ms`; 1080p HG FP16 `72.74 ms`, Mixed QAT `66.16 ms`, Full QAT `58.63 ms`; 720p no-HG remains FP16-favored (`15.64 ms` FP16 vs `18.44 ms` Mixed QAT) because the no-HG graph is small enough that INT8 overhead dominates
 - the final TensorRT sweep did not find a stable 25-28 ms mixed path; more aggressive AGCM quantization was faster by less than a millisecond but failed visual/temporal rolloff checks, so the stable LE/HG recipe remains the shipped mixed baseline. On the current RTX 5060 Ti HG path, strict Full QAT is the fastest INT8 preset while Mixed QAT remains the protected lower-risk composition.
 - Full INT8 verifies the strict checkpoint contract: no-HG `128` W8A8 layers and HG `149` W8A8 layers, with no W8A16 or FP16 fallback layers in the checkpoint composition
 - QAT INT8 checkpoints now ship in two included families: FP32-anchored tone-protected `QAT` and movie-accuracy `QAT (Film)`, with Full/Mixed and HG/no-HG variants trained for the same TensorRT composition used at deployment
@@ -248,7 +248,7 @@ Audio delay slider range: 0-2000 ms.
 Browser capture pacing:
 
 - The GUI exposes a Browser Window Capture FPS cap: `24`, `30`, or `60` fps. `24 fps` is the default smooth low-latency cap.
-- Browser-window processing/output presets are capped by both the captured window size and the largest attached monitor, so a 4K monitor can expose 2160p capture while smaller monitors stay capped to their own useful maximum.
+- Browser-window processing/output presets are capped by both the captured window size and the largest attached monitor, up to the app's 1080p processing preset.
 - Chrome compositor observation runs faster than processing, defaulting to 2x the selected process cap (`48`, `60`, or `120` fps) unless `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` overrides it.
 - Video processing samples the latest visible Chrome window frame at the selected GUI cap, or `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS` before the GUI setting is loaded. Default: `24`.
 - The mpv live feed repeats the latest processed frame at the selected cap for steadier display cadence. `HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS` can lower that feed, but values above process FPS are capped to avoid uneven duplicate cadence.
@@ -398,7 +398,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
   - existing `.gui_prefs.json` settings still win, so local user choices are preserved
 
 - **Pane-aware playback upscale**
-  - the `Resolution` control selects model processing size (`2160p`, `1440p`, `1080p`, `720p`, `540p`, or source-limited fallback); every preset above the source size is hidden, so a 720p source only offers 720p/540p
+  - the `Resolution` control selects model processing size (`1080p`, `720p`, `540p`, or source-limited fallback); every preset above the source size is hidden, so a 720p source only offers 720p/540p
   - the HDR pane's actual drawable size drives the upscale target, so fullscreen-with-UI and side-by-side do not request full-monitor upscale unless the pane itself fills that space
   - hide-UI fullscreen naturally becomes monitor-sized because the HDR pane fills the display
   - while UI is hidden, the playhead, `Show UI`, and performance metrics appear together as a temporary overlay when the cursor moves, then fade back out
@@ -527,7 +527,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 | **TensorRT engine cache** | NVIDIA engines are built on demand per model/resolution/mode and reused from `src/models/engines/` |
 | **Clear TensorRT engine cache** | NVIDIA-only tool for deleting selected or all cached `.engine` files |
 | **PyTorch kernel compilation** | AMD can use Triton/torch.compile caches in a clean subprocess; caches are repo-local under `src/models/compile_cache/` and verified before reuse |
-| **Resolution + scaling** | Process at 2160p/1440p/1080p/720p/540p (source-capped when the video is smaller); playback uses **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** through a pane-aware target, so the upscale stage follows the HDR pane's actual drawable size |
+| **Resolution + scaling** | Process at 1080p/720p/540p (source-capped when the video is smaller); playback uses **EWA LanczosSharp**, **FSR**, or **SSimSuperRes** through a pane-aware target, so the upscale stage follows the HDR pane's actual drawable size |
 | **Single-frame processing path** | Temporal stabilization is disabled globally for more predictable playback/export cost and latency |
 | **Film grain** | Optional film grain restoration (mpv shader) |
 | **Video export** | Separate export dialog with native resolution/FPS defaults, independent model preset selection, and ProRes 422 HQ output |
@@ -549,7 +549,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 
 ```bash
 python src/gui.py --video input.mp4 --resolution 720p --precision FP16 --view Tabbed --autoplay 1 --start-frame 1200 --use-hg 1 --film-grain 1 --hdr-gt hdr_reference.mkv
-python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1440p --precision "INT8 Mixed (QAT)" --use-hg 0
+python src/gui.py --source-mode window_capture --live-fps 30 --resolution 1080p --precision "INT8 Mixed (QAT)" --use-hg 0
 ```
 
 ### Objective Metrics (PSNR / SSIM / DeltaEITP / HDR-VDP3)
@@ -722,10 +722,10 @@ TensorRT engines are not universal binaries. The same checkpoint and command can
 The GUI creates the TensorRT engine only when the user activates a mode whose engine is missing. You can also pre-build NVIDIA engines manually:
 
 ```bash
-python src/build_tensorrt_engines.py 3840x2160 --precision fp16 --use-hg 1 --benchmark-runs 20
-python src/build_tensorrt_engines.py 3840x2160 --precision int8-mixed-qat --use-hg 0 --benchmark-runs 20
-python src/build_tensorrt_engines.py 3840x2160 --precision int8-mixed-qat --use-hg 1 --benchmark-runs 20
-python src/build_tensorrt_engines.py 3840x2160 --precision int8-full-qat --use-hg 1 --benchmark-runs 10
+python src/build_tensorrt_engines.py 1920x1080 --precision fp16 --use-hg 1 --benchmark-runs 20
+python src/build_tensorrt_engines.py 1920x1080 --precision int8-mixed-qat --use-hg 0 --benchmark-runs 20
+python src/build_tensorrt_engines.py 1920x1080 --precision int8-mixed-qat --use-hg 1 --benchmark-runs 20
+python src/build_tensorrt_engines.py 1920x1080 --precision int8-full-qat --use-hg 1 --benchmark-runs 10
 python src/build_tensorrt_engines.py 1920x1080 --precision fp8-mixed-qat --use-hg 0 --benchmark-runs 20
 ```
 
@@ -767,9 +767,9 @@ One-line 1080p mpv playback commands:
 .\venv\Scripts\python.exe src\cli_playback_benchmark.py --video "$VIDEO" --resolutions 1920x1080 --runs fp32 fp16 int8-mixed-ptq int8-full-ptq int8-mixed-qat int8-full-qat --use-hg 0 --duration-s 180 --warmup-frames 120 --sample-interval 120 --display --display-backend mpv --wall-clock --playback-mode realtime --loop-source --out-root logs\playback_sessions\cli_original_mpv_nohg
 ```
 
-Use `--use-hg 0` to benchmark HR/no-HG. Add `2560x1440` or `3840x2160` after `--resolutions` when the source video is at least that large. The script writes GUI-style playback logs under the selected `--out-root`, includes mpv display/feed cost in `render_ms` and total latency, and reports catch-up drops when realtime playback cannot keep up.
+Use `--use-hg 0` to benchmark HR/no-HG. The app-supported processing presets are 960x540, 1280x720, and 1920x1080. The script writes GUI-style playback logs under the selected `--out-root`, includes mpv display/feed cost in `render_ms` and total latency, and reports catch-up drops when realtime playback cannot keep up.
 
-On NVIDIA, missing TensorRT engines are built on first use before the timed playback window. On RTX 50/Blackwell-class GPUs, the default ModelOpt path makes `--trt-qdq-fusion native` export explicit Q/DQ and lets TensorRT fuse it natively. On older NVIDIA GPUs, the default native-implicit INT8 path uses TensorRT calibration instead; calibration defaults to the benchmark video unless you pass `--trt-calibration-dataset` or `--trt-calibration-cache`. Set `HDRTVNET_TRT_INT8_MODELOPT=1|0` to force either behavior.
+On NVIDIA, missing TensorRT engines are built on first use before the timed playback window. On RTX 50/Blackwell-class GPUs, the default ModelOpt path makes `--trt-qdq-fusion native` export explicit Q/DQ and lets TensorRT fuse it natively. On older NVIDIA GPUs, the default native-implicit INT8 path first looks for a shipped `.calib` file under `src/models/tensorrt_calibration/`; if none exists, pass `--trt-calibration-dataset`, `--trt-calibration-cache`, or `--trt-calibration-frames` for an explicit local calibration source. Set `HDRTVNET_TRT_INT8_MODELOPT=1|0` to force either behavior.
 
 **AMD PyTorch**
 
@@ -954,9 +954,9 @@ On NVIDIA, the selected INT8 preset maps to an original-family TensorRT source c
 
 The RTX 50/Blackwell default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly.
 
-For the native-implicit INT8 path, now the default on pre-RTX-50 NVIDIA GPUs unless `HDRTVNET_TRT_INT8_MODELOPT=1` is set, calibration still uses SDR/source inputs that match deployment content, not HDR targets. CLI and matrix tools accept `--trt-calibration-dataset` / `--calibration-dataset` for image directories, single images, or text manifests, plus `--trt-calibration-cache` / `--calibration-cache` for a prebuilt TensorRT cache. If no cache or dataset is provided, CLI playback can calibrate from the current video for first-time local engine builds.
+For the native-implicit INT8 path, now the default on pre-RTX-50 NVIDIA GPUs unless `HDRTVNET_TRT_INT8_MODELOPT=1` is set, calibration still uses SDR/source inputs that match deployment content, not HDR targets. CLI and matrix tools accept `--trt-calibration-dataset` / `--calibration-dataset` for image directories, single images, or text manifests, plus `--trt-calibration-cache` / `--calibration-cache` for a prebuilt TensorRT cache. When the matching shipped cache exists, GUI playback/export/benchmark and the CLI benchmark use it by default instead of recalibrating from the current video.
 
-Legacy prebuilt calibration caches live under `src/models/tensorrt_calibration/` and are ignored by git. To generate a native-implicit GUI matrix on an NVIDIA machine:
+Shipped native-implicit calibration caches live under `src/models/tensorrt_calibration/` and are tracked by git. To regenerate the native-implicit GUI matrix on an NVIDIA machine:
 
 ```powershell
 py scripts/build_tensorrt_calibration_caches.py `

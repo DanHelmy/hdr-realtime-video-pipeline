@@ -24,8 +24,8 @@ from gui_window_utils import configure_independent_window
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-_DEFAULT_MAX_W = 3840
-_DEFAULT_MAX_H = 2160
+_DEFAULT_MAX_W = 1920
+_DEFAULT_MAX_H = 1080
 
 
 def _default_quality_trials() -> int:
@@ -218,9 +218,7 @@ class _PrecompileOptionsDialog(QDialog):
 
         self._res_combo = QComboBox()
         res_options = [
-            (f"2160p ({max_w}x{max_h})", f"{max_w}x{max_h}", "2160p"),
-            ("1440p (2560x1440)", "2560x1440", "1440p"),
-            ("1080p (1920x1080)", "1920x1080", "1080p"),
+            (f"1080p ({max_w}x{max_h})", f"{max_w}x{max_h}", "1080p"),
             ("720p (1280x720)", "1280x720", "720p"),
             ("540p (960x540)", "960x540", "540p"),
         ]

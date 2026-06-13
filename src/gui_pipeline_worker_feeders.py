@@ -217,7 +217,7 @@ def _tensor_to_rgb48_bytes(tensor, host_state: dict):
             non_blocking = bool(host_tensor.is_pinned())
         except Exception:
             non_blocking = False
-        # Keep the 4K RGB48 conversion off the inference stream and reuse the
+        # Keep the RGB48 conversion off the inference stream and reuse the
         # large staging tensors. Reallocating these every frame causes periodic
         # GUI-only latency spikes even when the TensorRT engine itself is flat.
         with torch.cuda.device(rgb.device), torch.cuda.stream(stream):

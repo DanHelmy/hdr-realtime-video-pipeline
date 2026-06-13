@@ -21,11 +21,24 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# This script only builds native-implicit TensorRT INT8 calibration caches.
+# Keep it independent from the runtime GPU-generation default, which may use
+# ModelOpt/QDQ on RTX 50-class systems.
+os.environ.setdefault("HDRTVNET_TRT_INT8_MODELOPT", "0")
+
 from windows_runtime import ensure_windows_supported
 
 ensure_windows_supported("HDRTVNet++ TensorRT calibration cache builder")
 
-from gui_config import MAX_H, MAX_W, PRECISIONS, RESOLUTION_SCALES, _select_model_path
+from gui_config import (
+    MAX_H,
+    MAX_W,
+    PRECISIONS,
+    RESOLUTION_SCALES,
+    _precision_engine_mode_base,
+    _select_hg_weights_path,
+    _select_tensorrt_model_path,
+)
 from models.hdrtvnet_torch import (
     HDRTVNetTensorRT,
     build_tensorrt_native_int8_speed_calibration_cache,
@@ -189,12 +202,18 @@ def main() -> int:
         cfg = PRECISIONS[precision_key]
         model_precision = str(cfg.get("precision") or "")
         for use_hg in hg_states:
-            model_path = os.path.abspath(_select_model_path(precision_key, use_hg))
+            model_path = os.path.abspath(_select_tensorrt_model_path(precision_key, use_hg))
             if not os.path.isfile(model_path):
                 print(f"[calib] missing model: {model_path}", flush=True)
                 failures += 1
                 continue
-            mode_name = f"{precision_key}_{'hg' if use_hg else 'nohg'}"
+            hg_weights = None
+            if use_hg:
+                candidate_hg = _select_hg_weights_path(precision_key, tensorrt=True)
+                if candidate_hg and os.path.isfile(candidate_hg):
+                    hg_weights = os.path.abspath(candidate_hg)
+            mode_base = _precision_engine_mode_base(precision_key)
+            mode_name = f"{mode_base}_{'hg' if use_hg else 'nohg'}"
             for res_key in resolutions:
                 width, height = _resolution_dims(res_key)
                 cache_path = tensorrt_prebuilt_calibration_cache_path(
@@ -245,6 +264,7 @@ def main() -> int:
                             calibration_dataset=None if video else dataset,
                             calibration_video=video,
                             calibration_frames=args.calibration_frames,
+                            hg_weights=hg_weights,
                             protect_agcm=True,
                         )
                         print(
@@ -275,6 +295,7 @@ def main() -> int:
                             qdq_fusion="native",
                             keep_onnx=args.keep_onnx,
                             force_onnx=args.force,
+                            hg_weights=hg_weights,
                         )
                         print(
                             "[calib] wrote qparam cache: "
@@ -321,6 +342,7 @@ def main() -> int:
                         engine_width=width,
                         engine_height=height,
                         mode_name=mode_name,
+                        hg_weights=hg_weights,
                         use_hg=use_hg,
                         predequantize=False,
                         qdq_fusion="native",
