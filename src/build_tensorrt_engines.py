@@ -297,10 +297,8 @@ def main() -> int:
         default="native",
         choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
         help=(
-            "TensorRT INT8 export mode. With ModelOpt enabled, 'native' means "
-            "explicit Q/DQ export with TensorRT's native Q/DQ fusion. If "
-            "ModelOpt is disabled, it falls back to legacy implicit/native "
-            "TensorRT calibration. Default: native. "
+            "TensorRT INT8 Q/DQ export mode. 'native' means explicit ModelOpt "
+            "Q/DQ export with TensorRT's native Q/DQ fusion. Default: native. "
             "'add' inserts Q/DQ on eligible Add inputs that already feed "
             "calibrated quantized paths; 'add-mul' also patches Mul inputs."
         ),
@@ -319,28 +317,28 @@ def main() -> int:
         "--calibration-dataset",
         default=None,
         help=(
-            "Directory/image/manifest of SDR input frames for TensorRT native "
-            "INT8 calibration. Takes priority over --calibration-video."
+            "Legacy native-implicit INT8 calibration input. Ignored by the "
+            "current ModelOpt/QDQ runtime."
         ),
     )
     parser.add_argument(
         "--calibration-video",
         default=None,
-        help="Video used for TensorRT native INT8 calibration.",
+        help="Legacy video source for native-implicit INT8 calibration.",
     )
     parser.add_argument(
         "--calibration-frames",
         type=int,
         default=None,
         help=(
-            "Number of frames/images for TensorRT native INT8 calibration. "
-            "Default: 64. Use 0 for all dataset/video frames."
+            "Legacy native-implicit calibration frame/image count. Ignored by "
+            "the current ModelOpt/QDQ runtime."
         ),
     )
     parser.add_argument(
         "--calibration-cache",
         default=None,
-        help="TensorRT native INT8 calibration cache path.",
+        help="Legacy native-implicit TensorRT INT8 calibration cache path.",
     )
     parser.add_argument(
         "--force",

@@ -58,7 +58,7 @@ Core updates include:
 - benchmark interaction lock so playback controls (and compare) are frozen while benchmarking is open
 - playback performance benchmarking uses the same interaction lock: normal playback is paused/locked while the realtime mpv benchmark owns the GPU/display path, then restored when the benchmark window closes
 - first-run GUI defaults are tuned for the balanced NVIDIA path: `INT8 Mixed (QAT)`, `1080p`, `FSR`, and HG off
-- NVIDIA INT8 now chooses the TensorRT export path by GPU generation: RTX 50/Blackwell-class devices default to the current ModelOpt Torch Q/DQ builds, while older NVIDIA GPUs default to native-implicit INT8 calibration unless `HDRTVNET_TRT_INT8_MODELOPT` is explicitly set
+- NVIDIA INT8 now uses the ModelOpt Torch/QDQ TensorRT path on all NVIDIA GPUs; legacy native-implicit `.calib` files remain in the repo only as rollback/reference artifacts
 - normal `FP16` / `FP32` use the original HR/HR+HG checkpoints; INT8 PTQ/QAT/QAT Film use matching original eager and TensorRT source checkpoints
 - current RTX 5060 Ti TensorRT/mpv 30-second stress checks on the Daredevil SDR clip: 1080p no-HG FP16 `34.23 ms`, Mixed QAT `30.68 ms`, Full QAT `29.96 ms`; 1080p HG FP16 `72.74 ms`, Mixed QAT `66.16 ms`, Full QAT `58.63 ms`; 720p no-HG remains FP16-favored (`15.64 ms` FP16 vs `18.44 ms` Mixed QAT) because the no-HG graph is small enough that INT8 overhead dominates
 - the final TensorRT sweep did not find a stable 25-28 ms mixed path; more aggressive AGCM quantization was faster by less than a millisecond but failed visual/temporal rolloff checks, so the stable LE/HG recipe remains the shipped mixed baseline. On the current RTX 5060 Ti HG path, strict Full QAT is the fastest INT8 preset while Mixed QAT remains the protected lower-risk composition.
@@ -711,7 +711,7 @@ The first time you play, export, or benchmark a given model/resolution/mode comb
 
 `src/models/engines/{model}_{resolution}_{mode}.engine`
 
-INT8 TensorRT modes choose their default build path from the CUDA GPU generation. RTX 50/Blackwell-class devices default to the versioned ModelOpt Torch/QDQ path: Mixed INT8 uses the runtime include mask, KL-divergence scoring, an `8.25` effective-bit target, and active-compute output quantizers so TensorRT does not inherit orphaned Q/DQ outputs, while Full INT8 turns every ModelOpt Torch quantizer on and disables FP16 tactics when FP16 islands are off. Older NVIDIA GPUs default to the native-implicit TensorRT INT8 path with calibration caches. You can force either path with `HDRTVNET_TRT_INT8_MODELOPT=1|0`. FP8 TensorRT modes use their own ModelOpt Torch FP8 suffix and are hidden unless `Tools -> FP8 Experimental Presets` is enabled on an RTX 40/50-class GPU.
+INT8 TensorRT modes use the versioned ModelOpt Torch/QDQ path on all NVIDIA GPUs. Mixed INT8 uses the runtime include mask, KL-divergence scoring, an `8.25` effective-bit target, and active-compute output quantizers so TensorRT does not inherit orphaned Q/DQ outputs, while Full INT8 turns every ModelOpt Torch quantizer on. Native-implicit TensorRT INT8 calibration is no longer selected by the app. FP8 TensorRT modes use their own ModelOpt Torch FP8 suffix and are hidden unless `Tools -> FP8 Experimental Presets` is enabled on an RTX 40/50-class GPU.
 
 If the engine is missing, the app loads the selected `.pt` model, exports a temporary ONNX file with the same model/resolution/mode stem, builds a TensorRT engine, saves it, removes the ONNX file, and then runs inference through that engine. Later runs load the `.engine` directly when the cached engine metadata still matches the model, resolution, precision, mode, TensorRT export settings, and CUDA device fingerprint.
 
@@ -740,7 +740,7 @@ Advanced TensorRT build environment overrides:
 - `HDRTVNET_TRT_TIMING_CACHE=path|none` changes or disables the shared timing cache.
 - `HDRTVNET_TRT_DEDICATED_STREAM=1|0` runs TensorRT enqueue on a non-default CUDA stream; default is `1`.
 - `HDRTVNET_TRT_AUX_STREAMS=N` optionally sets TensorRT build-time auxiliary stream count.
-- `HDRTVNET_TRT_INT8_MODELOPT=1|0` overrides the GPU-generation default: `1` forces ModelOpt Torch/QDQ INT8, `0` forces native-implicit TensorRT INT8 calibration.
+- `HDRTVNET_TRT_INT8_MODELOPT=1|0` is a legacy override and is ignored by current runtime builds; NVIDIA INT8 always uses ModelOpt Torch/QDQ.
 - `HDRTVNET_TRT_INT8_MODELOPT_TORCH_EFFECTIVE_BITS=8.25` adjusts the mixed INT8 ModelOpt target; lower values quantize more layers but can reintroduce highlight rolloff/flicker.
 - `HDRTVNET_TRT_INT8_MODELOPT_TORCH_METHOD=kl_div|gradient` changes mixed INT8 scoring; the shipped default is `kl_div`.
 - `HDRTVNET_TRT_INT8_MODELOPT_TORCH_OUTPUT_POLICY=active|include` controls mixed output Q/DQ. The shipped default is `active`, meaning output quantizers are enabled only for layers whose input/weight quantizers stayed active.
@@ -769,7 +769,7 @@ One-line 1080p mpv playback commands:
 
 Use `--use-hg 0` to benchmark HR/no-HG. The app-supported processing presets are 960x540, 1280x720, and 1920x1080. The script writes GUI-style playback logs under the selected `--out-root`, includes mpv display/feed cost in `render_ms` and total latency, and reports catch-up drops when realtime playback cannot keep up.
 
-On NVIDIA, missing TensorRT engines are built on first use before the timed playback window. On RTX 50/Blackwell-class GPUs, the default ModelOpt path makes `--trt-qdq-fusion native` export explicit Q/DQ and lets TensorRT fuse it natively. On older NVIDIA GPUs, the default native-implicit INT8 path first looks for a shipped `.calib` file under `src/models/tensorrt_calibration/`; if none exists, pass `--trt-calibration-dataset`, `--trt-calibration-cache`, or `--trt-calibration-frames` for an explicit local calibration source. Set `HDRTVNET_TRT_INT8_MODELOPT=1|0` to force either behavior.
+On NVIDIA, missing TensorRT engines are built on first use before the timed playback window. For INT8, `--trt-qdq-fusion native` exports explicit ModelOpt Q/DQ and lets TensorRT fuse it natively. Legacy `--trt-calibration-dataset`, `--trt-calibration-cache`, and `--trt-calibration-frames` arguments are ignored by the current ModelOpt/QDQ runtime.
 
 **AMD PyTorch**
 
@@ -912,7 +912,7 @@ Video Source → GPU Upload → GPU Preprocess → torch.compile Model → GPU P
 - Pre-allocated GPU tensor buffers (zero per-frame allocation)
 - Pinned (page-locked) host memory for async H2D/D2H DMA transfers
 - `torch.inference_mode()` throughout
-- NVIDIA TensorRT engines built on demand and cached per model/resolution/mode; INT8 defaults to ModelOpt Torch Q/DQ on RTX 50/Blackwell-class GPUs and native-implicit calibration on older NVIDIA GPUs
+- NVIDIA TensorRT engines built on demand and cached per model/resolution/mode; INT8 uses ModelOpt Torch/QDQ on all NVIDIA GPUs
 - AMD PyTorch tensors use contiguous memory format by default, with channels-last available as an opt-in test
 - Async video prefetch queue
 - mpv fast path: skips GPU→CPU postprocess when mpv handles HDR display
@@ -952,13 +952,13 @@ For thesis interpretation, treat quantization as more than compression. PTQ can 
 
 On AMD, INT8 modes include **pre-dequantization** for GPUs without native INT8 convolution support: INT8 weights are converted to FP16 once at load time, giving native FP16 speed with compressed checkpoint storage. The default `Auto` mode resolves to pre-dequantize-on for AMD.
 
-On NVIDIA, the selected INT8 preset maps to an original-family TensorRT source checkpoint. No-HG uses `src/models/weights/original/tensorrt/hr`; HG uses the composite-split HR source in `src/models/weights/original/tensorrt/hr_hg` plus the matching HG source in `src/models/weights/original/tensorrt/hg`. RTX 50/Blackwell-class GPUs default to **ModelOpt Torch**, which inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). Older NVIDIA GPUs default to native-implicit TensorRT INT8, using calibration caches from the same source checkpoints. In the ModelOpt path, no-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Both use KL-divergence scoring with an `8.25` effective-bit target and enable output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on in the ModelOpt path, while native-implicit INT8 uses the checkpoint policy/calibration cache to request the matching INT8 regions. FP8 presets use the same mixed/full layer composition and source families but emit FP8 E4M3 Q/DQ during TensorRT export; no eager FP8 checkpoints are shipped. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/original/pytorch_int8/hr` and `src/models/weights/original/pytorch_int8/hg`.
+On NVIDIA, the selected INT8 preset maps to an original-family TensorRT source checkpoint. No-HG uses `src/models/weights/original/tensorrt/hr`; HG uses the composite-split HR source in `src/models/weights/original/tensorrt/hr_hg` plus the matching HG source under `src/models/weights/original/tensorrt/hg`. The runtime uses **ModelOpt Torch**, which inserts Q/DQ from the same runtime composition used for PTQ, QAT, and QAT (Film). In the ModelOpt path, no-HG mixed includes `LE` and excludes `LE.conv_last`; HG mixed includes `base.LE` and `hg`, and excludes `base.LE.conv_last` and `hg.low_out`. AGCM remains FP16 in mixed mode because stress tests showed it adds instability without useful speed on RTX 50. Mixed uses KL-divergence scoring with an `8.25` effective-bit target and enables output quantizers only for layers whose compute quantizers stayed active. This keeps the fast INT8 region large while avoiding the orphaned-output Q/DQ pattern that caused temporal flicker and harsh highlight rolloff. Full INT8 is the strict baseline: selecting an `INT8 Full` preset forces every ModelOpt Torch quantizer on. FP8 presets use the same mixed/full layer composition and source families but emit FP8 E4M3 Q/DQ during TensorRT export; no eager FP8 checkpoints are shipped. Eager PyTorch/AMD INT8 deploy checkpoints live separately under `src/models/weights/original/pytorch_int8/hr` and `src/models/weights/original/pytorch_int8/hg`.
 
-The RTX 50/Blackwell default ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly.
+The ModelOpt Torch/QDQ TensorRT path does not use shipped TensorRT `.calib` files. ModelOpt performs its export-time calibration from the app's deterministic calibration loop, and TensorRT then consumes the Q/DQ graph directly.
 
-For the native-implicit INT8 path, now the default on pre-RTX-50 NVIDIA GPUs unless `HDRTVNET_TRT_INT8_MODELOPT=1` is set, calibration still uses SDR/source inputs that match deployment content, not HDR targets. CLI and matrix tools accept `--trt-calibration-dataset` / `--calibration-dataset` for image directories, single images, or text manifests, plus `--trt-calibration-cache` / `--calibration-cache` for a prebuilt TensorRT cache. When the matching shipped cache exists, GUI playback/export/benchmark and the CLI benchmark use it by default instead of recalibrating from the current video.
+Legacy native-implicit `.calib` files are still tracked under `src/models/tensorrt_calibration/` so a rollback branch can restore that path without regenerating data. The current runtime does not select them automatically, and calibration CLI options are retained only for legacy tooling.
 
-Shipped native-implicit calibration caches live under `src/models/tensorrt_calibration/` and are tracked by git. To regenerate the native-implicit GUI matrix on an NVIDIA machine:
+To regenerate the legacy native-implicit GUI matrix on a rollback branch:
 
 ```powershell
 py scripts/build_tensorrt_calibration_caches.py `
@@ -967,7 +967,7 @@ py scripts/build_tensorrt_calibration_caches.py `
   --force
 ```
 
-This builds the 36 INT8 GUI cache files: 6 INT8 presets x 3 GUI resolutions x HG on/off. `--calibration-frames 0` means all available calibration images/frames; positive values such as `256` use deterministic content-ranked image selection for a faster representative subset. Rebuild or delete cached `.engine` files whenever replacing `.calib` files; engine metadata fingerprints the calibration cache contents so changed caches invalidate stale engines automatically.
+This builds the 36 legacy INT8 GUI cache files: 6 INT8 presets x 3 GUI resolutions x HG on/off. `--calibration-frames 0` means all available calibration images/frames; positive values such as `256` use deterministic content-ranked image selection for a faster representative subset.
 
 ---
 
@@ -1202,7 +1202,7 @@ AMD and CPU do not use TensorRT source files. They load the eager checkpoints fr
 | Engine/cache behavior | On-demand `.engine` build + cached load | `torch.compile` cache when enabled | N/A |
 | torch.compile | Not used | Auto (Windows: needs HIP SDK) | Not supported |
 | FP16 inference | ✅ | ✅ | Fallback to FP32 |
-| INT8 quantization | GPU-generation default: RTX 50/Blackwell uses ModelOpt Torch Q/DQ, older NVIDIA uses native-implicit INT8 with `.calib`; `HDRTVNET_TRT_INT8_MODELOPT=1|0` overrides | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
+| INT8 quantization | ModelOpt Torch/QDQ TensorRT path on all NVIDIA GPUs; legacy `.calib` files are retained only for rollback/reference | ✅ (compression/pre-dequantized FP16 path) | ✅ (compression only) |
 | CUDA graphs | Not used | ✅ | N/A |
 | channels_last | Not used in TensorRT engine runtime | Opt-in on AMD PyTorch | N/A |
 

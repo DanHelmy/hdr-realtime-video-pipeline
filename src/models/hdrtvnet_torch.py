@@ -70,6 +70,7 @@ _PORTABLE_INT8_STATE_FORMAT = "native_fp32"
 _FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
 _TENSORRT_CALIBRATION_IMAGE_SCORE_CACHE: dict[tuple[str, int, int], tuple[float, int]] = {}
 _TENSORRT_SOURCE_SIGNATURE_CACHE: str | None = None
+_TENSORRT_INT8_MODELOPT_OVERRIDE_WARNED = False
 
 _HAS_COMPILE = hasattr(torch, "compile")          # PyTorch >= 2.0
 _HAS_CUDA_GRAPHS = hasattr(torch.cuda, "CUDAGraph")  # PyTorch >= 1.10
@@ -3202,10 +3203,15 @@ def _tensorrt_rtx50_or_newer_default() -> bool:
 
 
 def _tensorrt_int8_modelopt_enabled() -> bool:
-    return _env_bool(
-        "HDRTVNET_TRT_INT8_MODELOPT",
-        _tensorrt_rtx50_or_newer_default(),
-    )
+    global _TENSORRT_INT8_MODELOPT_OVERRIDE_WARNED
+    if os.environ.get("HDRTVNET_TRT_INT8_MODELOPT") is not None:
+        if not _TENSORRT_INT8_MODELOPT_OVERRIDE_WARNED:
+            print(
+                "TensorRT INT8 ModelOpt override ignored: native-implicit INT8 "
+                "has been removed; ModelOpt Q/DQ is always used."
+            )
+            _TENSORRT_INT8_MODELOPT_OVERRIDE_WARNED = True
+    return _IS_NVIDIA
 
 
 def _tensorrt_int8_modelopt_torch_enabled() -> bool:
@@ -4391,14 +4397,16 @@ def tensorrt_prebuilt_calibration_cache_path(
     calibration_dir: str | None = None,
     require_exists: bool = True,
 ) -> str | None:
-    """Return the shipped TensorRT native-INT8 calibration cache path.
+    """Return the legacy shipped TensorRT native-INT8 calibration cache path.
 
     The filename mirrors the engine stem so each checkpoint/resolution/mode
     combination can have its own cache without a separate manifest.
     """
-    if not str(precision or "").startswith("int8"):
-        return None
+    # Native/implicit INT8 is no longer used by the runtime. Keep this helper
+    # only for legacy calibration tooling and existing cache-file inspection.
     if _tensorrt_int8_modelopt_enabled():
+        return None
+    if not str(precision or "").startswith("int8"):
         return None
     predeq = _resolve_tensorrt_predequantize(precision, predequantize)
     if predeq:
@@ -8372,9 +8380,9 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                     "then inserting explicit INT8 Q/DQ for TensorRT"
                 )
         elif self._trt_direct_fp_int8:
-            print(
-                "TensorRT native INT8: exporting the FP16 AGCM_LE model and "
-                "letting TensorRT choose native INT8 tactics"
+            raise RuntimeError(
+                "TensorRT native-implicit INT8 has been removed. "
+                "Use the ModelOpt Q/DQ INT8 path."
             )
         if getattr(self, "_trt_used_prebuilt_calibration_cache", False):
             print(
@@ -8657,19 +8665,18 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             except Exception as exc:
                 print(f"TensorRT profiling verbosity skipped: {exc}")
 
-        platform_has_fast_fp16 = bool(
-            getattr(builder, "platform_has_fast_fp16", True)
-        )
-        platform_has_fast_int8 = bool(
-            getattr(builder, "platform_has_fast_int8", True)
-        )
-        platform_has_fast_fp8 = bool(
-            getattr(builder, "platform_has_fast_fp8", True)
-        )
+        platform_has_fast_fp16 = bool(getattr(builder, "platform_has_fast_fp16", True))
+        platform_has_fast_int8 = bool(getattr(builder, "platform_has_fast_int8", True))
+        platform_has_fast_fp8 = bool(getattr(builder, "platform_has_fast_fp8", True))
+        builder_flags = getattr(trt, "BuilderFlag", object)
+        fp16_flag = getattr(builder_flags, "FP16", None)
+        int8_flag = getattr(builder_flags, "INT8", None)
+        fp8_flag = getattr(builder_flags, "FP8", None)
         if (
             builder_precision != "fp32"
             and not strongly_typed
             and platform_has_fast_fp16
+            and fp16_flag is not None
             and (
                 _tensorrt_fp16_enabled()
                 and (
@@ -8679,14 +8686,18 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 )
             )
         ):
-            config.set_flag(trt.BuilderFlag.FP16)
+            config.set_flag(fp16_flag)
+        elif builder_precision != "fp32" and not strongly_typed and fp16_flag is None:
+            print(
+                "TensorRT FP16 builder flag unavailable; relying on exported "
+                "ONNX tensor types."
+            )
         if builder_precision.startswith("int8-full"):
             if _tensorrt_full_int8_fp16_islands_enabled():
                 print("TensorRT full INT8 safety: FP16 islands enabled")
             else:
                 print("TensorRT full INT8 safety: all-out INT8, FP16 tactics disabled")
         if builder_precision.startswith("fp8") and not strongly_typed:
-            fp8_flag = getattr(getattr(trt, "BuilderFlag", object), "FP8", None)
             if fp8_flag is None:
                 raise RuntimeError(
                     "TensorRT FP8 BuilderFlag is unavailable. Install a TensorRT "
@@ -8700,7 +8711,12 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             config.set_flag(fp8_flag)
             print("TensorRT FP8 builder flag enabled")
         if native_int8 and platform_has_fast_int8:
-            config.set_flag(trt.BuilderFlag.INT8)
+            if int8_flag is None:
+                raise RuntimeError(
+                    "TensorRT native-implicit INT8 is unavailable in this "
+                    "TensorRT runtime. Use ModelOpt Q/DQ INT8 instead."
+                )
+            config.set_flag(int8_flag)
             if native_int8:
                 cache_path = _tensorrt_calibration_cache_path(
                     self.engine_path,

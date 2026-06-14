@@ -1370,10 +1370,8 @@ def parse_args():
         default="native",
         choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
         help=(
-            "TensorRT INT8 export mode. With ModelOpt enabled, 'native' means "
-            "explicit ModelOpt Q/DQ export with TensorRT's native Q/DQ fusion. "
-            "If ModelOpt is disabled, it falls back to legacy implicit/native "
-            "TensorRT calibration. Default: native."
+            "TensorRT INT8 Q/DQ export mode. 'native' means explicit ModelOpt "
+            "Q/DQ export with TensorRT's native Q/DQ fusion. Default: native."
         ),
     )
     parser.add_argument(
@@ -1390,22 +1388,22 @@ def parse_args():
         "--trt-calibration-dataset",
         default=None,
         help=(
-            "Directory/image/manifest of SDR input frames for TensorRT native "
-            "INT8 calibration. Defaults to the benchmark video."
+            "Legacy TensorRT native-implicit INT8 calibration input. Ignored by "
+            "the current ModelOpt/QDQ runtime."
         ),
     )
     parser.add_argument(
         "--trt-calibration-cache",
         default=None,
-        help="TensorRT native INT8 calibration cache path.",
+        help="Legacy TensorRT native-implicit INT8 calibration cache path.",
     )
     parser.add_argument(
         "--trt-calibration-frames",
         type=int,
         default=64,
         help=(
-            "Frame/image count for TensorRT native INT8 calibration. "
-            "Default: 64. Use 0 for all dataset/video frames."
+            "Legacy native-implicit calibration frame/image count. Ignored by "
+            "the current ModelOpt/QDQ runtime."
         ),
     )
     parser.add_argument(

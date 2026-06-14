@@ -185,22 +185,22 @@ def main() -> int:
         "--video",
         default=None,
         help=(
-            "Optional video for CLI playback benchmark. Engine builds use a "
-            "prebuilt .calib by default unless calibration inputs are provided."
+            "Optional video for CLI playback benchmark. INT8 engine builds use "
+            "ModelOpt/QDQ; legacy .calib files are not used by default."
         ),
     )
     parser.add_argument(
         "--calibration-dataset",
         default=None,
         help=(
-            "Directory/image/manifest of SDR input frames for TensorRT native "
-            "INT8 calibration. Takes priority over prebuilt .calib files."
+            "Legacy native-implicit INT8 calibration input. Ignored by the "
+            "current ModelOpt/QDQ runtime."
         ),
     )
     parser.add_argument(
         "--calibration-cache",
         default=None,
-        help="TensorRT native INT8 calibration cache path.",
+        help="Legacy native-implicit TensorRT INT8 calibration cache path.",
     )
     parser.add_argument("--duration-s", type=float, default=90.0)
     parser.add_argument("--warmup-frames", type=int, default=60)
@@ -218,22 +218,21 @@ def main() -> int:
         default="native",
         choices=["native", "auto", "none", "add", "add-mul", "elementwise"],
         help=(
-            "TensorRT INT8 mode. 'native' uses plain ONNX layers plus TensorRT "
-            "PTQ calibration; other values use explicit Q/DQ. Default: native."
+            "TensorRT INT8 Q/DQ mode. 'native' uses explicit ModelOpt Q/DQ "
+            "with TensorRT native Q/DQ fusion. Default: native."
         ),
     )
     parser.add_argument(
         "--calibration-frames",
         type=int,
         default=64,
-        help="Frame count for TensorRT native INT8 calibration. Default: 64. Use 0 for all.",
+        help="Legacy native-implicit calibration frame count. Ignored by ModelOpt/QDQ.",
     )
     parser.add_argument(
         "--calibrate-from-video",
         action="store_true",
         help=(
-            "Use --video as the TensorRT calibration source when no dataset/cache "
-            "is provided. By default, --video is only used for playback benchmark."
+            "Legacy native-implicit option. Current ModelOpt/QDQ builds ignore it."
         ),
     )
     parser.add_argument("--force", action="store_true", help="Force rebuild engines.")
