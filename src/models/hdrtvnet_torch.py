@@ -2653,11 +2653,27 @@ def _tensorrt_expected_engine_metadata(
 ) -> dict[str, object]:
     model_path = tensorrt_source_checkpoint_path(model_path)
     hg_path = hg_weights or _DEFAULT_HG_WEIGHTS
-    aux_streams = _tensorrt_aux_stream_count()
     resolved_qdq_fusion = _resolve_tensorrt_qdq_fusion(precision, qdq_fusion)
+    native_implicit_int8 = (
+        str(precision).startswith("int8")
+        and resolved_qdq_fusion == "native"
+        and not _tensorrt_int8_modelopt_enabled()
+    )
+    aux_streams = _tensorrt_aux_stream_count(native_implicit_int8)
     fp16_builder_enabled = _tensorrt_fp16_enabled()
     condition_free_single_input = _tensorrt_condition_free_arch_enabled_for_checkpoint(
         model_path
+    )
+    native_int8_auto_build = (
+        _tensorrt_native_int8_auto_build_settings()
+        if native_implicit_int8
+        else {
+            "vram_gb": _cuda_total_vram_gb(),
+            "opt_level": _tensorrt_builder_optimization_level(False),
+            "workspace_gb": _tensorrt_workspace_gb(False),
+            "aux_streams": aux_streams,
+            "applied": False,
+        }
     )
     effective_modelopt_torch = _tensorrt_lowp_modelopt_torch_effective_enabled(
         precision,
@@ -2706,11 +2722,14 @@ def _tensorrt_expected_engine_metadata(
             "device": _cuda_device_fingerprint(),
         },
         "build": {
-            "builder_optimization_level": _tensorrt_builder_optimization_level(),
+            "builder_optimization_level": _tensorrt_builder_optimization_level(
+                native_implicit_int8
+            ),
             "fp16_enabled": fp16_builder_enabled,
             "condition_free_single_input": condition_free_single_input,
-            "workspace_gb": _tensorrt_workspace_gb(),
+            "workspace_gb": _tensorrt_workspace_gb(native_implicit_int8),
             "aux_streams": aux_streams,
+            "native_int8_auto_build": native_int8_auto_build,
         },
     }
     if str(precision).startswith("int8"):
@@ -3061,7 +3080,68 @@ def _tensorrt_timing_cache_path():
     return os.path.join(_engine_cache_dir(), "tensorrt_timing.cache")
 
 
-def _tensorrt_builder_optimization_level() -> int:
+def _cuda_total_vram_gb() -> float | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        total = float(torch.cuda.get_device_properties(0).total_memory)
+    except Exception:
+        return None
+    if total <= 0.0:
+        return None
+    return total / float(1024 ** 3)
+
+
+def _tensorrt_native_int8_auto_build_settings() -> dict[str, object]:
+    total_gb = _cuda_total_vram_gb()
+    if total_gb is None:
+        return {
+            "vram_gb": None,
+            "opt_level": 5,
+            "workspace_gb": None,
+            "aux_streams": None,
+            "applied": False,
+        }
+    if total_gb <= 6.5:
+        opt_level, workspace_gb, aux_streams = 3, 1.5, 0
+    elif total_gb <= 8.5:
+        opt_level, workspace_gb, aux_streams = 4, 2.0, 0
+    elif total_gb <= 12.5:
+        opt_level, workspace_gb, aux_streams = 5, 3.0, 0
+    else:
+        opt_level, workspace_gb, aux_streams = 5, None, None
+    return {
+        "vram_gb": total_gb,
+        "opt_level": opt_level,
+        "workspace_gb": workspace_gb,
+        "aux_streams": aux_streams,
+        "applied": bool(opt_level != 5 or workspace_gb is not None or aux_streams is not None),
+    }
+
+
+def _tensorrt_build_env_overrides_present() -> bool:
+    for name in (
+        "HDRTVNET_TRT_BUILDER_OPT_LEVEL",
+        "HDRTVNET_TRT_WORKSPACE_GB",
+        "HDRTVNET_TRT_AUX_STREAMS",
+    ):
+        value = os.environ.get(name)
+        if value is not None and str(value).strip() != "":
+            return True
+    return False
+
+
+def _tensorrt_builder_optimization_level(native_int8: bool = False) -> int:
+    override = os.environ.get("HDRTVNET_TRT_BUILDER_OPT_LEVEL")
+    if override is not None and str(override).strip() != "":
+        try:
+            value = int(override)
+        except Exception:
+            value = 5
+        return min(5, max(0, value))
+    if native_int8:
+        value = int(_tensorrt_native_int8_auto_build_settings().get("opt_level", 5))
+        return min(5, max(0, value))
     try:
         value = int(os.environ.get("HDRTVNET_TRT_BUILDER_OPT_LEVEL", "5"))
     except Exception:
@@ -3069,9 +3149,12 @@ def _tensorrt_builder_optimization_level() -> int:
     return min(5, max(0, value))
 
 
-def _tensorrt_aux_stream_count():
+def _tensorrt_aux_stream_count(native_int8: bool = False):
     value = os.environ.get("HDRTVNET_TRT_AUX_STREAMS")
     if value is None or str(value).strip() == "":
+        if native_int8:
+            auto_value = _tensorrt_native_int8_auto_build_settings().get("aux_streams")
+            return None if auto_value is None else max(0, int(auto_value))
         return None
     try:
         return max(0, int(value))
@@ -3079,9 +3162,12 @@ def _tensorrt_aux_stream_count():
         return None
 
 
-def _tensorrt_workspace_gb() -> float | None:
+def _tensorrt_workspace_gb(native_int8: bool = False) -> float | None:
     value = os.environ.get("HDRTVNET_TRT_WORKSPACE_GB")
     if value is None or str(value).strip() == "":
+        if native_int8:
+            auto_value = _tensorrt_native_int8_auto_build_settings().get("workspace_gb")
+            return None if auto_value is None else float(auto_value)
         return None
     text = str(value).strip().lower()
     if text in {"0", "none", "unlimited", "default", "auto"}:
@@ -8516,8 +8602,28 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
                 errors.append(str(parser.get_error(i)))
             raise RuntimeError("ONNX parse failed:\n" + "\n".join(errors))
 
+        native_int8 = (
+            builder_precision.startswith("int8")
+            and self._trt_qdq_fusion == "native"
+            and not getattr(self, "_trt_modelopt_int8", False)
+        )
+        if native_int8:
+            auto_settings = _tensorrt_native_int8_auto_build_settings()
+            if (
+                bool(auto_settings.get("applied"))
+                and not _tensorrt_build_env_overrides_present()
+            ):
+                vram_gb = auto_settings.get("vram_gb")
+                vram_label = "unknown" if vram_gb is None else f"{float(vram_gb):.1f} GiB"
+                print(
+                    "TensorRT native INT8 auto build policy: "
+                    f"VRAM={vram_label}, opt={auto_settings.get('opt_level')}, "
+                    f"workspace={auto_settings.get('workspace_gb')} GiB, "
+                    f"aux_streams={auto_settings.get('aux_streams')}"
+                )
+
         config = builder.create_builder_config()
-        workspace_gb = _tensorrt_workspace_gb()
+        workspace_gb = _tensorrt_workspace_gb(native_int8)
         if workspace_gb is not None:
             workspace_bytes = int(max(1.0, workspace_gb) * (1024 ** 3))
             if hasattr(config, "set_memory_pool_limit"):
@@ -8528,7 +8634,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
         else:
             print("TensorRT workspace limit: TensorRT default")
 
-        opt_level = _tensorrt_builder_optimization_level()
+        opt_level = _tensorrt_builder_optimization_level(native_int8)
         if hasattr(config, "builder_optimization_level"):
             try:
                 config.builder_optimization_level = opt_level
@@ -8536,7 +8642,7 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             except Exception as exc:
                 print(f"TensorRT builder optimization level skipped: {exc}")
 
-        aux_streams = _tensorrt_aux_stream_count()
+        aux_streams = _tensorrt_aux_stream_count(native_int8)
         if aux_streams is not None and hasattr(config, "max_aux_streams"):
             try:
                 config.max_aux_streams = aux_streams
@@ -8551,11 +8657,6 @@ class HDRTVNetTensorRT(HDRTVNetTorch):
             except Exception as exc:
                 print(f"TensorRT profiling verbosity skipped: {exc}")
 
-        native_int8 = (
-            builder_precision.startswith("int8")
-            and self._trt_qdq_fusion == "native"
-            and not getattr(self, "_trt_modelopt_int8", False)
-        )
         platform_has_fast_fp16 = bool(
             getattr(builder, "platform_has_fast_fp16", True)
         )
