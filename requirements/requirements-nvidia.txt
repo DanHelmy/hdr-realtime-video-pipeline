@@ -15,6 +15,6 @@ nvidia-modelopt[onnx]>=0.44.0
 triton-windows
 huggingface_hub>=0.24
 requests>=2.32
-tensorrt_cu12==10.16.1.11
-tensorrt_cu12_bindings==10.16.1.11
-tensorrt_cu12_libs==10.16.1.11
+tensorrt_cu13==11.0.0.114
+tensorrt_cu13_bindings==11.0.0.114
+tensorrt_cu13_libs==11.0.0.114

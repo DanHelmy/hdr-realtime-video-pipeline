@@ -844,7 +844,7 @@ Equivalent setup scripts:
 ```
 NVIDIA uses TensorRT for inference. PyTorch is still required to load `.pt` / `.pth` checkpoints and export temporary ONNX artifacts during first-time model/resolution/mode builds. A full CUDA Toolkit 13.3 install is required on NVIDIA systems so ModelOpt/Torch extension builds can find `nvcc.exe`. `triton-windows` is installed for ModelOpt/Torch quantization helpers on Windows; TensorRT playback itself does not depend on Triton kernels.
 
-The NVIDIA requirement file installs PyTorch from the CUDA 13.0 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `nvidia-modelopt[onnx]>=0.44.0`, `triton-windows`, `tensorrt_cu12_bindings==10.16.1.11`, and `tensorrt_cu12_libs==10.16.1.11`. The Python import name remains `tensorrt`; the split package names are NVIDIA's TensorRT wheel names.
+The NVIDIA requirement file installs PyTorch from the CUDA 13.0 wheel index, then pulls `onnx>=1.16`, `onnxscript>=0.1.0`, `nvidia-modelopt[onnx]>=0.44.0`, `triton-windows`, `tensorrt_cu13==11.0.0.114`, `tensorrt_cu13_bindings==11.0.0.114`, and `tensorrt_cu13_libs==11.0.0.114`. The Python import name remains `tensorrt`; the split package names are NVIDIA's TensorRT wheel names.
 
 `setup.bat` / `scripts/setup_nvidia.ps1` performs a post-install NVIDIA runtime check:
 
@@ -857,6 +857,8 @@ The NVIDIA requirement file installs PyTorch from the CUDA 13.0 wheel index, the
 - `tensorrt_libs`
 - `tensorrt` import
 - TensorRT builder creation
+
+The GUI launcher and GUI startup path also validate the NVIDIA Python runtime. If PyTorch CUDA, TensorRT, or stale TensorRT package families do not match the pinned NVIDIA requirements, the app tells the user to run `setup.bat` again before continuing.
 
 Install CUDA Toolkit 13.3 from NVIDIA or winget before running the NVIDIA backend:
 

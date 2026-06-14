@@ -85,6 +85,39 @@ print("HDRTVNET_GUI_IMPORT_OK")
     }
 }
 
+function Test-NvidiaRuntime([string]$PythonExe, [string]$Repo) {
+    $checkScript = Join-Path $Repo "src\nvidia_runtime_check.py"
+    if (-not (Test-Path $checkScript)) {
+        return @{
+            Success = $true
+            NvidiaDetected = $false
+            Issues = @()
+            Output = ""
+        }
+    }
+
+    $output = & $PythonExe $checkScript --json 2>&1
+    $exitCode = $LASTEXITCODE
+    $text = (($output | ForEach-Object { $_.ToString() }) -join "`n").Trim()
+    try {
+        $status = $text | ConvertFrom-Json
+        $issues = @($status.issues | ForEach-Object { $_.ToString() })
+        return @{
+            Success = ($exitCode -eq 0 -and [bool]$status.ok)
+            NvidiaDetected = [bool]$status.nvidia_detected
+            Issues = $issues
+            Output = $text
+        }
+    } catch {
+        return @{
+            Success = $false
+            NvidiaDetected = $true
+            Issues = @("NVIDIA runtime check failed to return valid JSON.")
+            Output = $text
+        }
+    }
+}
+
 Write-Host "[run-gui] Repo: $repoRoot"
 Write-Host "[run-gui] Checking virtual environment..."
 if (-not (Test-Path $venvPython)) {
@@ -96,6 +129,34 @@ if (-not (Test-Path $venvPython)) {
 }
 
 Write-Host "[run-gui] Using Python: $venvPython"
+Write-Host "[run-gui] Checking NVIDIA runtime..."
+$nvidiaRuntime = Test-NvidiaRuntime -PythonExe $venvPython -Repo $repoRoot
+if (-not $nvidiaRuntime.Success) {
+    $issueText = ($nvidiaRuntime.Issues -join "`n- ")
+    if (-not [string]::IsNullOrWhiteSpace($issueText)) {
+        $issueText = "- $issueText"
+    } else {
+        $issueText = $nvidiaRuntime.Output
+    }
+    $reason = @"
+The NVIDIA CUDA/TensorRT Python runtime is outdated or inconsistent.
+
+$issueText
+
+Run setup.bat again to refresh the environment.
+"@
+    if (Invoke-SetupPrompt $reason) {
+        Invoke-SetupNow
+        $nvidiaRuntime = Test-NvidiaRuntime -PythonExe $venvPython -Repo $repoRoot
+    }
+    if (-not $nvidiaRuntime.Success) {
+        if (-not [string]::IsNullOrWhiteSpace($nvidiaRuntime.Output)) {
+            Write-Host $nvidiaRuntime.Output
+        }
+        throw "NVIDIA runtime check failed. Run setup.bat to refresh the environment."
+    }
+}
+
 $runImportCheck = Test-EnvFlagEnabled "HDRTVNET_CHECK_GUI_IMPORT"
 if ($runImportCheck) {
     Write-Host "[run-gui] Checking GUI imports..."

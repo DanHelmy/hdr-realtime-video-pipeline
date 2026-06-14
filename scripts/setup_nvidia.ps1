@@ -103,6 +103,9 @@ except Exception as exc:
 try:
     import tensorrt as trt
     print(f"[setup-nvidia] TensorRT {trt.__version__}")
+    if str(getattr(trt, "__version__", "")) != "11.0.0.114":
+        print("[setup-nvidia] WARNING: Expected TensorRT 11.0.0.114.")
+        ok = False
     _ = trt.Builder(trt.Logger(trt.Logger.WARNING))
     print("[setup-nvidia] TensorRT builder created successfully.")
 except Exception as exc:
@@ -121,8 +124,10 @@ sys.exit(0 if ok else 10)
         } else {
             $env:PYTHONPATH = $srcPath
         }
-        & $PythonExe $tmp
-        return ($LASTEXITCODE -eq 0)
+        $checkOutput = & $PythonExe $tmp 2>&1
+        $checkExitCode = $LASTEXITCODE
+        $checkOutput | ForEach-Object { Write-Host $_ }
+        return ($checkExitCode -eq 0)
     } finally {
         if ($null -eq $oldPythonPath) {
             Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
@@ -153,8 +158,8 @@ except Exception as exc:
     print(f"[setup-nvidia] Existing PyTorch check skipped: {exc}")
     needs_reinstall = True
 
-expected_trt = "10.16.1.11"
-for package in ("tensorrt_cu12", "tensorrt_cu12_bindings", "tensorrt_cu12_libs"):
+expected_trt = "11.0.0.114"
+for package in ("tensorrt_cu13", "tensorrt_cu13_bindings", "tensorrt_cu13_libs"):
     try:
         version = metadata.version(package)
         print(f"[setup-nvidia] existing {package} {version}")
@@ -170,11 +175,46 @@ sys.exit(20 if needs_reinstall else 0)
     $tmp = New-TemporaryFile
     try {
         Set-Content -LiteralPath $tmp -Value $checkScript -Encoding UTF8
-        & $PythonExe $tmp
-        return ($LASTEXITCODE -eq 20)
+        $checkOutput = & $PythonExe $tmp 2>&1
+        $checkExitCode = $LASTEXITCODE
+        $checkOutput | ForEach-Object { Write-Host $_ }
+        return ($checkExitCode -eq 20)
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Remove-ObsoleteNvidiaPythonDeps([string]$PythonExe) {
+    $obsoletePackages = @("tensorrt_cu12", "tensorrt_cu12_bindings", "tensorrt_cu12_libs")
+    $checkScript = @'
+import importlib.metadata as metadata
+import sys
+
+for package in sys.argv[1:]:
+    try:
+        metadata.version(package)
+    except metadata.PackageNotFoundError:
+        continue
+    print(package)
+'@
+    $tmp = New-TemporaryFile
+    try {
+        Set-Content -LiteralPath $tmp -Value $checkScript -Encoding UTF8
+        $installedPackages = @(& $PythonExe $tmp @obsoletePackages)
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if ($installedPackages.Count -eq 0) {
+        return $false
+    }
+    Write-Host "[setup-nvidia] Removing obsolete TensorRT CUDA 12 package(s): $($installedPackages -join ', ')"
+    $uninstallOutput = & $PythonExe -m pip uninstall -y @installedPackages 2>&1
+    $uninstallExitCode = $LASTEXITCODE
+    $uninstallOutput | ForEach-Object { Write-Host $_ }
+    if ($uninstallExitCode -ne 0) {
+        throw "Failed to remove obsolete TensorRT CUDA 12 package(s)."
+    }
+    return $true
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -213,6 +253,10 @@ $forceReinstallDeps = Test-NvidiaPythonDepsNeedForceReinstall -PythonExe $venvPy
 Write-Step "Installing NVIDIA dependencies..."
 if (-not $SkipPipUpgrade) {
     & $venvPython -m pip install --upgrade pip setuptools wheel
+}
+$removedObsoleteDeps = Remove-ObsoleteNvidiaPythonDeps -PythonExe $venvPython
+if ($removedObsoleteDeps) {
+    $forceReinstallDeps = $true
 }
 $pipArgs = @("install", "--prefer-binary", "-r", $reqFile)
 if ($forceReinstallDeps) {

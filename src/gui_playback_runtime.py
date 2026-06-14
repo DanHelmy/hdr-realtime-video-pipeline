@@ -68,6 +68,10 @@ from required_clone_assets import (
     manual_assets_drive_url,
     missing_required_clone_assets,
 )
+from nvidia_runtime_check import (
+    check_nvidia_python_runtime,
+    format_nvidia_runtime_issues,
+)
 from gui_scaling import (
     UPSCALER_CHOICES,
     DEFAULT_UPSCALER,
@@ -1131,6 +1135,8 @@ class PlaybackRuntimeMixin:
         )
 
     def _show_startup_runtime_warnings(self):
+        if not self._enforce_nvidia_runtime_environment():
+            return
         if not self._enforce_required_clone_assets():
             return
         self._warn_if_hip_sdk_missing_on_rocm_windows()
@@ -1195,6 +1201,35 @@ class PlaybackRuntimeMixin:
             "Setup has been opened in a new window.\n\n"
             "Finish setup, then launch the GUI again.",
         )
+        self.close()
+        return False
+
+    def _enforce_nvidia_runtime_environment(self) -> bool:
+        if not _env_enabled("HDRTVNET_REQUIRE_NVIDIA_RUNTIME", "1"):
+            return True
+
+        status = check_nvidia_python_runtime()
+        if status.get("ok", False):
+            return True
+        if not status.get("nvidia_detected", False):
+            return True
+
+        message = format_nvidia_runtime_issues(status)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("NVIDIA Runtime Needs Setup")
+        box.setText("The NVIDIA CUDA/TensorRT runtime needs to be refreshed.")
+        box.setInformativeText(message)
+        setup_btn = box.addButton(
+            "Run setup.bat",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        exit_btn = box.addButton("Exit", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(setup_btn)
+        box.setEscapeButton(exit_btn)
+        box.exec()
+        if box.clickedButton() is setup_btn:
+            return self._launch_setup_and_exit()
         self.close()
         return False
 
