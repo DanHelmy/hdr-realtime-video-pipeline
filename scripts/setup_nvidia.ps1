@@ -133,6 +133,50 @@ sys.exit(0 if ok else 10)
     }
 }
 
+function Test-NvidiaPythonDepsNeedForceReinstall([string]$PythonExe) {
+$checkScript = @'
+import importlib.metadata as metadata
+import sys
+
+needs_reinstall = False
+
+try:
+    import torch
+    torch_version = str(getattr(torch, "__version__", "unknown"))
+    torch_cuda = str(getattr(torch.version, "cuda", "") or "")
+    print(f"[setup-nvidia] existing torch {torch_version}")
+    print(f"[setup-nvidia] existing torch CUDA runtime: {torch_cuda or 'none'}")
+    if not torch_cuda.startswith("13."):
+        print("[setup-nvidia] Existing PyTorch CUDA runtime is not 13.x; forcing NVIDIA dependency reinstall.")
+        needs_reinstall = True
+except Exception as exc:
+    print(f"[setup-nvidia] Existing PyTorch check skipped: {exc}")
+    needs_reinstall = True
+
+expected_trt = "10.16.1.11"
+for package in ("tensorrt_cu12", "tensorrt_cu12_bindings", "tensorrt_cu12_libs"):
+    try:
+        version = metadata.version(package)
+        print(f"[setup-nvidia] existing {package} {version}")
+        if version != expected_trt:
+            print(f"[setup-nvidia] Expected {package} {expected_trt}; forcing NVIDIA dependency reinstall.")
+            needs_reinstall = True
+    except Exception as exc:
+        print(f"[setup-nvidia] Existing {package} check failed: {exc}; forcing NVIDIA dependency reinstall.")
+        needs_reinstall = True
+
+sys.exit(20 if needs_reinstall else 0)
+'@
+    $tmp = New-TemporaryFile
+    try {
+        Set-Content -LiteralPath $tmp -Value $checkScript -Encoding UTF8
+        & $PythonExe $tmp
+        return ($LASTEXITCODE -eq 20)
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $venvDir = Join-Path $repoRoot "venv"
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
@@ -164,11 +208,18 @@ if ($pyMm -ne "3.12") {
     throw "NVIDIA setup requires Python 3.12, but venv has $pyMm. Re-run with Python 3.12 (recommended: py -3.12) and use -RecreateVenv."
 }
 
+$forceReinstallDeps = Test-NvidiaPythonDepsNeedForceReinstall -PythonExe $venvPython
+
 Write-Step "Installing NVIDIA dependencies..."
 if (-not $SkipPipUpgrade) {
     & $venvPython -m pip install --upgrade pip setuptools wheel
 }
-& $venvPython -m pip install --prefer-binary -r $reqFile
+$pipArgs = @("install", "--prefer-binary", "-r", $reqFile)
+if ($forceReinstallDeps) {
+    Write-Host "[setup-nvidia] Reinstalling NVIDIA Python dependencies from a clean package cache path..."
+    $pipArgs = @("install", "--force-reinstall", "--no-cache-dir", "--prefer-binary", "-r", $reqFile)
+}
+& $venvPython -m pip @pipArgs
 
 Write-Step "Checking NVIDIA TensorRT runtime..."
 $trtReady = Test-NvidiaTensorRTRuntime -PythonExe $venvPython
