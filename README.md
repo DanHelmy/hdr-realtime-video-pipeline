@@ -1158,7 +1158,7 @@ After replacing eager INT8 checkpoints, regenerate TensorRT sources and validate
 
 ### Rebuild QAT Checkpoints
 
-QAT optimizes toward FP32/HDR accuracy. QAT Film uses the same quantized composition but is trained for movie-domain accuracy. PTQ, QAT, and QAT Film must keep the same precision composition inside a family; only the trained weights/objective change.
+QAT optimizes toward FP32/HDR accuracy. QAT Film uses the same quantized composition and the same staged SDR/HDR image-pair recipe, but with the Film objective/teacher-loss weights. It does not require movie frame assets in this repository. PTQ, QAT, and QAT Film must keep the same precision composition inside a family; only the trained weights/objective change.
 
 The QAT recipes expect paired SDR/HDR data staged locally as `dataset/train_sdr`, `dataset/train_hdr`, `dataset/test_sdr`, and `dataset/test_hdr`. These recipes use HDRTV1K by `chxy95`: [huggingface.co/datasets/chxy95/HDRTV1K](https://huggingface.co/datasets/chxy95/HDRTV1K). Follow the dataset page terms when downloading or redistributing the data.
 
@@ -1168,8 +1168,8 @@ QAT defaults:
 |---|---|
 | Mixed QAT | `1235` HDRTV1K train pairs, `epochs=10`, `lr=2e-6`, `crop-size=384`, `batch-size=1`, `max-long-edge=720`, `teacher-source=fp32`, `monitor-score=hybrid`, `teacher-loss-weight=0.68`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`, `protect-agcm-controls=0`, `protect-sft-controls=0`, `fp16-sensitive-layers=0`, `early-stop-patience=4` |
 | Full QAT | `1235` HDRTV1K train pairs, `epochs=6`, `lr=1.5e-6`, `max-long-edge=720`, `teacher-source=fp32`, `teacher-loss-weight=0.65`, `highlight-teacher-weight=0.35`, `dark-teacher-weight=0.34`, `freeze-sensitive-layers=0`, `freeze-sft-controls=0`, `early-stop-patience=3` |
-| Mixed QAT Film | same Mixed composition, movie-teacher replay data, `max-long-edge=960`, `teacher-loss-weight=0.72`, `teacher-luma-weight=0.12`, `teacher-chroma-weight=0.07`, `highlight-teacher-weight=0.40`, `dark-teacher-weight=0.38`, and source-chroma/source-shadow auxiliary weights set to `0` |
-| Full QAT Film | same Full composition, movie-teacher replay data, `max-long-edge=960`, `lr=2e-6`, `teacher-loss-weight=0.70`, `teacher-luma-weight=0.11`, `teacher-chroma-weight=0.065`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`, and source-chroma/source-shadow auxiliary weights set to `0` |
+| Mixed QAT Film | same Mixed composition and HDRTV1K-style SDR/HDR pairs, Film objective, `max-long-edge=960`, `teacher-loss-weight=0.72`, `teacher-luma-weight=0.12`, `teacher-chroma-weight=0.07`, `highlight-teacher-weight=0.40`, `dark-teacher-weight=0.38`, and source-chroma/source-shadow auxiliary weights set to `0` |
+| Full QAT Film | same Full composition and HDRTV1K-style SDR/HDR pairs, Film objective, `max-long-edge=960`, `lr=2e-6`, `teacher-loss-weight=0.70`, `teacher-luma-weight=0.11`, `teacher-chroma-weight=0.065`, `highlight-teacher-weight=0.38`, `dark-teacher-weight=0.36`, and source-chroma/source-shadow auxiliary weights set to `0` |
 
 ```powershell
 .\venv\Scripts\python.exe scripts\quantize\quantize_int8_mixed_qat.py --device cuda --ptq-checkpoint src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_mixed.pt --output src\models\weights\original\pytorch_int8\hg\HR_HG_original_int8_mixed_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 10 --lr 2e-6 --teacher-loss-weight 0.68 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.38 --dark-teacher-weight 0.36 --early-stop-patience 4
@@ -1179,7 +1179,7 @@ QAT defaults:
 .\venv\Scripts\python.exe scripts\quantize\quantize_int8_full_qat.py --use-hg 0 --device cuda --ptq-checkpoint src\models\weights\original\pytorch_int8\hr\HR_original_int8_full.pt --output src\models\weights\original\pytorch_int8\hr\HR_original_int8_full_qat.pt --sdr-dir dataset\train_sdr --hdr-dir dataset\train_hdr --val-sdr-dir dataset\test_sdr --val-hdr-dir dataset\test_hdr --max-images 0 --max-val-images 0 --num-validate 0 --crop-size 384 --batch-size 1 --max-long-edge 720 --teacher-source fp32 --monitor-score hybrid --source-chroma-weight 0 --source-shadow-luma-weight 0 --source-shadow-detail-weight 0 --epochs 6 --lr 1.5e-6 --teacher-loss-weight 0.65 --teacher-luma-weight 0.10 --teacher-chroma-weight 0.06 --highlight-teacher-weight 0.35 --dark-teacher-weight 0.34 --early-stop-patience 3
 ```
 
-QAT Film uses the same four commands with the same PTQ inputs and outputs ending in `_qat_film.pt`, but swaps in movie-teacher replay roots generated from the current FP32 teacher. The replay roots are reproducibility inputs, not shipped application assets.
+QAT Film uses the same four scripts, dataset directories, and PTQ inputs as regular QAT. To rebuild Film variants, keep the same commands but write outputs ending in `_qat_film.pt` and apply the Film hyperparameters from the table above (not a separate movie-frame replay dataset). After replacing eager Film checkpoints, regenerate the matching TensorRT source checkpoints with `scripts\quantize\split_tensorrt_sources.py`.
 
 ### AMD/CPU Eager INT8
 
