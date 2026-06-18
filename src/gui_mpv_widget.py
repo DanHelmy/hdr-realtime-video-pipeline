@@ -155,8 +155,8 @@ def _mpv_dither_options(*, live_capture: bool = False) -> dict:
 
 def _mpv_live_interpolation_enabled() -> bool:
     # Browser-window capture runs at a capped processing cadence. Use mpv's
-    # display-resample path, but keep the default temporal scaler restrained so
-    # motion does not pick up a strong soap-opera blend.
+    # display-resample path with visible temporal blending by default so low-FPS
+    # browser capture feels less like sharp frame sampling.
     return _env_bool_any(
         (
             "HDRTVNET_LIVE_MPV_INTERPOLATION",
@@ -170,12 +170,36 @@ def _mpv_live_tscale() -> str:
     value = str(
         os.environ.get(
             "HDRTVNET_LIVE_MPV_TSCALE",
-            os.environ.get("HDRTVNET_BROWSER_MPV_TSCALE", "mitchell"),
+            os.environ.get("HDRTVNET_BROWSER_MPV_TSCALE", "hermite"),
         )
     ).strip().lower().replace("-", "_")
     if not value:
-        return "mitchell"
+        return "hermite"
     return value
+
+
+def _mpv_live_tscale_blur() -> float:
+    return _env_float_any(
+        (
+            "HDRTVNET_LIVE_MPV_TSCALE_BLUR",
+            "HDRTVNET_BROWSER_MPV_TSCALE_BLUR",
+        ),
+        1.4,
+        min_value=0.0,
+        max_value=100.0,
+    )
+
+
+def _mpv_live_tscale_radius() -> float:
+    return _env_float_any(
+        (
+            "HDRTVNET_LIVE_MPV_TSCALE_RADIUS",
+            "HDRTVNET_BROWSER_MPV_TSCALE_RADIUS",
+        ),
+        3.0,
+        min_value=0.0,
+        max_value=100.0,
+    )
 
 
 def _mpv_downscale_kernel(*, hdr: bool = True) -> str:
@@ -959,6 +983,8 @@ class MpvHDRWidget(QWidget):
             mpv_kwargs.update(
                 interpolation=True,
                 tscale=_mpv_live_tscale(),
+                tscale_blur=str(_mpv_live_tscale_blur()),
+                tscale_radius=str(_mpv_live_tscale_radius()),
             )
         shader_paths = self._build_shader_paths(
             use_fsr=use_fsr,
@@ -1038,6 +1064,8 @@ class MpvHDRWidget(QWidget):
             fallback_kwargs["video_sync"] = "desync"
             fallback_kwargs.pop("interpolation", None)
             fallback_kwargs.pop("tscale", None)
+            fallback_kwargs.pop("tscale_blur", None)
+            fallback_kwargs.pop("tscale_radius", None)
             try:
                 player = self._mpv_lib.MPV(**fallback_kwargs)
                 self._active_vo = "gpu-next"

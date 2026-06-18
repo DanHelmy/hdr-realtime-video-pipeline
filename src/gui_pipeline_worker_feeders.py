@@ -324,8 +324,10 @@ class PipelineWorkerFeedersMixin:
             no_item = object()
             next_present_t = 0.0
             latest_rgb48_bytes: bytes | None = None
+            latest_sdr_bytes = None
             present_interval_s = _live_present_interval_s(display_fps)
             rgb48_host_state: dict = {}
+            sdr_host_state: dict = {}
             while True:
                 now = time.perf_counter()
                 wait_timeout = 0.2
@@ -366,7 +368,10 @@ class PipelineWorkerFeedersMixin:
 
                     source_t = None
                     ready_event = None
-                    if isinstance(item, tuple) and len(item) == 3:
+                    sdr_frame = None
+                    if isinstance(item, tuple) and len(item) == 4:
+                        source_t, tensor, ready_event, sdr_frame = item
+                    elif isinstance(item, tuple) and len(item) == 3:
                         source_t, tensor, ready_event = item
                     elif isinstance(item, tuple) and len(item) == 2:
                         source_t, tensor = item
@@ -385,6 +390,22 @@ class PipelineWorkerFeedersMixin:
                             rgb48_host_state,
                         )
                     )
+                    sdr_widget = getattr(self, "_sdr_mpv_widget", None)
+                    if sdr_frame is not None and sdr_widget is not None:
+                        raw_format = str(
+                            getattr(sdr_widget, "raw_video_format", "rgb48le")
+                            or "rgb48le"
+                        )
+                        try:
+                            latest_sdr_bytes = _bgr_to_sdr_mpv_bytes(
+                                sdr_frame,
+                                sdr_host_state,
+                                raw_format,
+                            )
+                        except Exception:
+                            latest_sdr_bytes = None
+                    elif sdr_frame is not None:
+                        latest_sdr_bytes = None
                     try:
                         item_present_t = float(source_t) if source_t is not None else 0.0
                     except Exception:
@@ -404,6 +425,9 @@ class PipelineWorkerFeedersMixin:
                     continue
 
                 mpv_widget.feed_frame(latest_rgb48_bytes)
+                sdr_widget = getattr(self, "_sdr_mpv_widget", None)
+                if latest_sdr_bytes is not None and sdr_widget is not None:
+                    sdr_widget.feed_frame(latest_sdr_bytes)
                 next_present_t = _next_live_present_deadline(
                     next_present_t,
                     now,
@@ -412,6 +436,7 @@ class PipelineWorkerFeedersMixin:
             return
 
         rgb48_host_state: dict = {}
+        sdr_host_state: dict = {}
         while True:
             try:
                 item = hdr_q.get(timeout=0.2)
@@ -432,7 +457,10 @@ class PipelineWorkerFeedersMixin:
             if item is None:
                 break
             ready_event = None
-            if isinstance(item, tuple) and len(item) == 3:
+            sdr_frame = None
+            if isinstance(item, tuple) and len(item) == 4:
+                present_t, tensor, ready_event, sdr_frame = item
+            elif isinstance(item, tuple) and len(item) == 3:
                 present_t, tensor, ready_event = item
             elif isinstance(item, tuple) and len(item) == 2:
                 present_t, tensor = item
@@ -444,11 +472,28 @@ class PipelineWorkerFeedersMixin:
                 except Exception:
                     pass
             rgb48_bytes = _tensor_to_rgb48_bytes(tensor, rgb48_host_state)
+            sdr_bytes = None
+            sdr_widget = getattr(self, "_sdr_mpv_widget", None)
+            if sdr_frame is not None and sdr_widget is not None:
+                raw_format = str(
+                    getattr(sdr_widget, "raw_video_format", "rgb48le")
+                    or "rgb48le"
+                )
+                try:
+                    sdr_bytes = _bgr_to_sdr_mpv_bytes(
+                        sdr_frame,
+                        sdr_host_state,
+                        raw_format,
+                    )
+                except Exception:
+                    sdr_bytes = None
             if present_t is not None:
                 now = time.perf_counter()
                 if now < present_t:
                     sleep_until(present_t)
             mpv_widget.feed_frame(rgb48_bytes)
+            if sdr_bytes is not None and sdr_widget is not None:
+                sdr_widget.feed_frame(sdr_bytes)
 
     def _sdr_feeder_fn(
         self,
@@ -633,6 +678,14 @@ class PipelineWorkerFeedersMixin:
             self._sdr_mpv_widget is None
             or self._sdr_queue is not None
         ):
+            return
+        if (
+            self._mpv_widget is not None
+            and self._hdr_queue is not None
+            and not bool(getattr(self, "_input_is_hdr", False))
+        ):
+            # Feed SDR from the HDR feeder when possible. This keeps both panes
+            # on one display clock and avoids a second live/raw-video feeder.
             return
         live_smooth_cadence = bool(getattr(self, "_capture_target", None))
         buffer_frames = (

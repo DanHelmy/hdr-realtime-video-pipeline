@@ -123,6 +123,11 @@ class WindowingMixin:
         return str(self._video_tabs.tabText(idx) or "")
 
     def _is_sdr_output_visible(self) -> bool:
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        ):
+            return False
         if self._sdr_float_window is not None and self._sdr_float_window.isVisible():
             return True
         if self._video_tabs is None:
@@ -133,6 +138,17 @@ class WindowingMixin:
         return label in {"SDR", "Side by Side"}
 
     def _sync_worker_sdr_visibility(self) -> bool:
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        ):
+            try:
+                self._worker.set_sdr_mpv_widget(None)
+                self._worker.set_sdr_visible(False)
+            except Exception:
+                pass
+            self._sdr_mpv_feed_from_worker = False
+            return False
         visible = self._is_sdr_output_visible()
         worker_visible = visible
         if (
@@ -302,6 +318,19 @@ class WindowingMixin:
         if self._video_tabs is None or index < 0:
             return
         new_label = str(self._video_tabs.tabText(index) or "")
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+            and new_label != "HDR"
+        ):
+            hdr_idx = (
+                self._video_tab_index("HDR")
+                if hasattr(self, "_video_tab_index")
+                else -1
+            )
+            if hdr_idx >= 0 and index != hdr_idx:
+                self._video_tabs.setCurrentIndex(hdr_idx)
+            return
         old_label = str(getattr(self, "_active_video_tab_label", "") or "")
         reactivate_sdr = old_label == "HDR" and new_label in {"SDR", "Side by Side"}
         self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
@@ -363,6 +392,11 @@ class WindowingMixin:
                 self._schedule_state_change_relock(delay_ms=140, drop_frames=2)
 
     def _toggle_sdr_popout(self):
+        if (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        ):
+            return
         if self._sdr_float_window is not None:
             self._dock_video_pane("sdr")
             return
@@ -1366,7 +1400,11 @@ class WindowingMixin:
         if not self._playing or not self._active_use_mpv:
             return
         source_mode = _normalize_source_mode(getattr(self, "_source_mode", None))
-        if self._disp_sdr_mpv is not None and self._disp_sdr_stack is not None:
+        if (
+            source_mode != SOURCE_MODE_WINDOW
+            and self._disp_sdr_mpv is not None
+            and self._disp_sdr_stack is not None
+        ):
             self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_mpv)
         if self._disp_hdr_mpv is not None and self._disp_hdr_stack is not None:
             self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_mpv)
@@ -1387,7 +1425,11 @@ class WindowingMixin:
             can_unpause_mpv = bool(source_mode == SOURCE_MODE_WINDOW or not worker_paused)
             if can_unpause_mpv and self._disp_hdr_mpv is not None:
                 self._disp_hdr_mpv.set_paused(False)
-            if can_unpause_mpv and self._disp_sdr_mpv is not None:
+            if (
+                source_mode != SOURCE_MODE_WINDOW
+                and can_unpause_mpv
+                and self._disp_sdr_mpv is not None
+            ):
                 self._disp_sdr_mpv.set_paused(False)
             self._with_layout_freeze(
                 lambda: None,
@@ -1489,9 +1531,13 @@ class WindowingMixin:
 
     def _on_view(self, mode):
         self._begin_video_pane_fade(duration_ms=1000, start_opacity=1.0)
+        is_window = (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        )
         if self._video_tabs is not None:
             self._video_tabs.tabBar().setVisible(True)
-        if self._disp_sdr_mpv is not None:
+        if self._disp_sdr_mpv is not None and not is_window:
             if self._playing:
                 self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_mpv)
             else:
@@ -1548,6 +1594,8 @@ class WindowingMixin:
         if (
             (not soft_only)
             and self._disp_sdr_mpv is not None
+            and _normalize_source_mode(getattr(self, "_source_mode", None))
+            != SOURCE_MODE_WINDOW
             and self._disp_sdr_mpv.needs_surface_refresh()
         ):
             self._disp_sdr_mpv.refresh_surface()

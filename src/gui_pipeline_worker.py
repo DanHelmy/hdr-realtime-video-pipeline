@@ -121,7 +121,6 @@ class PipelineWorker(
         self._sobel_x: torch.Tensor | None = None
         self._sobel_y: torch.Tensor | None = None
         self._input_is_hdr: bool = False
-        self._sdr_delay_frame: np.ndarray | None = None
         self._hdr_drop_until_frame: int = 0
         self._sdr_drop_until_frame: int = 0
         self._frame_idx: int = 0
@@ -805,7 +804,6 @@ class PipelineWorker(
                 seek_frame_ready_pending = True
                 self._display_prebuffer_count = 0
                 next_frame_t = time.perf_counter()
-                self._sdr_delay_frame = None
                 self._reset_enhance_history()
                 # Reset post-flush frame-drop watermarks to the new timeline
                 # position.  If we keep an old watermark from a later frame,

@@ -249,7 +249,7 @@ Browser capture pacing:
 
 - The GUI exposes a Browser Window Capture FPS cap: `24`, `30`, or `60` fps. `24 fps` is the default smooth low-latency cap.
 - Browser-window processing/output presets are capped by both the captured window size and the largest attached monitor, up to the app's 1080p processing preset.
-- Chrome compositor observation runs faster than processing, defaulting to 2x the selected process cap (`48`, `60`, or `120` fps) unless `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` overrides it.
+- Chrome compositor observation runs faster than processing, defaulting to 1.5x the selected process cap (`36`, `45`, or `90` fps) unless `HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS` overrides it.
 - Video processing samples the latest visible Chrome window frame at the selected GUI cap, or `HDRTVNET_LIVE_CAPTURE_PROCESS_FPS` before the GUI setting is loaded. Default: `24`.
 - The mpv live feed repeats the latest processed frame at the selected cap for steadier display cadence. `HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS` can lower that feed, but values above process FPS are capped to avoid uneven duplicate cadence.
 - mpv owns the final display timing with vsync-aware frame repeat, so Python does not need to write 60 frames per second.
@@ -257,16 +257,17 @@ Browser capture pacing:
 - The live mpv feeder allows a tiny bounded refill after a late write so mpv's raw-video pipe does not underflow into visible pauses.
 - Playback, capture, and feeder timing threads opt into Windows high-resolution timers plus MMCSS `Playback` scheduling so frame-deadline wakeups are less likely to slip under CPU load.
 - Once a live feeder has a frame to repeat, it uses precise short-slice polling instead of relying on coarse `Queue.get(timeout=...)` wakeups for presentation deadlines.
-- Both browser-capture mpv panes are attached and fed at startup; the GUI performs a soft surface warm-up after handoff instead of relying on a manual or simulated tab switch.
+- Browser Window Capture is HDR-only in the GUI; SDR and Side by Side panes stay available for normal video playback.
+- The browser-capture HDR mpv pane is attached and fed at startup; the GUI performs a soft surface warm-up after handoff instead of relying on a manual or simulated tab switch.
 - The mpv named-pipe writer can write directly from release-aware pinned RGB48 frame slots, reducing avoidable copies and jitter in the final delivery step.
 - mpv display debanding and built-in `fruit` output dithering are enabled by default for both Browser Window Capture and normal video playback to soften codec/compositor banding after SDR-to-HDR expansion.
-- Captured browser SDR frames are tagged as full-range sRGB for the SDR preview path; the converted HDR pane is still tagged as BT.2020/PQ after HDRTVNet++ inference.
+- Captured browser frames are treated as full-range sRGB input; the converted HDR pane is tagged as BT.2020/PQ after HDRTVNet++ inference.
 - Static browser windows keep feeding by repeating the latest visible frame at process FPS. If WinRT has no compositor frame yet, a visible-window fallback captures one startup seed frame so playback can start even before the tab video is moving.
 - Browser source delivery now resets after a meaningfully late frame instead of immediately catching up with a short interval. This favors steady motion cadence over shaving a few milliseconds of live latency.
 - To reduce load further, set the variables before launching:
 
 ```powershell
-$env:HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS="48"
+$env:HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS="36"
 $env:HDRTVNET_LIVE_CAPTURE_PROCESS_FPS="24"
 $env:HDRTVNET_LIVE_CAPTURE_DISPLAY_FPS="24"
 $env:HDRTVNET_LIVE_CAPTURE_MPV_BUFFER_FRAMES="3"
@@ -310,7 +311,7 @@ WinRT pacing tuning:
 
 - `HDRTVNET_WINRT_FRAME_POOL_BUFFERS=4` controls the Windows Graphics Capture frame-pool depth. Default: `4`.
 - `HDRTVNET_WINRT_DRAIN_TO_LATEST=0` keeps queued WinRT frames in order for steadier motion cadence. Set to `1` for the older lowest-latency behavior that always jumps to the newest queued frame.
-- Live capture interpolation is currently enabled by default.
+- Live capture interpolation is enabled by default with mpv `tscale=hermite`, `tscale-blur=1.4`, and `tscale-radius=3.0`.
 
 Important:
 
@@ -322,8 +323,8 @@ Important:
 - The extension is audio-only and delays tab audio locally inside Chrome.
 - Chrome Audio Sync now stays active until you stop it manually in the extension.
 - HDRTVNet++ stays silent during browser-window playback.
-- Browser-window capture observes Chrome separately (default 2x the selected GUI cap), feeds mpv a steady `24`/`30`/`60` fps stream, and lets mpv repeat frames on display vsync.
-- After a cold compile, playback waits for both mpv panes to attach before the worker starts producing frames, then softly warms their surfaces; this prevents hidden-tab panes from staying black until the user switches views.
+- Browser-window capture observes Chrome separately (default 1.5x the selected GUI cap), feeds mpv a steady `24`/`30`/`60` fps stream, and lets mpv repeat frames on display vsync.
+- After a cold compile, playback waits for the HDR mpv pane to attach before the worker starts producing frames, then softly warms its surface.
 - Without Chrome Audio Sync, Chrome keeps playing audio locally and it can lead the video.
 - If the Chrome source window disappears unexpectedly, HDRTVNet++ now treats that as source loss and restarts cleanly instead of holding onto a dead browser feed.
 
@@ -411,7 +412,7 @@ The GUI is the primary way to use the pipeline. It handles backend selection, mo
 - **Smoother normal video playback**
   - startup, seek, and resume fill a fixed `HDRTVNET_VIDEO_PLAYBACK_BUFFER_FRAMES` buffer before releasing audio and HDR/SDR panes together; default is `3`
   - HDR mpv feed uses a default 3-slot pinned RGB48 ring with CUDA-event handoff, separate from the playback jitter buffer
-  - side-by-side SDR/HDR mpv feeds preserve ordered frames during normal video playback, while Browser Window Capture keeps its low-delay latest-frame stabilizer
+  - side-by-side SDR frames ride the HDR mpv feeder when possible, preserving pane alignment without a second raw-video timing loop
   - SDR and HDR mpv panes stay active across `SDR`, `HDR`, and `Side by Side`; ordinary layout switches no longer tear down mpv, so switching to SDR-only should not flash black or drift out of sync
   - dragging the playhead shows an exact mpv scrub preview from the source file instead of relying on OpenCV seeking
   - side-by-side relock is back to the v5.1-style one-shot UI transition path; the periodic HDR-vs-SDR pair-chasing loop was removed so normal timestamp noise does not repeatedly flush both mpv panes

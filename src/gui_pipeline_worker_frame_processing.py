@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-import os
 import queue as _queue
 import time
 import torch
@@ -37,6 +36,14 @@ class PipelineWorkerFrameProcessingMixin:
         try:
             q.put_nowait(item)
             return
+        except _queue.Full:
+            pass
+        try:
+            q.get_nowait()
+        except _queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
         except _queue.Full:
             pass
 
@@ -176,37 +183,23 @@ class PipelineWorkerFrameProcessingMixin:
         # File playback may carry an absolute presentation time. Live capture
         # uses the feeder's steady low-FPS clock and mpv's display sync.
         queue_present_t = present_t
-        if (
-            queue_present_t is None
-            and getattr(self, "_capture_target", None)
-            and mpv_w is not None
-            and self._sdr_visible
-            and self._sdr_mpv_widget is not None
-        ):
-            try:
-                capture_fps = float(self._capture_target.get("fps", 24.0) or 24.0)
-            except Exception:
-                capture_fps = 24.0
-            try:
-                delay_frames = float(
-                    os.environ.get("HDRTVNET_LIVE_PAIR_PRESENT_DELAY_FRAMES", "0.75")
-                )
-            except Exception:
-                delay_frames = 0.75
-            interval_s = 1.0 / max(1.0, capture_fps)
-            queue_present_t = time.perf_counter() + (
-                interval_s * max(0.0, min(2.0, delay_frames))
-            )
         sdr_mpv_active = bool(
             self._sdr_visible
             and self._sdr_mpv_widget is not None
             and self._sdr_queue is not None
         )
+        combined_sdr_active = bool(
+            self._sdr_visible
+            and self._sdr_mpv_widget is not None
+            and self._hdr_queue is not None
+            and mpv_w is not None
+            and not self._input_is_hdr
+        )
         need_display_frame = bool(
             self._input_is_hdr
             or mpv_w is None
             or need_compare_frame
-            or (self._sdr_visible and not sdr_mpv_active)
+            or (self._sdr_visible and not (sdr_mpv_active or combined_sdr_active))
         )
         display_frame = _letterbox_bgr(frame, out_w, out_h) if need_display_frame else None
         model_latency_ms = 0.0
@@ -221,8 +214,11 @@ class PipelineWorkerFrameProcessingMixin:
             model_inp = frame
         else:
             model_inp = _letterbox_bgr(frame, out_w, out_h)
-        sdr_mpv_frame = model_inp if sdr_mpv_active else display_frame
-
+        sdr_mpv_frame = (
+            model_inp
+            if (sdr_mpv_active or combined_sdr_active)
+            else display_frame
+        )
         if self._input_is_hdr:
             need_hdr_cpu = False
             prepared_out = None
@@ -299,9 +295,17 @@ class PipelineWorkerFrameProcessingMixin:
                 if use_cuda:
                     ready_event = torch.cuda.Event(enable_timing=False)
                     ready_event.record(torch.cuda.current_stream())
+                hdr_item = (queue_present_t, queued_tensor, ready_event)
+                if combined_sdr_active:
+                    hdr_item = (
+                        queue_present_t,
+                        queued_tensor,
+                        ready_event,
+                        sdr_mpv_frame,
+                    )
                 self._queue_display_item(
                     self._hdr_queue,
-                    (queue_present_t, queued_tensor, ready_event),
+                    hdr_item,
                 )
 
         if (
@@ -309,6 +313,7 @@ class PipelineWorkerFrameProcessingMixin:
             and self._sdr_mpv_widget is not None
             and self._sdr_queue is not None
             and self._sdr_visible
+            and not combined_sdr_active
         ):
             if frame_idx < self._sdr_drop_until_frame:
                 pass

@@ -382,7 +382,13 @@ class SettingsPreviewMixin:
             ),
         }
         if self._video_tabs is not None and self._video_tabs.currentIndex() >= 0:
-            data["active_tab"] = self._video_tabs.tabText(self._video_tabs.currentIndex())
+            if (
+                _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+                == SOURCE_MODE_WINDOW
+            ):
+                data["active_tab"] = "HDR"
+            else:
+                data["active_tab"] = self._video_tabs.tabText(self._video_tabs.currentIndex())
         try:
             with open(_PREFS_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -476,10 +482,72 @@ class SettingsPreviewMixin:
             return getattr(self, "_capture_target", None) is not None
         return bool(getattr(self, "_video_path", None))
 
+    def _video_tab_index(self, label: str) -> int:
+        tabs = getattr(self, "_video_tabs", None)
+        if tabs is None:
+            return -1
+        for i in range(tabs.count()):
+            if str(tabs.tabText(i) or "") == str(label):
+                return i
+        return -1
+
+    def _set_browser_capture_tab_policy(self, is_window: bool):
+        tabs = getattr(self, "_video_tabs", None)
+        if tabs is None:
+            return
+
+        hdr_idx = self._video_tab_index("HDR")
+        if hdr_idx >= 0:
+            try:
+                tabs.setTabEnabled(hdr_idx, True)
+            except Exception:
+                pass
+            if hasattr(tabs, "setTabVisible"):
+                try:
+                    tabs.setTabVisible(hdr_idx, True)
+                except Exception:
+                    pass
+            if is_window and tabs.currentIndex() != hdr_idx:
+                tabs.setCurrentIndex(hdr_idx)
+
+        for label in ("SDR", "Side by Side"):
+            idx = self._video_tab_index(label)
+            if idx < 0:
+                continue
+            if hasattr(tabs, "setTabVisible"):
+                try:
+                    tabs.setTabVisible(idx, not is_window)
+                except Exception:
+                    pass
+            try:
+                tabs.setTabEnabled(idx, not is_window)
+            except Exception:
+                pass
+
+        if is_window:
+            if getattr(self, "_sdr_float_window", None) is not None:
+                try:
+                    self._dock_video_pane("sdr")
+                except Exception:
+                    pass
+            if getattr(self, "_worker", None) is not None:
+                try:
+                    self._worker.set_sdr_mpv_widget(None)
+                    self._worker.set_sdr_visible(False)
+                except Exception:
+                    pass
+            self._sdr_mpv_feed_from_worker = False
+
+        btn_sdr = getattr(self, "_btn_pop_sdr", None)
+        if btn_sdr is not None:
+            btn_sdr.setVisible(not is_window)
+            btn_sdr.setEnabled(not is_window)
+
     def _refresh_source_mode_ui(self):
         mode = _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
         self._source_mode = mode
         is_window = mode == SOURCE_MODE_WINDOW
+        self._set_browser_capture_tab_policy(is_window)
         if hasattr(self, "_cmb_source_mode") and self._cmb_source_mode is not None:
             self._cmb_source_mode.blockSignals(True)
             self._cmb_source_mode.setCurrentText(_source_mode_label(mode))
@@ -597,17 +665,21 @@ class SettingsPreviewMixin:
         self._save_user_settings()
 
     def _show_idle_preview_frame(self, preview: np.ndarray | None):
+        is_window = (
+            _normalize_source_mode(getattr(self, "_source_mode", SOURCE_MODE_VIDEO))
+            == SOURCE_MODE_WINDOW
+        )
         if preview is not None:
-            if self._disp_sdr_cpu is not None:
+            if self._disp_sdr_cpu is not None and not is_window:
                 self._disp_sdr_cpu.update_frame(preview)
             if self._disp_hdr_cpu is not None:
                 self._disp_hdr_cpu.update_frame(preview)
-            if self._disp_sdr_mpv is not None:
+            if self._disp_sdr_mpv is not None and not is_window:
                 self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
             if self._disp_hdr_mpv is not None:
                 self._disp_hdr_stack.setCurrentWidget(self._disp_hdr_cpu)
         else:
-            if self._disp_sdr_cpu is not None:
+            if self._disp_sdr_cpu is not None and not is_window:
                 self._disp_sdr_cpu.clear_display()
             if self._disp_hdr_cpu is not None:
                 self._disp_hdr_cpu.clear_display()

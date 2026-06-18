@@ -343,13 +343,13 @@ def live_capture_process_fps_from_value(value: object, default: float | None = N
 
 
 def live_capture_observe_fps(process_fps: float) -> float:
-    # Poll the compositor faster than the HDRTVNet++ budget so 24/30 fps
-    # processing usually receives a recent browser frame without making the
-    # mpv pipe itself run at high FPS.
+    # Poll the compositor moderately faster than the HDRTVNet++ budget so
+    # processing usually receives a recent browser frame without spending too
+    # much time copying frames that will be discarded before inference.
     process_fps = max(1.0, float(process_fps or 24.0))
     return _env_live_fps(
         "HDRTVNET_LIVE_CAPTURE_OBSERVE_FPS",
-        max(36.0, process_fps * 2.0),
+        max(process_fps, process_fps * 1.5),
     )
 
 

@@ -1692,6 +1692,17 @@ class PlaybackRuntimeMixin:
                     self._disp_sdr_stack.setCurrentWidget(self._disp_sdr_cpu)
                 self._pending_sdr_mpv_start = None
             self._pending_mpv_start = None
+        is_window_source = (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        )
+        if is_window_source:
+            try:
+                self._worker.set_sdr_mpv_widget(None)
+            except Exception:
+                pass
+            self._sdr_mpv_feed_from_worker = False
+            self._pending_sdr_mpv_start = None
         pending_sdr = getattr(self, "_pending_sdr_mpv_start", None)
         if pending_sdr and self._disp_sdr_mpv is not None and self._active_use_mpv:
             sdr_transfer = "bt1886"
@@ -1731,11 +1742,7 @@ class PlaybackRuntimeMixin:
         self._apply_monitor_upscale_settings(announce=False)
         self._sync_upscale_controls()
         self._refresh_playback_scale_status(force=True)
-        if (
-            bool(getattr(self, "_active_use_mpv", False))
-            and _normalize_source_mode(getattr(self, "_source_mode", None))
-            == SOURCE_MODE_WINDOW
-        ):
+        if bool(getattr(self, "_active_use_mpv", False)) and is_window_source:
             QTimer.singleShot(80, self._stabilize_window_capture_surface_after_startup)
             QTimer.singleShot(360, self._stabilize_window_capture_surface_after_startup)
         if self._startup_sync_pending:
@@ -3483,7 +3490,9 @@ class PlaybackRuntimeMixin:
         self._mpv_start_resync_t = 0.0
         if self._disp_sdr_mpv is not None:
             self._disp_sdr_stack.setCurrentWidget(
-                self._disp_sdr_mpv if use_mpv_pipeline else self._disp_sdr_cpu
+                self._disp_sdr_cpu
+                if is_window_source
+                else (self._disp_sdr_mpv if use_mpv_pipeline else self._disp_sdr_cpu)
             )
         if self._disp_hdr_mpv is not None:
             self._disp_hdr_stack.setCurrentWidget(
@@ -3555,7 +3564,7 @@ class PlaybackRuntimeMixin:
                 True,
                 live_vsync_timed,
             )
-            if self._disp_sdr_mpv is not None:
+            if (not is_window_source) and self._disp_sdr_mpv is not None:
                 # Feed SDR at the same processing size as HDR and let mpv's GPU
                 # scaler present it. Feeding final-size SDR frames can overload
                 # the SDR pipe/VO during side-by-side resize and make it drift.
@@ -3565,7 +3574,7 @@ class PlaybackRuntimeMixin:
                     float(display_fps),
                     "bicubic",
                     live_vsync_timed,
-                    "srgb" if is_window_source else "bt1886",
+                    "bt1886",
                 )
         else:
             self._worker.set_mpv_widget(None)
@@ -3615,8 +3624,13 @@ class PlaybackRuntimeMixin:
         )
         try:
             self._active_video_tab_label = self._current_video_tab_label()
-            sdr_worker_visible = bool(self._is_sdr_output_visible())
-            if bool(use_mpv_pipeline):
+            if is_window_source:
+                self._worker.set_sdr_mpv_widget(None)
+                self._sdr_mpv_feed_from_worker = False
+                sdr_worker_visible = False
+            else:
+                sdr_worker_visible = bool(self._is_sdr_output_visible())
+            if bool(use_mpv_pipeline) and not is_window_source:
                 sdr_worker_visible = True
             self._worker.set_sdr_visible(sdr_worker_visible)
         except Exception:

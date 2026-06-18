@@ -60,11 +60,19 @@ class WorkerSlotsMixin:
         self._hdr_labels["vo"].setText(f"VO: {info.get('vo', '?')}/{info.get('gpu_api', '?')}")
 
     def _on_frame(self, sdr, hdr):
+        is_window_source = (
+            _normalize_source_mode(getattr(self, "_source_mode", None))
+            == SOURCE_MODE_WINDOW
+        )
         sdr_show = sdr
-        self._last_sdr_frame = sdr_show
+        if not is_window_source:
+            self._last_sdr_frame = sdr_show
+        else:
+            self._last_sdr_frame = None
         self._last_hdr_frame = hdr
         if (
-            self._disp_sdr_mpv is not None
+            not is_window_source
+            and self._disp_sdr_mpv is not None
             and self._playing
             and self._active_use_mpv
             and not self._sdr_mpv_feed_from_worker
@@ -85,7 +93,11 @@ class WorkerSlotsMixin:
                     self._disp_sdr_mpv.feed_frame(rgb16.data)
             except Exception:
                 pass
-        if self._disp_sdr_cpu is not None and self._disp_sdr_cpu.isVisible():
+        if (
+            not is_window_source
+            and self._disp_sdr_cpu is not None
+            and self._disp_sdr_cpu.isVisible()
+        ):
             self._disp_sdr_cpu.update_frame(sdr_show)
         # QLabel fallbacks (mpv panes are fed directly from the worker)
         if self._disp_hdr_cpu is not None and self._disp_hdr_cpu.isVisible():
