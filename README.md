@@ -19,6 +19,10 @@ Latest stable release: **v6.0**.
 
 For normal use, download the latest stable build from GitHub **Releases** instead of cloning `main`.
 
+Demo video:
+
+[![HDRTVNet++ v6.0 showcase](docs/images/v6-demo-video-thumbnail.jpg)](https://youtu.be/DCTzbt9Ie7Y)
+
 Core updates include:
 
 - NVIDIA TensorRT backend for playback, export, benchmark, preview, and CLI inference
@@ -38,8 +42,8 @@ Core updates include:
 - display-side mpv tone mapping now uses `tone-mapping=spline` with `tone-mapping-param=0.45`, shared across playback, compare, and benchmark previews; it does not affect objective metrics or exported HDR content
 - pane-aware playback upscaling: mpv upscale quality follows the actual HDR pane size, so normal windowed, side-by-side, fullscreen-with-UI, and hide-UI fullscreen layouts only upscale when the pane is larger than the processed frame
 - FSR playback now uses an RGB `MAIN` mpv shader for the app's RGB48 feed, with EASU + gentle RCAS sharpening and a high-quality residual mpv scaler instead of bilinear fallback when FSR does not cover the full target
-- `SSimDownscaler.glsl` is loaded automatically as the mpv downscale shader companion when present (`HDRTVNET_MPV_SSIM_DOWNSCALER=0` disables it)
-- SDR panes now use SDR-specific downscaling (`mitchell`, non-linear) instead of the HDR linear-light downscale path, reducing glow around tiny SDR text in side-by-side/windowed layouts
+- mpv downscaling now defaults to non-linear `mitchell` with antiring `0.20` across SDR, HDR, and Browser Window Capture, with `SSimDownscaler.glsl` loaded as the downscale shader companion when present.
+- SDR, HDR, and browser-capture panes share `correct-downscaling=yes`, `linear-downscaling=no`, and `sigmoid-upscaling=no`; the selected `scale`/`cscale` upscaler and its tuned antiring still follow the GUI upscaler choice.
 - SDR preview panes feed mpv as BGR24 instead of RGB48 when HDR metadata is not forced, cutting SDR-only/side-by-side pipe bandwidth and conversion cost
 - SDR and HDR mpv panes now start and stay fed together from playback startup, so switching among `SDR`, `HDR`, and `Side by Side` is a warm UI change instead of enabling a cold pane after the click
 - tab, pop-out, and side-by-side layout refreshes avoid restarting mpv unless Qt actually recreates the native video surface, preventing the SDR-only flash-to-black and drift after view switches
@@ -644,7 +648,7 @@ Both SDR and HDR panes are rendered through embedded **mpv** (d3d11):
 - **SDR pane**: tagged as **Rec.709** (`bt.709` / `bt.1886`, full range)
 - **HDR pane**: tagged as **BT.2020/PQ** (`bt.2020` / `pq`, full range)
 - Output target is **auto-detected by mpv/display path** (no hard-forced target primaries/TRC)
-- SDR and HDR panes intentionally use different downscale defaults: SDR uses non-linear `mitchell` downscaling to avoid small-pane bloom around bright text, while HDR keeps linear-light `catmull_rom` downscaling for the HDR presentation path. Override with `HDRTVNET_MPV_SDR_DSCALE`, `HDRTVNET_MPV_SDR_DSCALE_ANTIRING`, `HDRTVNET_MPV_DSCALE`, and `HDRTVNET_MPV_DSCALE_ANTIRING`.
+- SDR, HDR, and Browser Window Capture share non-linear `mitchell` downscaling, `dscale-antiring=0.20`, `correct-downscaling=yes`, `linear-downscaling=no`, and `sigmoid-upscaling=no`. `SSimDownscaler.glsl` is also loaded by default when available; set `HDRTVNET_MPV_SSIM_DOWNSCALER=0` to disable it. Upscale antiring is still tuned by processing resolution and scaler choice. Override downscale with `HDRTVNET_MPV_SDR_DSCALE`, `HDRTVNET_MPV_SDR_DSCALE_ANTIRING`, `HDRTVNET_MPV_DSCALE`, and `HDRTVNET_MPV_DSCALE_ANTIRING`.
 
 Playback scaling is pane-aware:
 

@@ -204,7 +204,7 @@ def _mpv_live_tscale_radius() -> float:
 
 def _mpv_downscale_kernel(*, hdr: bool = True) -> str:
     env_name = "HDRTVNET_MPV_DSCALE" if hdr else "HDRTVNET_MPV_SDR_DSCALE"
-    fallback = os.environ.get("HDRTVNET_MPV_DSCALE", "catmull_rom")
+    fallback = os.environ.get("HDRTVNET_MPV_DSCALE", "mitchell")
     value = str(os.environ.get(env_name, fallback if hdr else "mitchell"))
     value = value.strip().lower().replace("-", "_")
     if value in {"", "none", "no", "off"}:
@@ -216,7 +216,7 @@ def _mpv_downscale_antiring(*, hdr: bool = True) -> float:
     if hdr:
         return _env_float(
             "HDRTVNET_MPV_DSCALE_ANTIRING",
-            0.35,
+            0.20,
             min_value=0.0,
             max_value=1.0,
         )
@@ -565,7 +565,8 @@ class MpvHDRWidget(QWidget):
         hdr_path = bool(self._force_hdr_metadata)
         settings = {
             "correct-downscaling": "yes",
-            "linear-downscaling": "yes" if hdr_path else "no",
+            "linear-downscaling": "no",
+            "sigmoid-upscaling": "no",
         }
         dscale = _mpv_downscale_kernel(hdr=hdr_path)
         if dscale:
